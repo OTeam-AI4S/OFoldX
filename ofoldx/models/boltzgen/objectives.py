@@ -18,7 +18,7 @@ from torch import Tensor
 from ...modules.diffusion.loss import denoising_criterion_factory
 from ...modules.geometry import weighted_rigid_align
 from ...modules.head.tm import tm_length_scale
-from ..training import TRAINING_CONTRACTS, TrainingContract
+from ..training import TrainingContract
 from .model import (
     BoltzGenConfidenceOutput,
     BoltzGenInput,
@@ -27,13 +27,10 @@ from .model import (
     _boltzgen_coordinate_frames,
 )
 
-TRAINING_CONTRACTS.register(
-    TrainingContract(
-        architectures=("boltzgen",),
-        criterion=denoising_criterion_factory,
-        strategy="denoising",
-        freeze=("distogram_head", "bfactor_head", "template_embedder"),
-    )
+TRAINING = TrainingContract(
+    architectures=("boltzgen",),
+    criterion=denoising_criterion_factory,
+    strategy="denoising",
 )
 
 _RESIDUE_TYPE_WEIGHTS = (

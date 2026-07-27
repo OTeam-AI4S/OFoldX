@@ -84,12 +84,10 @@ def test_sequence_family_trains_config_only(tmp_path: Path, name: str, model_cls
 def test_diffusion_family_trains_config_only(tmp_path: Path) -> None:
     # A diffusion family lowers each structure into (input, target) via `process_training`, noises the
     # target inside its own forward, and grounds the EDM denoising loss (resolved-atom mask, config
-    # sigma_data) against the model output. Its auxiliary heads are frozen.
+    # sigma_data) against the model output.
     runner = Runner(_config(tmp_path, _write(tmp_path / "chain.pdb"), name="boltz1", **_MINIMAL_BOLTZ1))
     try:
         assert type(runner.model).__name__ == "Boltz1Model"
-        frozen = {name for name, p in runner.model.named_parameters() if not p.requires_grad}
-        assert any(name.startswith("distogram_head.") for name in frozen)  # aux head frozen
         parameter = next(p for p in runner.model.parameters() if p.requires_grad)
         before = parameter.detach().clone()
         runner.model.eval()
@@ -230,11 +228,19 @@ def test_repository_model_loads_trains_and_rejects_processor_overrides(tmp_path:
     with pytest.raises(ValueError, match="published config"):
         Runner(config)
 
+    # The same holds for the Model config: a repository model's config is published, so model overrides
+    # are rejected rather than silently ignored.
+    with pytest.raises(ValueError, match="published config"):
+        Runner(_config(tmp_path, source, pretrained=str(repository), ca_only=True))
+
 
 @pytest.mark.skipif(not hasattr(torch.distributed, "is_gloo_available"), reason="torch.distributed unavailable")
-def test_frozen_diffusion_survives_ddp_second_step(tmp_path: Path) -> None:
-    # The single-step test cannot see it: under DDP(find_unused_parameters=False) an un-gradiented
-    # parameter crashes on the SECOND step. Freezing the aux heads (per the spec) must prevent that.
+def test_diffusion_survives_ddp_second_step_via_static_graph(tmp_path: Path) -> None:
+    # The single-step test cannot see it: under DDP an un-gradiented parameter crashes on the SECOND
+    # step, and find_unused_parameters=True cannot help because it walks the (dataclass) forward output.
+    # static_graph -- which the Runner enables in materialize_model -- learns the unused set from the
+    # first iteration's autograd hooks, so unused modules (here confidence + distogram + sampling-only)
+    # need no freezing. Build with confidence ENABLED so those parameters are genuinely present + unused.
     import torch.distributed as dist
 
     from ofoldx.io import read_structure
@@ -251,14 +257,13 @@ def test_frozen_diffusion_survives_ddp_second_step(tmp_path: Path) -> None:
         config.denoiser.num_token_encoder_blocks = 1
         config.denoiser.num_atom_encoder_blocks = 1
         config.denoiser.num_atom_decoder_blocks = 1
-        config.confidence.enabled = False
+        config.confidence.enabled = True
+        config.confidence.num_pairformer_blocks = 1
         model = Boltz1Model(config)
         model.train()
-        for name, parameter in model.named_parameters():
-            if any(name == pre or name.startswith(f"{pre}.") for pre in _training_spec("boltz1").freeze):
-                parameter.requires_grad_(False)
-        ddp = torch.nn.parallel.DistributedDataParallel(model, find_unused_parameters=False)
-        optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=1e-3)
+        ddp = torch.nn.parallel.DistributedDataParallel(model)  # DanLing's default (no find_unused_parameters)
+        ddp._set_static_graph()  # what Runner.materialize_model does once DDP has wrapped the model
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
         model_input, model_target = Boltz1Processor().process_training(read_structure(_write(tmp_path / "chain.pdb")))
         sigma_data = float(model.config.denoiser.sigma_data)
 

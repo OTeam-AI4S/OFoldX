@@ -359,7 +359,7 @@ class Boltz2Model(Model):
             msa_max_depth=msa_max_depth,
             generator=generator,
         )
-        target_positions, _ = _gather_boltz2_structure_target(
+        target_positions, target_mask = _gather_boltz2_structure_target(
             target,
             input,
             num_samples=num_samples,
@@ -368,6 +368,7 @@ class Boltz2Model(Model):
         diffusion_output = self.coordinate_diffusion.denoise_training(
             target_positions,
             input.atom_mask,
+            target_mask=target_mask,
             multiplicity=num_samples,
             synchronize_noise_levels=synchronize_noise_levels,
             coordinate_augmentation=coordinate_augmentation,
@@ -2325,6 +2326,7 @@ class Boltz2CoordinateDiffusion(nn.Module):
         target_coordinates: Tensor,
         atom_mask: Tensor,
         *,
+        target_mask: Tensor,
         multiplicity: int = 1,
         synchronize_noise_levels: bool = True,
         coordinate_augmentation: bool = True,
@@ -2342,7 +2344,9 @@ class Boltz2CoordinateDiffusion(nn.Module):
             target_coordinates.shape[-2],
             3,
         )
-        augmentation_mask = atom_mask.to(device=device, dtype=dtype)
+        # Centre and augment over the resolved atoms only: unresolved atoms carry no ground-truth
+        # coordinate, so including them (the wider ``atom_mask``) biases the centroid and rigid frame.
+        augmentation_mask = target_mask.to(device=device, dtype=dtype)
         augmentation_mask = augmentation_mask.repeat_interleave(multiplicity, 0)
         noise_batch_size = batch_size if synchronize_noise_levels else batch_size * multiplicity
         noise_level = self.noise_distribution(

@@ -11,11 +11,11 @@ train.
 
 DanLing drives forward → criterion → loss-normalizer → backward → step. The Runner adds only what DanLing
 cannot know generically: a config-bound criterion, a train/eval **mode** guard (DanLing never toggles module
-mode, and repository models load in ``eval()``), freezing of the untrained modules (so DDP does not hit an
-unreduced parameter on the second step -- ``find_unused_parameters=True`` cannot help, as it can only trace
-unused parameters through a list/dict/iterable forward output and these models return dataclasses), a
-nested-dataclass ``to_device``, and an ``infer_step`` that runs the family's inference entry point on its
-dataclass output instead of DanLing's tensor-shaped default.
+mode, and repository models load in ``eval()``), DDP ``static_graph`` (so the modules the objective does not
+train -- auxiliary heads, sampling-only modules, unexercised conditioning embedders -- are handled without a
+freeze list; ``find_unused_parameters=True`` cannot help, as it traces unused parameters through the forward
+output and these models return dataclasses), a nested-dataclass ``to_device``, and an ``infer_step`` that
+runs the family's inference entry point on its dataclass output instead of DanLing's tensor-shaped default.
 """
 
 from __future__ import annotations
@@ -26,7 +26,9 @@ from dataclasses import dataclass, fields, is_dataclass, replace
 from typing import Any, cast
 
 import danling as dl
+import torch
 from danling.runners.config import normalize_stack_name
+from torch import Tensor, nn
 
 from ..model import Model
 from ..models.registry import BUILTIN_MODULES, MODELS, ModelRegistration
@@ -36,9 +38,6 @@ from .config import RunnerConfig
 
 #: The only DanLing stack whose steps this Runner supports.
 _SUPPORTED_STACK = "ddp"
-
-#: Splits that run inference (no target/loss) rather than train/eval.
-_INFER_SPLITS = frozenset({"infer", "predict", "test"})
 
 Collate = Callable[[list[Any]], dict[str, Any]]
 Infer = Callable[[Any, Any], Any]
@@ -73,28 +72,26 @@ class _TrainingSpec:
     collate: Collate
     lower: str
     infer: Infer
-    freeze: tuple[str, ...]
 
 
 def _training_spec(architecture: str) -> _TrainingSpec:
     r"""
     Resolve the exact architecture's family-declared training contract into a runnable spec.
 
-    Importing the family's ``objectives`` module registers its contract; the contract lists the exact ids
-    it covers, so a same-package variant it does not cover (or an architecture with no ``objectives``
-    module) has no contract and is not trainable.
+    The family's ``objectives`` module exposes a ``TRAINING`` contract listing the exact ids it covers, so
+    a same-package variant it does not cover (or an architecture with no ``objectives`` module) is not
+    trainable.
     """
-
-    from ..models.training import TRAINING_CONTRACTS
 
     module_path = f"{BUILTIN_MODULES[architecture]}.objectives"
     try:
-        importlib.import_module(module_path)  # registers the family's training contract, if any
+        objectives = importlib.import_module(module_path)
     except ModuleNotFoundError as error:
         if error.name != module_path:
             raise  # a genuinely missing dependency inside objectives, not an absent objectives module
-    contract = TRAINING_CONTRACTS.get(architecture)
-    if contract is None:
+        objectives = None
+    contract = getattr(objectives, "TRAINING", None)
+    if contract is None or architecture not in contract.architectures:
         raise ValueError(
             f"architecture {architecture!r} is not trainable: its family declares no training contract "
             "covering it"
@@ -111,7 +108,6 @@ def _training_spec(architecture: str) -> _TrainingSpec:
         collate=build_collate(contract.collate_options),
         lower=lower,
         infer=infer,
-        freeze=contract.freeze,
     )
 
 
@@ -144,7 +140,6 @@ class Runner(dl.Runner):
         self.spec, self.model, self.processor = self._build()
         self.criterion = self.spec.criterion(self.model, self.processor)
         self.collate_fn = self.spec.collate
-        self._freeze_untrained_parameters()
         self.model.train()  # repository models load in eval(); DanLing never toggles module mode
         self.datasets.update(self.build_datasets())
 
@@ -199,6 +194,11 @@ class Runner(dl.Runner):
 
         if dict(self.config.processor):
             raise ValueError("a repository loads its Processor with the published config; drop the processor overrides")
+        model_overrides = sorted(k for k in model_config if k not in ("name", "pretrained", "revision"))
+        if model_overrides:
+            raise ValueError(
+                f"a repository loads its Model with the published config; drop the model override(s) {model_overrides}"
+            )
         repository = resolve_repository(
             model_config["pretrained"],
             revision=model_config.get("revision"),
@@ -220,27 +220,27 @@ class Runner(dl.Runner):
             self.config.model.revision = repository.commit  # pin the exact snapshot for resume
         return spec, model, processor
 
-    def _freeze_untrained_parameters(self) -> None:
+    def materialize_model(self) -> None:
         r"""
-        Freeze the modules the family's contract declares off the loss path (auxiliary heads, template
-        embedders). Freezing (``requires_grad=False``) removes them from DDP's gradient reduction. This is
-        necessary, not merely an optimization: DDP's ``find_unused_parameters=True`` traces unused
-        parameters through the forward's return value, which it can only walk when it is a list/dict/
-        iterable -- these models return dataclasses -- so without freezing, DDP raises on the second step.
+        Materialize the model, then -- once DanLing has wrapped it in DDP -- enable ``static_graph``.
+
+        The objective trains only the loss-path parameters; a model's auxiliary heads (distogram,
+        confidence, B-factor), sampling-only modules, and the conditioning embedders a given training set
+        does not exercise get no gradient. ``static_graph`` learns that used/unused set from the first
+        iteration's autograd hooks, so DDP reduces correctly without freezing anything -- unlike
+        ``find_unused_parameters=True``, which finds unused parameters by walking the forward's return
+        value and cannot walk the models' dataclass outputs. It assumes the set is constant across steps.
         """
 
-        prefixes = self.spec.freeze
-        if not prefixes:
-            return
-        for name, parameter in self.model.named_parameters():
-            if any(name == prefix or name.startswith(f"{prefix}.") for prefix in prefixes):
-                parameter.requires_grad_(False)
+        super().materialize_model()
+        if isinstance(self.model, nn.parallel.DistributedDataParallel):
+            self.model._set_static_graph()
 
     def build_datasets(self) -> dict[str, Any]:
         r"""
-        Build structure datasets for the configured splits. Train/eval splits lower with the spec's lowering
-        (diffusion families need the separate ``(input, target)``); inference splits lower with the plain
-        Processor call (no target).
+        Build structure datasets for the configured splits, all lowered by the spec's lowering (diffusion
+        families need the separate ``(input, target)``; the target is unused at inference). ``infer_step``
+        takes the model-visible input from the batch, so every split collates the same way.
         """
 
         from .dataset import StructureDataset
@@ -248,35 +248,42 @@ class Runner(dl.Runner):
         datasets: dict[str, Any] = {}
         for split, split_config in self.config.data.items():
             processor_kwargs = {key: value for key, value in split_config.items() if key != "source"}
-            lower = "call" if split in _INFER_SPLITS else self.spec.lower
             datasets[split] = StructureDataset(
-                split_config.source, self.processor, lower=lower, processor_kwargs=processor_kwargs
+                split_config.source, self.processor, lower=self.spec.lower, processor_kwargs=processor_kwargs
             )
         return datasets
 
     # -- batch movement ------------------------------------------------------
 
     def to_device(self, data: Any) -> Any:
+        r"""Move a nested batch (family Input/Target dataclasses and their nested fields) to the runner device."""
+
+        return self._move(data, self.device)
+
+    def _move(self, data: Any, device: torch.device) -> Any:
         r"""
-        Move a nested batch to the runner device, recursing through family Input/Target dataclasses and
-        their nested dataclass fields (e.g. ``ProtenixInput.template_features``), Mappings, and sequences.
+        Recursively move a nested structure to ``device``, descending through family Input/Target
+        dataclasses and their nested dataclass fields (e.g. ``ProtenixInput.template_features``), Mappings,
+        and sequences. Non-tensor leaves pass through unchanged.
         """
 
         if is_dataclass(data) and not isinstance(data, type):
             moved = {
-                field.name: self.to_device(value)
+                field.name: self._move(value, device)
                 for field in fields(data)
                 if (value := getattr(data, field.name)) is not None
             }
             return replace(data, **moved)
         if isinstance(data, Mapping):
-            moved = {key: self.to_device(value) for key, value in data.items()}
+            moved = {key: self._move(value, device) for key, value in data.items()}
             return type(data)(moved) if isinstance(data, dict) else moved
         if isinstance(data, list):
-            return [self.to_device(value) for value in data]
+            return [self._move(value, device) for value in data]
         if isinstance(data, tuple):
-            return tuple(self.to_device(value) for value in data)
-        return super().to_device(data)
+            return tuple(self._move(value, device) for value in data)
+        if isinstance(data, Tensor):
+            return data.to(device)
+        return data
 
     # -- steps ---------------------------------------------------------------
 
@@ -293,15 +300,14 @@ class Runner(dl.Runner):
 
     def infer_step(self, data: Any) -> list[Any]:
         r"""
-        Run the family's inference entry point and return its output(s).
+        Run the family's inference entry point and return its output(s) on the CPU.
 
         DanLing's default ``infer_step`` calls ``pred.squeeze(-1).tolist()``, which AttributeErrors on the
-        family dataclass outputs. This override instead runs ``spec.infer`` -- the plain forward for the
-        sequence families, ``model.sample`` for the diffusion families (whose training forward needs a
-        target that inference does not have) -- on the model-visible input and returns the raw output(s).
+        family dataclass outputs. This override runs ``spec.infer`` under DanLing's ``infer_context`` -- the
+        plain forward for the sequence families, ``model.sample`` for the diffusion families (whose training
+        forward needs a target that inference does not have) -- on the model-visible input, then moves the
+        output off the accelerator so a long inference pass does not accumulate whole dataclasses on device.
         """
-
-        import torch
 
         data = self.to_device(data)
         model = self.ema or self.model
@@ -311,5 +317,6 @@ class Runner(dl.Runner):
             model.eval()
         inputs = data["input"] if isinstance(data, Mapping) else data
         model_input = inputs["input"] if isinstance(inputs, Mapping) else inputs
-        with torch.inference_mode():
-            return [self.spec.infer(model, model_input)]
+        with self.infer_context():
+            prediction = self.spec.infer(model, model_input)
+        return [self._move(prediction, torch.device("cpu"))]

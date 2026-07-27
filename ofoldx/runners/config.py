@@ -73,14 +73,11 @@ class RunnerConfig(dl.RunnerConfig):
     inherited from [`danling.RunnerConfig`][danling.RunnerConfig].
 
     Attributes:
-        runner: Registered runner name.
         model: Model selection and architecture (model-config) overrides.
         processor: Processor-config overrides that are not model settings
             (e.g. NA-MPNN ``shared_nucleic_tokens``).
         data: Dataset configuration keyed by split name.
     """
-
-    runner: str = "ofoldx"
 
     model: ModelConfig
     processor: chanfig.Config

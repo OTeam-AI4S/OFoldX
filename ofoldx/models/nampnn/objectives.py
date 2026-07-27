@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from ...modules.mpnn import nll_loss as _nll_loss
-from ..training import TRAINING_CONTRACTS, TrainingContract
+from ..training import TrainingContract
 from .model import NA_MPNN_PADDING_TOKEN_ID
 
 _PROTEIN_RESIDUE_TYPE_SPAN = (0, 21)
@@ -125,11 +125,9 @@ def _criterion(model: Any, processor: Any) -> Any:
     return criterion_bound
 
 
-TRAINING_CONTRACTS.register(
-    TrainingContract(
-        architectures=("nampnn",),
-        criterion=_criterion,
-        strategy="sequence",
-        collate_options={"token_pad_id": NA_MPNN_PADDING_TOKEN_ID, "pair_bias_fields": ("pair_logit_bias",)},
-    )
+TRAINING = TrainingContract(
+    architectures=("nampnn",),
+    criterion=_criterion,
+    strategy="sequence",
+    collate_options={"token_pad_id": NA_MPNN_PADDING_TOKEN_ID, "pair_bias_fields": ("pair_logit_bias",)},
 )

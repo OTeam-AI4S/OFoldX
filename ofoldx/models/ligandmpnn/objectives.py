@@ -14,7 +14,7 @@ from torch import Tensor
 
 from ...modules.mpnn import label_smoothed_nll_loss
 from ...modules.mpnn import nll_loss as _nll_loss
-from ..training import TRAINING_CONTRACTS, TrainingContract
+from ..training import TrainingContract
 
 
 def nll_loss(sequence_tokens: Tensor, log_probabilities: Tensor) -> Tensor:
@@ -43,6 +43,4 @@ def _criterion(model: Any, processor: Any) -> Any:
 
 
 # LigandMPNN carries a single structure and its ligand context, so it trains at batch_size=1.
-TRAINING_CONTRACTS.register(
-    TrainingContract(architectures=("ligandmpnn",), criterion=_criterion, strategy="sequence_single")
-)
+TRAINING = TrainingContract(architectures=("ligandmpnn",), criterion=_criterion, strategy="sequence_single")
