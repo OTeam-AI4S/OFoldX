@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import importlib
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, fields, is_dataclass, replace
+from dataclasses import fields, is_dataclass, replace
 from typing import Any, cast
 
 import danling as dl
@@ -33,6 +33,7 @@ from torch import Tensor
 
 from ..model import Model
 from ..models.registry import BUILTIN_MODULES, MODELS, ModelRegistration
+from ..models.training import TrainingContract
 from ..processor import Processor
 from . import collate as _collate
 from .config import RunnerConfig
@@ -65,24 +66,13 @@ _STRATEGIES: dict[str, tuple[Callable[[Mapping[str, Any]], Collate], str, Infer]
 }
 
 
-@dataclass(frozen=True)
-class _TrainingSpec:
-    r"""A family contract resolved against its strategy: everything the Runner needs to train one model."""
-
-    criterion: Callable[[Model, Processor], Callable[[Any, Any], Any]]
-    collate: Collate
-    lower: str
-    infer: Infer
-    fresh_config: Callable[..., Any] | None
-
-
-def _training_spec(architecture: str) -> _TrainingSpec:
+def _training_contract(architecture: str) -> TrainingContract:
     r"""
-    Resolve the exact architecture's family-declared training contract into a runnable spec.
+    Return the family-declared training contract that covers this exact architecture, or raise.
 
     The family's ``objectives`` module exposes a ``TRAINING`` contract listing the exact ids it covers, so
     a same-package variant it does not cover (or an architecture with no ``objectives`` module) is not
-    trainable.
+    trainable. A contract naming a strategy the Runner does not implement is rejected here too.
     """
 
     module_path = f"{BUILTIN_MODULES[architecture]}.objectives"
@@ -98,20 +88,12 @@ def _training_spec(architecture: str) -> _TrainingSpec:
             f"architecture {architecture!r} is not trainable: its family declares no training contract "
             "covering it"
         )
-    strategy = _STRATEGIES.get(contract.strategy)
-    if strategy is None:
+    if contract.strategy not in _STRATEGIES:
         raise ValueError(
             f"the training contract for {architecture!r} names unknown strategy {contract.strategy!r}; known "
             f"strategies are {', '.join(sorted(_STRATEGIES))}"
         )
-    build_collate, lower, infer = strategy
-    return _TrainingSpec(
-        criterion=contract.criterion,
-        collate=build_collate(contract.collate_options),
-        lower=lower,
-        infer=infer,
-        fresh_config=contract.fresh_configs.get(architecture),
-    )
+    return contract
 
 
 class Runner(dl.Runner):
@@ -125,7 +107,6 @@ class Runner(dl.Runner):
     config: RunnerConfig
     model: Model
     processor: Processor
-    spec: _TrainingSpec
 
     def __init__(self, config: RunnerConfig | Mapping[str, Any]) -> None:
         if not isinstance(config, RunnerConfig):
@@ -145,9 +126,10 @@ class Runner(dl.Runner):
         repository = self._prepare_repository(config) if config.model.get("pretrained") else None
         super().__init__(config)
 
-        self.spec, self.model, self.processor = self._build(repository)
-        self.criterion = self.spec.criterion(self.model, self.processor)
-        self.collate_fn = self.spec.collate
+        self.model, self.processor, contract = self._build(repository)
+        self.criterion = contract.criterion(self.model, self.processor)
+        build_collate, self._lower, self._infer = _STRATEGIES[contract.strategy]
+        self.collate_fn = build_collate(contract.collate_options)
         # The objective trains only the loss-path parameters; auxiliary heads / sampling-only modules /
         # unexercised conditioning embedders get no gradient, so DDP must tolerate unused parameters. The
         # models now return ``tensorclass`` outputs, which DDP can walk, so ``find_unused_parameters=True``
@@ -162,23 +144,23 @@ class Runner(dl.Runner):
 
     # -- construction --------------------------------------------------------
 
-    def _build(self, repository: Any = None) -> tuple[_TrainingSpec, Model, Processor]:
+    def _build(self, repository: Any = None) -> tuple[Model, Processor, TrainingContract]:
         r"""Resolve the architecture, confirm it is trainable *before* building/loading, then instantiate."""
 
         model_config = self.config.model
         if model_config.pretrained:
             return self._build_from_repository(model_config, repository)
         registration = MODELS.lookup_model(model_config["name"])
-        spec = _training_spec(registration.id)  # fail fast before building the model
+        contract = _training_contract(registration.id)  # fail fast before building the model
         overrides = {
             key: value for key, value in model_config.items() if key not in ("name", "pretrained", "revision")
         }
         # A variant whose canonical fresh graph differs from the base config default (e.g. protenix_template's
         # template embedder) supplies its own config factory; otherwise the registered config_class applies.
-        build_config = spec.fresh_config or registration.model_config
+        build_config = contract.fresh_configs.get(registration.id) or registration.model_config
         model = registration.model(build_config(**overrides))
         processor = self._build_processor(registration, model)
-        return spec, model, processor
+        return model, processor, contract
 
     def _build_processor(self, registration: ModelRegistration, model: Model) -> Processor:
         r"""
@@ -231,7 +213,7 @@ class Runner(dl.Runner):
 
     def _build_from_repository(
         self, model_config: Mapping[str, Any], repository: Any
-    ) -> tuple[_TrainingSpec, Model, Processor]:
+    ) -> tuple[Model, Processor, TrainingContract]:
         r"""
         Load a Model/Processor pair from the already-resolved repository snapshot: decide architecture +
         trainability and validate the Processor metadata from the snapshot *before* the expensive weight
@@ -247,12 +229,12 @@ class Runner(dl.Runner):
                 f"config `model.name` {model_config['name']!r} does not match the repository architecture "
                 f"{architecture!r}"
             )
-        spec = _training_spec(architecture)  # fail fast before downloading weights
+        contract = _training_contract(architecture)  # fail fast before downloading weights
         # Load the Processor first -- it validates ``processor.json`` from the metadata-only snapshot before
         # ``load_model`` hydrates the full weights.
         processor = load_processor(repository)
         model = load_model(repository)
-        return spec, model, processor
+        return model, processor, contract
 
     def build_datasets(self) -> dict[str, Any]:
         r"""
@@ -267,7 +249,7 @@ class Runner(dl.Runner):
         for split, split_config in self.config.data.items():
             processor_kwargs = {key: value for key, value in split_config.items() if key != "source"}
             datasets[split] = StructureDataset(
-                split_config.source, self.processor, lower=self.spec.lower, processor_kwargs=processor_kwargs
+                split_config.source, self.processor, lower=self._lower, processor_kwargs=processor_kwargs
             )
         return datasets
 
@@ -319,10 +301,11 @@ class Runner(dl.Runner):
         Run the family's inference entry point and return its output(s) on the CPU.
 
         DanLing's default ``infer_step`` calls ``pred.squeeze(-1).tolist()``, which AttributeErrors on the
-        family dataclass outputs. This override runs ``spec.infer`` under DanLing's ``infer_context`` -- the
-        plain forward for the sequence families, ``model.sample`` for the diffusion families (whose training
-        forward needs a target that inference does not have) -- on the model-visible input, then moves the
-        output off the accelerator so a long inference pass does not accumulate whole dataclasses on device.
+        family dataclass outputs. This override runs the strategy's inference entry point under DanLing's
+        ``infer_context`` -- the plain forward for the sequence families, ``model.sample`` for the diffusion
+        families (whose training forward needs a target that inference does not have) -- on the model-visible
+        input, then moves the output off the accelerator so a long inference pass does not accumulate whole
+        dataclasses on device.
 
         Decorated with ``@torch.inference_mode()`` like DanLing's default ``infer_step`` (this override
         replaces it, so it must restore the guard) -- otherwise the forward would build and retain an
@@ -338,5 +321,5 @@ class Runner(dl.Runner):
         inputs = data["input"] if isinstance(data, Mapping) else data
         model_input = inputs["input"] if isinstance(inputs, Mapping) else inputs
         with self.infer_context():
-            prediction = self.spec.infer(model, model_input)
+            prediction = self._infer(model, model_input)
         return [self.to_device(prediction, torch.device("cpu"))]
