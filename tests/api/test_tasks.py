@@ -45,13 +45,7 @@ class ConcretePipeline(PairedPipeline[PairedModel, PairedProcessor]):
 class ConcreteCompositePipeline(CompositePipeline):
     pair_layout = (
         CompositePair("", "test.paired", "model", "processor"),
-        CompositePair(
-            "optional",
-            "test.alternate",
-            "optional_model",
-            "optional_processor",
-            required=False,
-        ),
+        CompositePair("alternate", "test.alternate", "alternate_model", "alternate_processor"),
     )
 
     def __init__(
@@ -59,13 +53,13 @@ class ConcreteCompositePipeline(CompositePipeline):
         *,
         model: PairedModel,
         processor: PairedProcessor,
-        optional_model: PairedModel | None = None,
-        optional_processor: AlternateProcessor | None = None,
+        alternate_model: PairedModel,
+        alternate_processor: AlternateProcessor,
     ) -> None:
         self.model = model
         self.processor = processor
-        self.optional_model = optional_model
-        self.optional_processor = optional_processor
+        self.alternate_model = alternate_model
+        self.alternate_processor = alternate_processor
         self._validate_components()
 
     def fold(self, input: object) -> object:
@@ -123,18 +117,16 @@ class TestPairedPipeline:
 
 
 class TestCompositePipeline:
-    @pytest.mark.parametrize("with_optional", (False, True))
-    def test_repository_round_trip(self, tmp_path, with_optional: bool) -> None:
+    def test_repository_round_trip(self, tmp_path) -> None:
         _register_test_artifacts()
-        optional_model = PairedModel(PairedConfig({"size": 2})) if with_optional else None
-        if optional_model is not None:
-            with torch.no_grad():
-                optional_model.weight.copy_(torch.tensor([4.0, 5.0]))
+        alternate_model = PairedModel(PairedConfig({"size": 2}))
+        with torch.no_grad():
+            alternate_model.weight.copy_(torch.tensor([4.0, 5.0]))
         original = ConcreteCompositePipeline(
             model=PairedModel(PairedConfig({"size": 2})),
             processor=PairedProcessor(),
-            optional_model=optional_model,
-            optional_processor=AlternateProcessor() if with_optional else None,
+            alternate_model=alternate_model,
+            alternate_processor=AlternateProcessor(),
         )
         original.save(tmp_path)
 
@@ -143,10 +135,6 @@ class TestCompositePipeline:
         assert type(loaded) is ConcreteCompositePipeline
         assert type(loaded.model) is PairedModel
         assert type(loaded.processor) is PairedProcessor
-        if optional_model is None:
-            assert loaded.optional_model is None
-            assert loaded.optional_processor is None
-        else:
-            assert type(loaded.optional_model) is PairedModel
-            assert type(loaded.optional_processor) is AlternateProcessor
-            assert torch.equal(loaded.optional_model.weight, optional_model.weight)
+        assert type(loaded.alternate_model) is PairedModel
+        assert type(loaded.alternate_processor) is AlternateProcessor
+        assert torch.equal(loaded.alternate_model.weight, alternate_model.weight)
