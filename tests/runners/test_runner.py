@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -8,8 +9,9 @@ import torch
 from ofoldx.io import read_structure
 from ofoldx.models.registry import MODELS
 from ofoldx.runners import Runner
-from ofoldx.runners.collate import collate_proteinmpnn
+from ofoldx.runners.collate import collate_nampnn, collate_proteinmpnn
 from ofoldx.runners.families import build_fresh
+from ofoldx.runners.objectives.mpnn import ProteinMpnnObjective
 
 # Minimal backbone-only chains (N, CA, C, O per residue) -- enough for the MPNN processors to lower a
 # real Input, and portable (no external data dependency).
@@ -111,11 +113,54 @@ def test_selecting_no_model_is_rejected(tmp_path: Path) -> None:
         )
 
 
-def test_model_and_processor_share_config() -> None:
-    registration = MODELS.lookup_model("proteinmpnn")
-    model, processor, _objective, _collate = build_fresh(registration, {"ca_only": True})
+def test_training_restores_train_mode(tmp_path: Path) -> None:
+    source = _write(tmp_path / "chain.pdb", _TRIPEPTIDE)
+    runner = Runner(_config(tmp_path, "proteinmpnn", source))
+    try:
+        runner.model.eval()  # as a repository-loaded model arrives (hub sets eval())
+        runner.train()
+        assert runner.model.training  # train_step re-enables train mode so dropout stays on
+    finally:
+        runner.close()
+
+
+def test_unsupported_stack_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="stack"):
+        Runner(
+            {
+                "model": {"name": "proteinmpnn"},
+                "stack": "graph",
+                "logging": {"enabled": False},
+                "workspace": {"root": str(tmp_path)},
+                "ckpt": {"async_mode": "disabled"},
+            }
+        )
+
+
+def test_proteinmpnn_model_and_processor_share_config() -> None:
+    # `ca_only` is a Model setting; the fresh builder threads it into the Processor so the graph agrees.
+    model, processor, _objective, _collate = build_fresh("proteinmpnn", {"ca_only": True}, {})
     assert model.config.ca_only is True
     assert processor.config.ca_only is True
+
+
+def test_nampnn_processor_override_reaches_processor_and_objective() -> None:
+    # `shared_nucleic_tokens` lives on the Processor config, not the Model config; a fresh run must be
+    # able to set it, and the objective must read the same value back.
+    _model, processor, objective, _collate = build_fresh("nampnn", {}, {"shared_nucleic_tokens": False})
+    assert processor.config.shared_nucleic_tokens is False
+    assert objective.shared_nucleic_tokens is False
+
+
+def test_empty_design_scope_yields_nan_not_zero(tmp_path: Path) -> None:
+    registration = MODELS.lookup_model("proteinmpnn")
+    processor = registration.processor()
+    model = registration.model(registration.model_config())
+    batch = processor(read_structure(_write(tmp_path / "chain.pdb", _TRIPEPTIDE)))
+    # Nothing is eligible for design: the loss must surface as NaN (0/0), not a silent zero.
+    batch = replace(batch, design_positions=torch.zeros_like(batch.design_positions))
+    _output, loss = ProteinMpnnObjective()(model, batch)
+    assert torch.isnan(loss)
 
 
 def test_collate_pads_tied_group_ids_to_own_index(tmp_path: Path) -> None:
@@ -132,3 +177,16 @@ def test_collate_pads_tied_group_ids_to_own_index(tmp_path: Path) -> None:
     padded = short.sequence_tokens.shape[1]
     assert not batch.residue_mask[0, padded:].any()
     assert torch.equal(batch.tied_group_ids[0, padded:], torch.arange(padded, length))
+
+
+def test_collate_pads_pair_logit_bias_on_both_residue_axes(tmp_path: Path) -> None:
+    processor = MODELS.lookup_model("nampnn").processor()
+    short = processor(read_structure(_write(tmp_path / "di.pdb", _DIPEPTIDE)))
+    long = processor(read_structure(_write(tmp_path / "tri.pdb", _TRIPEPTIDE)))
+    vocab = 4
+    short = replace(short, pair_logit_bias=torch.zeros(1, 2, vocab, 2, vocab))
+    long = replace(long, pair_logit_bias=torch.zeros(1, 3, vocab, 3, vocab))
+
+    batch = collate_nampnn([short, long])
+    # (B, L, V, L, V): L is padded on BOTH residue axes (1 and 3), V is untouched.
+    assert batch.pair_logit_bias.shape == (2, 3, vocab, 3, vocab)

@@ -69,17 +69,16 @@ class RunnerConfig(dl.RunnerConfig):
 
     Attributes:
         runner: Registered runner name.
-        training: Whether training splits are enabled.
-        objective: Training objective name. ``None`` selects the architecture default.
-        model: Model selection and architecture overrides.
+        model: Model selection and architecture (model-config) overrides.
+        processor: Processor-config overrides that are not model settings
+            (e.g. NA-MPNN ``shared_nucleic_tokens``).
         data: Dataset configuration keyed by split name.
     """
 
     runner: str = "ofoldx"
-    training: bool = True
-    objective: str | None = None
 
     model: ModelConfig
+    processor: chanfig.Config
     data: DataConfig
 
     def __post_init__(self, *args: Any, **kwargs: Any) -> None:
@@ -88,6 +87,10 @@ class RunnerConfig(dl.RunnerConfig):
             self.model = ModelConfig()
         elif not isinstance(self.model, ModelConfig):
             self.model = ModelConfig(self.model)
+        if "processor" not in self:
+            self.processor = chanfig.Config()
+        elif not isinstance(self.processor, chanfig.Config):
+            self.processor = chanfig.Config(self.processor)
         if "data" not in self:
             self.data = DataConfig()
         elif not isinstance(self.data, DataConfig):

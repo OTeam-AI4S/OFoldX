@@ -11,7 +11,6 @@ from __future__ import annotations
 
 from typing import Any
 
-import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
@@ -20,8 +19,10 @@ from ...models.proteinmpnn.objectives import smoothed_loss as proteinmpnn_smooth
 
 
 def _masked_mean(per_residue: Tensor, mask: Tensor) -> Tensor:
+    # No empty-scope guard: if nothing is valid-and-designable the mean is 0/0 -> NaN, which surfaces
+    # the (upstream) failure loudly instead of reporting a zero loss that still "trains".
     weights = mask.to(per_residue.dtype)
-    return (per_residue * weights).sum() / weights.sum().clamp_min(torch.finfo(per_residue.dtype).tiny)
+    return (per_residue * weights).sum() / weights.sum()
 
 
 class ProteinMpnnObjective:

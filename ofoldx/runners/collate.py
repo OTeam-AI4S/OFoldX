@@ -1,13 +1,18 @@
 r"""
 Collators for the MPNN inverse-folding family Inputs.
 
-Unlike a generic dataclass collator, these know each field's meaning and pad it correctly. In
-particular ``tied_group_ids`` indexes an autoregressive-unit tensor via ``scatter_reduce_``, so a
-padded row must become its **own** throwaway unit (its collated row index) rather than merging into
-real unit ``0``. Every model-consumed tensor is residue-aligned on axis 1 and padded to the batch's
-longest sequence; padded rows are gated out downstream by ``residue_mask``. Non-tensor per-item
-carriers (``structures``, ``component_references``, ``polymer_types``, ``conditions``) are only used
-for output decoding, not the forward, so they are concatenated in order without padding.
+These know each field's meaning and pad it correctly:
+
+* Most tensors are residue-aligned on axis 1 only and pad to the batch's longest sequence; padded rows
+  are gated out downstream by ``residue_mask``.
+* ``pair_logit_bias`` is residue-aligned on **two** axes -- ``(B, L, V, L, V)`` -- so it is padded on
+  axis 1 *and* axis 3. Fields with more than one residue axis must be listed in ``_PAIR_BIAS_FIELDS``;
+  that explicit declaration is what keeps this a true per-field collator instead of a "pad axis 1"
+  default that would silently mis-shape (and fail to concatenate) ragged pair biases.
+* ``tied_group_ids`` indexes an autoregressive-unit tensor via ``scatter_reduce_``, so a padded row
+  must become its **own** throwaway unit (its collated row index) rather than merging into real unit 0.
+* Non-tensor per-item carriers (``structures``, ``component_references``, ``polymer_types``,
+  ``conditions``) are only used for output decoding, not the forward, so they are concatenated in order.
 """
 
 from __future__ import annotations
@@ -20,13 +25,17 @@ from torch import Tensor
 
 from ..models.nampnn.model import NA_MPNN_PADDING_TOKEN_ID
 
+#: Fields whose residue axis appears more than once (both endpoints of a token pair).
+_PAIR_BIAS_FIELDS = frozenset({"pair_logit_bias"})
 
-def _pad_residue_axis(tensor: Tensor, length: int, value: float | bool) -> Tensor:
-    current = tensor.shape[1]
+
+def _pad_axis(tensor: Tensor, axis: int, length: int, value: float | bool) -> Tensor:
+    current = tensor.shape[axis]
     if current == length:
         return tensor
-    padding = tensor.new_full((tensor.shape[0], length - current, *tensor.shape[2:]), value)
-    return torch.cat([tensor, padding], dim=1)
+    shape = list(tensor.shape)
+    shape[axis] = length - current
+    return torch.cat([tensor, tensor.new_full(shape, value)], dim=axis)
 
 
 def _pad_tied_group_ids(tensor: Tensor, length: int) -> Tensor:
@@ -37,6 +46,10 @@ def _pad_tied_group_ids(tensor: Tensor, length: int) -> Tensor:
         return tensor
     extra = torch.arange(current, length, device=tensor.device, dtype=tensor.dtype).expand(tensor.shape[0], -1)
     return torch.cat([tensor, extra], dim=1)
+
+
+def _residue_axes(field_name: str) -> tuple[int, ...]:
+    return (1, 3) if field_name in _PAIR_BIAS_FIELDS else (1,)
 
 
 def _pad_value(field_name: str, token_pad_id: int) -> float | bool:
@@ -73,9 +86,15 @@ def _collate_mpnn(batch: list[Any], *, token_pad_id: int) -> Any:
         if isinstance(values[0], Tensor):
             if field.name == "tied_group_ids":
                 merged[field.name] = torch.cat([_pad_tied_group_ids(value, length) for value in values], dim=0)
-            else:
-                pad = _pad_value(field.name, token_pad_id)
-                merged[field.name] = torch.cat([_pad_residue_axis(value, length, pad) for value in values], dim=0)
+                continue
+            pad = _pad_value(field.name, token_pad_id)
+            axes = _residue_axes(field.name)
+            padded = []
+            for value in values:
+                for axis in axes:
+                    value = _pad_axis(value, axis, length, pad)
+                padded.append(value)
+            merged[field.name] = torch.cat(padded, dim=0)
         else:
             merged[field.name] = tuple(element for value in values for element in value)
     return replace(first, **merged)

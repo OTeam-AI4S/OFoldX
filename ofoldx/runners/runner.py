@@ -2,9 +2,13 @@ r"""
 Training, evaluation, and inference runner for the trainable model families.
 
 The Runner is config-only and special-cases no family: it resolves an architecture (fresh from
-``model.name`` or loaded from ``model.pretrained``), looks up its training pairing in
+``model.name`` or loaded from ``model.pretrained``), looks up its explicit builder in
 [`ofoldx.runners.families`][ofoldx.runners.families], and wires the Model, Processor, objective, and
 collate. Adding a trainable family is a `families` entry, not a Runner change.
+
+V1 targets the plain Torch/DDP stack only. The step methods below override DanLing's, so the Graph and
+parallel stacks -- which supply their own step implementations -- are rejected rather than silently
+half-supported.
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ from typing import Any
 
 import danling as dl
 import torch
+from danling.runners.config import normalize_stack_name
 from danling.runners.utils import RunnerMode
 from torch import Tensor
 
@@ -22,8 +27,11 @@ from ..model import Model
 from ..models.registry import MODELS
 from ..processor import Processor
 from .config import RunnerConfig
-from .families import Collate, Objective, build_fresh, wire_loaded
+from .families import Collate, Objective, build_fresh, require_trainable, wire_loaded
 from .registry import RUNNERS
+
+#: The only DanLing stack whose train/evaluate/infer steps this Runner implements.
+_SUPPORTED_STACK = "ddp"
 
 
 @RUNNERS.register("ofoldx", default=True)
@@ -46,6 +54,13 @@ class Runner(dl.Runner):
             config = RunnerConfig(config)
         # Boot (runs ``post`` validation + finalizes) BEFORE DanLing consumes workspace/logging/checkpoint.
         config.boot()
+        stack = normalize_stack_name(config.get("stack", "auto"))
+        if stack != _SUPPORTED_STACK:
+            raise ValueError(
+                f"the OFoldX Runner supports only the plain Torch/DDP stack ({_SUPPORTED_STACK!r}); got "
+                f"{stack!r}. Graph and parallel stacks require their own train/evaluate/infer steps, which "
+                "this Runner overrides."
+            )
         super().__init__(config)
 
         self.model, self.processor, self.objective, self.collate_fn = self._build()
@@ -59,32 +74,43 @@ class Runner(dl.Runner):
         """
 
         model_config = self.config.model
+        processor_overrides = self.config.processor
         if model_config.pretrained:
-            model, processor = self._load_repository(model_config.pretrained)
-            registration = MODELS.for_config(model.config)
-            if model_config.name and model_config.name != registration.id:
-                raise ValueError(
-                    f"config `model.name` {model_config.name!r} does not match the loaded repository "
-                    f"architecture {registration.id!r}"
-                )
-            objective, collate = wire_loaded(registration, processor)
-            return model, processor, objective, collate
-        registration = MODELS.lookup_model(model_config.name)
-        overrides = {key: value for key, value in model_config.items() if key not in ("name", "pretrained")}
-        return build_fresh(registration, overrides)
+            return self._build_from_repository(model_config, processor_overrides)
+        architecture = MODELS.lookup_model(model_config.name).id
+        return build_fresh(architecture, model_config, processor_overrides)
 
-    @staticmethod
-    def _load_repository(pretrained: str) -> tuple[Model, Processor]:
+    def _build_from_repository(
+        self,
+        model_config: Mapping[str, Any],
+        processor_overrides: Mapping[str, Any],
+    ) -> tuple[Model, Processor, Objective, Collate]:
         r"""
-        Resolve one repository snapshot and load both the Model and its Processor from it.
+        Load a Model/Processor pair from one repository snapshot, rejecting before any weights download.
         """
 
-        from ..hub import PROCESSOR_METADATA, load_model, load_processor, resolve_repository
+        from ..hub import PROCESSOR_METADATA, load_model, load_processor, model_values, resolve_repository
 
         # ``PROCESSOR_METADATA`` covers both ``model.json`` and ``processor.json``, so one resolution
-        # feeds both loaders (rather than resolving the repository twice).
-        repository = resolve_repository(pretrained, allow_patterns=PROCESSOR_METADATA)
-        return load_model(repository), load_processor(repository)
+        # feeds both loaders and the metadata check below.
+        repository = resolve_repository(model_config["pretrained"], allow_patterns=PROCESSOR_METADATA)
+        # Decide from the metadata snapshot -- before downloading/loading weights -- whether this
+        # architecture is trainable and matches any requested ``model.name``.
+        metadata_registration, _values = model_values(repository.path)
+        architecture = metadata_registration.id
+        if model_config["name"] and model_config["name"] != architecture:
+            raise ValueError(
+                f"config `model.name` {model_config['name']!r} does not match the repository architecture "
+                f"{architecture!r}"
+            )
+        require_trainable(architecture)
+
+        model = load_model(repository)
+        processor = load_processor(repository)
+        # Bind the objective/collate by the exact loaded Model/Processor pair.
+        registration = MODELS.for_pair(model, processor)
+        objective, collate = wire_loaded(registration.id, processor)
+        return model, processor, objective, collate
 
     def build_datasets(self) -> dict[str, Any]:
         r"""
@@ -130,6 +156,9 @@ class Runner(dl.Runner):
         """
 
         data = self.to_device(data)
+        # Repository models are loaded in eval() and DanLing never toggles module train/eval mode, so
+        # set it here or dropout/other train-time layers would stay off during training.
+        self.model.train()
         with self.train_context():
             output, loss = self.objective(self.model, data)
             self.backward(loss)
@@ -143,6 +172,7 @@ class Runner(dl.Runner):
 
         data = self.to_device(data)
         model = self.ema or self.model
+        model.eval()
         with self.infer_context():
             output, loss = self.objective(model, data)
         return output, loss
@@ -154,6 +184,7 @@ class Runner(dl.Runner):
 
         data = self.to_device(data)
         model = self.ema or self.model
+        model.eval()
         with self.infer_context():
             return model(**data) if isinstance(data, Mapping) else model(data)
 
