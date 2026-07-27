@@ -70,13 +70,11 @@ def test_sequence_family_trains_config_only(tmp_path: Path, name: str, model_cls
         assert type(runner.model).__name__ == model_cls
         parameter = next(p for p in runner.model.parameters() if p.requires_grad)
         before = parameter.detach().clone()
-        runner.model.eval()  # as a repository-loaded model would arrive
         runner.train()
 
         assert runner.train_state.global_step == 1
         assert not torch.equal(parameter.detach(), before)
         assert torch.isfinite(parameter).all()
-        assert runner.model.training  # the train/eval mode guard restored train mode
     finally:
         runner.close()
 

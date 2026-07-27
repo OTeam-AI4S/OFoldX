@@ -9,13 +9,13 @@ applies the contract: its config-aware criterion, one of the generic batching/lo
 below (the only generic Runner-side training knowledge), and freezing of the modules the objective does not
 train.
 
-DanLing drives forward → criterion → loss-normalizer → backward → step. The Runner adds only what DanLing
-cannot know generically: a config-bound criterion, a train/eval **mode** guard (DanLing never toggles module
-mode, and repository models load in ``eval()``), DDP ``find_unused_parameters=True`` (the objective trains
-only the loss-path parameters, so auxiliary heads, sampling-only modules, and unexercised conditioning
-embedders get no gradient; the models return ``tensorclass`` outputs, which DDP can walk to find them),
-a ``tensorclass``-native ``to_device``, and an ``infer_step`` that runs the family's inference entry point
-on its ``tensorclass`` output instead of DanLing's tensor-shaped default.
+DanLing drives forward → criterion → loss-normalizer → backward → step, and toggles train/eval module mode
+itself (train_epoch/evaluate_epoch/infer set ``self.mode``). The Runner adds only what DanLing cannot know
+generically: a config-bound criterion, DDP ``find_unused_parameters=True`` (the objective trains only the
+loss-path parameters, so auxiliary heads, sampling-only modules, and unexercised conditioning embedders get
+no gradient; the models return ``tensorclass`` outputs, which DDP can walk to find them), a ``tensorclass``-
+native ``to_device``, and an ``infer_step`` that runs the family's inference entry point on its
+``tensorclass`` output instead of DanLing's tensor-shaped default.
 """
 
 from __future__ import annotations
@@ -154,7 +154,10 @@ class Runner(dl.Runner):
         # works (and re-checks each step, unlike ``static_graph``, so it also handles the data-dependent
         # template case).
         self.config.ddp.find_unused_parameters = True
-        self.model.train()  # repository models load in eval(); DanLing never toggles module mode
+        # DanLing toggles module mode from its ``mode`` setter (train_epoch/evaluate_epoch/infer set it), but
+        # it fixed ``mode=train`` before this model existed, so the first train_epoch's mode=train is a no-op
+        # that will not force train mode -- and a repository model loads in eval(). Establish train mode here.
+        self.model.train()
         self.datasets.update(self.build_datasets())
 
     # -- construction --------------------------------------------------------
@@ -270,59 +273,45 @@ class Runner(dl.Runner):
 
     # -- batch movement ------------------------------------------------------
 
-    def to_device(self, data: Any) -> Any:
-        r"""Move a nested batch (family Input/Target dataclasses and their nested fields) to the runner device."""
-
-        return self._move(data, self.device)
-
-    def _move(self, data: Any, device: torch.device) -> Any:
+    def to_device(self, data: Any, device: torch.device | None = None) -> Any:
         r"""
-        Recursively move a nested structure to ``device``. Family Input/Output/Target are ``tensorclass``
-        instances -- moved with their native ``.to`` (which recurses into nested tensorclasses and keeps
-        ``batch_size``; ``dataclasses.replace`` would reset it). ``.to`` cannot reach tensors held inside a
-        non-tensor dataclass field (e.g. Protenix's tfg/template feature bundles, whose index tensors are
-        unbatched so they cannot themselves be a tensorclass), so those are moved explicitly. Mappings/
-        sequences recurse; non-tensor leaves pass through. The plain-dataclass branch remains for any
+        Recursively move a nested batch to ``device`` -- the runner device by default; ``infer_step`` passes
+        the CPU. Family Input/Output/Target are ``tensorclass`` instances, moved with their native ``.to``
+        (which keeps ``batch_size``; ``dataclasses.replace`` would reset it). ``.to`` cannot reach tensors
+        held inside a non-tensor dataclass field (e.g. Protenix's tfg/template feature bundles, whose index
+        tensors are unbatched so they cannot themselves be a tensorclass), so those are moved explicitly.
+        Mappings/sequences recurse; non-tensor leaves pass through; the plain-dataclass branch handles any
         non-tensorclass dataclass.
         """
 
+        if device is None:
+            device = self.device
         if is_tensorclass(data):
             moved = data.to(device)
             for field in fields(data):
                 value = getattr(data, field.name)
                 if is_dataclass(value) and not isinstance(value, type):
-                    setattr(moved, field.name, self._move(value, device))
+                    setattr(moved, field.name, self.to_device(value, device))
             return moved
         if is_dataclass(data) and not isinstance(data, type):
             moved = {
-                field.name: self._move(value, device)
+                field.name: self.to_device(value, device)
                 for field in fields(data)
                 if (value := getattr(data, field.name)) is not None
             }
             return replace(data, **moved)
         if isinstance(data, Mapping):
-            moved = {key: self._move(value, device) for key, value in data.items()}
+            moved = {key: self.to_device(value, device) for key, value in data.items()}
             return type(data)(moved) if isinstance(data, dict) else moved
         if isinstance(data, list):
-            return [self._move(value, device) for value in data]
+            return [self.to_device(value, device) for value in data]
         if isinstance(data, tuple):
-            return tuple(self._move(value, device) for value in data)
+            return tuple(self.to_device(value, device) for value in data)
         if isinstance(data, Tensor):
             return data.to(device)
         return data
 
     # -- steps ---------------------------------------------------------------
-
-    def train_step(self, data: Any) -> tuple[Any, Any]:
-        if not self.model.training:
-            self.model.train()
-        return super().train_step(data)
-
-    def evaluate_step(self, data: Any) -> tuple[Any, Any]:
-        model = self.ema or self.model
-        if model.training:
-            model.eval()
-        return super().evaluate_step(data)
 
     @torch.inference_mode()
     def infer_step(self, data: Any) -> list[Any]:
@@ -346,10 +335,8 @@ class Runner(dl.Runner):
         if model is None:
             raise ValueError("cannot run infer_step: model is not initialized")
         model = self.unwrap(model)  # reach the family's own inference entry point (e.g. ``sample``) under DDP
-        if model.training:
-            model.eval()
         inputs = data["input"] if isinstance(data, Mapping) else data
         model_input = inputs["input"] if isinstance(inputs, Mapping) else inputs
         with self.infer_context():
             prediction = self.spec.infer(model, model_input)
-        return [self._move(prediction, torch.device("cpu"))]
+        return [self.to_device(prediction, torch.device("cpu"))]
