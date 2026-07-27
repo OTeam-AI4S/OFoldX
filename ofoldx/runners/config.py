@@ -97,10 +97,18 @@ class RunnerConfig(dl.RunnerConfig):
         r"""
         Finalize and validate the runner configuration.
 
+        The model is selected either by ``model.pretrained`` (a repository whose snapshot supplies both
+        the model and its processor) or by ``model.name`` (a registered architecture built fresh). When
+        a repository is given, ``model.name`` is optional and, if present, is asserted against the loaded
+        architecture at build time.
+
         Raises:
-            ValueError: If no registered model architecture is selected.
+            ValueError: If neither ``model.pretrained`` nor ``model.name`` is set.
         """
 
         super().post()
-        if not self.model.name:
-            raise ValueError("`model.name` (a registered architecture id) is required")
+        if not self.model.pretrained and not self.model.name:
+            raise ValueError(
+                "select a model with `model.pretrained` (a repository) or `model.name` "
+                "(a registered architecture id)"
+            )

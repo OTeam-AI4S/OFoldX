@@ -1,131 +1,93 @@
 r"""
-Collation for typed model-input dataclasses.
+Collators for the MPNN inverse-folding family Inputs.
+
+Unlike a generic dataclass collator, these know each field's meaning and pad it correctly. In
+particular ``tied_group_ids`` indexes an autoregressive-unit tensor via ``scatter_reduce_``, so a
+padded row must become its **own** throwaway unit (its collated row index) rather than merging into
+real unit ``0``. Every model-consumed tensor is residue-aligned on axis 1 and padded to the batch's
+longest sequence; padded rows are gated out downstream by ``residue_mask``. Non-tensor per-item
+carriers (``structures``, ``component_references``, ``polymer_types``, ``conditions``) are only used
+for output decoding, not the forward, so they are concatenated in order without padding.
 """
 
 from __future__ import annotations
 
-import dataclasses
+from dataclasses import fields, is_dataclass, replace
 from typing import Any
 
 import torch
 from torch import Tensor
 
+from ..models.nampnn.model import NA_MPNN_PADDING_TOKEN_ID
 
-def collate(batch: list[Any]) -> Any:
-    r"""
-    Collate model-input dataclasses along their leading batch axes.
 
-    Tensor fields are right-padded on non-batch axes and concatenated on axis zero.
-    Sequence fields are flattened in input order. Optional fields must be present on
-    all items or absent on all items.
+def _pad_residue_axis(tensor: Tensor, length: int, value: float | bool) -> Tensor:
+    current = tensor.shape[1]
+    if current == length:
+        return tensor
+    padding = tensor.new_full((tensor.shape[0], length - current, *tensor.shape[2:]), value)
+    return torch.cat([tensor, padding], dim=1)
 
-    Args:
-        batch: Non-empty list of dataclass instances of one type.
 
-    Returns:
-        A dataclass whose leading tensor-axis length is the sum of input leading-axis
-        lengths.
+def _pad_tied_group_ids(tensor: Tensor, length: int) -> Tensor:
+    # Padded rows become singleton throwaway units: their own collated row index (>= real unit ids,
+    # which are < the item's own length, and < the padded length so they stay valid scatter indices).
+    current = tensor.shape[1]
+    if current == length:
+        return tensor
+    extra = torch.arange(current, length, device=tensor.device, dtype=tensor.dtype).expand(tensor.shape[0], -1)
+    return torch.cat([tensor, extra], dim=1)
 
-    Raises:
-        TypeError: If inputs are not dataclass instances of one type.
-        ValueError: If the batch is empty or aligned fields cannot be collated.
-    """
 
+def _pad_value(field_name: str, token_pad_id: int) -> float | bool:
+    if field_name == "sequence_tokens":
+        return token_pad_id
+    if field_name == "allowed_token_mask":
+        return True  # padded rows are gated out; keep unrestricted rather than forbid every token
+    return 0
+
+
+def _collate_mpnn(batch: list[Any], *, token_pad_id: int) -> Any:
     if not batch:
         raise ValueError("collate requires a non-empty batch")
-
     first = batch[0]
-    if not dataclasses.is_dataclass(first) or isinstance(first, type):
-        raise TypeError("collate expects family Input dataclass instances")
+    if not is_dataclass(first) or isinstance(first, type):
+        raise TypeError("MPNN collate expects family Input dataclass instances")
     input_type = type(first)
     for item in batch:
         if type(item) is not input_type:
             raise TypeError(
-                "collate requires every batch element to be the same family Input type; got "
-                f"{input_type.__name__} and {type(item).__name__}"
+                f"collate requires one Input type per batch; got {input_type.__name__} and {type(item).__name__}"
             )
 
-    merged = {
-        field.name: _collate_field(field.name, [getattr(item, field.name) for item in batch])
-        for field in dataclasses.fields(first)
-    }
-    return dataclasses.replace(first, **merged)
-
-
-def _collate_field(name: str, values: list[Any]) -> Any:
-    r"""
-    Collate one aligned dataclass field.
-    """
-
-    present = [value is not None for value in values]
-    if not any(present):
-        return None
-    if not all(present):
-        raise ValueError(
-            f"field {name!r} is present on some batch elements and None on others; an optional "
-            "field must be None on every element or on none of them"
-        )
-
-    reference = values[0]
-    if isinstance(reference, Tensor):
-        return _collate_tensors(name, values)
-    if isinstance(reference, (tuple, list)):
-        return _collate_sequences(values)
-    return _collate_identity(name, values)
-
-
-def _collate_tensors(name: str, tensors: list[Tensor]) -> Tensor:
-    r"""
-    Right-pad non-batch axes and concatenate tensors on axis zero.
-
-    All tensors must have the same rank. Their leading-axis lengths may differ.
-    """
-
-    reference = tensors[0]
-    for tensor in tensors:
-        if tensor.ndim != reference.ndim:
-            raise ValueError(f"field {name!r} tensors must share their rank to collate")
-        if tensor.ndim == 0:
-            raise ValueError(f"field {name!r} tensors must carry a leading batch axis")
-
-    non_batch_maxima = [max(tensor.shape[axis] for tensor in tensors) for axis in range(1, reference.ndim)]
-    padded: list[Tensor] = []
-    for tensor in tensors:
-        if list(tensor.shape[1:]) == non_batch_maxima:
-            padded.append(tensor)
+    length = max(item.sequence_tokens.shape[1] for item in batch)
+    merged: dict[str, Any] = {}
+    for field in fields(first):
+        values = [getattr(item, field.name) for item in batch]
+        present = [value is not None for value in values]
+        if not any(present):
+            merged[field.name] = None
             continue
-        rectangular = torch.zeros(
-            (tensor.shape[0], *non_batch_maxima),
-            dtype=tensor.dtype,
-            device=tensor.device,
-        )
-        region = (slice(None), *(slice(0, extent) for extent in tensor.shape[1:]))
-        rectangular[region] = tensor
-        padded.append(rectangular)
-    return torch.cat(padded, dim=0)
+        if not all(present):
+            raise ValueError(f"optional field {field.name!r} must be present on every item or on none")
+        if isinstance(values[0], Tensor):
+            if field.name == "tied_group_ids":
+                merged[field.name] = torch.cat([_pad_tied_group_ids(value, length) for value in values], dim=0)
+            else:
+                pad = _pad_value(field.name, token_pad_id)
+                merged[field.name] = torch.cat([_pad_residue_axis(value, length, pad) for value in values], dim=0)
+        else:
+            merged[field.name] = tuple(element for value in values for element in value)
+    return replace(first, **merged)
 
 
-def _collate_sequences(sequences: list[Any]) -> tuple[Any, ...]:
-    r"""
-    Flatten aligned sequence fields in input order.
-    """
+def collate_proteinmpnn(batch: list[Any]) -> Any:
+    r"""Collate a batch of ``ProteinMpnnInput`` (sequence pad id ``0``, an ordinary residue token)."""
 
-    flattened: list[Any] = []
-    for sequence in sequences:
-        flattened.extend(sequence)
-    return tuple(flattened)
+    return _collate_mpnn(batch, token_pad_id=0)
 
 
-def _collate_identity(name: str, values: list[Any]) -> Any:
-    r"""
-    Return a non-batched field shared by every input.
-    """
+def collate_nampnn(batch: list[Any]) -> Any:
+    r"""Collate a batch of ``NaMpnnInput`` (sequence pad id ``NA_MPNN_PADDING_TOKEN_ID``)."""
 
-    reference = values[0]
-    for value in values[1:]:
-        if value != reference:
-            raise ValueError(
-                f"field {name!r} is a non-tensor identity field and must be equal across the "
-                f"batch; got {reference!r} and {value!r}"
-            )
-    return reference
+    return _collate_mpnn(batch, token_pad_id=NA_MPNN_PADDING_TOKEN_ID)

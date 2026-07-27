@@ -1,147 +1,102 @@
 r"""
-Training, evaluation, and inference runner for registered OFoldX models.
+Training, evaluation, and inference runner for the trainable model families.
+
+The Runner is config-only and special-cases no family: it resolves an architecture (fresh from
+``model.name`` or loaded from ``model.pretrained``), looks up its training pairing in
+[`ofoldx.runners.families`][ofoldx.runners.families], and wires the Model, Processor, objective, and
+collate. Adding a trainable family is a `families` entry, not a Runner change.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import fields, is_dataclass, replace
 from typing import Any
 
 import danling as dl
 import torch
 from danling.runners.utils import RunnerMode
-from torch import Tensor, nn
+from torch import Tensor
 
 from ..model import Model
+from ..models.registry import MODELS
 from ..processor import Processor
-from .collate import collate
 from .config import RunnerConfig
-from .registry import ARCHITECTURE_OBJECTIVES, OBJECTIVES, RUNNERS
-
-Objective = Callable[[nn.Module, Any], tuple[Any, Tensor]]
+from .families import Collate, Objective, build_fresh, wire_loaded
+from .registry import RUNNERS
 
 
 @RUNNERS.register("ofoldx", default=True)
 class Runner(dl.Runner):
     r"""
-    Train, evaluate, and run forward inference for a registered model.
-
-    The model, datasets, objective, and collate function are built from
-    ``config`` by default; any of them may instead be injected directly (a plain
-    model and in-memory datasets, e.g. for testing or bespoke training loops).
+    Train, evaluate, and run forward inference for a trainable model family.
 
     Args:
-        config: Runner configuration or values used to construct one.
-        model: Model to train. When omitted, built from ``config.model``.
-        datasets: Split-keyed datasets. When omitted, built from ``config.data``.
-        train_objective: ``(model, batch) -> (output, loss)`` used for training.
-            When omitted, resolved from the model's architecture.
-        evaluate_objective: Objective used for evaluation. Defaults to
-            ``train_objective``.
-        collate_fn: Batch collation. Defaults to the OFoldX structure collate.
+        config: Runner configuration, or any mapping it can be built from.
     """
 
     config: RunnerConfig
+    model: Model
+    processor: Processor
+    objective: Objective
+    collate_fn: Collate
 
-    def __new__(cls, config: RunnerConfig | Mapping[str, Any], **kwargs: Any) -> Runner:
-        # danling's factory ``__new__`` composes the dynamic ``(cls, TorchRunner)`` runtime class and
-        # accepts ``config`` only; drop the optional injection kwargs so they do not reach it (they are
-        # applied in ``__init__``).
-        return super().__new__(cls, config)
-
-    def __init__(
-        self,
-        config: RunnerConfig | Mapping[str, Any],
-        *,
-        model: nn.Module | None = None,
-        datasets: Mapping[str, Any] | None = None,
-        train_objective: Objective | None = None,
-        evaluate_objective: Objective | None = None,
-        collate_fn: Callable[[list[Any]], Any] | None = None,
-    ) -> None:
+    def __init__(self, config: RunnerConfig | Mapping[str, Any]) -> None:
         if not isinstance(config, RunnerConfig):
             config = RunnerConfig(config)
+        # Boot (runs ``post`` validation + finalizes) BEFORE DanLing consumes workspace/logging/checkpoint.
+        config.boot()
         super().__init__(config)
-        self._architecture = ""
 
-        if model is not None:
-            self.model = model
-        else:
-            # Config-only construction can skip chanfig's ``boot`` (which runs ``post``), so run the
-            # curated ``RunnerConfig.post`` validation here before ``build_model`` -- otherwise a missing
-            # ``model.name`` surfaces as ``MODELS.lookup_model(None)``'s opaque "unknown model architecture".
-            self.config.post()
-            self.model = self.build_model()
-
-        if train_objective is not None:
-            self.objective: Objective = train_objective
-        else:
-            from .objectives import denoiser, diffusion, mpnn  # noqa: F401 — register the built-in objectives
-
-            name = self.config.objective or ARCHITECTURE_OBJECTIVES.get(self._architecture)
-            if name is None:
-                raise ValueError(
-                    f"no training objective is defined for architecture {self._architecture!r}; "
-                    f"set `objective` explicitly or use an architecture with a registered objective "
-                    f"({', '.join(sorted(set(ARCHITECTURE_OBJECTIVES.values())))})"
-                )
-            self.objective = OBJECTIVES.build(type=name)
-        self.evaluate_objective: Objective = self.objective if evaluate_objective is None else evaluate_objective
-        self.collate_fn = collate if collate_fn is None else collate_fn
-
-        if datasets is not None:
-            self.datasets.update(datasets)
-        elif self.config.data:
-            self.datasets.update(self.build_datasets())
+        self.model, self.processor, self.objective, self.collate_fn = self._build()
+        self.datasets.update(self.build_datasets())
 
     # -- construction --------------------------------------------------------
 
-    def build_model(self) -> Model:
+    def _build(self) -> tuple[Model, Processor, Objective, Collate]:
         r"""
-        Build the configured model.
-
-        Returns:
-            A pretrained model when ``model.pretrained`` is set, otherwise a model
-            initialized from the registered architecture config.
+        Resolve the architecture and build a consistent Model, Processor, objective, and collate.
         """
 
-        from ..models.registry import MODELS
-
         model_config = self.config.model
-        registration = MODELS.lookup_model(model_config.name)
-        self._architecture = registration.id
         if model_config.pretrained:
-            from ..auto import AutoModel
-
-            return AutoModel(model_config.pretrained)
+            model, processor = self._load_repository(model_config.pretrained)
+            registration = MODELS.for_config(model.config)
+            if model_config.name and model_config.name != registration.id:
+                raise ValueError(
+                    f"config `model.name` {model_config.name!r} does not match the loaded repository "
+                    f"architecture {registration.id!r}"
+                )
+            objective, collate = wire_loaded(registration, processor)
+            return model, processor, objective, collate
+        registration = MODELS.lookup_model(model_config.name)
         overrides = {key: value for key, value in model_config.items() if key not in ("name", "pretrained")}
-        typed_config = registration.model_config(**overrides) if overrides else registration.model_config()
-        return registration.model(typed_config)
+        return build_fresh(registration, overrides)
+
+    @staticmethod
+    def _load_repository(pretrained: str) -> tuple[Model, Processor]:
+        r"""
+        Resolve one repository snapshot and load both the Model and its Processor from it.
+        """
+
+        from ..hub import PROCESSOR_METADATA, load_model, load_processor, resolve_repository
+
+        # ``PROCESSOR_METADATA`` covers both ``model.json`` and ``processor.json``, so one resolution
+        # feeds both loaders (rather than resolving the repository twice).
+        repository = resolve_repository(pretrained, allow_patterns=PROCESSOR_METADATA)
+        return load_model(repository), load_processor(repository)
 
     def build_datasets(self) -> dict[str, Any]:
         r"""
-        Build datasets for configured splits.
-
-        Returns:
-            Structure datasets keyed by split name.
+        Build structure datasets for the configured splits, lowered by the paired processor.
         """
 
-        from ..models.registry import MODELS
         from .dataset import StructureDataset
 
-        model_config = self.config.model
-        processor: Processor
-        if model_config.pretrained:
-            from ..auto import AutoProcessor
-
-            processor = AutoProcessor.from_pretrained(model_config.pretrained)
-        else:
-            processor = MODELS.lookup_model(model_config.name).processor()
         datasets: dict[str, Any] = {}
         for split, spec in self.config.data.items():
             processor_kwargs = {key: value for key, value in spec.items() if key != "source"}
-            datasets[split] = StructureDataset(spec.source, processor, processor_kwargs=processor_kwargs)
+            datasets[split] = StructureDataset(spec.source, self.processor, processor_kwargs=processor_kwargs)
         return datasets
 
     # -- batch movement ------------------------------------------------------
@@ -149,12 +104,6 @@ class Runner(dl.Runner):
     def to_device(self, data: Any) -> Any:
         r"""
         Move tensors in a nested batch to the runner device.
-
-        Args:
-            data: Tensor, dataclass, mapping, or sequence batch.
-
-        Returns:
-            The batch with tensor values moved to the runner device.
         """
 
         if is_dataclass(data) and not isinstance(data, type):
@@ -178,13 +127,8 @@ class Runner(dl.Runner):
     def train_step(self, data: Any) -> tuple[Any, Tensor]:
         r"""
         Run one optimization step.
-
-        Args:
-            data: Batch accepted by the configured objective.
-
-        Returns:
-            The model output and scalar training loss.
         """
+
         data = self.to_device(data)
         with self.train_context():
             output, loss = self.objective(self.model, data)
@@ -195,29 +139,19 @@ class Runner(dl.Runner):
     def evaluate_step(self, data: Any) -> tuple[Any, Tensor]:
         r"""
         Evaluate one batch without parameter updates.
-
-        Args:
-            data: Batch accepted by the configured objective.
-
-        Returns:
-            The model output and scalar evaluation loss.
         """
+
         data = self.to_device(data)
         model = self.ema or self.model
         with self.infer_context():
-            output, loss = self.evaluate_objective(model, data)
+            output, loss = self.objective(model, data)
         return output, loss
 
     def infer_step(self, data: Any) -> Any:
         r"""
         Run one model forward pass without gradients.
-
-        Args:
-            data: Positional model input or mapping of model arguments.
-
-        Returns:
-            The model output.
         """
+
         data = self.to_device(data)
         model = self.ema or self.model
         with self.infer_context():
@@ -227,12 +161,6 @@ class Runner(dl.Runner):
     def infer(self, split: str = "infer") -> list[Any]:
         r"""
         Run forward inference over one configured split.
-
-        Args:
-            split: Dataset split to evaluate.
-
-        Returns:
-            Model outputs in dataloader order.
 
         Raises:
             KeyError: If ``split`` has no dataloader.

@@ -1,152 +1,134 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 
-import danling
+import pytest
 import torch
-from torch import Tensor, nn
-from torchdata.stateful_dataloader import StatefulDataLoader
 
-import ofoldx
+from ofoldx.io import read_structure
+from ofoldx.models.registry import MODELS
 from ofoldx.runners import Runner
+from ofoldx.runners.collate import collate_proteinmpnn
+from ofoldx.runners.families import build_fresh
+
+# Minimal backbone-only chains (N, CA, C, O per residue) -- enough for the MPNN processors to lower a
+# real Input, and portable (no external data dependency).
+_TRIPEPTIDE = """\
+ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00           N
+ATOM      2  CA  ALA A   1       1.458   0.000   0.000  1.00  0.00           C
+ATOM      3  C   ALA A   1       2.009   1.420   0.000  1.00  0.00           C
+ATOM      4  O   ALA A   1       1.251   2.390   0.000  1.00  0.00           O
+ATOM      5  N   GLY A   2       3.332   1.550   0.000  1.00  0.00           N
+ATOM      6  CA  GLY A   2       3.970   2.850   0.000  1.00  0.00           C
+ATOM      7  C   GLY A   2       5.480   2.700   0.000  1.00  0.00           C
+ATOM      8  O   GLY A   2       6.000   1.580   0.000  1.00  0.00           O
+ATOM      9  N   SER A   3       6.150   3.830   0.000  1.00  0.00           N
+ATOM     10  CA  SER A   3       7.600   3.900   0.000  1.00  0.00           C
+ATOM     11  C   SER A   3       8.100   5.330   0.000  1.00  0.00           C
+ATOM     12  O   SER A   3       7.350   6.300   0.000  1.00  0.00           O
+END
+"""
+_DIPEPTIDE = """\
+ATOM      1  N   ALA A   1       0.000   0.000   0.000  1.00  0.00           N
+ATOM      2  CA  ALA A   1       1.458   0.000   0.000  1.00  0.00           C
+ATOM      3  C   ALA A   1       2.009   1.420   0.000  1.00  0.00           C
+ATOM      4  O   ALA A   1       1.251   2.390   0.000  1.00  0.00           O
+ATOM      5  N   GLY A   2       3.332   1.550   0.000  1.00  0.00           N
+ATOM      6  CA  GLY A   2       3.970   2.850   0.000  1.00  0.00           C
+ATOM      7  C   GLY A   2       5.480   2.700   0.000  1.00  0.00           C
+ATOM      8  O   GLY A   2       6.000   1.580   0.000  1.00  0.00           O
+END
+"""
 
 
-@dataclass(frozen=True)
-class Layout:
-    static_tensor: Tensor
+def _write(path: Path, text: str) -> Path:
+    path.write_text(text, encoding="ascii")
+    return path
 
 
-@dataclass(frozen=True)
-class Batch:
-    inputs: Tensor
-    targets: Tensor
-    layout: Layout
-
-
-def collate(batch: list[Batch]) -> Batch:
-    return batch[0]
-
-
-def objective(model: nn.Module, batch: Batch) -> tuple[Tensor, Tensor]:
-    output = model(batch.inputs)
-    return output, (output - batch.targets).square().mean()
-
-
-def config(root: Path) -> dict:
+def _config(root: Path, name: str, source: Path) -> dict:
     return {
-        "logging": {"enabled": False},
-        "workspace": {"root": str(root)},
+        "model": {"name": name},
+        "data": {"train": {"source": str(source)}},
         "epochs": 1,
-        "optim": {"type": "sgd", "lr": 0.1, "momentum": 0.9},
+        "optim": {"type": "adamw", "lr": 1e-3},
         "dataloader": {"batch_size": 1, "shuffle": False, "drop_last": False},
+        "logging": {"enabled": False},
+        "workspace": {"root": str(root / "workspace")},
         "ckpt": {"async_mode": "disabled"},
     }
 
 
-def batch() -> Batch:
-    return Batch(torch.ones(1, 1), torch.ones(1, 1), Layout(torch.ones(1)))
-
-
-def test_runner_uses_danling_dynamic_runtime(tmp_path: Path) -> None:
-    model = nn.Linear(1, 1)
-    runner = Runner(
-        config(tmp_path),
-        model=model,
-        datasets={"train": [batch()]},
-        train_objective=objective,
-        collate_fn=collate,
-    )
+@pytest.mark.parametrize(
+    ("name", "model_cls", "objective_cls"),
+    [
+        ("proteinmpnn", "ProteinMpnnModel", "ProteinMpnnObjective"),
+        ("nampnn", "NaMpnnModel", "NaMpnnObjective"),
+    ],
+)
+def test_config_only_family_trains(tmp_path: Path, name: str, model_cls: str, objective_cls: str) -> None:
+    source = _write(tmp_path / "chain.pdb", _TRIPEPTIDE)
+    runner = Runner(_config(tmp_path, name, source))
     try:
-        assert ofoldx.Runner is Runner
-        assert isinstance(runner, danling.TorchRunner)
-        assert runner.model is model
-        assert isinstance(runner.dataloaders["train"], StatefulDataLoader)
-    finally:
-        runner.close()
+        assert type(runner.model).__name__ == model_cls
+        assert type(runner.objective).__name__ == objective_cls
+        # The paired processor produced the family's own Input type.
+        assert type(runner.processor) is MODELS.lookup_model(name).processor
 
-
-def test_runner_moves_direct_dataclass_tensors_and_preserves_layout(tmp_path: Path) -> None:
-    runner = Runner(config(tmp_path), model=nn.Linear(1, 1), datasets={}, train_objective=objective)
-    try:
-        original = batch()
-        type(runner).device = property(lambda _: torch.device("meta"))
-        moved = runner.to_device({"batch": original, "nested": [torch.ones(1)]})
-
-        assert moved["batch"].inputs.device.type == "meta"
-        assert moved["batch"].targets.device.type == "meta"
-        assert moved["batch"].layout is original.layout
-        assert moved["batch"].layout.static_tensor.device.type == "cpu"
-        assert moved["nested"][0].device.type == "meta"
-    finally:
-        runner.close()
-
-
-def test_runner_train_evaluate_and_infer(tmp_path: Path) -> None:
-    calls: list[str] = []
-
-    def train_objective(model: nn.Module, data: Batch) -> tuple[Tensor, Tensor]:
-        calls.append("train")
-        return objective(model, data)
-
-    def evaluate_objective(model: nn.Module, data: Batch) -> tuple[Tensor, Tensor]:
-        calls.append("evaluate")
-        return objective(model, data)
-
-    model = nn.Linear(1, 1, bias=False)
-    model.weight.data.zero_()
-    runner = Runner(
-        config(tmp_path) | {"evaluate_splits": ["validation"]},
-        model=model,
-        datasets={"train": [batch()], "validation": [batch()], "infer": [torch.ones(1, 1)]},
-        train_objective=train_objective,
-        evaluate_objective=evaluate_objective,
-        collate_fn=collate,
-    )
-    before = model.weight.detach().clone()
-    try:
+        parameter = next(p for p in runner.model.parameters() if p.requires_grad)
+        before = parameter.detach().clone()
         runner.train()
-        outputs = runner.infer()
 
-        assert calls == ["train", "evaluate"]
         assert runner.train_state.global_step == 1
-        assert not torch.equal(model.weight, before)
-        assert len(outputs) == 1
-        assert outputs[0].shape == (1, 1)
+        # A real backward + optimizer step ran: the parameter moved and stayed finite (a NaN loss
+        # would have propagated into the weights).
+        assert not torch.equal(parameter.detach(), before)
+        assert torch.isfinite(parameter).all()
     finally:
         runner.close()
 
 
-def test_runner_restores_danling_checkpoint(tmp_path: Path) -> None:
-    runner_config = config(tmp_path)
-    model = nn.Linear(1, 1, bias=False)
-    model.weight.data.zero_()
-    runner = Runner(
-        runner_config,
-        model=model,
-        datasets={"train": [batch()]},
-        train_objective=objective,
-        collate_fn=collate,
-    )
-    try:
-        runner.train()
-        expected_weight = model.weight.detach().clone()
-        checkpoint = Path(runner.workspace.checkpoint_dir) / "latest.pth"
-    finally:
-        runner.close()
+def test_untrainable_architecture_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="not trainable"):
+        Runner(
+            {
+                "model": {"name": "boltz1"},
+                "logging": {"enabled": False},
+                "workspace": {"root": str(tmp_path)},
+                "ckpt": {"async_mode": "disabled"},
+            }
+        )
 
-    restored_model = nn.Linear(1, 1, bias=False)
-    restored = Runner(
-        runner_config | {"checkpoint": str(checkpoint)},
-        model=restored_model,
-        datasets={"train": [batch()]},
-        train_objective=objective,
-        collate_fn=collate,
-    )
-    try:
-        torch.testing.assert_close(restored_model.weight, expected_weight)
-        assert restored.train_state.global_step == 1
-        assert restored.optimizer is not None
-        assert restored.optimizer.state_dict()["state"]
-    finally:
-        restored.close()
+
+def test_selecting_no_model_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="model.pretrained|model.name"):
+        Runner(
+            {
+                "logging": {"enabled": False},
+                "workspace": {"root": str(tmp_path)},
+                "ckpt": {"async_mode": "disabled"},
+            }
+        )
+
+
+def test_model_and_processor_share_config() -> None:
+    registration = MODELS.lookup_model("proteinmpnn")
+    model, processor, _objective, _collate = build_fresh(registration, {"ca_only": True})
+    assert model.config.ca_only is True
+    assert processor.config.ca_only is True
+
+
+def test_collate_pads_tied_group_ids_to_own_index(tmp_path: Path) -> None:
+    processor = MODELS.lookup_model("proteinmpnn").processor()
+    short = processor(read_structure(_write(tmp_path / "di.pdb", _DIPEPTIDE)))
+    long = processor(read_structure(_write(tmp_path / "tri.pdb", _TRIPEPTIDE)))
+
+    batch = collate_proteinmpnn([short, long])
+    length = long.sequence_tokens.shape[1]
+
+    assert batch.sequence_tokens.shape == (2, length)
+    # The shorter chain's padded rows are gated out and become their own throwaway causal units
+    # (their collated row index), never merging into real unit 0.
+    padded = short.sequence_tokens.shape[1]
+    assert not batch.residue_mask[0, padded:].any()
+    assert torch.equal(batch.tied_group_ids[0, padded:], torch.arange(padded, length))
