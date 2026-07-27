@@ -1,25 +1,39 @@
 r"""
 BoltzGen training objectives.
+
+The Runner trains BoltzGen with the shared EDM coordinate-denoising objective (see the registered
+contract below). ``diffusion_loss`` here is BoltzGen's own fuller published objective (rigid-aligned,
+type-weighted MSE plus smooth lDDT and bond terms), kept as a family API for callers who want it.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import cast
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from ...modules.collate import collate_denoising
+from ...modules.diffusion.loss import denoising_criterion_factory
 from ...modules.geometry import weighted_rigid_align
 from ...modules.head.tm import tm_length_scale
+from ..training import TRAINING_CONTRACTS, TrainingContract
 from .model import (
     BoltzGenConfidenceOutput,
     BoltzGenInput,
     BoltzGenOutput,
     BoltzGenStructureTarget,
     _boltzgen_coordinate_frames,
+)
+
+TRAINING_CONTRACTS.register(
+    TrainingContract(
+        architectures=("boltzgen",),
+        criterion=denoising_criterion_factory,
+        strategy="denoising",
+        freeze=("distogram_head", "bfactor_head", "template_embedder"),
+    )
 )
 
 _RESIDUE_TYPE_WEIGHTS = (
@@ -632,24 +646,6 @@ def diffusion_loss(
         smooth_lddt_loss=smooth_lddt,
         bond_loss=bonds,
     )
-
-
-def criterion(pred: BoltzGenOutput, target: Any) -> Tensor:
-    r"""
-    DanLing-shaped BoltzGen training loss: BoltzGen's own grounded coordinate objective reduced to a
-    scalar.
-
-    Unlike the sibling diffusion families -- which share the bare EDM denoising core -- BoltzGen ships a
-    fuller published objective (rigid-aligned, type-weighted MSE plus smooth lDDT), so its criterion wraps
-    that. ``target`` is the ``{"input", "target"}`` mapping from
-    [`collate_denoising`][ofoldx.modules.collate.collate_denoising].
-    """
-
-    return diffusion_loss(pred, target["input"], target["target"]).loss.mean()
-
-
-#: BoltzGen trains at batch_size=1 like its sibling diffusion families -- see ``collate_denoising``.
-collate = collate_denoising
 
 
 def _weighted_center(

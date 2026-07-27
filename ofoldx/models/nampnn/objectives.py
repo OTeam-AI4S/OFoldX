@@ -11,6 +11,8 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from ...modules.mpnn import nll_loss as _nll_loss
+from ..training import TRAINING_CONTRACTS, TrainingContract
+from .model import NA_MPNN_PADDING_TOKEN_ID
 
 _PROTEIN_RESIDUE_TYPE_SPAN = (0, 21)
 _DNA_RESIDUE_TYPE_SPAN = (21, 26)
@@ -112,20 +114,22 @@ def criterion(pred: Any, target: Any, *, label_smoothing: float = 0.1, shared_nu
     return (per_residue * mask).sum() / mask.sum()
 
 
-def loss_tokens(target: Any) -> int:
-    r"""Local count of designable residues -- DanLing's per-token loss normalizer."""
+def _criterion(model: Any, processor: Any) -> Any:
+    r"""Bind the loss to the Processor's actual RNA token scheme, not a baked default."""
 
-    return int((target.residue_mask & target.design_positions).sum())
+    shared_nucleic_tokens = bool(processor.config.shared_nucleic_tokens)
+
+    def criterion_bound(pred: Any, target: Any) -> Tensor:
+        return criterion(pred, target, shared_nucleic_tokens=shared_nucleic_tokens)
+
+    return criterion_bound
 
 
-def collate(batch: list[Any]) -> dict[str, Any]:
-    r"""
-    Collate to DanLing's ``{"input", "target", "loss_normalizer"}`` batch. ``pair_logit_bias`` is
-    residue-aligned on two axes; ``sequence_tokens`` pad with the NA-MPNN padding id.
-    """
-
-    from ...modules.collate import pad_and_collate
-    from .model import NA_MPNN_PADDING_TOKEN_ID
-
-    batched = pad_and_collate(batch, token_pad_id=NA_MPNN_PADDING_TOKEN_ID, pair_bias_fields={"pair_logit_bias"})
-    return {"input": batched, "target": batched, "loss_normalizer": loss_tokens(batched)}
+TRAINING_CONTRACTS.register(
+    TrainingContract(
+        architectures=("nampnn",),
+        criterion=_criterion,
+        strategy="sequence",
+        collate_options={"token_pad_id": NA_MPNN_PADDING_TOKEN_ID, "pair_bias_fields": ("pair_logit_bias",)},
+    )
+)

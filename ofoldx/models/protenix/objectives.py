@@ -1,15 +1,19 @@
 r"""
-Protenix training objective.
-
-Protenix noises the target internally and exposes its denoised coordinates alongside the augmented target
-and per-sample noise level, so the shared EDM coordinate-denoising loss grounds directly against the
-model output. The batch is DanLing's ``{"input", "target", "loss_normalizer"}`` from
-``collate_denoising``.
+Protenix training contract: the shared EDM coordinate-denoising objective, covering the base model and its
+conditioning variants (they share ``ProtenixModel.forward`` and ``ProtenixOutput``). The distogram and
+confidence heads and the template embedder are off the loss path and frozen.
 """
 
 from __future__ import annotations
 
-from ...modules.collate import collate_denoising as collate
-from ...modules.diffusion.loss import denoising_criterion as criterion
+from ...modules.diffusion.loss import denoising_criterion_factory
+from ..training import TRAINING_CONTRACTS, TrainingContract
 
-__all__ = ["collate", "criterion"]
+TRAINING_CONTRACTS.register(
+    TrainingContract(
+        architectures=("protenix", "protenix_template", "protenix_structure_condition", "protenix_constraint"),
+        criterion=denoising_criterion_factory,
+        strategy="denoising",
+        freeze=("distogram_head", "confidence_head", "template_embedder"),
+    )
+)

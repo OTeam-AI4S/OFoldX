@@ -24,6 +24,10 @@ class StructureDataset(Dataset):
         source: Directory, glob, manifest, structure file, or ``None`` for an empty
             dataset.
         processor: Callable that converts one structure reference into a model input.
+        lower: How to lower each structure -- ``"process_training"`` to produce the separate
+            ``(input, target)`` the diffusion families train on, or ``"call"`` for the plain Processor
+            call (the sequence families, and every family's inference splits). The Runner supplies this
+            explicitly from the architecture's training spec rather than sniffing the Processor's methods.
         processor_kwargs: Arguments forwarded to every processor call.
     """
 
@@ -32,12 +36,15 @@ class StructureDataset(Dataset):
         source: Any,
         processor: Any,
         *,
+        lower: str = "call",
         processor_kwargs: Mapping[str, Any] | None = None,
     ) -> None:
+        if lower not in ("call", "process_training"):
+            raise ValueError(f"lower must be 'call' or 'process_training'; got {lower!r}")
         self.processor = processor
+        self.lower = lower
         self.processor_kwargs = dict(processor_kwargs or {})
-        # Records stay as raw paths (lazy): the Processor owns reading, so the same
-        # reference inference passes drives training-time lowering identically.
+        # Records stay as raw paths (lazy): the Processor owns reading, one file per access.
         self.records: list[str] = _resolve_records(source)
 
     def __len__(self) -> int:
@@ -46,13 +53,10 @@ class StructureDataset(Dataset):
     def __getitem__(self, index: int) -> Any:
         from ..io import read_structure
 
-        # Records are structure-file paths; read each into a Structure (which every family
-        # Processor accepts) before lowering. Reading stays lazy -- one file per access. A Processor
-        # that separates model-visible features from the truth exposes ``process_training`` (the
-        # diffusion families, which need both to noise the target); otherwise the Input carries its own
-        # target (the sequence families) and plain ``__call__`` suffices.
-        lower = getattr(self.processor, "process_training", self.processor)
-        return lower(read_structure(self.records[index]), **self.processor_kwargs)
+        structure = read_structure(self.records[index])
+        if self.lower == "process_training":
+            return self.processor.process_training(structure, **self.processor_kwargs)
+        return self.processor(structure, **self.processor_kwargs)
 
 
 def _resolve_records(source: Any) -> list[str]:

@@ -9,9 +9,9 @@ from typing import Any
 import torch.nn.functional as F
 from torch import Tensor
 
-from ...modules.collate import pad_and_collate
 from ...modules.mpnn import label_smoothed_nll_loss
 from ...modules.mpnn import nll_loss as _nll_loss
+from ..training import TRAINING_CONTRACTS, TrainingContract
 
 
 def nll_loss(sequence_tokens: Tensor, log_probabilities: Tensor) -> Tensor:
@@ -53,17 +53,15 @@ def criterion(pred: Any, target: Any, *, label_smoothing: float = 0.1) -> Tensor
     return (per_residue * mask).sum() / mask.sum()
 
 
-def loss_tokens(target: Any) -> int:
-    r"""Local count of designable residues -- DanLing's per-token loss normalizer for one micro-batch."""
-
-    return int((target.residue_mask & target.design_positions).sum())
+def _criterion(model: Any, processor: Any) -> Any:
+    return criterion
 
 
-def collate(batch: list[Any]) -> dict[str, Any]:
-    r"""
-    Collate to DanLing's ``{"input", "target", "loss_normalizer"}`` batch. ``input`` and ``target`` are
-    the same batched ``ProteinMpnnInput`` (it carries both the graph features and the target sequence).
-    """
-
-    batched = pad_and_collate(batch, token_pad_id=0)
-    return {"input": batched, "target": batched, "loss_normalizer": loss_tokens(batched)}
+TRAINING_CONTRACTS.register(
+    TrainingContract(
+        architectures=("proteinmpnn",),
+        criterion=_criterion,
+        strategy="sequence",
+        collate_options={"token_pad_id": 0},
+    )
+)

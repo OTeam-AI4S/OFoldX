@@ -20,14 +20,19 @@ class ModelConfig(chanfig.Config):
     Attributes:
         name: Registered architecture ID.
         pretrained: Optional local model repository or Hugging Face Hub repository ID.
+        revision: Optional Hub revision (branch, tag, or commit) to resolve ``pretrained`` at. On load the
+            Runner records the resolved commit sha back here, so a mutable id (branch/tag) resumes from the
+            exact snapshot it was trained on.
     """
 
     name: str = ""
     pretrained: str | None = None
+    revision: str | None = None
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self.name = ""
         self.pretrained = None
+        self.revision = None
         super().__init__(*args, **kwargs)
 
 

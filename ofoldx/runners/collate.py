@@ -1,14 +1,13 @@
 r"""
-Shared batching helpers for the training Inputs.
+Batching of family training Inputs into DanLing's ``{"input", "target", "loss_normalizer"}`` batch.
 
-``pad_and_collate``/``collate_single`` batch the MPNN-family sequence Inputs; ``collate_denoising`` batches
-the diffusion families' ``(input, target)`` pairs into DanLing's training batch. The first is pure padding
-logic parameterised by the family's pad token and its multi-residue-axis fields;
-each family wraps it into its own ``training_collate``. Most tensors are residue-aligned on axis 1;
-fields listed in ``pair_bias_fields`` (e.g. NA-MPNN ``pair_logit_bias`` of shape ``(B, L, V, L, V)``) are
-residue-aligned on axes 1 and 3. ``tied_group_ids`` indexes an autoregressive-unit tensor via
-``scatter_reduce_``, so padded rows become their own collated index rather than merging into real unit 0.
-Non-tensor per-item carriers are concatenated in order (they feed output decoding, not the forward).
+This is Runner plumbing, not model math: it turns a list of per-structure processed items into one batch
+and reports the ``loss_normalizer`` -- the exact count each family's criterion averages over, so DanLing's
+accumulation/DDP reduction (which scales the backward by ``normalizer / Σnormalizer``) forms a true global
+per-unit mean. The sequence families average over designable residues; the diffusion families average over
+resolved atoms. ``pad_and_collate`` is the multi-residue-axis padding for batch_size>1 sequence families;
+``collate_single`` and ``collate_denoising`` are batch_size=1 (large single-structure models -- multi
+structure training comes from gradient accumulation weighted by the normalizer).
 """
 
 from __future__ import annotations
@@ -96,9 +95,6 @@ def pad_and_collate(batch: list[Any], *, token_pad_id: int, pair_bias_fields: Co
 def collate_single(batch: list[Any]) -> Any:
     r"""
     Batch-size-1 collate for large structure models: return the sole already-batched Input.
-
-    Multi-structure batching for these families comes from gradient accumulation weighted by the
-    token-count normalizer, not from padding heterogeneous atom/token tensors here.
     """
 
     if len(batch) != 1:
@@ -106,20 +102,46 @@ def collate_single(batch: list[Any]) -> Any:
     return batch[0]
 
 
+def _design_count(batched: Any) -> int:
+    r"""Count designable residues -- the unit the sequence-recovery criteria average over."""
+
+    return int((batched.residue_mask & batched.design_positions).sum())
+
+
+def collate_sequence(batch: list[Any], *, token_pad_id: int, pair_bias_fields: Collection[str] = ()) -> dict[str, Any]:
+    r"""
+    Collate a batch_size>1 sequence family to DanLing's batch, normalized by designable residues.
+    """
+
+    batched = pad_and_collate(batch, token_pad_id=token_pad_id, pair_bias_fields=pair_bias_fields)
+    return {"input": batched, "target": batched, "loss_normalizer": _design_count(batched)}
+
+
+def collate_sequence_single(batch: list[Any]) -> dict[str, Any]:
+    r"""
+    Collate a batch_size=1 sequence family (e.g. LigandMPNN's single-structure Input) to DanLing's batch.
+    """
+
+    batched = collate_single(batch)
+    return {"input": batched, "target": batched, "loss_normalizer": _design_count(batched)}
+
+
 def collate_denoising(batch: list[Any]) -> dict[str, Any]:
     r"""
-    Batch-size-1 collate for the diffusion structure families to DanLing's training batch.
+    Batch-size-1 collate for the diffusion families to DanLing's batch, normalized by resolved atoms.
 
     Each item is a ``(model_input, model_target)`` pair from the Processor's ``process_training``. The
-    diffusion forward needs both (it noises the target internally), so ``input`` is the mapping
-    ``{"input", "target"}`` that DanLing splats as ``model(input=..., target=...)``; the same mapping is
-    the criterion's ``target`` (its ``input`` carries ``atom_mask``, its ``target`` the truth a fuller
-    per-family loss may need). Multi-structure training comes from gradient accumulation weighted by the
-    atom-count normalizer, not from padding heterogeneous atom tensors here.
+    diffusion forward needs both, so ``input`` is the ``{"input", "target"}`` mapping DanLing splats as
+    ``model(input=..., target=...)``; the same mapping is the criterion's ``target`` (carrying both the
+    ``atom_mask`` and the resolved-atom Target). The normalizer is the resolved-atom count the denoising
+    loss averages over.
     """
+
+    from ..modules.diffusion.loss import resolved_atom_mask
 
     if len(batch) != 1:
         raise ValueError(f"the diffusion families train at batch_size=1; got a batch of {len(batch)}")
     model_input, model_target = batch[0]
     pair = {"input": model_input, "target": model_target}
-    return {"input": pair, "target": pair, "loss_normalizer": int(model_input.atom_mask.sum())}
+    resolved = resolved_atom_mask(model_target, model_input)
+    return {"input": pair, "target": pair, "loss_normalizer": int(resolved.sum())}

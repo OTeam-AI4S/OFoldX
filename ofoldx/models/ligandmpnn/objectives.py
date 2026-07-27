@@ -12,9 +12,9 @@ from typing import Any
 import torch.nn.functional as F
 from torch import Tensor
 
-from ...modules.collate import collate_single
 from ...modules.mpnn import label_smoothed_nll_loss
 from ...modules.mpnn import nll_loss as _nll_loss
+from ..training import TRAINING_CONTRACTS, TrainingContract
 
 
 def nll_loss(sequence_tokens: Tensor, log_probabilities: Tensor) -> Tensor:
@@ -38,18 +38,11 @@ def criterion(pred: Any, target: Any, *, label_smoothing: float = 0.1) -> Tensor
     return (per_residue * mask).sum() / mask.sum()
 
 
-def loss_tokens(target: Any) -> int:
-    r"""Local count of designable residues -- DanLing's per-token loss normalizer."""
-
-    return int((target.residue_mask & target.design_positions).sum())
+def _criterion(model: Any, processor: Any) -> Any:
+    return criterion
 
 
-def collate(batch: list[Any]) -> dict[str, Any]:
-    r"""
-    Collate to DanLing's ``{"input", "target", "loss_normalizer"}`` batch. ``LigandMpnnInput`` carries a
-    single ``structure`` and its ligand context, so LigandMPNN trains at batch_size=1 (multi-structure
-    batching via gradient accumulation weighted by the token count).
-    """
-
-    batched = collate_single(batch)
-    return {"input": batched, "target": batched, "loss_normalizer": loss_tokens(batched)}
+# LigandMPNN carries a single structure and its ligand context, so it trains at batch_size=1.
+TRAINING_CONTRACTS.register(
+    TrainingContract(architectures=("ligandmpnn",), criterion=_criterion, strategy="sequence_single")
+)

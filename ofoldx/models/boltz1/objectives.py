@@ -1,15 +1,18 @@
 r"""
-Boltz-1 training objective.
-
-Boltz-1 noises the target internally and exposes its denoised coordinates alongside the augmented target
-and per-sample noise level, so the shared EDM coordinate-denoising loss grounds directly against the
-model output. The batch is DanLing's ``{"input", "target", "loss_normalizer"}`` from
-``collate_denoising``.
+Boltz-1 training contract: the shared EDM coordinate-denoising objective. The distogram and confidence
+heads never feed the denoised coordinates, so they are frozen (Boltz-1 has no template embedder).
 """
 
 from __future__ import annotations
 
-from ...modules.collate import collate_denoising as collate
-from ...modules.diffusion.loss import denoising_criterion as criterion
+from ...modules.diffusion.loss import denoising_criterion_factory
+from ..training import TRAINING_CONTRACTS, TrainingContract
 
-__all__ = ["collate", "criterion"]
+TRAINING_CONTRACTS.register(
+    TrainingContract(
+        architectures=("boltz1",),
+        criterion=denoising_criterion_factory,
+        strategy="denoising",
+        freeze=("distogram_head", "confidence"),
+    )
+)
