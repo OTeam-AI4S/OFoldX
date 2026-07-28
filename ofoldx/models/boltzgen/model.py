@@ -7,6 +7,7 @@ from __future__ import annotations
 import operator
 from dataclasses import dataclass, field
 
+from tensordict import tensorclass
 from functools import partial
 from typing import Literal, cast
 
@@ -418,6 +419,7 @@ class _BoltzGenStructureModel(Model):
             bfactor_logits=self.bfactor_head(trunk.single),
             coordinate_trajectory=coordinate_trajectory,
             denoised_coordinate_trajectory=denoised_coordinate_trajectory,
+            batch_size=[batch_size],
         )
 
     def _run_trunk(
@@ -517,6 +519,7 @@ class _BoltzGenStructureModel(Model):
             pair=pair,
             relative_position_encoding=relative_position_encoding,
             distogram_logits=self.distogram_head(pair),
+            batch_size=[single_inputs.shape[0]],
         )
 
     def _build_denoiser_conditioning(
@@ -740,6 +743,7 @@ class BoltzGenModel(_BoltzGenStructureModel):
             augmented_target_coordinates=augmented_target_coordinates,
             noise_level=noise_level,
             residue_type_logits=residue_type_logits,
+            batch_size=[batch_size],
         )
 
     def sample(
@@ -990,6 +994,7 @@ class BoltzGenConfidenceModel(_BoltzGenStructureModel):
             confidence=confidence,
             coordinate_trajectory=coordinate_trajectory,
             denoised_coordinate_trajectory=denoised_coordinate_trajectory,
+            batch_size=[batch_size],
         )
 
     def _score_confidence(
@@ -1191,7 +1196,7 @@ class BoltzGenInverseFoldingModel(Model):
             target_residue_type,
             generator=generator,
         )
-        return BoltzGenInverseFoldingOutput(logits=logits)
+        return BoltzGenInverseFoldingOutput(logits=logits, batch_size=[logits.shape[0]])
 
     @torch.no_grad()
     def design(
@@ -1251,6 +1256,7 @@ class BoltzGenInverseFoldingModel(Model):
         return BoltzGenInverseFoldingDesignOutput(
             logits=logits,
             tokens=residue_type.argmax(dim=-1),
+            batch_size=[logits.shape[0]],
         )
 
 
@@ -4172,6 +4178,7 @@ def _boltzgen_confidence_output(
         chain_pair_ipsae=unflatten(tm_scores["chain_pair_ipsae"]),
         confidence_single=None if confidence_single is None else unflatten(confidence_single),
         confidence_pair=None if confidence_pair is None else unflatten(confidence_pair),
+        batch_size=[batch_size],
     )
 
 
@@ -4844,7 +4851,7 @@ BoltzGenSchema = (
 )
 
 
-@dataclass(kw_only=True, eq=False)
+@tensorclass
 class BoltzGenStructureTarget:
     r"""
     Structure-training labels aligned to one [`BoltzGenInput`][].
@@ -4892,7 +4899,7 @@ class BoltzGenStructureTarget:
     bond_mask: Tensor | None = None
 
 
-@dataclass(kw_only=True, eq=False)
+@tensorclass
 class BoltzGenInput:
     r"""
     Input tensors consumed by BoltzGen design models.
@@ -5001,7 +5008,7 @@ class BoltzGenInput:
     layout: BoltzGenLayout | None = None
 
 
-@dataclass(kw_only=True, eq=False)
+@tensorclass
 class BoltzGenInverseFoldingInput:
     r"""
     Tensor and molecular-layout input for BoltzGen inverse folding.
@@ -5067,7 +5074,7 @@ class BoltzGenInverseFoldingInput:
     layout: BoltzGenInverseFoldingLayout | None = None
 
 
-@dataclass(eq=False)
+@tensorclass
 class _BoltzGenTrunkOutput:
     r"""
     Trunk representations consumed by the diffusion and confidence heads.
@@ -5080,7 +5087,7 @@ class _BoltzGenTrunkOutput:
     distogram_logits: Tensor
 
 
-@dataclass(eq=False)
+@tensorclass
 class BoltzGenOutput:
     r"""
     Predictions from one BoltzGen training denoising pass.
@@ -5105,7 +5112,7 @@ class BoltzGenOutput:
     residue_type_logits: Tensor | None
 
 
-@dataclass(eq=False)
+@tensorclass
 class BoltzGenConfidenceOutput:
     r"""
     Complete raw and derived outputs from the BoltzGen confidence equation.
@@ -5156,7 +5163,7 @@ class BoltzGenConfidenceOutput:
     confidence_pair: Tensor | None
 
 
-@dataclass(eq=False)
+@tensorclass
 class BoltzGenSampleOutput:
     r"""
     Predictions from one BoltzGen reverse-diffusion sampling pass.
@@ -5179,7 +5186,7 @@ class BoltzGenSampleOutput:
     denoised_coordinate_trajectory: Tensor | None = None
 
 
-@dataclass(eq=False)
+@tensorclass
 class BoltzGenSampleWithConfidenceOutput:
     r"""
     Coordinate samples and confidence values produced from one trunk execution.
@@ -5193,7 +5200,7 @@ class BoltzGenSampleWithConfidenceOutput:
     denoised_coordinate_trajectory: Tensor | None = None
 
 
-@dataclass(eq=False)
+@tensorclass
 class BoltzGenInverseFoldingOutput:
     r"""
     Logit predictions from one BoltzGen inverse-folding forward pass.
@@ -5205,7 +5212,7 @@ class BoltzGenInverseFoldingOutput:
     logits: Tensor
 
 
-@dataclass(eq=False)
+@tensorclass
 class BoltzGenInverseFoldingDesignOutput:
     r"""
     Predictions from one BoltzGen inverse-folding design pass.

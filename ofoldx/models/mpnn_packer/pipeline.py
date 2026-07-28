@@ -138,8 +138,9 @@ class MpnnPackerPipeline(PairedPipeline[MpnnPackerModel, MpnnPackerProcessor]):
         if num_samples <= 0:
             raise ValueError("num_samples must be positive")
 
-        # Model.sample consumes only the tensor fields. Each singleton input remains
-        # beside the tensor batch to retain its own structure realization mapping.
+        # Model.sample consumes only the tensor fields; the structure metadata is carried per batch element
+        # (a list -> NonTensorStack) so the B-sized input stays internally consistent -- ``batched[i]`` maps
+        # to ``inputs[i]``. Realization below still reads each item directly.
         batched = MpnnPackerInput(
             backbone_coordinates=torch.cat([item.backbone_coordinates for item in inputs]),
             sequence_tokens=torch.cat([item.sequence_tokens for item in inputs]),
@@ -152,8 +153,9 @@ class MpnnPackerPipeline(PairedPipeline[MpnnPackerModel, MpnnPackerProcessor]):
             atom37_coordinates=torch.cat([item.atom37_coordinates for item in inputs]),
             atom37_mask=torch.cat([item.atom37_mask for item in inputs]),
             pack_positions=torch.cat([item.pack_positions for item in inputs]),
-            structure=inputs[0].structure,
-            component_references=inputs[0].component_references,
+            structure=[item.structure for item in inputs],
+            component_references=[item.component_references for item in inputs],
+            batch_size=[len(inputs)],
         )
 
         predictions: list[list[PackPrediction]] = [[] for _ in inputs]

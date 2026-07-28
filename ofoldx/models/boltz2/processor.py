@@ -660,6 +660,7 @@ def _prepare_boltz2_affinity_features(
             token_sites=tuple(cast(AtomSite | tuple[str, int], token["token_site"]) for token in tokens),
             affinity_instance_id=ligand,
         ),
+        batch_size=[1],
     )
 
 
@@ -945,6 +946,7 @@ def _prepare_boltz2_structure_features(
             token_sites=tuple(cast(AtomSite | tuple[str, int], token["token_site"]) for token in tokens),
             affinity_instance_id=None,
         ),
+        batch_size=[1],
     )
 
 
@@ -1022,6 +1024,7 @@ def _prepare_boltz2_target(
         ).unsqueeze(0),
         symmetry_atom_index=symmetry_atom_index.to(device=device).unsqueeze(0),
         symmetry_permutation=symmetry_permutation.to(device=device).unsqueeze(0),
+        batch_size=[1],
     )
 
 

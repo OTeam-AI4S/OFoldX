@@ -623,6 +623,7 @@ class ProteinMpnnProcessor(Processor):
             pssm_coefficients=pssm_coefficient_values,
             pssm_probabilities=pssm_probability_values,
             pssm_log_odds=pssm_log_odds_values,
+            batch_size=[1],
         )
 
 

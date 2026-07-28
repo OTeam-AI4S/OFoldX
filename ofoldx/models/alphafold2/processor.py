@@ -325,7 +325,7 @@ class AlphaFold2InitialGuessProcessor(Processor):
                 device=self.device,
             ).unsqueeze(0),
         )
-        return AlphaFold2InitialGuessInput(**values)
+        return AlphaFold2InitialGuessInput(**values, batch_size=[1])
 
 
 def monomer_system_from_sequences(
@@ -513,6 +513,7 @@ def _prepare_alphafold2_features(
         ),
         template_residue_type_ids=template_residue_type_ids.to(device=device).unsqueeze(0),
         **placed,
+        batch_size=[1],
     )
 
 

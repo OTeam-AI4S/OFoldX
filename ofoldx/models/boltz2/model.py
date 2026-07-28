@@ -8,6 +8,7 @@ import math
 import operator
 from dataclasses import dataclass
 
+from tensordict import tensorclass
 from functools import partial
 from typing import cast
 
@@ -391,6 +392,7 @@ class Boltz2Model(Model):
             augmented_target_coordinates=_unflatten_sample_axis(augmented_target_coordinates, batch_size, num_samples),
             noise_level=noise_level.reshape(batch_size, num_samples),
             bfactor_logits=bfactor_logits,
+            batch_size=[batch_size],
         )
 
     def confidence(
@@ -459,6 +461,7 @@ class Boltz2Model(Model):
         return Boltz2Representations(
             single=representations.single,
             pair=representations.pair,
+            batch_size=[representations.single.shape[0]],
         )
 
     def sample(
@@ -582,6 +585,7 @@ class Boltz2Model(Model):
             resolved_logits=resolved_logits,
             bfactor_logits=bfactor_logits,
             **values,
+            batch_size=[batch_size],
         )
 
     @torch.inference_mode()
@@ -826,6 +830,7 @@ class Boltz2Model(Model):
             pair=pair,
             distogram_logits=self.distogram_head(pair),
             relative_position_encoding=relative_position_encoding,
+            batch_size=[single_inputs.shape[0]],
         )
 
     def _initial_representations(self, input: Boltz2Input) -> tuple[Tensor, Tensor, Tensor, Tensor]:
@@ -1157,6 +1162,7 @@ class Boltz2AffinityModel(Boltz2Model):
             affinity_pred_value2=values["affinity_pred_value2"],
             affinity_logits_binary2=values["affinity_logits_binary2"],
             affinity_probability_binary2=values["affinity_probability_binary2"],
+            batch_size=[values["affinity_pred_value"].shape[0]],
         )
 
     @torch.inference_mode()
@@ -5079,7 +5085,7 @@ class Boltz2Layout:
     affinity_instance_id: str | None = None
 
 
-@dataclass(kw_only=True, eq=False)
+@tensorclass
 class Boltz2StructureTarget:
     r"""
     Complete pre-crop structure truth for Boltz-2.
@@ -5108,7 +5114,7 @@ class Boltz2StructureTarget:
     symmetry_permutation: Tensor
 
 
-@dataclass(kw_only=True, eq=False)
+@tensorclass
 class Boltz2Input:
     r"""
     Input tensors consumed by [`Boltz2Model`][].
@@ -5255,7 +5261,7 @@ class Boltz2Input:
     layout: Boltz2Layout | None = None
 
 
-@dataclass(eq=False)
+@tensorclass
 class _Boltz2TrunkOutput:
     r"""
     Trunk outputs consumed by the diffusion / confidence heads.
@@ -5268,7 +5274,7 @@ class _Boltz2TrunkOutput:
     relative_position_encoding: Tensor
 
 
-@dataclass(kw_only=True, eq=False)
+@tensorclass
 class Boltz2Representations:
     r"""
     Raw Boltz-2 trunk representations surfaced by ``Boltz2Model.representations``.
@@ -5282,7 +5288,7 @@ class Boltz2Representations:
     pair: Tensor
 
 
-@dataclass(eq=False)
+@tensorclass
 class Boltz2Output:
     r"""
     Predictions from one Boltz-2 training denoising pass.
@@ -5306,7 +5312,7 @@ class Boltz2Output:
     bfactor_logits: Tensor | None = None
 
 
-@dataclass(kw_only=True, eq=False)
+@tensorclass
 class Boltz2AffinityOutput:
     r"""
     Raw differentiable Boltz-2 affinity predictions with explicit sample axes.
@@ -5325,7 +5331,7 @@ class Boltz2AffinityOutput:
     affinity_probability_binary2: Tensor
 
 
-@dataclass(kw_only=True, eq=False)
+@tensorclass
 class Boltz2ConfidenceOutput:
     r"""
     Raw predictions from one Boltz-2 folding pass.
