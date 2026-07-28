@@ -124,18 +124,19 @@ class Runner(dl.Runner):
         # it afterwards would let a mutable branch/tag that later moves resume under an identity that no longer
         # matches the snapshot actually loaded.
         repository = self._prepare_repository(config) if config.model.get("pretrained") else None
+        # The objective trains only the loss-path parameters; auxiliary heads / sampling-only modules /
+        # unexercised conditioning embedders get no gradient, so DDP must tolerate unused parameters (the
+        # models return ``tensorclass`` outputs, which DDP can walk; and unlike ``static_graph`` this
+        # re-checks each step, so it also handles the data-dependent template case). Set it BEFORE
+        # ``super().__init__`` so DanLing hashes it into the run identity/workspace, not the default it
+        # would otherwise cache first.
+        config.ddp.find_unused_parameters = True
         super().__init__(config)
 
         self.model, self.processor, contract = self._build(repository)
         self.criterion = contract.criterion(self.model, self.processor)
         build_collate, self._lower, self._infer = _STRATEGIES[contract.strategy]
         self.collate_fn = build_collate(contract.collate_options)
-        # The objective trains only the loss-path parameters; auxiliary heads / sampling-only modules /
-        # unexercised conditioning embedders get no gradient, so DDP must tolerate unused parameters. The
-        # models now return ``tensorclass`` outputs, which DDP can walk, so ``find_unused_parameters=True``
-        # works (and re-checks each step, unlike ``static_graph``, so it also handles the data-dependent
-        # template case).
-        self.config.ddp.find_unused_parameters = True
         # DanLing toggles module mode from its ``mode`` setter (train_epoch/evaluate_epoch/infer set it), but
         # it fixed ``mode=train`` before this model existed, so the first train_epoch's mode=train is a no-op
         # that will not force train mode -- and a repository model loads in eval(). Establish train mode here.
