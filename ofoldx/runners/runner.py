@@ -117,18 +117,19 @@ class Runner(dl.Runner):
         # it afterwards would let a mutable branch/tag that later moves resume under an identity that no longer
         # matches the snapshot actually loaded.
         repository = self._prepare_repository(config) if config.model.get("pretrained") else None
-        # The objective trains only the loss-path parameters; auxiliary heads / sampling-only modules /
-        # unexercised conditioning embedders get no gradient, so DDP must tolerate unused parameters (the
-        # models return ``tensorclass`` outputs, which DDP can walk; and unlike ``static_graph`` this
-        # re-checks each step, so it also handles the data-dependent template case). Set it BEFORE
-        # ``super().__init__`` so DanLing hashes it into the run identity/workspace, not the default it
-        # would otherwise cache first.
-        config.ddp.find_unused_parameters = True
         super().__init__(config)
 
         self.model, self.processor, registration = self._build(repository)
         criterion, strategy = registration.criterion, registration.strategy
         assert criterion is not None and strategy is not None  # _require_trainable enforced this in _build
+        # ``find_unused_parameters`` is a DDP graph-traversal flag derived from the model, not a run knob:
+        # only the denoising families compute auxiliary heads (confidence, distogram, ...) the objective
+        # leaves untrained, so DDP must walk the ``tensorclass`` output to tolerate them; the sequence
+        # families train every forward-computed parameter and skip the traversal. An explicit user setting
+        # wins (``None`` is "unset"). DanLing reads this in ``materialize_model``, which ``MetaRunner`` runs
+        # after ``__init__``, so setting it here is in time.
+        if self.config.ddp.get("find_unused_parameters") is None:
+            self.config.ddp.find_unused_parameters = strategy == "denoising"
         self.criterion = criterion(self.model, self.processor)
         build_collate, self._train_lower, self._infer_lower, self._infer = _STRATEGIES[strategy]
         self.collate_fn = build_collate(registration.collate_options)

@@ -311,12 +311,10 @@ class ProtenixProcessorConfig(Config):
     Configure Protenix input preprocessing.
 
     Args:
-        constraints: Whether the paired processor exposes constraint inputs.
         max_msa_rows: Maximum MSA depth included in model inputs.
         augment_reference_positions: Whether to randomly rotate and translate reference coordinates.
     """
 
-    constraints: bool = False
     max_msa_rows: int = 16384
     augment_reference_positions: bool = True
 
@@ -325,8 +323,7 @@ class ProtenixConstraintProcessorConfig(ProtenixProcessorConfig):
     r"""
     Configure Protenix constraint preprocessing.
 
-    Args:
-        constraints: Whether constraint inputs are exposed; fixed to ``True`` here.
+    A distinct type so a loaded Processor pairs unambiguously with the constraint architecture; it exposes
+    the same feature limits as the base processor. Whether constraint inputs are extracted is decided by the
+    Processor class (``ProtenixConstraintProcessor``), not a config flag.
     """
-
-    constraints: bool = True
