@@ -24,7 +24,7 @@ from .model import (
     NaMpnnOutput,
     NaMpnnSamplingOutput,
 )
-from .objectives import criterion, nll_loss, smoothed_loss
+from .objectives import criterion, criterion_factory, nll_loss, smoothed_loss
 from .pipeline import NaMpnnPipeline
 from .processor import NaMpnnProcessor
 
@@ -32,6 +32,9 @@ _MODELS.register(
     "nampnn",
     model=NaMpnnModel,
     processor=NaMpnnProcessor,
+    criterion=criterion_factory,
+    strategy="sequence",
+    collate_options={"token_pad_id": NA_MPNN_PADDING_TOKEN_ID, "pair_bias_fields": ("pair_logit_bias",)},
 )
 _PIPELINES.register(
     "nampnn",

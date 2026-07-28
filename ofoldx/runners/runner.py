@@ -1,13 +1,12 @@
 r"""
 Training, evaluation, and inference runner for the trainable model families.
 
-Trainability is bound to the **exact** architecture id through its family's training contract (see
-[`TrainingContract`][ofoldx.models.training.TrainingContract]), never guessed from a family directory, and
-is verified *before* any model build or weight download. The Runner resolves the architecture (fresh from
-``model.name`` or loaded from ``model.pretrained``), builds the Model and a config-consistent Processor, then
-applies the contract: its config-aware criterion, one of the generic batching/lowering/inference strategies
-below (the only generic Runner-side training knowledge), and freezing of the modules the objective does not
-train.
+Trainability is bound to the **exact** registered architecture: an architecture is trainable iff its
+[`register`][ofoldx.models.registry.ModelRegistry.register] call declared a training ``criterion`` (and a
+``strategy``), verified *before* any model build or weight download. The Runner resolves the architecture
+(fresh from ``model.name`` or loaded from ``model.pretrained``), builds the Model and a config-consistent
+Processor, then applies the registration's config-aware criterion and one of the generic batching/lowering/
+inference strategies below (the only generic Runner-side training knowledge).
 
 DanLing drives forward → criterion → loss-normalizer → backward → step, and toggles train/eval module mode
 itself (train_epoch/evaluate_epoch/infer set ``self.mode``). The Runner adds only what DanLing cannot know
@@ -20,7 +19,6 @@ native ``to_device``, and an ``infer_step`` that runs the family's inference ent
 
 from __future__ import annotations
 
-import importlib
 from collections.abc import Callable, Mapping
 from dataclasses import fields, is_dataclass, replace
 from typing import Any, cast
@@ -32,8 +30,7 @@ from tensordict import is_tensorclass
 from torch import Tensor
 
 from ..model import Model
-from ..models.registry import BUILTIN_MODULES, MODELS, ModelRegistration
-from ..models.training import TrainingContract
+from ..models.registry import MODELS, ModelRegistration
 from ..processor import Processor
 from . import collate as _collate
 from .config import RunnerConfig
@@ -57,8 +54,8 @@ def _sample_infer(model: Any, model_input: Any) -> Any:
     return model.sample(model_input)
 
 
-#: Strategy name -> (build a collate from the contract's options, dataset lowering, inference entry point).
-#: The only generic Runner-side training knowledge; a family's contract names one of these.
+#: Strategy name -> (build a collate from the registration's options, dataset lowering, inference entry
+#: point). The only generic Runner-side training knowledge; a trainable architecture registers one of these.
 _STRATEGIES: dict[str, tuple[Callable[[Mapping[str, Any]], Collate], str, Infer]] = {
     "sequence": (lambda options: (lambda batch: _collate.collate_sequence(batch, **options)), "call", _forward_infer),
     "sequence_single": (lambda options: _collate.collate_sequence_single, "call", _forward_infer),
@@ -66,34 +63,22 @@ _STRATEGIES: dict[str, tuple[Callable[[Mapping[str, Any]], Collate], str, Infer]
 }
 
 
-def _training_contract(architecture: str) -> TrainingContract:
+def _require_trainable(registration: ModelRegistration) -> None:
     r"""
-    Return the family-declared training contract that covers this exact architecture, or raise.
-
-    The family's ``objectives`` module exposes a ``TRAINING`` contract listing the exact ids it covers, so
-    a same-package variant it does not cover (or an architecture with no ``objectives`` module) is not
-    trainable. A contract naming a strategy the Runner does not implement is rejected here too.
+    Raise unless the architecture is trainable: its registration declares a training ``criterion`` and a
+    ``strategy`` the Runner implements. Trainability is a property of the exact registered architecture, so a
+    same-family variant that registered no criterion is simply not trainable.
     """
 
-    module_path = f"{BUILTIN_MODULES[architecture]}.objectives"
-    try:
-        objectives = importlib.import_module(module_path)
-    except ModuleNotFoundError as error:
-        if error.name != module_path:
-            raise  # a genuinely missing dependency inside objectives, not an absent objectives module
-        objectives = None
-    contract = getattr(objectives, "TRAINING", None)
-    if contract is None or architecture not in contract.architectures:
+    if registration.criterion is None:
         raise ValueError(
-            f"architecture {architecture!r} is not trainable: its family declares no training contract "
-            "covering it"
+            f"architecture {registration.id!r} is not trainable: its registration declares no training criterion"
         )
-    if contract.strategy not in _STRATEGIES:
+    if registration.strategy not in _STRATEGIES:
         raise ValueError(
-            f"the training contract for {architecture!r} names unknown strategy {contract.strategy!r}; known "
-            f"strategies are {', '.join(sorted(_STRATEGIES))}"
+            f"architecture {registration.id!r} registers unknown training strategy {registration.strategy!r}; "
+            f"known strategies are {', '.join(sorted(_STRATEGIES))}"
         )
-    return contract
 
 
 class Runner(dl.Runner):
@@ -133,10 +118,12 @@ class Runner(dl.Runner):
         config.ddp.find_unused_parameters = True
         super().__init__(config)
 
-        self.model, self.processor, contract = self._build(repository)
-        self.criterion = contract.criterion(self.model, self.processor)
-        build_collate, self._lower, self._infer = _STRATEGIES[contract.strategy]
-        self.collate_fn = build_collate(contract.collate_options)
+        self.model, self.processor, registration = self._build(repository)
+        criterion, strategy = registration.criterion, registration.strategy
+        assert criterion is not None and strategy is not None  # _require_trainable enforced this in _build
+        self.criterion = criterion(self.model, self.processor)
+        build_collate, self._lower, self._infer = _STRATEGIES[strategy]
+        self.collate_fn = build_collate(registration.collate_options)
         # DanLing toggles module mode from its ``mode`` setter (train_epoch/evaluate_epoch/infer set it), but
         # it fixed ``mode=train`` before this model existed, so the first train_epoch's mode=train is a no-op
         # that will not force train mode -- and a repository model loads in eval(). Establish train mode here.
@@ -145,20 +132,20 @@ class Runner(dl.Runner):
 
     # -- construction --------------------------------------------------------
 
-    def _build(self, repository: Any = None) -> tuple[Model, Processor, TrainingContract]:
+    def _build(self, repository: Any = None) -> tuple[Model, Processor, ModelRegistration]:
         r"""Resolve the architecture, confirm it is trainable *before* building/loading, then instantiate."""
 
         model_config = self.config.model
         if model_config.pretrained:
             return self._build_from_repository(model_config, repository)
         registration = MODELS.lookup_model(model_config["name"])
-        contract = _training_contract(registration.id)  # fail fast before building the model
+        _require_trainable(registration)  # fail fast before building the model
         overrides = {
             key: value for key, value in model_config.items() if key not in ("name", "pretrained", "revision")
         }
         model = registration.model(registration.model_config(**overrides))
         processor = self._build_processor(registration, model)
-        return model, processor, contract
+        return model, processor, registration
 
     def _build_processor(self, registration: ModelRegistration, model: Model) -> Processor:
         r"""
@@ -211,7 +198,7 @@ class Runner(dl.Runner):
 
     def _build_from_repository(
         self, model_config: Mapping[str, Any], repository: Any
-    ) -> tuple[Model, Processor, TrainingContract]:
+    ) -> tuple[Model, Processor, ModelRegistration]:
         r"""
         Load a Model/Processor pair from the already-resolved repository snapshot: decide architecture +
         trainability and validate the Processor metadata from the snapshot *before* the expensive weight
@@ -227,12 +214,12 @@ class Runner(dl.Runner):
                 f"config `model.name` {model_config['name']!r} does not match the repository architecture "
                 f"{architecture!r}"
             )
-        contract = _training_contract(architecture)  # fail fast before downloading weights
+        _require_trainable(metadata_registration)  # fail fast before downloading weights
         # Load the Processor first -- it validates ``processor.json`` from the metadata-only snapshot before
         # ``load_model`` hydrates the full weights.
         processor = load_processor(repository)
         model = load_model(repository)
-        return model, processor, contract
+        return model, processor, metadata_registration
 
     def build_datasets(self) -> dict[str, Any]:
         r"""

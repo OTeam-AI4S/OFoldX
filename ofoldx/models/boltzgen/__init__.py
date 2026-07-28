@@ -4,6 +4,7 @@ BoltzGen structure design, inverse folding, analysis, and released composition.
 
 from __future__ import annotations
 
+from ...modules.diffusion.loss import denoising_criterion_factory
 from ...pipelines.registry import PIPELINES as _PIPELINES
 from ..registry import MODELS as _MODELS
 from .analysis import (
@@ -132,6 +133,8 @@ _MODELS.register(
     "boltzgen",
     model=BoltzGenModel,
     processor=BoltzGenProcessor,
+    criterion=denoising_criterion_factory,
+    strategy="denoising",
 )
 _MODELS.register(
     "boltzgen_confidence",

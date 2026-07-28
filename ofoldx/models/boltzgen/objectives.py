@@ -15,22 +15,14 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from ...modules.diffusion.loss import denoising_criterion_factory
 from ...modules.geometry import weighted_rigid_align
 from ...modules.head.tm import tm_length_scale
-from ..training import TrainingContract
 from .model import (
     BoltzGenConfidenceOutput,
     BoltzGenInput,
     BoltzGenOutput,
     BoltzGenStructureTarget,
     _boltzgen_coordinate_frames,
-)
-
-TRAINING = TrainingContract(
-    architectures=("boltzgen",),
-    criterion=denoising_criterion_factory,
-    strategy="denoising",
 )
 
 _RESIDUE_TYPE_WEIGHTS = (

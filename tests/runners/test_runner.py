@@ -11,7 +11,6 @@ from ofoldx.models.registry import MODELS
 from ofoldx.modules.diffusion.loss import resolved_atom_mask
 from ofoldx.runners import Runner
 from ofoldx.runners.collate import collate_denoising
-from ofoldx.runners.runner import _training_contract
 
 # Minimal backbone-only chain -- enough for the MPNN + structure Processors to lower a real Input, and
 # portable (no external data dependency).
@@ -144,7 +143,7 @@ def test_nampnn_criterion_binds_processor_token_scheme(tmp_path: Path) -> None:
     model = registration.model(registration.model_config())
     for scheme in (True, False):
         processor = registration.processor(registration.processor.config_class(shared_nucleic_tokens=scheme))
-        criterion = _training_contract("nampnn").criterion(model, processor)
+        criterion = MODELS.lookup_model("nampnn").criterion(model, processor)
         bound = criterion.__closure__[-1].cell_contents  # the captured shared_nucleic_tokens
         assert bound is scheme
 

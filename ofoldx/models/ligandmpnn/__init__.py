@@ -14,7 +14,7 @@ from .model import (
     LigandMpnnOutput,
     LigandMpnnSamplingOutput,
 )
-from .objectives import criterion, nll_loss, smoothed_loss
+from .objectives import criterion, criterion_factory, nll_loss, smoothed_loss
 from .pipeline import LigandMpnnDesignAndPackPipeline, LigandMpnnPipeline
 from .processor import LigandMpnnProcessor
 
@@ -22,6 +22,8 @@ _MODELS.register(
     "ligandmpnn",
     model=LigandMpnnModel,
     processor=LigandMpnnProcessor,
+    criterion=criterion_factory,
+    strategy="sequence_single",
 )
 _PIPELINES.register(
     "ligandmpnn",

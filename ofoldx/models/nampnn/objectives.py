@@ -11,8 +11,6 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from ...modules.mpnn import nll_loss as _nll_loss
-from ..training import TrainingContract
-from .model import NA_MPNN_PADDING_TOKEN_ID
 
 _PROTEIN_RESIDUE_TYPE_SPAN = (0, 21)
 _DNA_RESIDUE_TYPE_SPAN = (21, 26)
@@ -114,7 +112,7 @@ def criterion(pred: Any, target: Any, *, label_smoothing: float = 0.1, shared_nu
     return (per_residue * mask).sum() / mask.sum()
 
 
-def _criterion(model: Any, processor: Any) -> Any:
+def criterion_factory(model: Any, processor: Any) -> Any:
     r"""Bind the loss to the Processor's actual RNA token scheme, not a baked default."""
 
     shared_nucleic_tokens = bool(processor.config.shared_nucleic_tokens)
@@ -123,11 +121,3 @@ def _criterion(model: Any, processor: Any) -> Any:
         return criterion(pred, target, shared_nucleic_tokens=shared_nucleic_tokens)
 
     return criterion_bound
-
-
-TRAINING = TrainingContract(
-    architectures=("nampnn",),
-    criterion=_criterion,
-    strategy="sequence",
-    collate_options={"token_pad_id": NA_MPNN_PADDING_TOKEN_ID, "pair_bias_fields": ("pair_logit_bias",)},
-)

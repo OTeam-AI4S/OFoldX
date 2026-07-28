@@ -15,7 +15,7 @@ from .model import (
     ProteinMpnnOutput,
     ProteinMpnnSamplingOutput,
 )
-from .objectives import criterion, nll_loss, smoothed_loss
+from .objectives import criterion, criterion_factory, nll_loss, smoothed_loss
 from .pipeline import ProteinMpnnDesignAndPackPipeline, ProteinMpnnPipeline
 from .processor import ProteinMpnnProcessor
 
@@ -23,6 +23,9 @@ _MODELS.register(
     "proteinmpnn",
     model=ProteinMpnnModel,
     processor=ProteinMpnnProcessor,
+    criterion=criterion_factory,
+    strategy="sequence",
+    collate_options={"token_pad_id": 0},
 )
 _PIPELINES.register(
     "proteinmpnn",

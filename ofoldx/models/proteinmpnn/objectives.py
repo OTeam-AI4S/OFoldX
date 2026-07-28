@@ -11,7 +11,6 @@ from torch import Tensor
 
 from ...modules.mpnn import label_smoothed_nll_loss
 from ...modules.mpnn import nll_loss as _nll_loss
-from ..training import TrainingContract
 
 
 def nll_loss(sequence_tokens: Tensor, log_probabilities: Tensor) -> Tensor:
@@ -53,13 +52,7 @@ def criterion(pred: Any, target: Any, *, label_smoothing: float = 0.1) -> Tensor
     return (per_residue * mask).sum() / mask.sum()
 
 
-def _criterion(model: Any, processor: Any) -> Any:
+def criterion_factory(model: Any, processor: Any) -> Any:
+    r"""Runner criterion factory: ProteinMPNN's loss needs no Model/Processor binding."""
+
     return criterion
-
-
-TRAINING = TrainingContract(
-    architectures=("proteinmpnn",),
-    criterion=_criterion,
-    strategy="sequence",
-    collate_options={"token_pad_id": 0},
-)

@@ -4,6 +4,7 @@ Boltz-2 folding and affinity implementations.
 
 from __future__ import annotations
 
+from ...modules.diffusion.loss import denoising_criterion_factory
 from ...pipelines.registry import PIPELINES as _PIPELINES
 from ..registry import MODELS as _MODELS
 from .chemistry import standardize_boltz2_affinity_smiles
@@ -38,6 +39,8 @@ _MODELS.register(
     "boltz2",
     model=Boltz2Model,
     processor=Boltz2Processor,
+    criterion=denoising_criterion_factory,
+    strategy="denoising",
 )
 _MODELS.register(
     "boltz2_affinity",

@@ -4,13 +4,19 @@ Model and Processor registration.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from importlib import import_module
-from typing import NamedTuple, cast
+from typing import Any, NamedTuple, cast
 
 import chanfig
 
 from ..model import Model
 from ..processor import Processor
+
+#: A criterion factory: ``(model, processor) -> (pred, target) -> loss``. A factory (not a bare loss) so the
+#: loss can close over the Model config (e.g. ``sigma_data``) and Processor config (e.g. NA-MPNN's RNA token
+#: scheme) instead of a default that silently diverges from how the data was produced.
+CriterionFactory = Callable[[Model, Processor], Callable[[Any, Any], Any]]
 
 
 class ModelRegistration(NamedTuple):
@@ -22,12 +28,20 @@ class ModelRegistration(NamedTuple):
         model: Registered model class.
         processor: Registered processor class.
         model_config: Model configuration class.
+        criterion: Training criterion factory, or ``None`` for an inference-only architecture. Its presence
+            is what makes an architecture trainable.
+        strategy: Which generic Runner batching/lowering/inference strategy trains it (``"sequence"``,
+            ``"sequence_single"``, ``"denoising"``); ``None`` when not trainable.
+        collate_options: Family-specific batching parameters (e.g. the sequence pad token id).
     """
 
     id: str
     model: type[Model]
     processor: type[Processor]
     model_config: type[chanfig.Config]
+    criterion: CriterionFactory | None = None
+    strategy: str | None = None
+    collate_options: Mapping[str, Any] = {}
 
 
 BUILTIN_MODULES = {
@@ -88,6 +102,9 @@ class ModelRegistry(chanfig.Registry):
         *,
         model: type[Model],
         processor: type[Processor],
+        criterion: CriterionFactory | None = None,
+        strategy: str | None = None,
+        collate_options: Mapping[str, Any] | None = None,
     ) -> None:
         r"""
         Register one architecture.
@@ -96,6 +113,9 @@ class ModelRegistry(chanfig.Registry):
             id: Architecture ID stored in model metadata.
             model: Model class implementing the architecture.
             processor: Processor class producing the model's input type.
+            criterion: Training criterion factory; pass it to make the architecture trainable.
+            strategy: Generic Runner training strategy (required with ``criterion``).
+            collate_options: Family-specific batching parameters.
 
         Raises:
             ValueError: If the model, processor, or config is already registered
@@ -120,6 +140,9 @@ class ModelRegistry(chanfig.Registry):
             model=model,
             processor=processor,
             model_config=model_config,
+            criterion=criterion,
+            strategy=strategy,
+            collate_options={} if collate_options is None else collate_options,
         )
         super().register(registration, id)
         self.by_pair[pair] = registration
