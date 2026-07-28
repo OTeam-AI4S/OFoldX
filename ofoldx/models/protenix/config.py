@@ -218,11 +218,9 @@ class ProtenixConfig(Config):
             "protenix_base_default_v1.0.0",
             "protenix_base_20250630_v1.0.0",
         }:
-            return ProtenixConfig(
-                template=ProtenixTemplateConfig(),
-            )
+            return ProtenixTemplateModelConfig()
         if variant == "protenix-v2":
-            return ProtenixConfig(
+            return ProtenixTemplateModelConfig(
                 pair_size=256,
                 trunk=ProtenixTrunkConfig(
                     msa_size=128,
@@ -289,6 +287,23 @@ class ProtenixConstraintConfig(ProtenixConfig):
     """
 
     constraints: bool = True
+
+
+class ProtenixTemplateModelConfig(ProtenixConfig):
+    r"""
+    Configure the base Protenix graph with the template embedder enabled.
+
+    This is the ``protenix_template`` architecture: the same graph as base Protenix but with the released
+    template embedder built in by default (``template`` on), so a fresh build pairs correctly with the
+    template-producing Processor instead of silently ignoring template features.
+
+    Examples:
+        >>> from ofoldx.models.protenix import ProtenixTemplateModelConfig
+        >>> ProtenixTemplateModelConfig().template is not None
+        True
+    """
+
+    template: ProtenixTemplateConfig | None = ProtenixTemplateConfig()
 
 
 class ProtenixProcessorConfig(Config):

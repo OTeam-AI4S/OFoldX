@@ -20,12 +20,6 @@ A family declares:
   (padded recovery), ``"sequence_single"`` (batch_size=1 recovery), or ``"denoising"`` (batch_size=1
   coordinate diffusion). This is the only coupling to Runner machinery, and it is a name, not an import.
 - ``collate_options``: family-specific batching parameters (e.g. the sequence pad token id).
-- ``fresh_configs``: optional per-architecture config factories for variants whose canonical fresh graph
-  differs from the base ``config_class`` default -- e.g. ``protenix_template`` shares ``ProtenixModel`` /
-  ``ProtenixConfig`` with the base architecture but must enable its template embedder, or its
-  template-producing Processor would feed a model that silently ignores templates. Only fresh
-  (``model.name``) builds consult it; a repository build loads the published config. The base config
-  applies to any architecture not listed.
 
 The objective trains only the parameters on the loss path; a model's auxiliary heads (distogram, confidence,
 B-factor), sampling-only modules, and (input-conditionally) template embedders receive no gradient. The
@@ -54,4 +48,3 @@ class TrainingContract:
     criterion: CriterionFactory
     strategy: str
     collate_options: Mapping[str, Any] = field(default_factory=dict)
-    fresh_configs: Mapping[str, Callable[..., Any]] = field(default_factory=dict)

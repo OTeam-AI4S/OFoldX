@@ -14,6 +14,7 @@ from .config import (
     ProtenixProcessorConfig,
     ProtenixStructureConditionConfig,
     ProtenixTemplateConfig,
+    ProtenixTemplateModelConfig,
     ProtenixTrunkConfig,
     ProtenixVariant,
 )
@@ -44,6 +45,7 @@ from .model import (
     ProtenixStructureConditionModel,
     ProtenixStructureTarget,
     ProtenixTemplateFeatures,
+    ProtenixTemplateModel,
     ProtenixTfgFeatures,
     ProtenixTfgGuidance,
     ProtenixTfgPotential,
@@ -71,7 +73,7 @@ _MODELS.register(
 )
 _MODELS.register(
     "protenix_template",
-    model=ProtenixModel,
+    model=ProtenixTemplateModel,
     processor=ProtenixTemplateProcessor,
 )
 _MODELS.register(

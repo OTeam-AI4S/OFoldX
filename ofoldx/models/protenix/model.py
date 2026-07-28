@@ -61,6 +61,7 @@ from .config import (
     ProtenixConfig,
     ProtenixConstraintConfig,
     ProtenixStructureConditionConfig,
+    ProtenixTemplateModelConfig,
 )
 
 
@@ -1480,6 +1481,22 @@ class ProtenixConstraintModel(ProtenixModel):
 
     def __init__(self, config: ProtenixConstraintConfig | None = None) -> None:
         super().__init__(ProtenixConstraintConfig() if config is None else config)
+
+
+class ProtenixTemplateModel(ProtenixModel):
+    r"""
+    Base Protenix graph with the template embedder enabled -- the ``protenix_template`` architecture.
+
+    Identical to [`ProtenixModel`][] except its config defaults ``template`` on, so a fresh build always
+    constructs the template embedder that its ``ProtenixTemplateProcessor`` feeds, rather than silently
+    dropping template features.
+    """
+
+    config_class = ProtenixTemplateModelConfig
+    config: ProtenixTemplateModelConfig
+
+    def __init__(self, config: ProtenixTemplateModelConfig | None = None) -> None:
+        super().__init__(ProtenixTemplateModelConfig() if config is None else config)
 
 
 class ProtenixNoisyStructureEmbedder(nn.Module):

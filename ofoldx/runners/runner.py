@@ -156,10 +156,7 @@ class Runner(dl.Runner):
         overrides = {
             key: value for key, value in model_config.items() if key not in ("name", "pretrained", "revision")
         }
-        # A variant whose canonical fresh graph differs from the base config default (e.g. protenix_template's
-        # template embedder) supplies its own config factory; otherwise the registered config_class applies.
-        build_config = contract.fresh_configs.get(registration.id) or registration.model_config
-        model = registration.model(build_config(**overrides))
+        model = registration.model(registration.model_config(**overrides))
         processor = self._build_processor(registration, model)
         return model, processor, contract
 

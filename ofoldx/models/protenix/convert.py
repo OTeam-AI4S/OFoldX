@@ -237,11 +237,13 @@ def convert_protenix_model(
         ProtenixConfig,
         ProtenixConstraintConfig,
         ProtenixStructureConditionConfig,
+        ProtenixTemplateModelConfig,
     )
     from .model import (
         ProtenixConstraintModel,
         ProtenixModel,
         ProtenixStructureConditionModel,
+        ProtenixTemplateModel,
     )
 
     needs_esm = variant in _ESM_VARIANTS
@@ -257,6 +259,8 @@ def convert_protenix_model(
             model = ProtenixConstraintModel(cast(ProtenixConstraintConfig, config))
         elif variant == _STRUCTURE_CONDITION_VARIANT:
             model = ProtenixStructureConditionModel(cast(ProtenixStructureConditionConfig, config))
+        elif variant in _TEMPLATE_VARIANTS:
+            model = ProtenixTemplateModel(cast(ProtenixTemplateModelConfig, config))
         else:
             model = ProtenixModel(config)
     reference_state = load_reference_state(Path(checkpoint_path))
