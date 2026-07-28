@@ -541,7 +541,10 @@ class ProtenixModel(Model):
         if tfg_guidance is not None:
             if input.tfg_features is None:
                 raise ValueError("tfg_guidance requires ProtenixInput.tfg_features prepared by the processor")
-            tfg_potential = ProtenixTfgPotential(input.tfg_features, tfg_guidance)
+            # ``tfg_features`` is a plain (non-tensorclass) bundle of unbatched index tensors, so
+            # ``ProtenixInput.to(device)`` cannot reach it; align the potential's feature buffers to the
+            # sampling device here so guidance is correct however the input was moved.
+            tfg_potential = ProtenixTfgPotential(input.tfg_features, tfg_guidance).to(input.msa_tokens.device)
 
         reference_positions = input.reference_positions
         msa_indices = tuple(
