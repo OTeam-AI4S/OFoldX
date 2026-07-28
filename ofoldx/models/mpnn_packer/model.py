@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from tensordict import tensorclass
 
 import numpy as np
 import torch
@@ -1491,7 +1490,7 @@ def _frame_cat(frames: list[MpnnPackerFrame]) -> MpnnPackerFrame:
 # ---------------------------------------------------------------------------
 
 
-@tensorclass
+@dataclass(eq=False)
 class MpnnPackerInput:
     r"""
     Inputs for side-chain packing.

@@ -408,7 +408,6 @@ class BoltzGenProcessor(Processor):
         processed = BoltzGenInput(
             **{name: value.unsqueeze(0) for name, value in placed.items()},
             layout=layout,
-            batch_size=[1],
         )
         if plan.source_structure is None:
             return processed, None
@@ -469,7 +468,6 @@ class BoltzGenProcessor(Processor):
                 placed_target["bond_atom_index"].unsqueeze(0) if "bond_atom_index" in placed_target else None
             ),
             bond_mask=(placed_target["bond_mask"].unsqueeze(0) if "bond_mask" in placed_target else None),
-            batch_size=[1],
         )
         return processed, target
 
@@ -709,7 +707,6 @@ class BoltzGenInverseFoldingProcessor(Processor):
             BoltzGenInverseFoldingInput(
                 **{name: value.unsqueeze(0) for name, value in placed.items()},
                 layout=layout,
-                batch_size=[1],
             ),
             target_residue_type.to(device=self.device, dtype=self.dtype).unsqueeze(0),
         )

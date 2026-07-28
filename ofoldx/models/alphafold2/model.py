@@ -13,7 +13,6 @@ from typing import Protocol, TypeVar, cast
 import numpy as np
 import torch
 import torch.nn.functional as F
-from tensordict import tensorclass
 from torch import Tensor, nn
 
 from ...data.molecular import AtomSite, MolecularSystem
@@ -3727,7 +3726,6 @@ def _template_batch(input: AlphaFold2Input) -> AlphaFold2TemplateBatch:
         template_torsion_angles_sin_cos=input.template_torsion_angles_sin_cos,
         template_alternative_torsion_angles_sin_cos=input.template_alternative_torsion_angles_sin_cos,
         template_torsion_angles_mask=input.template_torsion_angles_mask,
-        batch_size=[input.template_mask.shape[0]],
     )
 
 
@@ -4031,7 +4029,7 @@ class AlphaFold2StructureModuleOutput:
     sidechain_unnormalized_angles: Tensor
 
 
-@tensorclass
+@dataclass(eq=False)
 class AlphaFold2TemplateBatch:
     r"""
     Template tensors shared by the pair and torsion embedding modules.
@@ -4104,7 +4102,7 @@ class AlphaFold2Layout:
     residue_sites: tuple[tuple[str, int], ...]
 
 
-@tensorclass
+@dataclass(kw_only=True, eq=False)
 class AlphaFold2Input:
     r"""
     Tensor and molecular-layout input for monomer AlphaFold 2.
@@ -4171,7 +4169,7 @@ class AlphaFold2Input:
     true_msa: Tensor | None = None
 
 
-@tensorclass
+@dataclass(kw_only=True, eq=False)
 class AlphaFold2InitialGuessInput(AlphaFold2Input):
     r"""
     Monomer/pTM features with an explicit first recycling coordinate state.
@@ -4262,7 +4260,7 @@ class AlphaFold2MultimerLayout:
     chain_boundaries: tuple[tuple[str, int, int], ...]
 
 
-@tensorclass
+@dataclass(kw_only=True, eq=False)
 class AlphaFold2MultimerInput:
     r"""
     Tensor and molecular-layout input for AlphaFold-Multimer.

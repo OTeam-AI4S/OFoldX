@@ -7,7 +7,6 @@ from __future__ import annotations
 import math
 import operator
 from dataclasses import dataclass, field
-from tensordict import tensorclass
 from typing import Generic, Literal, TypeVar
 
 import numpy as np
@@ -309,7 +308,6 @@ class ODesignModel(Model):
             distogram_logits=raw_output.distogram_logits,
             token_bond_type_logits=raw_output.token_bond_type_logits,
             noise_level=noise_level,
-            batch_size=[coordinates.shape[0]],
         )
 
     def denoise(
@@ -518,7 +516,6 @@ class ODesignModel(Model):
             coordinates=torch.stack(coordinates, dim=1),
             distogram_logits=torch.stack(distograms, dim=1),
             token_bond_type_logits=torch.stack(bond_logits, dim=1),
-            batch_size=[input.atom_features.shape[0]],
         )
 
     def _denoise_from_trunk(
@@ -545,7 +542,6 @@ class ODesignModel(Model):
             coordinates=coordinates,
             distogram_logits=self.distogram_head(trunk.pair),
             token_bond_type_logits=self.token_bond_type_head(trunk.pair),
-            batch_size=[coordinates.shape[0]],
         )
 
     def _run_trunk(
@@ -607,7 +603,6 @@ class ODesignModel(Model):
             single=single,
             pair=pair,
             relative_features=relative_features,
-            batch_size=[single.shape[0]],
         )
 
     def _initial_pair(
@@ -990,7 +985,7 @@ def _resolve_atom(reference, source_residues, placement_map, instance_of, source
 # ---------------------------------------------------------------------------
 
 
-@tensorclass
+@dataclass(eq=False)
 class _ODesignTrunkOutput:
     r"""
     Named representations produced by the ODesign trunk.
@@ -1202,7 +1197,7 @@ class ODesignLigandLayout:
 _ODesignLayoutT = TypeVar("_ODesignLayoutT", ODesignLayout, ODesignLigandLayout)
 
 
-@tensorclass
+@dataclass(kw_only=True, eq=False)
 class ODesignInput(Generic[_ODesignLayoutT]):
     r"""
     Tensor and molecular-layout input for ODesign.
@@ -1263,14 +1258,14 @@ class ODesignInput(Generic[_ODesignLayoutT]):
     layout: _ODesignLayoutT
 
 
-@tensorclass
+@dataclass(kw_only=True, eq=False)
 class ODesignLigandInput(ODesignInput[ODesignLigandLayout]):
     r"""
     ODesign tensor input with a separate provisional ligand layout.
     """
 
 
-@tensorclass
+@dataclass(eq=False)
 class ODesignStructureTarget:
     r"""
     Structure coordinates mapped onto an ODesign Model atom axis.
@@ -1287,7 +1282,7 @@ class ODesignStructureTarget:
     atom_index: Tensor
 
 
-@tensorclass
+@dataclass(eq=False)
 class ODesignRawOutput:
     r"""
     Predictions from one explicit ODesign denoising call.
@@ -1305,7 +1300,7 @@ class ODesignRawOutput:
     token_bond_type_logits: Tensor
 
 
-@tensorclass
+@dataclass(eq=False)
 class ODesignOutput(ODesignRawOutput):
     r"""
     Predictions from stochastic target corruption and denoising.
@@ -1322,7 +1317,7 @@ class ODesignOutput(ODesignRawOutput):
     noise_level: Tensor
 
 
-@tensorclass
+@dataclass(eq=False)
 class ODesignSamplingOutput:
     r"""
     Predictions from one ODesign sampling call.

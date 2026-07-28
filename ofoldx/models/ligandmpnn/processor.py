@@ -441,7 +441,6 @@ class LigandMpnnProcessor(Processor):
             tied_weights=tied_weight_values,
             allowed_token_mask=allowed_token_mask,
             residue_logit_bias=residue_logit_bias_values,
-            batch_size=[1],
         )
 
     def _lower_design(

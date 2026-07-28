@@ -7,7 +7,6 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from tensordict import tensorclass
 
 import numpy as np
 import torch
@@ -155,7 +154,7 @@ class PxDesignModel(Model):
                 noise_level=noise_level,
             )
         )
-        return PxDesignOutput(coordinates, batch_size=[coordinates.shape[0]])
+        return PxDesignOutput(coordinates)
 
     @torch.inference_mode()
     def sample(
@@ -195,7 +194,7 @@ class PxDesignModel(Model):
             sample_chunk_size=sample_chunk_size,
             generator=generator,
         )
-        return PxDesignOutput(coordinates, batch_size=[coordinates.shape[0]])
+        return PxDesignOutput(coordinates)
 
     @torch.inference_mode()
     def design(
@@ -584,7 +583,7 @@ class PxDesignLayout:
     sites: tuple[AtomSite, ...]
 
 
-@tensorclass
+@dataclass(kw_only=True, eq=False)
 class PxDesignInput:
     r"""
     Tensor and molecular-layout input for PxDesign.
@@ -634,7 +633,7 @@ class PxDesignInput:
     layout: PxDesignLayout
 
 
-@tensorclass
+@dataclass(eq=False)
 class PxDesignOutput:
     r"""
     Predictions from one PxDesign denoising or sampling call.

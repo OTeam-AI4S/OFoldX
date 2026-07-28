@@ -15,7 +15,6 @@ import torch
 import torch.nn.functional as F
 from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation
-from tensordict import tensorclass
 from torch import Tensor, einsum, nn
 
 # RFdiffusion spatial and placement records (RfDiffusionPlacements,
@@ -1168,7 +1167,6 @@ class RfDiffusionExtraTrunkBlock(nn.Module):
             translations=structure_output.translations,
             state=structure_output.state,
             torsion_angles=structure_output.torsion_angles,
-            batch_size=[msa.shape[0]],
         )
 
 
@@ -1249,7 +1247,6 @@ class RfDiffusionTrunkBlock(nn.Module):
             translations=structure_output.translations,
             state=structure_output.state,
             torsion_angles=structure_output.torsion_angles,
-            batch_size=[msa.shape[0]],
         )
 
 
@@ -1543,7 +1540,6 @@ class RfDiffusionStructureUpdate(nn.Module):
             translations=translations,
             state=state,
             torsion_angles=torsion_angles,
-            batch_size=[batch_size],
         )
 
 
@@ -2555,7 +2551,6 @@ class RfDiffusionPairwiseGeometryHead(nn.Module):
             omega_logits=_channel_first(omega_logits),
             theta_logits=_channel_first(theta_logits),
             phi_logits=_channel_first(phi_logits),
-            batch_size=[pair.shape[0]],
         )
 
 
@@ -5565,7 +5560,6 @@ def _sample_variable_lengths(
             output_instance_ids=instances,
             combined_length=input.layout.combined_length,
         ),
-        batch_size=[coords.shape[0]],
     )
 
 
@@ -6526,7 +6520,7 @@ _RF_ATOM14_KINEMATICS = _build_rfdiffusion_atom14_kinematics()
 # ---------------------------------------------------------------------------
 
 
-@tensorclass
+@dataclass(eq=False)
 class _RfDiffusionStructureUpdateOutput:
     rotations: Tensor
     translations: Tensor
@@ -6534,7 +6528,7 @@ class _RfDiffusionStructureUpdateOutput:
     torsion_angles: Tensor
 
 
-@tensorclass
+@dataclass(eq=False)
 class _RfDiffusionTrunkBlockOutput:
     msa: Tensor
     pair: Tensor
@@ -6554,7 +6548,7 @@ class _RfDiffusionTrunkOutput:
     state: Tensor
 
 
-@tensorclass
+@dataclass(eq=False)
 class _RfDiffusionGeometryLogits:
     distance_logits: Tensor
     omega_logits: Tensor
@@ -6629,7 +6623,7 @@ class RfDiffusionLayout:
     combined_length: tuple[int, int] | None = None
 
 
-@tensorclass
+@dataclass(kw_only=True, eq=False)
 class RfDiffusionInput:
     r"""
     Tensor and molecular-layout input for RFdiffusion.

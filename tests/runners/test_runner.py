@@ -253,14 +253,15 @@ def test_repository_model_loads_trains_and_rejects_processor_overrides(tmp_path:
 
 
 @pytest.mark.skipif(not hasattr(torch.distributed, "is_gloo_available"), reason="torch.distributed unavailable")
-def test_diffusion_survives_ddp_second_step_via_find_unused_parameters(tmp_path: Path) -> None:
+def test_diffusion_survives_ddp_second_step_via_static_graph(tmp_path: Path) -> None:
     # The single-step test cannot see it: under DDP an un-gradiented parameter crashes on the SECOND step.
-    # The Runner sets find_unused_parameters=True, which locates the unused parameters by walking the
-    # forward RETURN VALUE -- possible only because the model returns a ``tensorclass`` (a plain dataclass
-    # return defeats it). So unused modules (here confidence + distogram + sampling-only) need no freezing.
-    # Build with confidence ENABLED so those parameters are genuinely present + unused.
+    # The models return plain dataclasses, which DDP find_unused_parameters cannot walk to locate a
+    # computed-but-unused head's output. static_graph -- which the Runner enables in materialize_model after
+    # DDP wraps -- instead learns the (constant) unused set from the first iteration's autograd hooks, so the
+    # unused modules (here confidence + distogram + sampling-only) need no freezing. Build with confidence
+    # ENABLED so those parameters are genuinely present + unused.
     import torch.distributed as dist
-    from tensordict import is_tensorclass
+    from dataclasses import is_dataclass
 
     from ofoldx.io import read_structure
     from ofoldx.models.boltz1 import Boltz1Config, Boltz1Model, Boltz1Processor
@@ -280,8 +281,8 @@ def test_diffusion_survives_ddp_second_step_via_find_unused_parameters(tmp_path:
         config.confidence.num_pairformer_blocks = 1
         model = Boltz1Model(config)
         model.train()
-        # Exactly what DanLing's materialize_model does with the Runner's ddp.find_unused_parameters=True.
-        ddp = torch.nn.parallel.DistributedDataParallel(model, find_unused_parameters=True)
+        ddp = torch.nn.parallel.DistributedDataParallel(model)  # DanLing default: no find_unused_parameters
+        ddp._set_static_graph()  # exactly what the Runner's materialize_model does once DDP has wrapped
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
         model_input, model_target = Boltz1Processor().process_training(read_structure(_write(tmp_path / "chain.pdb")))
         sigma_data = float(model.config.denoiser.sigma_data)
@@ -289,7 +290,7 @@ def test_diffusion_survives_ddp_second_step_via_find_unused_parameters(tmp_path:
         for _ in range(2):  # the second step is the one that would raise on an unreduced parameter
             optimizer.zero_grad()
             prediction = ddp(input=model_input, target=model_target)
-            assert is_tensorclass(prediction)  # the property that lets find_unused_parameters walk the output
+            assert is_dataclass(prediction)  # DDP find_unused_parameters walks this plain dataclass output
             resolved = resolved_atom_mask(model_target, model_input)
             edm_denoising_loss(prediction, resolved, sigma_data=sigma_data).backward()
             optimizer.step()

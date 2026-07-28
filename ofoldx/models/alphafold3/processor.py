@@ -517,7 +517,6 @@ def _features(
         system=system,
         atom_sites=atom_sites,
         token_sites=tuple(cast(AtomSite | ComponentReference, token["site"]) for token in tokens),
-        batch_size=[1],
     )
 
 
@@ -766,7 +765,6 @@ def _template_to(features: TemplateFeatures, *, device: torch.device, dtype: tor
         template_mask=(
             None if features.template_mask is None else features.template_mask.to(device=device, dtype=dtype)
         ),
-        batch_size=[features.distogram.shape[0]],
     )
 
 
@@ -891,7 +889,6 @@ def _template_features(
         unit_vector=torch.stack(unit_vectors).unsqueeze(0),
         backbone_frame_mask=torch.stack(backbone_masks).unsqueeze(0),
         template_mask=torch.ones(1, len(templates)),
-        batch_size=[1],
     )
 
 

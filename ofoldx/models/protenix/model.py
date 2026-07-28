@@ -8,7 +8,6 @@ import math
 import operator
 from dataclasses import dataclass
 
-from tensordict import tensorclass
 from typing import Callable, Literal, cast, overload
 
 import numpy as np
@@ -436,7 +435,6 @@ class ProtenixModel(Model):
             resolved_logits=raw_output.resolved_logits,
             augmented_target_coordinates=augmented_target_coordinates,
             noise_level=noise_level,
-            batch_size=[augmented_target_coordinates.shape[0]],
         )
 
     def denoise(
@@ -830,7 +828,6 @@ class ProtenixModel(Model):
             pae_logits=pae_logits,
             pde_logits=pde_logits,
             resolved_logits=resolved_logits,
-            batch_size=[coordinates.shape[0]],
         )
 
     def _denoise_context(
@@ -919,7 +916,6 @@ class ProtenixModel(Model):
             single=single,
             pair=pair,
             relative_features=relative_features,
-            batch_size=[token_embedding.shape[0]],
         )
 
     def _esm_token_embedding(self, input: ProtenixInput) -> Tensor:
@@ -4112,7 +4108,7 @@ def _center_random_augmentation(
 # =====================================================================================
 
 
-@tensorclass
+@dataclass(kw_only=True, eq=False, repr=False)
 class ProtenixTemplateFeatures:
     r"""
     Fixed-four template features consumed by [`ProtenixTemplateEmbedder`][].
@@ -4178,7 +4174,7 @@ class ProtenixTfgFeatures:
     planar_improper_index: Tensor
 
 
-@tensorclass(frozen=True)
+@dataclass(frozen=True, kw_only=True, eq=False)
 class _ProtenixTrunkOutput:
     r"""
     Named representations returned by the Protenix recycling trunk.
@@ -4273,7 +4269,7 @@ class ProtenixPocket:
                 raise ValueError("a Protenix pocket residue cannot belong to the binder chain")
 
 
-@tensorclass
+@dataclass(kw_only=True, eq=False)
 class ProtenixStructureTarget:
     r"""
     Complete-pool structure truth for Protenix training.
@@ -4291,7 +4287,7 @@ class ProtenixStructureTarget:
     atom_index: Tensor
 
 
-@tensorclass
+@dataclass(kw_only=True, eq=False, repr=False)
 class ProtenixInput:
     r"""
     Tensor and molecular-layout input for Protenix.
@@ -4382,7 +4378,7 @@ class ProtenixInput:
     token_sites: tuple[AtomSite | ComponentReference, ...]
 
 
-@tensorclass
+@dataclass(eq=False, repr=False)
 class ProtenixRawOutput:
     r"""
     Raw predictions from one Protenix denoising or sampling call.
@@ -4419,7 +4415,7 @@ class ProtenixRawOutput:
         return expected_plddt(self.plddt_logits)
 
 
-@tensorclass
+@dataclass(eq=False, repr=False)
 class ProtenixOutput(ProtenixRawOutput):
     r"""
     Predictions from one Protenix training denoising pass.

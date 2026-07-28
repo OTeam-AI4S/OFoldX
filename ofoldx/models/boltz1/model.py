@@ -9,7 +9,6 @@ import operator
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-from tensordict import tensorclass
 from functools import partial
 from typing import TypeAlias, cast
 
@@ -431,7 +430,6 @@ class Boltz1Model(Model):
                 num_samples,
             ),
             noise_level=noise_level.reshape(batch_size, num_samples),
-            batch_size=[batch_size],
         )
 
     def confidence(
@@ -503,7 +501,6 @@ class Boltz1Model(Model):
         return Boltz1Representations(
             single=representations.single,
             pair=representations.pair,
-            batch_size=[representations.single.shape[0]],
         )
 
     def sample(
@@ -797,13 +794,11 @@ class Boltz1Model(Model):
                 ligand_iptm=confidence_values.get("ligand_iptm"),
                 protein_iptm=confidence_values.get("protein_iptm"),
                 chain_pair_iptm=confidence_values.get("chain_pair_iptm"),
-                batch_size=[batch_size],
             )
         return _Boltz1FoldOutput(
             coordinates=coordinates,
             distogram_logits=distogram_logits,
             confidence=confidence_output,
-            batch_size=[batch_size],
         )
 
     def _run_trunk(
@@ -872,7 +867,6 @@ class Boltz1Model(Model):
             pair=pair,
             distogram_logits=self.distogram_head(pair),
             relative_position_encoding=relative_position_encoding,
-            batch_size=[single_inputs.shape[0]],
         )
 
     def _initial_representations(self, input: Boltz1Input) -> tuple[Tensor, Tensor, Tensor, Tensor]:
@@ -4085,7 +4079,7 @@ class Boltz1Layout:
     token_sites: tuple[AtomSite | tuple[str, int], ...]
 
 
-@tensorclass
+@dataclass(kw_only=True, eq=False)
 class Boltz1StructureTarget:
     r"""
     Complete pre-crop structure truth for Boltz-1 training.
@@ -4116,7 +4110,7 @@ class Boltz1StructureTarget:
     symmetry_permutation: Tensor
 
 
-@tensorclass
+@dataclass(kw_only=True, eq=False)
 class Boltz1Input:
     r"""
     Input tensors consumed by [`Boltz1Model`][].
@@ -4214,7 +4208,7 @@ class Boltz1Input:
     layout: Boltz1Layout | None = None
 
 
-@tensorclass
+@dataclass(kw_only=True, eq=False)
 class _Boltz1TrunkOutput:
     r"""
     Boltz-1 trunk representations returned by the recycling trunk.
@@ -4227,7 +4221,7 @@ class _Boltz1TrunkOutput:
     relative_position_encoding: Tensor
 
 
-@tensorclass
+@dataclass(kw_only=True, eq=False)
 class Boltz1Output:
     r"""
     Predictions from one Boltz-1 training denoising pass.
@@ -4248,7 +4242,7 @@ class Boltz1Output:
     noise_level: Tensor
 
 
-@tensorclass
+@dataclass(kw_only=True, eq=False)
 class Boltz1ConfidenceOutput:
     r"""
     Raw Boltz-1 confidence predictions and their official derived values.
@@ -4301,7 +4295,7 @@ class Boltz1ConfidenceOutput:
     chain_pair_iptm: Tensor | None = None
 
 
-@tensorclass
+@dataclass(kw_only=True, eq=False)
 class _Boltz1FoldOutput:
     r"""
     Raw predictions from one Boltz-1 folding pass.
@@ -4319,7 +4313,7 @@ class _Boltz1FoldOutput:
     confidence: Boltz1ConfidenceOutput | None
 
 
-@tensorclass
+@dataclass(kw_only=True, eq=False)
 class Boltz1Representations:
     r"""
     Raw Boltz-1 trunk representations surfaced by ``Boltz1Model.representations``.

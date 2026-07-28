@@ -13,7 +13,7 @@ structure training comes from gradient accumulation weighted by the normalizer).
 from __future__ import annotations
 
 from collections.abc import Collection
-from dataclasses import fields, is_dataclass
+from dataclasses import fields, is_dataclass, replace
 from typing import Any
 
 import torch
@@ -88,12 +88,8 @@ def pad_and_collate(batch: list[Any], *, token_pad_id: int, pair_bias_fields: Co
                 padded.append(value)
             merged[field.name] = torch.cat(padded, dim=0)
         else:
-            # A list (not a tuple) becomes a batched NonTensorStack, so batch indexing ``input[i]`` selects
-            # the i-th item's metadata; a tuple would be one shared blob that does not track the batch axis.
-            merged[field.name] = [element for value in values for element in value]
-    # Rebuild with an explicit batch_size: the tensors are now ``(len(batch), ...)``. ``dataclasses.replace``
-    # would reset a tensorclass batch_size to ``[]``, leaving the batch axis untracked.
-    return type(first)(**merged, batch_size=[len(batch)])
+            merged[field.name] = tuple(element for value in values for element in value)
+    return replace(first, **merged)
 
 
 def collate_single(batch: list[Any]) -> Any:

@@ -10,11 +10,12 @@ inference strategies below (the only generic Runner-side training knowledge).
 
 DanLing drives forward → criterion → loss-normalizer → backward → step, and toggles train/eval module mode
 itself (train_epoch/evaluate_epoch/infer set ``self.mode``). The Runner adds only what DanLing cannot know
-generically: a config-bound criterion, DDP ``find_unused_parameters=True`` (the objective trains only the
-loss-path parameters, so auxiliary heads, sampling-only modules, and unexercised conditioning embedders get
-no gradient; the models return ``tensorclass`` outputs, which DDP can walk to find them), a ``tensorclass``-
-native ``to_device``, and an ``infer_step`` that runs the family's inference entry point on its
-``tensorclass`` output instead of DanLing's tensor-shaped default.
+generically: a config-bound criterion, DDP ``static_graph`` (the objective trains only the loss-path
+parameters, so auxiliary heads, sampling-only modules, and unexercised conditioning embedders get no
+gradient; static_graph learns that fixed unused set from the first iteration, so the plain-dataclass forward
+outputs need not be a walkable pytree), a nested ``to_device`` for the family dataclasses, and an
+``infer_step`` that runs the family's inference entry point on its dataclass output instead of DanLing's
+tensor-shaped default.
 """
 
 from __future__ import annotations
@@ -26,7 +27,6 @@ from typing import Any, cast
 import danling as dl
 import torch
 from danling.runners.config import normalize_stack_name
-from tensordict import is_tensorclass
 from torch import Tensor
 
 from ..model import Model
@@ -117,13 +117,6 @@ class Runner(dl.Runner):
         # it afterwards would let a mutable branch/tag that later moves resume under an identity that no longer
         # matches the snapshot actually loaded.
         repository = self._prepare_repository(config) if config.model.get("pretrained") else None
-        # The objective trains only the loss-path parameters; auxiliary heads / sampling-only modules /
-        # unexercised conditioning embedders get no gradient, so DDP must tolerate unused parameters (the
-        # models return ``tensorclass`` outputs, which DDP can walk; and unlike ``static_graph`` this
-        # re-checks each step, so it also handles the data-dependent template case). Set it BEFORE
-        # ``super().__init__`` so DanLing hashes it into the run identity/workspace, not the default it
-        # would otherwise cache first.
-        config.ddp.find_unused_parameters = True
         super().__init__(config)
 
         self.model, self.processor, registration = self._build(repository)
@@ -229,6 +222,21 @@ class Runner(dl.Runner):
         model = load_model(repository)
         return model, processor, metadata_registration
 
+    def materialize_model(self) -> None:
+        r"""
+        Enable DDP ``static_graph`` once DanLing has wrapped the model. The objective trains only the
+        loss-path parameters; auxiliary heads (confidence/distogram/B-factor), sampling-only modules, and
+        unexercised conditioning embedders receive no gradient. ``static_graph`` learns that unused set from
+        the first iteration's autograd hooks, so DDP tolerates it without a freeze list -- and without
+        needing the plain-dataclass forward outputs to be a walkable pytree, which ``find_unused_parameters``
+        would require. This assumes the unused set is constant across steps, which holds for the homogeneous,
+        fixed-config training sets the trainable families use.
+        """
+
+        super().materialize_model()
+        if isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
+            self.model._set_static_graph()
+
     def build_datasets(self) -> dict[str, Any]:
         r"""
         Build structure datasets for the configured splits. Training and evaluation splits lower to whatever
@@ -253,23 +261,13 @@ class Runner(dl.Runner):
     def to_device(self, data: Any, device: torch.device | None = None) -> Any:
         r"""
         Recursively move a nested batch to ``device`` -- the runner device by default; ``infer_step`` passes
-        the CPU. Family Input/Output/Target are ``tensorclass`` instances, moved with their native ``.to``
-        (which keeps ``batch_size``; ``dataclasses.replace`` would reset it). ``.to`` cannot reach tensors
-        held inside a non-tensor dataclass field (e.g. Protenix's tfg/template feature bundles, whose index
-        tensors are unbatched so they cannot themselves be a tensorclass), so those are moved explicitly.
-        Mappings/sequences recurse; non-tensor leaves pass through; the plain-dataclass branch handles any
-        non-tensorclass dataclass.
+        the CPU. Family Input/Output/Target are plain dataclasses: the dataclass branch rebuilds them with
+        every field moved, so tensors nested inside a dataclass field (e.g. Protenix's tfg/template feature
+        bundles) are moved too. Mappings/sequences recurse; non-tensor leaves pass through.
         """
 
         if device is None:
             device = self.device
-        if is_tensorclass(data):
-            moved = data.to(device)
-            for field in fields(data):
-                value = getattr(data, field.name)
-                if is_dataclass(value) and not isinstance(value, type):
-                    setattr(moved, field.name, self.to_device(value, device))
-            return moved
         if is_dataclass(data) and not isinstance(data, type):
             moved = {
                 field.name: self.to_device(value, device)
@@ -316,9 +314,4 @@ class Runner(dl.Runner):
         model_input = data["input"]  # the infer split collates to ``{"input": model_input}`` (no target)
         with self.infer_context():
             prediction = self._infer(model, model_input)
-        prediction = self.to_device(prediction, torch.device("cpu"))
-        # One output per input in the batch, not one per batch, so infer()'s result grouping does not shift
-        # with batch size (matching DanLing's per-sample convention). Non-tensorclass outputs pass through.
-        if is_tensorclass(prediction) and prediction.batch_size:
-            return [prediction[index] for index in range(prediction.batch_size[0])]
-        return [prediction]
+        return [self.to_device(prediction, torch.device("cpu"))]

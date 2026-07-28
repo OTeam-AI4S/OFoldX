@@ -282,7 +282,6 @@ class NaMpnnProcessor(Processor):
             residue_logit_bias=residue_logit_bias,
             allowed_token_mask=allowed_token_mask,
             pair_logit_bias=pair_logit_bias,
-            batch_size=[1],
         )
 
     # ------------------------------------------------------------------

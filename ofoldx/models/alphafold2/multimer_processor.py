@@ -312,7 +312,6 @@ def prepare_multimer_features(
         ),
         **placed,
         **placed_integral,
-        batch_size=[1],
     )
 
 

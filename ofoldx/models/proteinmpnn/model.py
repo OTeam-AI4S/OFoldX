@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from tensordict import tensorclass
 
 import torch
 import torch.nn.functional as F
@@ -165,7 +164,6 @@ class ProteinMpnnModel(Model):
             pssm_coefficients=repeat(input.pssm_coefficients),
             pssm_probabilities=repeat(input.pssm_probabilities),
             pssm_log_odds=repeat(input.pssm_log_odds),
-            batch_size=[input.backbone_coordinates.shape[0] * count],
         )
 
     def _probability_result(
@@ -453,7 +451,7 @@ class ProteinMpnnModel(Model):
             input.residue_mask,
             decoding_ranks,
         )
-        return ProteinMpnnOutput(logits=logits, decoding_ranks=decoding_ranks, batch_size=[logits.shape[0]])
+        return ProteinMpnnOutput(logits=logits, decoding_ranks=decoding_ranks)
 
     def autoregressive_probabilities(
         self,
@@ -1077,7 +1075,6 @@ class ProteinMpnnModel(Model):
             log_probabilities=log_probabilities,
             sampling_probabilities=sampling_probabilities,
             decoding_ranks=ranks,
-            batch_size=[num_samples],
         )
 
     @staticmethod
@@ -1426,7 +1423,7 @@ def _pair_radial_basis(
 # ---------------------------------------------------------------------------
 
 
-@tensorclass
+@dataclass(eq=False)
 class ProteinMpnnInput:
     r"""
     Inputs for ProteinMPNN sequence design and scoring.
@@ -1474,7 +1471,7 @@ class ProteinMpnnInput:
     pssm_log_odds: Tensor | None = None
 
 
-@tensorclass
+@dataclass(eq=False)
 class ProteinMpnnOutput:
     r"""
     Outputs from one ProteinMPNN forward pass.
@@ -1506,7 +1503,7 @@ class ProteinMpnnOutput:
         return self.logits.softmax(dim=-1)
 
 
-@tensorclass
+@dataclass(eq=False)
 class ProteinMpnnSamplingOutput:
     r"""
     Outputs from ProteinMPNN autoregressive sampling.

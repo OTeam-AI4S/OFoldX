@@ -7,7 +7,6 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from tensordict import tensorclass
 from typing import Any, cast
 
 import numpy as np
@@ -1043,7 +1042,6 @@ class EsmFold2Model(Model):
             pae_logits=confidence["pae_logits"].unflatten(0, (batch_size, num_samples)),
             pde_logits=confidence["pde_logits"].unflatten(0, (batch_size, num_samples)),
             resolved_logits=confidence["resolved_logits"].unflatten(0, (batch_size, num_samples)),
-            batch_size=[batch_size],
         )
 
 
@@ -1386,7 +1384,6 @@ class EsmFold2ExperimentalModel(Model):
             reference_element_features=reference_element_features,
             reference_atom_name_character_features=reference_atom_name_character_features,
             atom_to_token=atom_to_token,
-            batch_size=[single_inputs.shape[0]],
         )
 
     def _sample_from_trunk(
@@ -1426,7 +1423,6 @@ class EsmFold2ExperimentalModel(Model):
         return EsmFold2ExperimentalSample(
             distogram_logits=trunk.distogram_logits,
             coordinates=coordinates.reshape(batch_size, num_samples, *coordinates.shape[1:]),
-            batch_size=[batch_size],
         )
 
     def _confidence_from_trunk(
@@ -4171,7 +4167,6 @@ class EsmFold2ExperimentalConfidenceHead(nn.Module):
             ptm=unflatten(ptm),
             iptm=unflatten(iptm),
             chain_pair_iptm=unflatten(chain_pair_iptm),
-            batch_size=[batch_size],
         )
 
 
@@ -4575,7 +4570,7 @@ class EsmFold2Input:
     esmc_hidden_states: Tensor | None = None
 
 
-@tensorclass
+@dataclass(eq=False)
 class EsmFold2Output:
     r"""
     Predictions from one ESMFold2 denoising call.
@@ -4598,7 +4593,7 @@ class EsmFold2Output:
     resolved_logits: Tensor
 
 
-@tensorclass
+@dataclass(eq=False)
 class _EsmFold2ExperimentalTrunkOutput:
     r"""
     Experimental trunk representations consumed by coordinate and confidence heads.
@@ -4614,7 +4609,7 @@ class _EsmFold2ExperimentalTrunkOutput:
     atom_to_token: Tensor
 
 
-@tensorclass
+@dataclass(eq=False)
 class EsmFold2ExperimentalSample:
     r"""
     Distogram and coordinate samples from experimental ESMFold2.
@@ -4629,7 +4624,7 @@ class EsmFold2ExperimentalSample:
     coordinates: Tensor
 
 
-@tensorclass
+@dataclass(eq=False)
 class EsmFold2ExperimentalConfidence:
     r"""
     Fixed confidence values for one experimental ESMFold2 sample carrier.

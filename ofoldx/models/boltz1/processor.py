@@ -499,7 +499,6 @@ def _prepare_boltz1_features(
             atom_sites=atom_sites,
             token_sites=tuple(cast(AtomSite | tuple[str, int], token["token_site"]) for token in tokens),
         ),
-        batch_size=[1],
     )
 
 
@@ -577,7 +576,6 @@ def _prepare_boltz1_target(
         ).unsqueeze(0),
         symmetry_atom_index=symmetry_atom_index.to(device=device).unsqueeze(0),
         symmetry_permutation=symmetry_permutation.to(device=device).unsqueeze(0),
-        batch_size=[1],
     )
 
 

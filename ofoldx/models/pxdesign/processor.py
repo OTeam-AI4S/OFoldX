@@ -307,7 +307,6 @@ class PxDesignProcessor(Processor):
                 system=system,
                 sites=sites,
             ),
-            batch_size=[1],
         )
 
 

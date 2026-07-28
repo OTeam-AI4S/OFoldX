@@ -302,7 +302,6 @@ class ODesignProcessor(Processor):
                 dtype=torch.int64,
                 device=self.device,
             ).unsqueeze(0),
-            batch_size=[1],
         )
         return model_input, structure_target
 
@@ -634,7 +633,6 @@ class ODesignProcessor(Processor):
                 source_residue_map=source_residue_map,
                 source_atom_map=source_atom_map,
             ),
-            batch_size=[1],
         )
 
 
@@ -1005,7 +1003,6 @@ class ODesignLigandProcessor(Processor):
                 conditions=plan.conditions,
                 source_atom_map=plan.source_atom_map,
             ),
-            batch_size=[1],
         )
 
 
