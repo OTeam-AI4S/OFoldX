@@ -990,6 +990,7 @@ def _features(
         structure_rep_mask=integer(structure_rep_mask),
         template_features=template_features,
         tfg_features=tfg_features,
+        tfg_guidance=tfg_guidance,
         system=system,
         atom_sites=atom_sites,
         token_sites=tuple(cast(AtomSite | ComponentReference, token["site"]) for token in tokens),

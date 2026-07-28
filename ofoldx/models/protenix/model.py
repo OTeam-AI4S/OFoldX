@@ -537,6 +537,8 @@ class ProtenixModel(Model):
         num_sampling_steps = self._num_sampling_steps if num_sampling_steps is None else num_sampling_steps
         if num_sampling_steps < 1:
             raise ValueError("num_sampling_steps must be positive")
+        if tfg_guidance is None:
+            tfg_guidance = input.tfg_guidance  # a processor-prepared input carries the guidance it was built for
         tfg_potential = None
         if tfg_guidance is not None:
             if input.tfg_features is None:
@@ -4343,6 +4345,8 @@ class ProtenixInput:
             ``(B, N)``.
         template_features: Optional fixed-four template features for base v1 and v2.
         tfg_features: Optional static geometry prepared for training-free guidance.
+        tfg_guidance: The guidance ``tfg_features`` was prepared for; ``sample`` defaults to it when no
+            guidance is passed explicitly, so a processor-prepared input carries its own guidance.
         system: Molecular system represented by the tensors.
         atom_sites: Atom occurrences aligned to the atom axis.
         token_sites: Molecular occurrences aligned to the token axis.
@@ -4383,6 +4387,7 @@ class ProtenixInput:
     system: MolecularSystem
     atom_sites: tuple[AtomSite, ...]
     token_sites: tuple[AtomSite | ComponentReference, ...]
+    tfg_guidance: ProtenixTfgGuidance | None = None
 
 
 @tensorclass
