@@ -317,13 +317,3 @@ class ProtenixProcessorConfig(Config):
 
     max_msa_rows: int = 16384
     augment_reference_positions: bool = True
-
-
-class ProtenixConstraintProcessorConfig(ProtenixProcessorConfig):
-    r"""
-    Configure Protenix constraint preprocessing.
-
-    A distinct type so a loaded Processor pairs unambiguously with the constraint architecture; it exposes
-    the same feature limits as the base processor. Whether constraint inputs are extracted is decided by the
-    Processor class (``ProtenixConstraintProcessor``), not a config flag.
-    """

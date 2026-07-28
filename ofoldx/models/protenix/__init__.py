@@ -10,7 +10,6 @@ from ..registry import MODELS as _MODELS
 from .config import (
     ProtenixConfig,
     ProtenixConstraintConfig,
-    ProtenixConstraintProcessorConfig,
     ProtenixEsmConfig,
     ProtenixProcessorConfig,
     ProtenixStructureConditionConfig,

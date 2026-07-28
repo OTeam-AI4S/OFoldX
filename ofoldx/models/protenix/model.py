@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import math
 import operator
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 
 from tensordict import tensorclass
 from typing import Any, Callable, Literal, cast, overload
@@ -63,6 +63,10 @@ from .config import (
     ProtenixStructureConditionConfig,
     ProtenixTemplateModelConfig,
 )
+
+#: Sentinel for an omitted ``tfg_guidance`` argument, distinct from an explicit ``None``: omission inherits
+#: the guidance a processor-prepared input carries, while ``None`` disables guidance (the documented meaning).
+_INHERIT_TFG_GUIDANCE: Any = object()
 
 
 class ProtenixModel(Model):
@@ -519,7 +523,7 @@ class ProtenixModel(Model):
         num_sampling_steps: int | None = None,
         churn_rate: float | None = None,
         step_scale: float | None = None,
-        tfg_guidance: ProtenixTfgGuidance | None = None,
+        tfg_guidance: ProtenixTfgGuidance | None = _INHERIT_TFG_GUIDANCE,
     ) -> ProtenixRawOutput:
         r"""
         Run reverse diffusion and return raw coordinates and prediction heads.
@@ -535,7 +539,8 @@ class ProtenixModel(Model):
                 configured value.
             churn_rate: Per-call extra-noise fraction. ``None`` uses the configured value.
             step_scale: Per-call solver-step multiplier. ``None`` uses the configured value.
-            tfg_guidance: Optional training-free chemical guidance.
+            tfg_guidance: Training-free chemical guidance. Omit to inherit the guidance the input was
+                prepared with; pass ``None`` to disable it.
 
         Returns:
             Raw sampled coordinates, distogram, and confidence logits.
@@ -555,13 +560,16 @@ class ProtenixModel(Model):
         num_sampling_steps = self._num_sampling_steps if num_sampling_steps is None else num_sampling_steps
         if num_sampling_steps < 1:
             raise ValueError("num_sampling_steps must be positive")
-        if tfg_guidance is None:
-            tfg_guidance = input.tfg_guidance  # a processor-prepared input carries the guidance it was built for
+        if tfg_guidance is _INHERIT_TFG_GUIDANCE:
+            tfg_guidance = input.tfg_guidance  # omitted -> inherit the input's guidance; explicit None disables
         tfg_potential = None
         if tfg_guidance is not None:
             if input.tfg_features is None:
                 raise ValueError("tfg_guidance requires ProtenixInput.tfg_features prepared by the processor")
-            tfg_potential = ProtenixTfgPotential(input.tfg_features, tfg_guidance)
+            # ``tfg_features`` is a plain (non-tensorclass) bundle whose unbatched index tensors ``.to()``
+            # cannot reach, so a direct user who moved the input with ``.to()`` may leave it on another
+            # device; align the potential's feature buffers to the sampling device.
+            tfg_potential = ProtenixTfgPotential(input.tfg_features, tfg_guidance).to(input.msa_tokens.device)
 
         reference_positions = input.reference_positions
         msa_indices = tuple(
@@ -598,7 +606,7 @@ class ProtenixModel(Model):
         num_sampling_steps: int | None = None,
         churn_rate: float | None = None,
         step_scale: float | None = None,
-        tfg_guidance: ProtenixTfgGuidance | None = None,
+        tfg_guidance: ProtenixTfgGuidance | None = _INHERIT_TFG_GUIDANCE,
     ) -> FoldResult:
         r"""
         Predict structures for one molecular assembly with Protenix.
@@ -615,9 +623,9 @@ class ProtenixModel(Model):
                 configured value.
             churn_rate: Per-call extra-noise fraction. ``None`` uses the configured value.
             step_scale: Per-call solver-step multiplier. ``None`` uses the configured value.
-            tfg_guidance: Training-free chemical guidance. ``None`` disables
-                guidance; ``ProtenixTfgGuidance()`` uses the released enabled
-                defaults.
+            tfg_guidance: Training-free chemical guidance. Omit to inherit the guidance the input was
+                prepared with; pass ``None`` to disable guidance; ``ProtenixTfgGuidance()`` uses the
+                released enabled defaults.
 
         Returns:
             One generation-ordered prediction per sample. Structure, PAE, PDE, and
@@ -4199,11 +4207,6 @@ class ProtenixTfgFeatures:
     stereo_bond_orientation: Tensor
     planar_improper_index: Tensor
 
-    def to(self, *args: Any, **kwargs: Any) -> "ProtenixTfgFeatures":
-        r"""Move every index/bound tensor, like ``Tensor.to`` -- this bundle is not a tensorclass."""
-
-        return type(self)(**{field.name: getattr(self, field.name).to(*args, **kwargs) for field in fields(self)})
-
 
 @tensorclass(frozen=True)
 class _ProtenixTrunkOutput:
@@ -4410,17 +4413,6 @@ class ProtenixInput:
     atom_sites: tuple[AtomSite, ...]
     token_sites: tuple[AtomSite | ComponentReference, ...]
     tfg_guidance: ProtenixTfgGuidance | None = None
-
-    def to(self, *args: Any, **kwargs: Any) -> "ProtenixInput":
-        r"""
-        Move to a device/dtype. ``tfg_features`` is a plain dataclass of unbatched index tensors (it cannot
-        be a batched tensorclass), so the generated tensorclass move cannot reach it; move it explicitly.
-        """
-
-        moved = self.apply(lambda tensor: tensor.to(*args, **kwargs))
-        if self.tfg_features is not None:
-            moved.tfg_features = self.tfg_features.to(*args, **kwargs)
-        return moved
 
 
 @tensorclass

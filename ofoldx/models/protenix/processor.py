@@ -37,7 +37,7 @@ from ...data.molecular import (
 from ...data.structure import Structure
 from ...modules.geometry import uniform_random_rotation
 from ...processor import Processor
-from .config import ProtenixConstraintProcessorConfig, ProtenixProcessorConfig
+from .config import ProtenixProcessorConfig
 from .model import (
     ProtenixAtomContact,
     ProtenixInput,
@@ -464,28 +464,9 @@ class ProtenixConstraintProcessor(ProtenixProcessor):
     r"""
     Convert biomolecular inputs and spatial constraints into `ProtenixInput`.
 
-    Args:
-        config: Constraint feature limits and reference-position options. Defaults to
-            ``ProtenixConstraintProcessorConfig()``.
-        device: Device for produced tensors.
-        dtype: Floating-point dtype for produced tensors.
+    The config (``ProtenixProcessorConfig``), device, and dtype are inherited from `ProtenixProcessor`; this
+    variant differs only in the spatial-constraint inputs its ``__call__`` accepts.
     """
-
-    config_class = ProtenixConstraintProcessorConfig
-    config: ProtenixConstraintProcessorConfig
-
-    def __init__(
-        self,
-        config: ProtenixConstraintProcessorConfig | None = None,
-        *,
-        device: torch.device | str | None = None,
-        dtype: torch.dtype | None = None,
-    ) -> None:
-        super().__init__(
-            ProtenixConstraintProcessorConfig() if config is None else config,
-            device=device,
-            dtype=dtype,
-        )
 
     def __call__(
         self,
