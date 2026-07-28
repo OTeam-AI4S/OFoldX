@@ -54,6 +54,24 @@ def _sample_infer(model: Any, model_input: Any) -> Any:
     return model.sample(model_input)
 
 
+def _strip_residues(output: Any, residue_mask: Tensor) -> Any:
+    r"""
+    Keep only the valid residues of one per-structure sequence Output, so a short sequence's output does
+    not carry the collate padding of the batch's longest. ``residue_mask`` is the 1-D validity mask over
+    the padded residue axis; every residue-aligned tensor field (leading axis == the padded length) is
+    indexed by it, and non-residue fields pass through unchanged.
+    """
+
+    kept = {}
+    for field in fields(output):
+        value = getattr(output, field.name)
+        if isinstance(value, Tensor) and value.dim() >= 1 and value.shape[0] == residue_mask.shape[0]:
+            kept[field.name] = value[residue_mask]
+        else:
+            kept[field.name] = value
+    return type(output)(**kept, batch_size=[])
+
+
 #: Strategy name -> (build a collate from the registration's options, train-split lowering, infer-split
 #: lowering, inference entry point). The diffusion families lower the training splits to the ``(input,
 #: target)`` the denoising loss needs, but the ``infer`` split to the plain Processor call so inference-only
@@ -131,6 +149,7 @@ class Runner(dl.Runner):
         if self.config.ddp.get("find_unused_parameters") is None:
             self.config.ddp.find_unused_parameters = strategy == "denoising"
         self.criterion = criterion(self.model, self.processor)
+        self._is_sequence = strategy in ("sequence", "sequence_single")
         build_collate, self._train_lower, self._infer_lower, self._infer = _STRATEGIES[strategy]
         self.collate_fn = build_collate(registration.collate_options)
         # DanLing toggles module mode from its ``mode`` setter (train_epoch/evaluate_epoch/infer set it), but
@@ -317,9 +336,16 @@ class Runner(dl.Runner):
         model_input = data["input"]  # the infer split collates to ``{"input": model_input}`` (no target)
         with self.infer_context():
             prediction = self._infer(model, model_input)
-        prediction = self.to_device(prediction, torch.device("cpu"))
         # One output per input in the batch, not one per batch, so infer()'s result grouping does not shift
         # with batch size (matching DanLing's per-sample convention). Non-tensorclass outputs pass through.
         if is_tensorclass(prediction) and prediction.batch_size:
-            return [prediction[index] for index in range(prediction.batch_size[0])]
-        return [prediction]
+            outputs = [prediction[index] for index in range(prediction.batch_size[0])]
+            if self._is_sequence and is_tensorclass(model_input) and model_input.batch_size:
+                # A sequence batch is padded to its longest member; strip each output back to its own valid
+                # residues so the result is the same whatever else shared the batch.
+                outputs = [
+                    _strip_residues(output, model_input[index].residue_mask)
+                    for index, output in enumerate(outputs)
+                ]
+            return [self.to_device(output, torch.device("cpu")) for output in outputs]
+        return [self.to_device(prediction, torch.device("cpu"))]
