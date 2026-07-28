@@ -316,4 +316,9 @@ class Runner(dl.Runner):
         model_input = data["input"]  # the infer split collates to ``{"input": model_input}`` (no target)
         with self.infer_context():
             prediction = self._infer(model, model_input)
-        return [self.to_device(prediction, torch.device("cpu"))]
+        prediction = self.to_device(prediction, torch.device("cpu"))
+        # One output per input in the batch, not one per batch, so infer()'s result grouping does not shift
+        # with batch size (matching DanLing's per-sample convention). Non-tensorclass outputs pass through.
+        if is_tensorclass(prediction) and prediction.batch_size:
+            return [prediction[index] for index in range(prediction.batch_size[0])]
+        return [prediction]
