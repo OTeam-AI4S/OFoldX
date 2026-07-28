@@ -20,7 +20,7 @@ native ``to_device``, and an ``infer_step`` that runs the family's inference ent
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import fields, is_dataclass, replace
+from dataclasses import fields
 from typing import Any, cast
 
 import danling as dl
@@ -285,32 +285,18 @@ class Runner(dl.Runner):
     def to_device(self, data: Any, device: torch.device | None = None) -> Any:
         r"""
         Recursively move a nested batch to ``device`` -- the runner device by default; ``infer_step`` passes
-        the CPU. Family Input/Output/Target are ``tensorclass`` instances, moved with their native ``.to``
-        (which keeps ``batch_size``; ``dataclasses.replace`` would reset it). ``.to`` cannot reach tensors
-        held inside a non-tensor dataclass field (e.g. Protenix's tfg/template feature bundles, whose index
-        tensors are unbatched so they cannot themselves be a tensorclass), so those are moved explicitly.
-        Mappings/sequences recurse; non-tensor leaves pass through; the plain-dataclass branch handles any
-        non-tensorclass dataclass.
+        the CPU. Family Input/Output/Target are ``tensorclass`` instances, moved with their native ``.to``,
+        which also moves nested ``tensorclass`` fields (e.g. Protenix ``template_features``). The one
+        tensor-bearing field it cannot reach is a plain (non-``tensorclass``) dataclass -- only Protenix's
+        ``tfg_features`` bundle, whose unbatched index tensors cannot be a tensorclass -- and its placement
+        is handled by the sampling consumer, so no dataclass recursion is needed here. Mappings/sequences
+        recurse; other leaves pass through.
         """
 
         if device is None:
             device = self.device
         if is_tensorclass(data):
-            moved = data.to(device)
-            for field in fields(data):
-                value = getattr(data, field.name)
-                # ``data.to`` already moved tensor fields and nested tensorclasses; only a plain
-                # (non-tensorclass) dataclass field -- e.g. Protenix's tfg bundle -- is left behind.
-                if is_dataclass(value) and not is_tensorclass(value) and not isinstance(value, type):
-                    setattr(moved, field.name, self.to_device(value, device))
-            return moved
-        if is_dataclass(data) and not isinstance(data, type):
-            moved = {
-                field.name: self.to_device(value, device)
-                for field in fields(data)
-                if (value := getattr(data, field.name)) is not None
-            }
-            return replace(data, **moved)
+            return data.to(device)
         if isinstance(data, Mapping):
             moved = {key: self.to_device(value, device) for key, value in data.items()}
             return type(data)(moved) if isinstance(data, dict) else moved

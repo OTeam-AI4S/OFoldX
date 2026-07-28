@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -159,30 +158,6 @@ def test_denoising_collate_normalizer_is_the_resolved_atom_count(tmp_path: Path)
     batch = collate_denoising([item])  # boltz1's wired collate (strategy="denoising"); wiring covered elsewhere
     model_input, model_target = batch["input"]["input"], batch["input"]["target"]
     assert batch["loss_normalizer"] == int(resolved_atom_mask(model_target, model_input).sum())
-
-
-def test_to_device_recurses_into_nested_dataclasses(tmp_path: Path) -> None:
-    # A dataclass field that is itself a dataclass holding tensors (e.g. ProtenixInput.template_features)
-    # must be moved, not left behind. The old tensor-only mover would keep the same nested object.
-    @dataclass
-    class _Inner:
-        tensor: torch.Tensor
-
-    @dataclass
-    class _Outer:
-        top: torch.Tensor
-        inner: _Inner
-        label: str
-
-    runner = Runner(_config(tmp_path, _write(tmp_path / "chain.pdb"), name="proteinmpnn"))
-    try:
-        outer = _Outer(top=torch.zeros(2), inner=_Inner(tensor=torch.ones(3)), label="x")
-        moved = runner.to_device(outer)
-        assert moved.inner is not outer.inner  # recursed -> a new nested instance
-        assert isinstance(moved.inner.tensor, torch.Tensor)
-        assert moved.label == "x"
-    finally:
-        runner.close()
 
 
 def test_infer_step_returns_dataclass_output(tmp_path: Path) -> None:
