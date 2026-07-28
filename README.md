@@ -10,10 +10,12 @@ registration is reserved for a family only after all of its released scientific
 functions, checkpoint variants, canonical mappings, and conversion paths are
 complete.
 
-Training orchestration is not part of the current Model Hub API freeze. The tree
-retains a working Danling-based Runner scaffold; its final public contract will be
-one config-only `ofoldx.runners.Runner` supporting train, evaluate, and infer.
-Training support is not a model-registration requirement.
+Training, evaluation, and inference run through one config-only `ofoldx.runners.Runner`
+(Danling-backed). It resolves the exact registered architecture, builds the Model and a
+config-consistent Processor, and applies the training criterion and batching/inference
+strategy that architecture registers; an architecture is trainable exactly when its
+registration declares a criterion. Training support is not a model-registration
+requirement.
 
 ## Get Started
 
