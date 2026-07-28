@@ -134,18 +134,25 @@ def collate_denoising(batch: list[Any]) -> dict[str, Any]:
     r"""
     Batch-size-1 collate for the diffusion families to DanLing's batch, normalized by resolved atoms.
 
-    Each item is a ``(model_input, model_target)`` pair from the Processor's ``process_training``. The
+    A training item is a ``(model_input, model_target)`` pair from the Processor's ``process_training``. The
     diffusion forward needs both, so ``input`` is the ``{"input", "target"}`` mapping DanLing splats as
     ``model(input=..., target=...)``; the same mapping is the criterion's ``target`` (carrying both the
     ``atom_mask`` and the resolved-atom Target). The normalizer is the resolved-atom count the denoising
     loss averages over.
+
+    An inference item is a bare model input from the plain Processor call (the ``infer`` split lowers that
+    way, so inference-only kwargs like ``tfg_guidance`` / ``placement`` flow through). There is no target;
+    ``infer_step`` samples from the input alone, so the batch is just ``{"input": model_input}``.
     """
 
     from ..modules.diffusion.loss import resolved_atom_mask
 
     if len(batch) != 1:
         raise ValueError(f"the diffusion families train at batch_size=1; got a batch of {len(batch)}")
-    model_input, model_target = batch[0]
+    item = batch[0]
+    if not isinstance(item, tuple):
+        return {"input": item}
+    model_input, model_target = item
     pair = {"input": model_input, "target": model_target}
     resolved = resolved_atom_mask(model_target, model_input)
     return {"input": pair, "target": pair, "loss_normalizer": int(resolved.sum())}

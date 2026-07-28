@@ -198,6 +198,26 @@ def test_infer_step_returns_dataclass_output(tmp_path: Path) -> None:
         runner.close()
 
 
+def test_diffusion_infer_split_lowers_via_plain_call(tmp_path: Path) -> None:
+    # The infer split must lower with the plain Processor call, not process_training: that is the only path
+    # inference-only kwargs (tfg_guidance, placement, ...) travel, and it builds no target. collate_denoising
+    # then yields just {"input": ...}, and infer_step samples from it.
+    source = str(_write(tmp_path / "chain.pdb"))
+    config = _config(tmp_path, name="boltz1", **_MINIMAL_BOLTZ1)
+    config["data"] = {"train": {"source": source}, "infer": {"source": source}}
+    runner = Runner(config)
+    try:
+        assert runner.datasets["train"].lower == "process_training"
+        assert runner.datasets["infer"].lower == "call"
+        item = runner.datasets["infer"][0]
+        assert not isinstance(item, tuple)  # a bare model input, not (input, target)
+        batch = runner.collate_fn([item])
+        assert set(batch) == {"input"}  # no target / loss_normalizer at inference
+        assert len(runner.infer_step(batch)) == 1
+    finally:
+        runner.close()
+
+
 def test_repository_model_loads_trains_and_rejects_processor_overrides(tmp_path: Path) -> None:
     from ofoldx.models.proteinmpnn import ProteinMpnnPipeline
 

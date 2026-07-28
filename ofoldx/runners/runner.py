@@ -54,12 +54,20 @@ def _sample_infer(model: Any, model_input: Any) -> Any:
     return model.sample(model_input)
 
 
-#: Strategy name -> (build a collate from the registration's options, dataset lowering, inference entry
-#: point). The only generic Runner-side training knowledge; a trainable architecture registers one of these.
-_STRATEGIES: dict[str, tuple[Callable[[Mapping[str, Any]], Collate], str, Infer]] = {
-    "sequence": (lambda options: (lambda batch: _collate.collate_sequence(batch, **options)), "call", _forward_infer),
-    "sequence_single": (lambda options: _collate.collate_sequence_single, "call", _forward_infer),
-    "denoising": (lambda options: _collate.collate_denoising, "process_training", _sample_infer),
+#: Strategy name -> (build a collate from the registration's options, train-split lowering, infer-split
+#: lowering, inference entry point). The diffusion families lower the training splits to the ``(input,
+#: target)`` the denoising loss needs, but the ``infer`` split to the plain Processor call so inference-only
+#: kwargs (``tfg_guidance``, ``placement``, ...) flow and no target is built. The sequence families lower
+#: both the same way. The only generic Runner-side training knowledge; a trainable arch registers a strategy.
+_STRATEGIES: dict[str, tuple[Callable[[Mapping[str, Any]], Collate], str, str, Infer]] = {
+    "sequence": (
+        lambda options: (lambda batch: _collate.collate_sequence(batch, **options)),
+        "call",
+        "call",
+        _forward_infer,
+    ),
+    "sequence_single": (lambda options: _collate.collate_sequence_single, "call", "call", _forward_infer),
+    "denoising": (lambda options: _collate.collate_denoising, "process_training", "call", _sample_infer),
 }
 
 
@@ -122,7 +130,7 @@ class Runner(dl.Runner):
         criterion, strategy = registration.criterion, registration.strategy
         assert criterion is not None and strategy is not None  # _require_trainable enforced this in _build
         self.criterion = criterion(self.model, self.processor)
-        build_collate, self._lower, self._infer = _STRATEGIES[strategy]
+        build_collate, self._train_lower, self._infer_lower, self._infer = _STRATEGIES[strategy]
         self.collate_fn = build_collate(registration.collate_options)
         # DanLing toggles module mode from its ``mode`` setter (train_epoch/evaluate_epoch/infer set it), but
         # it fixed ``mode=train`` before this model existed, so the first train_epoch's mode=train is a no-op
@@ -223,9 +231,10 @@ class Runner(dl.Runner):
 
     def build_datasets(self) -> dict[str, Any]:
         r"""
-        Build structure datasets for the configured splits, all lowered by the spec's lowering (diffusion
-        families need the separate ``(input, target)``; the target is unused at inference). ``infer_step``
-        takes the model-visible input from the batch, so every split collates the same way.
+        Build structure datasets for the configured splits. Training and evaluation splits lower to whatever
+        the forward + criterion need (the diffusion families' separate ``(input, target)``); the ``infer``
+        split -- DanLing's inference split -- lowers with the plain Processor call, so inference-only kwargs
+        (``tfg_guidance``, ``placement``, ...) declared beside its ``source`` flow and no target is built.
         """
 
         from .dataset import StructureDataset
@@ -233,8 +242,9 @@ class Runner(dl.Runner):
         datasets: dict[str, Any] = {}
         for split, split_config in self.config.data.items():
             processor_kwargs = {key: value for key, value in split_config.items() if key != "source"}
+            lower = self._infer_lower if split == "infer" else self._train_lower
             datasets[split] = StructureDataset(
-                split_config.source, self.processor, lower=self._lower, processor_kwargs=processor_kwargs
+                split_config.source, self.processor, lower=lower, processor_kwargs=processor_kwargs
             )
         return datasets
 
@@ -303,8 +313,7 @@ class Runner(dl.Runner):
         if model is None:
             raise ValueError("cannot run infer_step: model is not initialized")
         model = self.unwrap(model)  # reach the family's own inference entry point (e.g. ``sample``) under DDP
-        inputs = data["input"] if isinstance(data, Mapping) else data
-        model_input = inputs["input"] if isinstance(inputs, Mapping) else inputs
+        model_input = data["input"]  # the infer split collates to ``{"input": model_input}`` (no target)
         with self.infer_context():
             prediction = self._infer(model, model_input)
         return [self.to_device(prediction, torch.device("cpu"))]
