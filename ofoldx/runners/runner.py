@@ -117,6 +117,14 @@ class Runner(dl.Runner):
         # it afterwards would let a mutable branch/tag that later moves resume under an identity that no longer
         # matches the snapshot actually loaded.
         repository = self._prepare_repository(config) if config.model.get("pretrained") else None
+        # The objective trains only the loss-path parameters; auxiliary heads (confidence/distogram/B-factor),
+        # sampling-only modules, and unexercised conditioning embedders get no gradient. static_graph learns
+        # that fixed unused set from the first iteration's autograd hooks, so DDP tolerates it without a freeze
+        # list and without needing the plain-dataclass forward outputs to be a walkable pytree (which
+        # find_unused_parameters would require for a computed-but-unused head). Constant unused set holds for
+        # the homogeneous, fixed-config training the trainable families use. Set it BEFORE ``super().__init__``
+        # so DanLing hashes it into the run identity/workspace.
+        config.ddp.static_graph = True
         super().__init__(config)
 
         self.model, self.processor, registration = self._build(repository)
@@ -221,21 +229,6 @@ class Runner(dl.Runner):
         processor = load_processor(repository)
         model = load_model(repository)
         return model, processor, metadata_registration
-
-    def materialize_model(self) -> None:
-        r"""
-        Enable DDP ``static_graph`` once DanLing has wrapped the model. The objective trains only the
-        loss-path parameters; auxiliary heads (confidence/distogram/B-factor), sampling-only modules, and
-        unexercised conditioning embedders receive no gradient. ``static_graph`` learns that unused set from
-        the first iteration's autograd hooks, so DDP tolerates it without a freeze list -- and without
-        needing the plain-dataclass forward outputs to be a walkable pytree, which ``find_unused_parameters``
-        would require. This assumes the unused set is constant across steps, which holds for the homogeneous,
-        fixed-config training sets the trainable families use.
-        """
-
-        super().materialize_model()
-        if isinstance(self.model, torch.nn.parallel.DistributedDataParallel):
-            self.model._set_static_graph()
 
     def build_datasets(self) -> dict[str, Any]:
         r"""

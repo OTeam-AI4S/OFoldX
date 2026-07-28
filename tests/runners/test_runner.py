@@ -281,8 +281,10 @@ def test_diffusion_survives_ddp_second_step_via_static_graph(tmp_path: Path) -> 
         config.confidence.num_pairformer_blocks = 1
         model = Boltz1Model(config)
         model.train()
-        ddp = torch.nn.parallel.DistributedDataParallel(model)  # DanLing default: no find_unused_parameters
-        ddp._set_static_graph()  # exactly what the Runner's materialize_model does once DDP has wrapped
+        # The Runner sets config.ddp.static_graph=True, which DanLing passes to the DDP constructor; wrap and
+        # enable it directly here to exercise the same behavior.
+        ddp = torch.nn.parallel.DistributedDataParallel(model)
+        ddp._set_static_graph()
         optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
         model_input, model_target = Boltz1Processor().process_training(read_structure(_write(tmp_path / "chain.pdb")))
         sigma_data = float(model.config.denoiser.sigma_data)
