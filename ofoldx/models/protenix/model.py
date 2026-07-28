@@ -152,9 +152,27 @@ class ProtenixModel(Model):
     config_class = ProtenixConfig
     config: ProtenixConfig
 
+    #: Whether this architecture has a template graph. The base and structure-condition architectures do
+    #: not, and their paired Processor produces no template features to feed one; ``ProtenixTemplateModel``
+    #: overrides this. Enabling ``config.template`` on an architecture that cannot feed it is rejected below.
+    _supports_template = False
+    #: Whether this architecture has the four-branch constraint graph. Only ``ProtenixConstraintModel`` does;
+    #: the others' paired Processor exposes no constraint inputs, so the graph would sit silently unreachable.
+    _supports_constraints = False
+
     def __init__(self, config: ProtenixConfig | None = None) -> None:
         config = ProtenixConfig() if config is None else config
         super().__init__(config)
+        if config.template is not None and not self._supports_template:
+            raise ValueError(
+                "this Protenix architecture has no template graph and its Processor produces no template "
+                "features; use protenix_template for the template architecture"
+            )
+        if config.constraints and not self._supports_constraints:
+            raise ValueError(
+                "this Protenix architecture has no constraint graph and its Processor exposes no constraint "
+                "inputs; use protenix_constraint for the constraint architecture"
+            )
         self._recycling_steps = config.recycling_steps
         self.input_embeddings = ProtenixInputEmbeddings(
             single_size=config.single_size,
@@ -1483,6 +1501,7 @@ class ProtenixConstraintModel(ProtenixModel):
 
     config_class = ProtenixConstraintConfig
     config: ProtenixConstraintConfig
+    _supports_constraints = True
 
     def __init__(self, config: ProtenixConstraintConfig | None = None) -> None:
         resolved = ProtenixConstraintConfig() if config is None else config
@@ -1502,6 +1521,7 @@ class ProtenixTemplateModel(ProtenixModel):
 
     config_class = ProtenixTemplateModelConfig
     config: ProtenixTemplateModelConfig
+    _supports_template = True
 
     def __init__(self, config: ProtenixTemplateModelConfig | None = None) -> None:
         resolved = ProtenixTemplateModelConfig() if config is None else config
