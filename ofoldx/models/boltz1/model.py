@@ -397,14 +397,13 @@ class Boltz1Model(Model):
             generator=generator,
         )
         conditioning = self._build_denoiser_conditioning(representations, input)
-        target_coordinates, target_mask = _gather_boltz1_structure_target(
+        target_coordinates, _ = _gather_boltz1_structure_target(
             target,
             input,
         )
         denoised_coordinates, augmented_target_coordinates, noise_level = self.coordinate_diffusion.denoise_training(
             target_coordinates,
             input.atom_mask,
-            target_mask=target_mask,
             multiplicity=num_samples,
             synchronize_noise_levels=synchronize_noise_levels,
             coordinate_augmentation=coordinate_augmentation,
@@ -1898,7 +1897,6 @@ class Boltz1CoordinateDiffusion(nn.Module):
         target_coordinates: Tensor,
         atom_mask: Tensor,
         *,
-        target_mask: Tensor,
         multiplicity: int = 1,
         synchronize_noise_levels: bool = True,
         coordinate_augmentation: bool = True,
@@ -1917,8 +1915,10 @@ class Boltz1CoordinateDiffusion(nn.Module):
             multiplicity,
             0,
         )
-        resolved = target_mask.to(dtype=dtype, device=device)
-        resolved = resolved.repeat_interleave(multiplicity, 0)
+        # Centre and rigid-augment over ALL padded atoms (atom_pad_mask), matching upstream
+        # ``center_random_augmentation``. The resolved-atom mask is a loss/alignment concern applied by the
+        # criterion, not part of the corruption equation.
+        augmentation_mask = atom_mask.to(dtype=dtype, device=device).repeat_interleave(multiplicity, 0)
         sample_batch_size = target.shape[0]
         noise_batch_size = target_coordinates.shape[0] if synchronize_noise_levels else sample_batch_size
         noise_level = self.noise_distribution(
@@ -1933,7 +1933,7 @@ class Boltz1CoordinateDiffusion(nn.Module):
             noise_level = noise_level.repeat_interleave(multiplicity)
         augmented_target_coordinates = self._augment_target(
             target,
-            resolved,
+            augmentation_mask,
             coordinate_augmentation=coordinate_augmentation,
             translation_scale=augmentation_translation_scale,
             generator=generator,

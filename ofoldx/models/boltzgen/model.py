@@ -709,7 +709,6 @@ class BoltzGenModel(_BoltzGenStructureModel):
         ) = self.coordinate_diffusion.denoise_training(
             target_coordinates,
             input.atom_mask,
-            target_mask=target_atom_mask,
             multiplicity=num_samples,
             synchronize_noise_levels=synchronize_noise_levels,
             coordinate_augmentation=coordinate_augmentation,
@@ -2832,7 +2831,6 @@ class BoltzGenCoordinateDiffusion(nn.Module):
         target_coordinates: Tensor,
         atom_mask: Tensor,
         *,
-        target_mask: Tensor,
         multiplicity: int = 1,
         synchronize_noise_levels: bool = False,
         coordinate_augmentation: bool = True,
@@ -2856,7 +2854,6 @@ class BoltzGenCoordinateDiffusion(nn.Module):
 
         device, dtype = single_trunk.device, single_trunk.dtype
         target_coordinates = target_coordinates.to(device=device, dtype=dtype)
-        target_mask = target_mask.to(device=device, dtype=dtype)
         batch_size, conformers, atom_count = target_coordinates.shape[:3]
         if conformers == 1:
             target_coordinates = target_coordinates.expand(
@@ -2875,10 +2872,13 @@ class BoltzGenCoordinateDiffusion(nn.Module):
             atom_count,
             3,
         )
-        target_mask = target_mask.repeat_interleave(multiplicity, dim=0)
+        # Centre and rigid-augment over ALL padded atoms (atom_pad_mask), matching upstream
+        # ``center_random_augmentation``. The resolved-atom mask is a loss/alignment concern applied by the
+        # criterion, not part of the corruption equation.
+        augmentation_mask = atom_mask.to(device=device, dtype=dtype).repeat_interleave(multiplicity, dim=0)
         augmented_target_coordinates = _center_random_augmentation(
             target_coordinates,
-            target_mask,
+            augmentation_mask,
             augmentation=coordinate_augmentation,
             translation_scale=augmentation_translation_scale,
             generator=generator,
