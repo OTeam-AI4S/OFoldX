@@ -6,10 +6,10 @@ from __future__ import annotations
 
 import math
 import operator
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
 from tensordict import tensorclass
-from typing import Callable, Literal, cast, overload
+from typing import Any, Callable, Literal, cast, overload
 
 import numpy as np
 import torch
@@ -561,10 +561,7 @@ class ProtenixModel(Model):
         if tfg_guidance is not None:
             if input.tfg_features is None:
                 raise ValueError("tfg_guidance requires ProtenixInput.tfg_features prepared by the processor")
-            # ``tfg_features`` is a plain (non-tensorclass) bundle of unbatched index tensors, so
-            # ``ProtenixInput.to(device)`` cannot reach it; align the potential's feature buffers to the
-            # sampling device here so guidance is correct however the input was moved.
-            tfg_potential = ProtenixTfgPotential(input.tfg_features, tfg_guidance).to(input.msa_tokens.device)
+            tfg_potential = ProtenixTfgPotential(input.tfg_features, tfg_guidance)
 
         reference_positions = input.reference_positions
         msa_indices = tuple(
@@ -4202,6 +4199,11 @@ class ProtenixTfgFeatures:
     stereo_bond_orientation: Tensor
     planar_improper_index: Tensor
 
+    def to(self, *args: Any, **kwargs: Any) -> "ProtenixTfgFeatures":
+        r"""Move every index/bound tensor, like ``Tensor.to`` -- this bundle is not a tensorclass."""
+
+        return type(self)(**{field.name: getattr(self, field.name).to(*args, **kwargs) for field in fields(self)})
+
 
 @tensorclass(frozen=True)
 class _ProtenixTrunkOutput:
@@ -4408,6 +4410,17 @@ class ProtenixInput:
     atom_sites: tuple[AtomSite, ...]
     token_sites: tuple[AtomSite | ComponentReference, ...]
     tfg_guidance: ProtenixTfgGuidance | None = None
+
+    def to(self, *args: Any, **kwargs: Any) -> "ProtenixInput":
+        r"""
+        Move to a device/dtype. ``tfg_features`` is a plain dataclass of unbatched index tensors (it cannot
+        be a batched tensorclass), so the generated tensorclass move cannot reach it; move it explicitly.
+        """
+
+        moved = self.apply(lambda tensor: tensor.to(*args, **kwargs))
+        if self.tfg_features is not None:
+            moved.tfg_features = self.tfg_features.to(*args, **kwargs)
+        return moved
 
 
 @tensorclass
