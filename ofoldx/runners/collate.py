@@ -118,7 +118,10 @@ def collate_sequence(batch: list[Any], *, token_pad_id: int, pair_bias_fields: C
     """
 
     batched = pad_and_collate(batch, token_pad_id=token_pad_id, pair_bias_fields=pair_bias_fields)
-    return {"input": batched, "target": batched, "loss_normalizer": _design_count(batched)}
+    # Per-item pre-padding residue counts, so inference can drop each output's tail padding by its own
+    # length (not by residue_mask, which would delete unresolved/gap rows).
+    lengths = [int(item.sequence_tokens.shape[1]) for item in batch]
+    return {"input": batched, "target": batched, "loss_normalizer": _design_count(batched), "lengths": lengths}
 
 
 def collate_sequence_single(batch: list[Any]) -> dict[str, Any]:
@@ -127,7 +130,12 @@ def collate_sequence_single(batch: list[Any]) -> dict[str, Any]:
     """
 
     batched = collate_single(batch)
-    return {"input": batched, "target": batched, "loss_normalizer": _design_count(batched)}
+    return {
+        "input": batched,
+        "target": batched,
+        "loss_normalizer": _design_count(batched),
+        "lengths": [int(batched.sequence_tokens.shape[1])],
+    }
 
 
 def collate_denoising(batch: list[Any]) -> dict[str, Any]:

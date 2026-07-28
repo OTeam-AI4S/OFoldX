@@ -54,19 +54,21 @@ def _sample_infer(model: Any, model_input: Any) -> Any:
     return model.sample(model_input)
 
 
-def _strip_residues(output: Any, residue_mask: Tensor) -> Any:
+def _trim_tail_padding(output: Any, length: int, padded_length: int) -> Any:
     r"""
-    Keep only the valid residues of one per-structure sequence Output, so a short sequence's output does
-    not carry the collate padding of the batch's longest. ``residue_mask`` is the 1-D validity mask over
-    the padded residue axis; every residue-aligned tensor field (leading axis == the padded length) is
-    indexed by it, and non-residue fields pass through unchanged.
+    Drop the collate's tail padding from one per-structure sequence Output: keep the first ``length`` rows
+    of every residue-aligned tensor field (leading axis == ``padded_length``). This removes only padding, so
+    unresolved/gap residues WITHIN ``length`` are preserved -- unlike a ``residue_mask`` index, which would
+    also delete those real rows. Non-residue fields pass through unchanged.
     """
 
+    if length == padded_length:
+        return output
     kept = {}
     for field in fields(output):
         value = getattr(output, field.name)
-        if isinstance(value, Tensor) and value.dim() >= 1 and value.shape[0] == residue_mask.shape[0]:
-            kept[field.name] = value[residue_mask]
+        if isinstance(value, Tensor) and value.dim() >= 1 and value.shape[0] == padded_length:
+            kept[field.name] = value[:length]
         else:
             kept[field.name] = value
     return type(output)(**kept, batch_size=[])
@@ -135,21 +137,22 @@ class Runner(dl.Runner):
         # it afterwards would let a mutable branch/tag that later moves resume under an identity that no longer
         # matches the snapshot actually loaded.
         repository = self._prepare_repository(config) if config.model.get("pretrained") else None
+        # Resolve the architecture (no model build) so ``find_unused_parameters`` can be derived from the
+        # strategy BEFORE ``super().__init__``. It is a DDP graph-traversal flag, but DanLing's ``config_id``
+        # is ``hash(config)`` -- which includes ``ddp`` -- so it must be settled before the identity is
+        # frozen. Only the denoising families compute auxiliary heads (confidence, distogram, ...) the
+        # objective leaves untrained, so DDP must walk the ``tensorclass`` output to tolerate them; the
+        # sequence families train every forward-computed parameter and skip the traversal. An explicit user
+        # setting wins (``None`` is "unset").
+        registration = self._resolve_registration(config, repository)
+        if config.ddp.get("find_unused_parameters") is None:
+            config.ddp.find_unused_parameters = registration.strategy == "denoising"
         super().__init__(config)
 
-        self.model, self.processor, registration = self._build(repository)
+        self.model, self.processor = self._build(repository, registration)
         criterion, strategy = registration.criterion, registration.strategy
-        assert criterion is not None and strategy is not None  # _require_trainable enforced this in _build
-        # ``find_unused_parameters`` is a DDP graph-traversal flag derived from the model, not a run knob:
-        # only the denoising families compute auxiliary heads (confidence, distogram, ...) the objective
-        # leaves untrained, so DDP must walk the ``tensorclass`` output to tolerate them; the sequence
-        # families train every forward-computed parameter and skip the traversal. An explicit user setting
-        # wins (``None`` is "unset"). DanLing reads this in ``materialize_model``, which ``MetaRunner`` runs
-        # after ``__init__``, so setting it here is in time.
-        if self.config.ddp.get("find_unused_parameters") is None:
-            self.config.ddp.find_unused_parameters = strategy == "denoising"
+        assert criterion is not None and strategy is not None  # _resolve_registration enforced trainability
         self.criterion = criterion(self.model, self.processor)
-        self._is_sequence = strategy in ("sequence", "sequence_single")
         build_collate, self._train_lower, self._infer_lower, self._infer = _STRATEGIES[strategy]
         self.collate_fn = build_collate(registration.collate_options)
         # DanLing toggles module mode from its ``mode`` setter (train_epoch/evaluate_epoch/infer set it), but
@@ -160,20 +163,41 @@ class Runner(dl.Runner):
 
     # -- construction --------------------------------------------------------
 
-    def _build(self, repository: Any = None) -> tuple[Model, Processor, ModelRegistration]:
-        r"""Resolve the architecture, confirm it is trainable *before* building/loading, then instantiate."""
+    def _resolve_registration(self, config: RunnerConfig, repository: Any) -> ModelRegistration:
+        r"""
+        Resolve the architecture registration WITHOUT building the model, and confirm it is trainable, so the
+        strategy is available before ``super().__init__`` and no download/build happens for an untrainable
+        architecture. A repository run resolves from the pinned snapshot metadata and asserts any
+        ``model.name`` against it; a fresh run resolves from ``model.name``.
+        """
+
+        model_config = config.model
+        if model_config.get("pretrained"):
+            from ..hub import model_values
+
+            registration, _values = model_values(repository.path)
+            if model_config["name"] and model_config["name"] != registration.id:
+                raise ValueError(
+                    f"config `model.name` {model_config['name']!r} does not match the repository architecture "
+                    f"{registration.id!r}"
+                )
+        else:
+            registration = MODELS.lookup_model(model_config["name"])
+        _require_trainable(registration)  # fail fast before downloading/building
+        return registration
+
+    def _build(self, repository: Any, registration: ModelRegistration) -> tuple[Model, Processor]:
+        r"""Instantiate the resolved architecture: load the repository snapshot, or build a fresh pair."""
 
         model_config = self.config.model
         if model_config.pretrained:
-            return self._build_from_repository(model_config, repository)
-        registration = MODELS.lookup_model(model_config["name"])
-        _require_trainable(registration)  # fail fast before building the model
+            return self._build_from_repository(repository)
         overrides = {
             key: value for key, value in model_config.items() if key not in ("name", "pretrained", "revision")
         }
         model = registration.model(registration.model_config(**overrides))
         processor = self._build_processor(registration, model)
-        return model, processor, registration
+        return model, processor
 
     def _build_processor(self, registration: ModelRegistration, model: Model) -> Processor:
         r"""
@@ -224,30 +248,18 @@ class Runner(dl.Runner):
             config.model.revision = repository.commit  # pin the exact snapshot BEFORE the identity is frozen
         return repository
 
-    def _build_from_repository(
-        self, model_config: Mapping[str, Any], repository: Any
-    ) -> tuple[Model, Processor, ModelRegistration]:
+    def _build_from_repository(self, repository: Any) -> tuple[Model, Processor]:
         r"""
-        Load a Model/Processor pair from the already-resolved repository snapshot: decide architecture +
-        trainability and validate the Processor metadata from the snapshot *before* the expensive weight
-        download. ``_prepare_repository`` has already resolved the snapshot and pinned its commit.
+        Load a Model/Processor pair from the already-resolved repository snapshot (architecture and
+        trainability were settled in ``_resolve_registration``). Load the Processor first -- it validates
+        ``processor.json`` from the metadata-only snapshot before ``load_model`` hydrates the full weights.
         """
 
-        from ..hub import load_model, load_processor, model_values
+        from ..hub import load_model, load_processor
 
-        metadata_registration, _values = model_values(repository.path)
-        architecture = metadata_registration.id
-        if model_config["name"] and model_config["name"] != architecture:
-            raise ValueError(
-                f"config `model.name` {model_config['name']!r} does not match the repository architecture "
-                f"{architecture!r}"
-            )
-        _require_trainable(metadata_registration)  # fail fast before downloading weights
-        # Load the Processor first -- it validates ``processor.json`` from the metadata-only snapshot before
-        # ``load_model`` hydrates the full weights.
         processor = load_processor(repository)
         model = load_model(repository)
-        return model, processor, metadata_registration
+        return model, processor
 
     def build_datasets(self) -> dict[str, Any]:
         r"""
@@ -287,7 +299,9 @@ class Runner(dl.Runner):
             moved = data.to(device)
             for field in fields(data):
                 value = getattr(data, field.name)
-                if is_dataclass(value) and not isinstance(value, type):
+                # ``data.to`` already moved tensor fields and nested tensorclasses; only a plain
+                # (non-tensorclass) dataclass field -- e.g. Protenix's tfg bundle -- is left behind.
+                if is_dataclass(value) and not is_tensorclass(value) and not isinstance(value, type):
                     setattr(moved, field.name, self.to_device(value, device))
             return moved
         if is_dataclass(data) and not isinstance(data, type):
@@ -340,11 +354,14 @@ class Runner(dl.Runner):
         # with batch size (matching DanLing's per-sample convention). Non-tensorclass outputs pass through.
         if is_tensorclass(prediction) and prediction.batch_size:
             outputs = [prediction[index] for index in range(prediction.batch_size[0])]
-            if self._is_sequence and is_tensorclass(model_input) and model_input.batch_size:
-                # A sequence batch is padded to its longest member; strip each output back to its own valid
-                # residues so the result is the same whatever else shared the batch.
+            # A batch>1 sequence collate padded every member to the longest; drop each output's tail padding
+            # back to its own original length so the result is the same whatever else shared the batch. The
+            # collate reports per-item lengths; diffusion (batch=1) reports none, so nothing is trimmed.
+            lengths = data.get("lengths") if isinstance(data, Mapping) else None
+            if lengths is not None:
+                padded_length = max(lengths)
                 outputs = [
-                    _strip_residues(output, model_input[index].residue_mask)
+                    _trim_tail_padding(output, lengths[index], padded_length)
                     for index, output in enumerate(outputs)
                 ]
             return [self.to_device(output, torch.device("cpu")) for output in outputs]
