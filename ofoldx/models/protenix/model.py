@@ -1480,7 +1480,10 @@ class ProtenixConstraintModel(ProtenixModel):
     config: ProtenixConstraintConfig
 
     def __init__(self, config: ProtenixConstraintConfig | None = None) -> None:
-        super().__init__(ProtenixConstraintConfig() if config is None else config)
+        resolved = ProtenixConstraintConfig() if config is None else config
+        if not resolved.constraints:
+            raise ValueError("protenix_constraint requires constraints=True; it is the constraint architecture")
+        super().__init__(resolved)
 
 
 class ProtenixTemplateModel(ProtenixModel):
@@ -1496,7 +1499,10 @@ class ProtenixTemplateModel(ProtenixModel):
     config: ProtenixTemplateModelConfig
 
     def __init__(self, config: ProtenixTemplateModelConfig | None = None) -> None:
-        super().__init__(ProtenixTemplateModelConfig() if config is None else config)
+        resolved = ProtenixTemplateModelConfig() if config is None else config
+        if resolved.template is None:
+            raise ValueError("protenix_template requires a template graph; config.template must not be None")
+        super().__init__(resolved)
 
 
 class ProtenixNoisyStructureEmbedder(nn.Module):

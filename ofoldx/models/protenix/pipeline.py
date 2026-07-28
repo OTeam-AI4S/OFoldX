@@ -23,6 +23,7 @@ from .model import (
     ProtenixModel,
     ProtenixPocket,
     ProtenixStructureConditionModel,
+    ProtenixTemplateModel,
     ProtenixTfgGuidance,
     ProtenixTokenContact,
 )
@@ -105,7 +106,7 @@ class ProtenixPipeline(PairedPipeline[ProtenixModel, ProtenixProcessor]):
         )
 
 
-class ProtenixTemplatePipeline(PairedPipeline[ProtenixModel, ProtenixTemplateProcessor]):
+class ProtenixTemplatePipeline(PairedPipeline[ProtenixTemplateModel, ProtenixTemplateProcessor]):
     r"""
     Template- and RNA-MSA-capable structure prediction pipeline for Protenix v1 and v2.
     """

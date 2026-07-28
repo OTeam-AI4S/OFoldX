@@ -82,9 +82,10 @@ def denoising_criterion_factory(model: Any, processor: Any) -> Any:
     Build the coordinate-denoising criterion for a diffusion family, closed over the model's ``sigma_data``.
 
     The diffusion families share this criterion (they all expose the same augmented-frame
-    ``coordinates``/``augmented_target_coordinates``/``noise_level`` output); a family's
-    ``TrainingContract`` names it. The resolved-atom mask is rebuilt from the collated ``(input, target)``
-    pair at each call, and ``sigma_data`` is read once from ``model.config.denoiser.sigma_data``.
+    ``coordinates``/``augmented_target_coordinates``/``noise_level`` output); a family's architecture
+    registers it as its training ``criterion``. The resolved-atom mask is rebuilt from the collated
+    ``(input, target)`` pair at each call, and ``sigma_data`` is read once from
+    ``model.config.denoiser.sigma_data``.
     """
 
     sigma_data = float(model.config.denoiser.sigma_data)
