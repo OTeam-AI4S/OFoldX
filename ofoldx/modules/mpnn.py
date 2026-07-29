@@ -113,8 +113,10 @@ def nearest_neighbors(
     pair_mask = mask[:, :, None] * mask[:, None, :]
     distances = torch.sqrt(torch.sum((coords[:, :, None] - coords[:, None, :]) ** 2, dim=-1) + eps)
     distances = pair_mask * distances
+    # Push filler (masked) pairs strictly past the farthest real neighbor (``+ 1`` Angstrom), never merely
+    # tie with it, so ``topk`` can never displace a genuine neighbor with a filler slot.
     maximum = distances.max(dim=-1, keepdim=True).values
-    adjusted = distances + (1.0 - pair_mask) * maximum
+    adjusted = distances + (1.0 - pair_mask) * (maximum + 1.0)
     neighbor_distances, neighbor_indices = torch.topk(adjusted, num_neighbors, dim=-1, largest=False)
     # A neighbor is real only when both it and the query residue are valid; a filler (masked padding row) is 0.
     neighbor_valid = gather_nodes(mask.unsqueeze(-1), neighbor_indices).squeeze(-1) * mask[:, :, None]
@@ -337,6 +339,7 @@ def autoregressive_masks(
     decoding_ranks: Tensor,
     neighbor_indices: Tensor,
     residue_mask: Tensor,
+    neighbor_valid: Tensor,
 ) -> tuple[Tensor, Tensor]:
     r"""
     Build backward and forward neighbor masks directly from aligned causal ranks.
@@ -345,6 +348,10 @@ def autoregressive_masks(
         decoding_ranks: Per-residue decoding ranks with shape ``(B, N)``.
         neighbor_indices: Selected neighbor indices with shape ``(B, N, K)``.
         residue_mask: Valid-residue mask with shape ``(B, N)``.
+        neighbor_valid: Real-neighbor mask with shape ``(B, N, K)`` (0 for a filler slot padded in when a
+            structure is shorter than ``num_neighbors``). Filler slots must contribute no causal message,
+            exactly as they are masked in the encoder. For a structure at least ``num_neighbors`` long this is
+            all ones, so the masks are unchanged.
 
     Returns:
         Backward and forward masks with shape ``(B, N, K, 1)``.
@@ -352,7 +359,7 @@ def autoregressive_masks(
 
     neighbor_ranks = gather_nodes(decoding_ranks.unsqueeze(-1), neighbor_indices).squeeze(-1)
     backward = neighbor_ranks < decoding_ranks.unsqueeze(-1)
-    query_mask = residue_mask.unsqueeze(-1).unsqueeze(-1)
+    query_mask = residue_mask.unsqueeze(-1).unsqueeze(-1) * neighbor_valid.unsqueeze(-1)
     return (
         query_mask * backward.unsqueeze(-1),
         query_mask * (~backward).unsqueeze(-1),

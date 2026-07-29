@@ -333,7 +333,7 @@ class NaMpnnModel(Model):
         *,
         polymer_coordinate_noise: tuple[float, float, float] = (0.0, 0.0, 0.0),
         generator: torch.Generator | None = None,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         r"""
         Run the one coordinate encoder shared by every operation.
         """
@@ -371,13 +371,14 @@ class NaMpnnModel(Model):
         mask = input.residue_mask.to(dtype=node_states.dtype)
         for block in self.encoder_blocks:
             node_states, edge_states = block(node_states, edge_states, neighbor_indices, mask, attend_mask)
-        return node_states, edge_states, neighbor_indices
+        return node_states, edge_states, neighbor_indices, attend_mask
 
     def _decode_logits(
         self,
         node_states: Tensor,
         edge_states: Tensor,
         neighbor_indices: Tensor,
+        neighbor_valid: Tensor,
         sequence_tokens: Tensor,
         residue_mask: Tensor,
         decoding_ranks: Tensor,
@@ -394,6 +395,7 @@ class NaMpnnModel(Model):
             decoding_ranks,
             neighbor_indices,
             residue_mask.to(dtype=node_states.dtype),
+            neighbor_valid.to(dtype=node_states.dtype),
         )
         forward_context = forward_mask * encoder_context
         mask = residue_mask.to(node_states.dtype)
@@ -407,6 +409,7 @@ class NaMpnnModel(Model):
         node_states: Tensor,
         edge_states: Tensor,
         neighbor_indices: Tensor,
+        neighbor_valid: Tensor,
         residue_mask: Tensor,
     ) -> Tensor:
         r"""
@@ -416,7 +419,10 @@ class NaMpnnModel(Model):
         mask = residue_mask.to(dtype=node_states.dtype)
         encoder_edges = cat_neighbors_nodes(torch.zeros_like(node_states), edge_states, neighbor_indices)
         encoder_context = cat_neighbors_nodes(node_states, encoder_edges, neighbor_indices)
-        forward_context = mask[:, :, None, None] * encoder_context
+        # Gate the filler neighbor slots exactly as the encoder does, so a structure shorter than
+        # ``num_neighbors`` never sees a padded neighbor's message; all-ones for a full structure.
+        attend = neighbor_valid.to(dtype=node_states.dtype).unsqueeze(-1)
+        forward_context = mask[:, :, None, None] * attend * encoder_context
         states = node_states
         for block in self.decoder_blocks:
             states = block(states, forward_context, mask)
@@ -430,7 +436,7 @@ class NaMpnnModel(Model):
         dna_coordinate_noise: float = 0.0,
         rna_coordinate_noise: float = 0.0,
         generator: torch.Generator | None = None,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         r"""
         Encode a batch of mixed-polymer backbones as residue graph states.
 
@@ -443,7 +449,9 @@ class NaMpnnModel(Model):
 
         Returns:
             Node states with shape ``(B, L, H)``, edge states with shape
-            ``(B, L, K, H)``, and neighbor indices with shape ``(B, L, K)``.
+            ``(B, L, K, H)``, neighbor indices with shape ``(B, L, K)``, and the real-neighbor
+            mask with shape ``(B, L, K)`` (0 for a filler slot padded in when a structure is
+            shorter than ``num_neighbors``).
         """
 
         return self._encode(
@@ -490,7 +498,7 @@ class NaMpnnModel(Model):
             Vocabulary logits and the decoding ranks used for the forward pass.
         """
 
-        node_states, edge_states, neighbor_indices = self._encode(
+        node_states, edge_states, neighbor_indices, neighbor_valid = self._encode(
             input,
             polymer_coordinate_noise=(
                 protein_coordinate_noise,
@@ -505,6 +513,7 @@ class NaMpnnModel(Model):
             node_states,
             edge_states,
             neighbor_indices,
+            neighbor_valid,
             input.sequence_tokens,
             input.residue_mask,
             decoding_ranks,
@@ -569,7 +578,7 @@ class NaMpnnModel(Model):
         self._require_single_target(input)
         num_decoding_orders = self._validate_num_decoding_orders(num_decoding_orders)
         repeated = self._repeat_input(input, num_decoding_orders)
-        node_states, edge_states, neighbor_indices = self._encode(repeated)
+        node_states, edge_states, neighbor_indices, neighbor_valid = self._encode(repeated)
         if decoding_ranks is None:
             decoding_ranks = self._generate_ranks(
                 repeated.residue_mask,
@@ -581,6 +590,7 @@ class NaMpnnModel(Model):
             node_states,
             edge_states,
             neighbor_indices,
+            neighbor_valid,
             repeated.sequence_tokens,
             repeated.residue_mask,
             decoding_ranks,
@@ -608,11 +618,12 @@ class NaMpnnModel(Model):
         self._require_single_target(input)
         num_decoding_orders = self._validate_num_decoding_orders(num_decoding_orders)
         repeated = self._repeat_input(input, num_decoding_orders)
-        node_states, edge_states, neighbor_indices = self._encode(repeated)
+        node_states, edge_states, neighbor_indices, neighbor_valid = self._encode(repeated)
         logits = self._decode_unconditional_logits(
             node_states,
             edge_states,
             neighbor_indices,
+            neighbor_valid,
             repeated.residue_mask,
         )
         decoding_ranks = torch.zeros(
@@ -644,7 +655,9 @@ class NaMpnnModel(Model):
             input: One processed mixed-polymer target.
             num_samples: Number of sequences to sample.
             temperature: Positive sampling temperature.
-            decoding_ranks: Optional ranks with shape ``(num_samples, num_residues)``.
+            decoding_ranks: Optional ranks with shape ``(num_samples, num_residues)``. The sampler
+                decodes one causal order shared across the whole sample axis, so every row must be
+                identical; distinct per-sample orders are rejected with ``ValueError``.
             global_logit_bias: Optional bias with shape ``(vocabulary_size,)``.
             generator: Random generator used for orders and token sampling.
 
@@ -664,7 +677,7 @@ class NaMpnnModel(Model):
         length = repeated.sequence_tokens.shape[1]
         vocabulary = self.vocab_size
 
-        node_states, edge_states, neighbor_indices = self._encode(repeated)
+        node_states, edge_states, neighbor_indices, neighbor_valid = self._encode(repeated)
         if decoding_ranks is None:
             ranks = self._shared_ranks(
                 repeated.residue_mask,
@@ -674,12 +687,19 @@ class NaMpnnModel(Model):
             )
         else:
             ranks = decoding_ranks
+            # The incremental sampler decodes one causal order (``ranks[0]``) shared across the sample axis,
+            # so tied members stay simultaneous and only the multinomial draw differs per sample. Distinct
+            # per-sample rows would silently corrupt every sample past the first; reject them rather than
+            # honor an order the loop cannot follow.
+            if not torch.equal(ranks, ranks[:1].expand_as(ranks)):
+                raise ValueError("NaMpnn.sample decodes one shared order; decoding_ranks rows must be identical")
         hard_support = None if repeated.allowed_token_mask is None else repeated.allowed_token_mask.bool()
 
         backward_mask, forward_mask = autoregressive_masks(
             ranks,
             neighbor_indices,
             repeated.residue_mask.to(dtype=node_states.dtype),
+            neighbor_valid.to(dtype=node_states.dtype),
         )
         token_states = torch.zeros_like(node_states)
         encoder_edges = cat_neighbors_nodes(token_states, edge_states, neighbor_indices)
@@ -692,6 +712,7 @@ class NaMpnnModel(Model):
         sampling_probabilities = torch.zeros_like(log_probabilities)
 
         designed = (input.design_positions[0] & input.residue_mask[0]).tolist()
+        valid = input.residue_mask[0].tolist()
         tied_weights = repeated.tied_weights
         residue_bias = repeated.residue_logit_bias
         pair_bias = repeated.pair_logit_bias
@@ -736,6 +757,11 @@ class NaMpnnModel(Model):
             probabilities = F.softmax(total / temperature, dim=-1)
 
             generated_unit = all(designed[member] for member in members)
+            # A unit that mixes designed and fixed members is fixed to its anchor identity: the fixed
+            # members pin the whole unit's token, so every member takes the anchor rather than keeping
+            # its own input token (the processor rejects two fixed members with different identities).
+            anchor_members = [member for member in members if valid[member] and not designed[member]]
+            anchor = repeated.sequence_tokens[:, anchor_members[0]] if anchor_members and not generated_unit else None
             if generated_unit:
                 drawn = torch.multinomial(probabilities, 1, generator=generator)[:, 0]
             else:
@@ -745,6 +771,8 @@ class NaMpnnModel(Model):
                 keep = float(designed[member])
                 if generated_unit and drawn is not None:
                     token = drawn
+                elif anchor is not None:
+                    token = anchor
                 else:
                     token = repeated.sequence_tokens[:, member]
                 sequence_tokens[:, member] = token
@@ -1091,7 +1119,7 @@ class NaMpnnFeatures(nn.Module):
         protein_mask: Tensor,
         dna_mask: Tensor,
         rna_mask: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         r"""
         Build graph features from mixed-polymer coordinates.
 
@@ -1108,7 +1136,8 @@ class NaMpnnFeatures(nn.Module):
 
         Returns:
             Node features ``(B, N, C)``, neighbor-edge features ``(B, N, K, C)``,
-            and neighbor indices ``(B, N, K)``.
+            neighbor indices ``(B, N, K)``, and the real-neighbor mask ``(B, N, K)`` (the encoder's
+            ``attend_mask``: 1 for a real neighbor, 0 for a filler slot).
         """
 
         dtype = atom_coordinates.dtype

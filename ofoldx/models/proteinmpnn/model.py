@@ -291,7 +291,7 @@ class ProteinMpnnModel(Model):
         *,
         coordinate_noise: float,
         generator: torch.Generator | None,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         r"""
         Run the one coordinate encoder shared by every operation.
         """
@@ -325,13 +325,14 @@ class ProteinMpnnModel(Model):
                 mask,
                 attend_mask,
             )
-        return node_states, edge_states, neighbor_indices
+        return node_states, edge_states, neighbor_indices, attend_mask
 
     def _decode_logits(
         self,
         node_states: Tensor,
         edge_states: Tensor,
         neighbor_indices: Tensor,
+        neighbor_valid: Tensor,
         sequence_tokens: Tensor,
         residue_mask: Tensor,
         decoding_ranks: Tensor,
@@ -348,6 +349,7 @@ class ProteinMpnnModel(Model):
             decoding_ranks,
             neighbor_indices,
             residue_mask.to(dtype=node_states.dtype),
+            neighbor_valid.to(dtype=node_states.dtype),
         )
         forward_context = forward_mask * encoder_context
         for block in self.decoder_blocks:
@@ -364,6 +366,7 @@ class ProteinMpnnModel(Model):
         node_states: Tensor,
         edge_states: Tensor,
         neighbor_indices: Tensor,
+        neighbor_valid: Tensor,
         residue_mask: Tensor,
         decoding_ranks: Tensor,
     ) -> Tensor:
@@ -379,7 +382,9 @@ class ProteinMpnnModel(Model):
         token_states = torch.zeros_like(node_states)
         encoder_edges = cat_neighbors_nodes(token_states, edge_states, neighbor_indices)
         encoder_context = cat_neighbors_nodes(node_states, encoder_edges, neighbor_indices)
-        _, forward_mask = autoregressive_masks(decoding_ranks, neighbor_indices, mask)
+        _, forward_mask = autoregressive_masks(
+            decoding_ranks, neighbor_indices, mask, neighbor_valid.to(dtype=node_states.dtype)
+        )
         forward_context = forward_mask * encoder_context
         states = node_states
         for block in self.decoder_blocks:
@@ -392,7 +397,7 @@ class ProteinMpnnModel(Model):
         *,
         coordinate_noise: float = 0.0,
         generator: torch.Generator | None = None,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         r"""
         Encode a batch of protein backbones as residue graph states.
 
@@ -403,7 +408,8 @@ class ProteinMpnnModel(Model):
 
         Returns:
             Node states with shape ``(B, L, H)``, edge states with shape
-            ``(B, L, K, H)``, and neighbor indices with shape ``(B, L, K)``.
+            ``(B, L, K, H)``, neighbor indices with shape ``(B, L, K)``, and the
+            real-neighbor mask with shape ``(B, L, K)``.
         """
 
         return self._encode(
@@ -444,7 +450,7 @@ class ProteinMpnnModel(Model):
 
         if decoding_ranks is not None:
             self._assert_decoding_ranks(decoding_ranks, input.tied_group_ids)
-        node_states, edge_states, neighbor_indices = self._encode(
+        node_states, edge_states, neighbor_indices, neighbor_valid = self._encode(
             input.backbone_coordinates,
             input.residue_mask,
             input.residue_index,
@@ -464,6 +470,7 @@ class ProteinMpnnModel(Model):
             node_states,
             edge_states,
             neighbor_indices,
+            neighbor_valid,
             input.sequence_tokens,
             input.residue_mask,
             decoding_ranks,
@@ -535,7 +542,7 @@ class ProteinMpnnModel(Model):
         repeated = self._repeat_input(input, num_decoding_orders)
         if decoding_ranks is not None:
             self._assert_decoding_ranks(decoding_ranks, repeated.tied_group_ids)
-        node_states, edge_states, neighbor_indices = self._encode(
+        node_states, edge_states, neighbor_indices, neighbor_valid = self._encode(
             repeated.backbone_coordinates,
             repeated.residue_mask,
             repeated.residue_index,
@@ -554,6 +561,7 @@ class ProteinMpnnModel(Model):
             node_states,
             edge_states,
             neighbor_indices,
+            neighbor_valid,
             repeated.residue_mask,
             decoding_ranks,
         )
@@ -577,7 +585,7 @@ class ProteinMpnnModel(Model):
         num_decoding_orders = self._validate_num_decoding_orders(num_decoding_orders)
         repeated = self._repeat_input(input, num_decoding_orders)
         device = repeated.backbone_coordinates.device
-        node_states, edge_states, neighbor_indices = self._encode(
+        node_states, edge_states, neighbor_indices, neighbor_valid = self._encode(
             repeated.backbone_coordinates,
             repeated.residue_mask,
             repeated.residue_index,
@@ -636,6 +644,7 @@ class ProteinMpnnModel(Model):
                 node_states,
                 edge_states,
                 neighbor_indices,
+                neighbor_valid,
                 repeated.sequence_tokens,
                 repeated.residue_mask,
                 ranks,
@@ -905,7 +914,7 @@ class ProteinMpnnModel(Model):
         if decoding_ranks is not None:
             self._assert_decoding_ranks(decoding_ranks, repeated.tied_group_ids)
 
-        node_states, edge_states, neighbor_indices = self._encode(
+        node_states, edge_states, neighbor_indices, neighbor_valid = self._encode(
             repeated.backbone_coordinates,
             repeated.residue_mask,
             repeated.residue_index,
@@ -933,6 +942,7 @@ class ProteinMpnnModel(Model):
             ranks,
             neighbor_indices,
             repeated.residue_mask.to(dtype=node_states.dtype),
+            neighbor_valid.to(dtype=node_states.dtype),
         )
         token_states = torch.zeros_like(node_states)
         encoder_edges = cat_neighbors_nodes(token_states, edge_states, neighbor_indices)

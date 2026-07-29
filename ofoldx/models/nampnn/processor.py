@@ -495,6 +495,16 @@ class NaMpnnProcessor(Processor):
 
         allowed_token_mask = self._allowed_token_mask(rows, global_omit_tokens)
         for members in groups.values():
+            # A tie shares one decoding position, so a fixed member pins the whole unit to its identity.
+            # Two fixed members disagreeing over that identity is unsatisfiable; fail loud rather than let
+            # the sampler silently keep each member's own token.
+            fixed_identities = {
+                sequence_tokens[index]
+                for index in members
+                if rows[index][7] and not lowered_design_positions[index]
+            }
+            if len(fixed_identities) > 1:
+                raise ValueError("NA-MPNN cannot tie residues fixed to different identities")
             polymer_types = {rows[index][2] for index in members}
             exact_tie = any(
                 isinstance(condition, TiedResidueIdentities)

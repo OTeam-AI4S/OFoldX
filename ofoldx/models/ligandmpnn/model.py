@@ -290,7 +290,7 @@ class LigandMpnnModel(Model):
         coordinate_noise: float,
         use_sidechain_context: bool,
         generator: torch.Generator | None,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         r"""
         Run the coordinate/context encoder shared by every operation.
 
@@ -355,13 +355,14 @@ class LigandMpnnModel(Model):
             atom_nodes = self.atom_context_blocks[block_index](atom_nodes, atom_edges, atom_mask, atom_pair_mask)
             residue_context = block(residue_context, torch.cat((atom_context, atom_nodes), dim=-1), mask, atom_mask)
         node_states = node_states + self.context_norm(self.dropout(self.context_output(residue_context)))
-        return node_states, edge_states, neighbor_indices
+        return node_states, edge_states, neighbor_indices, attend_mask
 
     def _decode_logits(
         self,
         node_states: Tensor,
         edge_states: Tensor,
         neighbor_indices: Tensor,
+        neighbor_valid: Tensor,
         sequence_tokens: Tensor,
         residue_mask: Tensor,
         decoding_ranks: Tensor,
@@ -375,7 +376,9 @@ class LigandMpnnModel(Model):
         sequence_edges = cat_neighbors_nodes(token_states, edge_states, neighbor_indices)
         encoder_edges = cat_neighbors_nodes(torch.zeros_like(token_states), edge_states, neighbor_indices)
         encoder_context = cat_neighbors_nodes(node_states, encoder_edges, neighbor_indices)
-        backward_mask, forward_mask = autoregressive_masks(decoding_ranks, neighbor_indices, mask)
+        backward_mask, forward_mask = autoregressive_masks(
+            decoding_ranks, neighbor_indices, mask, neighbor_valid.to(dtype=node_states.dtype)
+        )
         forward_context = forward_mask * encoder_context
         for block in self.decoder_blocks:
             decoder_context = cat_neighbors_nodes(node_states, sequence_edges, neighbor_indices)
@@ -387,6 +390,7 @@ class LigandMpnnModel(Model):
         node_states: Tensor,
         edge_states: Tensor,
         neighbor_indices: Tensor,
+        neighbor_valid: Tensor,
         residue_mask: Tensor,
         decoding_ranks: Tensor,
     ) -> Tensor:
@@ -398,7 +402,9 @@ class LigandMpnnModel(Model):
         token_states = torch.zeros_like(node_states)
         encoder_edges = cat_neighbors_nodes(token_states, edge_states, neighbor_indices)
         encoder_context = cat_neighbors_nodes(node_states, encoder_edges, neighbor_indices)
-        _, forward_mask = autoregressive_masks(decoding_ranks, neighbor_indices, mask)
+        _, forward_mask = autoregressive_masks(
+            decoding_ranks, neighbor_indices, mask, neighbor_valid.to(dtype=node_states.dtype)
+        )
         forward_context = forward_mask * encoder_context
         states = node_states
         for block in self.decoder_blocks:
@@ -414,7 +420,7 @@ class LigandMpnnModel(Model):
         coordinate_noise: float = 0.0,
         use_sidechain_context: bool = False,
         generator: torch.Generator | None = None,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         r"""
         Encode a batch of protein-ligand inputs as residue graph states.
 
@@ -426,7 +432,8 @@ class LigandMpnnModel(Model):
 
         Returns:
             Node states with shape ``(B, L, H)``, edge states with shape
-            ``(B, L, K, H)``, and neighbor indices with shape ``(B, L, K)``.
+            ``(B, L, K, H)``, neighbor indices with shape ``(B, L, K)``, and the
+            real-neighbor mask with shape ``(B, L, K)``.
         """
 
         coordinate_noise = self._validate_coordinate_noise(coordinate_noise)
@@ -467,7 +474,7 @@ class LigandMpnnModel(Model):
         """
 
         coordinate_noise = self._validate_coordinate_noise(coordinate_noise)
-        node_states, edge_states, neighbor_indices = self._encode(
+        node_states, edge_states, neighbor_indices, neighbor_valid = self._encode(
             input,
             coordinate_noise=coordinate_noise,
             use_sidechain_context=use_sidechain_context,
@@ -481,6 +488,7 @@ class LigandMpnnModel(Model):
             node_states,
             edge_states,
             neighbor_indices,
+            neighbor_valid,
             input.sequence_tokens,
             input.residue_mask,
             decoding_ranks,
@@ -517,7 +525,7 @@ class LigandMpnnModel(Model):
         num_decoding_orders = self._validate_num_decoding_orders(num_decoding_orders)
         coordinate_noise = self._validate_coordinate_noise(coordinate_noise)
         repeated = self._repeat_input(input, num_decoding_orders)
-        node_states, edge_states, neighbor_indices = self._encode(
+        node_states, edge_states, neighbor_indices, neighbor_valid = self._encode(
             repeated,
             coordinate_noise=coordinate_noise,
             use_sidechain_context=use_sidechain_context,
@@ -528,6 +536,7 @@ class LigandMpnnModel(Model):
             node_states,
             edge_states,
             neighbor_indices,
+            neighbor_valid,
             repeated.sequence_tokens,
             repeated.residue_mask,
             ranks,
@@ -565,7 +574,7 @@ class LigandMpnnModel(Model):
         num_decoding_orders = self._validate_num_decoding_orders(num_decoding_orders)
         coordinate_noise = self._validate_coordinate_noise(coordinate_noise)
         repeated = self._repeat_input(input, num_decoding_orders)
-        node_states, edge_states, neighbor_indices = self._encode(
+        node_states, edge_states, neighbor_indices, neighbor_valid = self._encode(
             repeated,
             coordinate_noise=coordinate_noise,
             use_sidechain_context=use_sidechain_context,
@@ -576,6 +585,7 @@ class LigandMpnnModel(Model):
             node_states,
             edge_states,
             neighbor_indices,
+            neighbor_valid,
             repeated.residue_mask,
             ranks,
         )
@@ -601,7 +611,7 @@ class LigandMpnnModel(Model):
         coordinate_noise = self._validate_coordinate_noise(coordinate_noise)
         repeated = self._repeat_input(input, num_decoding_orders)
         device = repeated.backbone_coordinates.device
-        node_states, edge_states, neighbor_indices = self._encode(
+        node_states, edge_states, neighbor_indices, neighbor_valid = self._encode(
             repeated,
             coordinate_noise=coordinate_noise,
             use_sidechain_context=use_sidechain_context,
@@ -641,6 +651,7 @@ class LigandMpnnModel(Model):
                 node_states,
                 edge_states,
                 neighbor_indices,
+                neighbor_valid,
                 repeated.sequence_tokens,
                 repeated.residue_mask,
                 ranks,
@@ -798,7 +809,7 @@ class LigandMpnnModel(Model):
         coordinate_noise = self._validate_coordinate_noise(coordinate_noise)
 
         repeated = self._repeat_input(input, num_samples)
-        node_states, edge_states, neighbor_indices = self._encode(
+        node_states, edge_states, neighbor_indices, neighbor_valid = self._encode(
             repeated,
             coordinate_noise=coordinate_noise,
             use_sidechain_context=use_sidechain_context,
@@ -819,6 +830,7 @@ class LigandMpnnModel(Model):
                 node_states,
                 edge_states,
                 neighbor_indices,
+                neighbor_valid,
                 repeated.sequence_tokens,
                 residue_mask,
                 chain_mask,
@@ -839,6 +851,7 @@ class LigandMpnnModel(Model):
                 node_states,
                 edge_states,
                 neighbor_indices,
+                neighbor_valid,
                 repeated.sequence_tokens,
                 residue_mask,
                 chain_mask,
@@ -863,6 +876,7 @@ class LigandMpnnModel(Model):
         node_states: Tensor,
         edge_states: Tensor,
         neighbor_indices: Tensor,
+        neighbor_valid: Tensor,
         sequence_true: Tensor,
         residue_mask: Tensor,
         chain_mask: Tensor,
@@ -888,6 +902,7 @@ class LigandMpnnModel(Model):
             decoding_order_to_ranks(decode_order),
             neighbor_indices,
             residue_mask,
+            neighbor_valid.to(dtype=node_states.dtype),
         )
         encoder_edges = cat_neighbors_nodes(torch.zeros_like(token_states), edge_states, neighbor_indices)
         encoder_context = cat_neighbors_nodes(node_states, encoder_edges, neighbor_indices)
@@ -984,6 +999,7 @@ class LigandMpnnModel(Model):
         node_states: Tensor,
         edge_states: Tensor,
         neighbor_indices: Tensor,
+        neighbor_valid: Tensor,
         sequence_true: Tensor,
         residue_mask: Tensor,
         chain_mask: Tensor,
@@ -1015,11 +1031,17 @@ class LigandMpnnModel(Model):
             decoding_order_to_ranks(decode_order),
             neighbor_indices,
             residue_mask,
+            neighbor_valid.to(dtype=node_states.dtype),
         )
         encoder_edges = cat_neighbors_nodes(torch.zeros_like(token_states), edge_states, neighbor_indices)
         encoder_context = cat_neighbors_nodes(node_states, encoder_edges, neighbor_indices)
         forward_context = forward_mask * encoder_context
 
+        # LigandMPNN DELIBERATELY decodes a tied group as consecutive per-member ranks (each member gets
+        # its own distinct rank via ``_collapse_tied_order``/``decoding_order_to_ranks``), not one shared
+        # rank. This faithfully mirrors upstream LigandMPNN ``model_utils.py``, whose tied sampling walks a
+        # flat distinct-rank permutation and evaluates members one after another. It is why this differs
+        # from ProteinMPNN's shared-rank tied decode -- do NOT "unify" them, or upstream parity breaks.
         ordered_groups = _decode_groups(decode_order[0], [list(group) for group in tied_groups])
         for residue_group in ordered_groups:
             total_logits = node_states.new_zeros(num_samples, _VOCABULARY)
@@ -1439,6 +1461,11 @@ def _collapse_tied_order(
 ) -> Tensor:
     r"""
     Collapse a drawn order so every tied group decodes consecutively from its first member.
+
+    The members stay as a flat run of DISTINCT consecutive positions (each keeps its own rank once
+    :func:`decoding_order_to_ranks` runs), NOT one shared rank -- this faithfully mirrors upstream
+    LigandMPNN ``model_utils.py`` and is why LigandMPNN's tied decode differs from ProteinMPNN's
+    shared-rank scheme. Do not "unify" them, or upstream parity breaks.
     """
 
     ordered = _decode_groups(decode_order_row, [list(group) for group in tied_groups])
