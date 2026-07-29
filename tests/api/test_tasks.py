@@ -16,7 +16,7 @@ from ofoldx.pipelines.registry import PIPELINES
 
 
 class PairedConfig(chanfig.Config):
-    pass
+    size: int = 1
 
 
 class PairedModel(Model):
