@@ -503,18 +503,26 @@ class NaMpnnProcessor(Processor):
             )
             if exact_tie and len(polymer_types) != 1:
                 raise ValueError("NA-MPNN cannot tie exact residue identities across different polymer types")
-            declared: list[set[str]] = []
+            # A tie shares one decoding position, so allowed identities intersect in token space:
+            # token-symmetric nucleic identities (A/DA, ...) stay equivalent across a DNA/RNA tie
+            # instead of being rejected as different component IDs.
+            declared: list[set[int]] = []
             for index in members:
                 restriction = restrictions[index]
                 if restriction is not None:
-                    declared.append(restriction)
+                    polymer_type = rows[index][2]
+                    declared.append({self._component_token(component_id, polymer_type) for component_id in restriction})
             if declared:
                 allowed = set.intersection(*declared)
                 for index in members:
                     row = rows[index]
-                    supported = allowed & set(_GENERATED_COMPONENTS[row[2]])
+                    supported = {
+                        component_id
+                        for component_id in _GENERATED_COMPONENTS[row[2]]
+                        if self._component_token(component_id, row[2]) in allowed
+                    }
                     if not supported:
-                        if row[1] in allowed:
+                        if self._component_token(row[1], row[2]) in allowed:
                             lowered_design_positions[index] = False
                             continue
                         raise ValueError("NA-MPNN allowed identities contain no residue it can generate")
