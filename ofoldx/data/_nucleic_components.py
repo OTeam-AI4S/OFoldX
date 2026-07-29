@@ -721,6 +721,12 @@ COMPONENT_ROWS: Mapping[str, ComponentRows] = {
     ),
 }
 
+# Reference conformers are the wwPDB Chemical Component Dictionary ideal coordinates
+# (``pdbx_model_Cartn_*_ideal``), generated offline via ``ofoldx.data.ccd.build`` from the
+# pinned CCD snapshot -- the same canonical source ``ofoldx.data.ccd.resolve_ccd_component``
+# reads for arbitrary ligands. Each standard component carries a complete ideal conformer:
+# every heavy atom and every hydrogen. The ``N`` / ``DN`` generated placeholders are not CCD
+# entries and keep their own rows. Component construction aligns the rows to the atom tuple.
 REFERENCE_COORDINATE_ROWS: Mapping[str, _RawReferenceCoordinates] = {
     "A": (
         ("OP3", (2.135, -1.141, -5.313)),

@@ -935,13 +935,11 @@ COMPONENT_ROWS: Mapping[str, ComponentRows] = {
     ),
 }
 
-# Reference conformers from Biohub/transformers
-# src/transformers/models/esmfold2/protein_utils.py at revision
-# ef32577f55da19a4989cd7b22e004dc43a4998cb (Apache-2.0).
-#
-# These rows intentionally contain only coordinates published by Biohub. Component
-# construction aligns them to the complete atom tuple; every unlisted site becomes
-# None.
+# Reference conformers are the wwPDB Chemical Component Dictionary ideal coordinates
+# (``pdbx_model_Cartn_*_ideal``), generated offline via ``ofoldx.data.ccd.build`` from the
+# pinned CCD snapshot -- the same canonical source ``ofoldx.data.ccd.resolve_ccd_component``
+# reads for arbitrary ligands. Each standard component carries a complete ideal conformer:
+# every heavy atom and every hydrogen. Component construction aligns the rows to the atom tuple.
 REFERENCE_COORDINATE_ROWS: Mapping[str, _RawReferenceCoordinates] = {
     "ALA": (
         ("N", (-0.966, 0.493, 1.5)),
