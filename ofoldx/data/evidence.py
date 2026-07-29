@@ -9,8 +9,41 @@ from dataclasses import dataclass
 import numpy as np
 from numpy.typing import NDArray
 
-from .molecular import MolecularSystem, PolymerSequence
+from .molecular import _STANDARD_COMPONENTS, MolecularSystem, PolymerSequence, one_letter_to_component
 from .structure import Structure
+
+# Component IDs a one-letter alphabet names unambiguously, per polymer chemistry. Used to check an MSA
+# query row against its target sequence: only standard residues on both sides can genuinely conflict.
+_STANDARD_COMPONENT_IDS: dict[str, frozenset[str]] = {
+    polymer_type: frozenset(mapping.values()) for polymer_type, mapping in _STANDARD_COMPONENTS.items()
+}
+
+
+def _query_conflicts_with_entity(query: str, entity: PolymerSequence) -> int | None:
+    r"""
+    Locate the first query column whose residue chemistry contradicts the target sequence.
+
+    The MSA query row is the one-letter target sequence. A column conflicts only when the query symbol
+    and the bound target residue resolve to distinct *standard* components: a modified target residue the
+    one-letter alphabet cannot name, or a wildcard query symbol (``X`` and the other non-standard
+    conventions), is treated as agreeing. Returns the offending column index, or ``None`` when the query
+    is consistent with the target.
+    """
+
+    standard_ids = _STANDARD_COMPONENT_IDS.get(entity.polymer_type)
+    if standard_ids is None:
+        return None
+    for index, (symbol, component) in enumerate(zip(query, entity.components)):
+        target_id = component.component_id
+        if target_id not in standard_ids:
+            continue
+        try:
+            query_id = one_letter_to_component(symbol, entity.polymer_type, policy="strict")
+        except KeyError:
+            continue
+        if query_id != target_id:
+            return index
+    return None
 
 
 @dataclass(eq=False)
@@ -183,7 +216,8 @@ def resolve_msa_bindings(
 
     Raises:
         ValueError: If a referenced entity or instance is invalid, an instance belongs
-            to another entity, or an MSA width differs from its polymer length.
+            to another entity, an MSA width differs from its polymer length, or the MSA
+            query row disagrees with the target entity sequence.
     """
 
     resolved: list[tuple[MSA, str | None, PolymerSequence]] = []
@@ -200,10 +234,16 @@ def resolve_msa_bindings(
                     f"MSA target instance {target_instance_id!r} belongs to entity "
                     f"{target_entity_id!r}, not {column.entity_id!r}"
                 )
-        width = len(column.unpaired_sequences[0])
+        query = column.unpaired_sequences[0]
+        width = len(query)
         if width != len(entity):
             raise ValueError(
                 f"MSA for entity {column.entity_id!r} spans {width} columns but the entity has {len(entity)} components"
+            )
+        conflict = _query_conflicts_with_entity(query, entity)
+        if conflict is not None:
+            raise ValueError(
+                f"MSA query for entity {column.entity_id!r} disagrees with the target sequence at column {conflict}"
             )
         resolved.append((column, target_instance_id, entity))
     return tuple(resolved)

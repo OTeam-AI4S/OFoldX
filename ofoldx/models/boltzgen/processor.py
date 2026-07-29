@@ -15,7 +15,7 @@ from torch import Tensor
 
 from ...data.components import get_component
 from ...data.conditions import Contact, Endpoint
-from ...data.evidence import MSA, MSACollection, Template, msa_bindings
+from ...data.evidence import MSA, MSACollection, Template, msa_bindings, resolve_msa_bindings
 from ...data.molecular import (
     AtomSite,
     ChemicalComponent,
@@ -2443,8 +2443,11 @@ def _template_channels(
                     targets = (hit,)
                 else:
                     targets = tuple(entity_residue.get((alignment.target_entity_id, target_component), ()))
-                if not targets:
-                    continue
+                    if not targets:
+                        raise ValueError(
+                            f"BoltzGen template alignment target {alignment.target_entity_id!r}:"
+                            f"{target_component} does not resolve to a token"
+                        )
                 component = template_entity.components[template_component]
                 component_id = component.component_id
                 instance_id = alignment.template_instance_id
@@ -3067,17 +3070,9 @@ def _validate_msa(
 ) -> MSA | MSACollection | None:
     if msa is None:
         return None
-    values = (msa,) if isinstance(msa, MSA) else msa.msas
-    for value in values:
-        # Evidence holds no PolymerSequence: it names one entity by ``entity_id`` and closes over the
-        # primary system supplied here, so the Processor resolves the entity and checks its query width.
-        entity = system.entities.get(value.entity_id)
-        if not isinstance(entity, PolymerSequence):
-            raise ValueError(f"MSA entity {value.entity_id!r} disagrees with the input system")
-        width = len(value.unpaired_sequences[0])
-        if width != len(entity.components):
-            raise ValueError(
-                f"MSA for entity {value.entity_id!r} spans {width} columns but the entity has "
-                f"{len(entity.components)} components"
-            )
+    # Evidence holds no PolymerSequence: each column names one entity by ``entity_id`` (and an optional exact
+    # target instance) and closes over the primary system supplied here. The shared resolver binds the entity,
+    # verifies any exact target instance, and checks the query width and query chemistry against the target -- so
+    # an MSA bound to an unknown instance raises here instead of silently lowering to an all-gap row.
+    resolve_msa_bindings(msa, system)
     return msa
