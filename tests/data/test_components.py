@@ -252,12 +252,9 @@ def test_standard_protein_reference_coordinates_are_atom_aligned() -> None:
 
     for component in sequence.components:
         assert len(component.reference_coordinates) == len(component.atoms)
-        for atom, coordinate in zip(
-            component.atoms,
-            component.reference_coordinates,
-            strict=True,
-        ):
-            assert (coordinate is None) == (atom.element == "H" or atom.atom_id == "OXT")
+        # The reference is the complete wwPDB CCD ideal conformer: every atom -- heavy and
+        # hydrogen, including the terminal OXT -- carries an idealized position.
+        assert all(coordinate is not None for coordinate in component.reference_coordinates)
 
     alanine = get_component("ALA")
     coordinates = dict(
@@ -267,7 +264,9 @@ def test_standard_protein_reference_coordinates_are_atom_aligned() -> None:
             strict=True,
         )
     )
-    assert coordinates["N"] == (-0.01003183238208294, -1.2073018550872803, -1.0555061101913452)
+    assert coordinates["N"] == (-0.966, 0.493, 1.5)
+    # UNK is the unknown-residue placeholder: the checkpoint cannot generate its side chain, so it
+    # deliberately carries no reference conformer.
     assert get_component("UNK").reference_coordinates == ()
 
 
@@ -389,9 +388,9 @@ def test_standard_nucleic_components_are_complete_released_ccd_graphs() -> None:
         assert component.next_attachment is not None
         assert component.next_attachment.atom_id == "O3'"
         assert component.next_attachment.leaving_atom_ids == frozenset({"HO3'"})
-        for atom, coordinate in zip(component.atoms, component.reference_coordinates, strict=True):
-            is_model_atom = atom.element != "H" and atom.atom_id not in {"OP3", "HO3'"}
-            assert (coordinate is not None) == is_model_atom
+        # Complete CCD ideal conformer: every atom -- heavy and hydrogen, including the
+        # 5'-terminal OP3 -- has an idealized position.
+        assert all(coordinate is not None for coordinate in component.reference_coordinates)
 
     adenine = get_component("A")
     assert adenine.bonds is not None
