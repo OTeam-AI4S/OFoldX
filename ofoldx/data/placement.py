@@ -21,11 +21,23 @@ class GeneratedSegment:
         polymer_type: Chemistry of the generated polymer.
         min_length: Minimum number of generated components.
         max_length: Maximum number of generated components.
+
+    Raises:
+        ValueError: If the lengths do not satisfy ``0 <= min_length <= max_length``.
     """
 
     polymer_type: PolymerType
     min_length: int
     max_length: int
+
+    def __post_init__(self) -> None:
+        if self.min_length < 0:
+            raise ValueError(f"min_length must be >= 0, got {self.min_length}")
+        if self.max_length < self.min_length:
+            raise ValueError(
+                f"max_length must be >= min_length, got min_length={self.min_length}, "
+                f"max_length={self.max_length}"
+            )
 
 
 @dataclass(frozen=True)
@@ -37,11 +49,20 @@ class ExistingSpan:
         instance_id: Source molecular instance.
         start: Zero-based index of the first included component.
         stop: Zero-based index after the last included component.
+
+    Raises:
+        ValueError: If the bounds do not satisfy ``0 <= start <= stop``.
     """
 
     instance_id: str
     start: int
     stop: int
+
+    def __post_init__(self) -> None:
+        if self.start < 0:
+            raise ValueError(f"start must be >= 0, got {self.start}")
+        if self.stop < self.start:
+            raise ValueError(f"stop must be >= start, got start={self.start}, stop={self.stop}")
 
 
 #: A generated segment or copied source span.
