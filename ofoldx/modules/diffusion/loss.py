@@ -2,9 +2,11 @@ r"""
 Shared EDM coordinate-denoising training loss for the diffusion structure families.
 
 The internally-noising diffusion models (Boltz-1, Boltz-2, BoltzGen, Protenix) expose their denoised
-coordinates and the augmented training target on the same augmented frame, plus the per-sample noise
-level, so the canonical EDM denoising objective -- the ``1/c_out(sigma)**2``-weighted squared error
-between the two -- grounds directly against the model output.
+coordinates, the augmented training target, and the per-sample noise level, so the canonical EDM
+denoising objective -- the ``1/c_out(sigma)**2``-weighted squared error -- grounds directly against the
+model output. The target is rigidly aligned onto the prediction first (detached weighted Kabsch, as in
+AF3/Boltz/Protenix): the denoiser output is not exactly equivariant, so its global pose is not anchored
+to the augmented frame and the arbitrary augmentation rotation would otherwise be penalized.
 
 The loss is reduced over the *resolved* atoms only. ``input.atom_mask`` marks every atom slot in the
 padded layout, but unresolved/missing atoms carry no ground truth, so their augmented target coordinates
@@ -18,6 +20,8 @@ from __future__ import annotations
 from typing import Any
 
 from torch import Tensor
+
+from ..geometry import weighted_rigid_align
 
 
 def resolved_atom_mask(target: Any, model_input: Any) -> Tensor:
@@ -60,7 +64,8 @@ def edm_denoising_loss(pred: Any, resolved: Tensor, *, sigma_data: float) -> Ten
 
     Args:
         pred: A diffusion model output carrying ``coordinates`` and ``augmented_target_coordinates`` of
-            shape ``(B, S, A, 3)`` and ``noise_level`` of shape ``(B, S)``, all on the augmented frame.
+            shape ``(B, S, A, 3)`` and ``noise_level`` of shape ``(B, S)``. The target is rigidly aligned
+            onto the prediction before the squared error.
         resolved: The ``(B, A)`` resolved-atom mask from
             [`resolved_atom_mask`][ofoldx.modules.diffusion.loss.resolved_atom_mask].
         sigma_data: EDM data scale (from the model's ``config.denoiser.sigma_data``).
@@ -70,7 +75,20 @@ def edm_denoising_loss(pred: Any, resolved: Tensor, *, sigma_data: float) -> Ten
     accumulation/DDP reduction forms the true global per-atom mean.
     """
 
-    squared_error = (pred.coordinates - pred.augmented_target_coordinates).pow(2).sum(dim=-1)  # (B, S, A)
+    # Rigidly align the augmented target onto the prediction (per sample, over resolved atoms) before the
+    # MSE, as AF3/Boltz/Protenix -- and this repo's own BoltzGen loss -- do. The EDM output
+    # ``denoised = c_skip*noisy + c_out*update`` is dominated at high sigma by the non-equivariant network
+    # ``update``, whose global pose is NOT anchored to the augmented frame, so the arbitrary augmentation
+    # rotation must be aligned out rather than penalized. ``weighted_rigid_align`` is detached, so the
+    # gradient flows only through the prediction; unresolved atoms are zeroed and given zero weight so they
+    # neither bias nor NaN the fit.
+    resolved_atoms = resolved.bool()
+    aligned_target = weighted_rigid_align(
+        source=pred.augmented_target_coordinates.masked_fill(~resolved_atoms[:, None, :, None], 0),
+        target=pred.coordinates,
+        weight=resolved_atoms.to(pred.coordinates.dtype)[:, None, :],
+    )
+    squared_error = (pred.coordinates - aligned_target).pow(2).sum(dim=-1)  # (B, S, A)
     weight = edm_loss_weight(pred.noise_level, sigma_data).unsqueeze(-1)  # (B, S, 1)
     weighted_error = weight * squared_error  # (B, S, A)
     mask = resolved.to(weighted_error.dtype).unsqueeze(1).expand_as(weighted_error)  # (B, S, A)
