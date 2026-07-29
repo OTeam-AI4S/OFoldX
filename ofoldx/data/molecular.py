@@ -444,6 +444,45 @@ class SystemBond:
     origin: BondOrigin = "user"
 
 
+def _merge_physical_edge(existing: SystemBond, incoming: SystemBond) -> SystemBond:
+    r"""
+    Fold two canonically oriented bonds on the same physical edge into one.
+
+    An unspecified stereochemistry facet (``None``) is refined by the other bond;
+    order, aromaticity, and any specified stereochemistry must agree. ``incoming``
+    supplies the retained provenance, so folding a stored bond onto an intrinsic edge
+    keeps the stored origin while never dropping the intrinsic stereochemistry.
+
+    Raises:
+        ValueError: If the two bonds carry incompatible order, aromaticity, or
+            stereochemistry for the same physical edge.
+    """
+
+    def facet(name: str, existing_value: object, incoming_value: object) -> object:
+        if existing_value is not None and incoming_value is not None and existing_value != incoming_value:
+            raise ValueError(
+                f"conflicting {name} for physical edge {existing.site_a}-{existing.site_b}: "
+                f"{existing_value!r} vs {incoming_value!r}"
+            )
+        return existing_value if incoming_value is None else incoming_value
+
+    if existing.order != incoming.order:
+        raise ValueError(
+            f"conflicting order for physical edge {existing.site_a}-{existing.site_b}: "
+            f"{existing.order!r} vs {incoming.order!r}"
+        )
+    if existing.aromatic != incoming.aromatic:
+        raise ValueError(
+            f"conflicting aromaticity for physical edge {existing.site_a}-{existing.site_b}: "
+            f"{existing.aromatic!r} vs {incoming.aromatic!r}"
+        )
+    return replace(
+        incoming,
+        stereo=facet("stereo", existing.stereo, incoming.stereo),
+        stereo_sites=facet("stereo sites", existing.stereo_sites, incoming.stereo_sites),
+    )
+
+
 class MolecularSystem:
     r"""
     A coordinate-free assembly of molecular entities and instances.
@@ -481,10 +520,17 @@ class MolecularSystem:
         for bond in self.bonds:
             self.atom(bond.site_a)
             self.atom(bond.site_b)
+            if bond.site_a == bond.site_b:
+                raise ValueError("a system bond cannot connect an atom occurrence to itself")
             if bond.stereo_sites is not None:
                 stereo_a, stereo_b = bond.stereo_sites
                 self.atom(stereo_a)
                 self.atom(stereo_b)
+
+        # Materialize the physical graph once so genuinely conflicting chemistries for
+        # the same undirected edge fail loud here, at the construction boundary, rather
+        # than reconciling by hidden precedence when the graph is later consumed.
+        self._reconcile_edges()
 
     def component(self, reference: ComponentReference) -> ChemicalComponent:
         r"""
@@ -583,13 +629,26 @@ class MolecularSystem:
         r"""
         Iterate the complete known covalent graph as well-formed physical edges.
 
-        Component, molecule, polymer, and assembly-level bonds are reconciled into a
-        single undirected edge per atom pair: endpoints are canonically ordered, a
-        self-edge is dropped, and a duplicated or reversed edge is emitted once with a
-        later assembly-level bond overriding an earlier intrinsic one.
+        Component, molecule, polymer, and assembly-level bonds are materialized into a
+        single undirected edge per atom pair: endpoints are canonically ordered, the
+        intrinsic bond stereochemistry is preserved, and a stored assembly bond that
+        agrees with or refines an unspecified facet of an intrinsic edge is folded in
+        transparently. Genuine physical-edge conflicts are rejected at construction, so
+        this accessor applies no hidden precedence.
 
         Yields:
             One canonicalized system bond per physical edge.
+        """
+
+        yield from self._reconcile_edges().values()
+
+    def _reconcile_edges(self) -> dict[frozenset[tuple[str, int, str]], SystemBond]:
+        r"""
+        Materialize one canonical system bond per undirected physical edge.
+
+        Raises:
+            ValueError: If two bonds on the same physical edge carry incompatible
+                order, aromaticity, or stereochemistry.
         """
 
         realized = {site for site, _ in self.iter_atoms()}
@@ -600,8 +659,6 @@ class MolecularSystem:
 
         def reconcile(bond: SystemBond) -> None:
             key_a, key_b = site_key(bond.site_a), site_key(bond.site_b)
-            if key_a == key_b:
-                return  # a physical edge never connects an atom to itself
             if key_b < key_a:
                 bond = replace(
                     bond,
@@ -609,7 +666,9 @@ class MolecularSystem:
                     site_b=bond.site_a,
                     stereo_sites=None if bond.stereo_sites is None else bond.stereo_sites[::-1],
                 )
-            reconciled[frozenset((key_a, key_b))] = bond
+            key = frozenset((key_a, key_b))
+            existing = reconciled.get(key)
+            reconciled[key] = bond if existing is None else _merge_physical_edge(existing, bond)
 
         for instance_id, entity_id in self.instances.items():
             entity = self.entities[entity_id]
@@ -626,8 +685,15 @@ class MolecularSystem:
                                 site_b,
                                 order=bond.order,
                                 aromatic=bond.aromatic,
-                                stereo=None,
-                                stereo_sites=None,
+                                stereo=bond.stereo,
+                                stereo_sites=(
+                                    None
+                                    if bond.stereo_atoms is None
+                                    else (
+                                        AtomSite(instance_id, component_index, bond.stereo_atoms[0]),
+                                        AtomSite(instance_id, component_index, bond.stereo_atoms[1]),
+                                    )
+                                ),
                                 origin="component",
                             )
                         )
@@ -642,8 +708,15 @@ class MolecularSystem:
                                 site_b,
                                 order=molecule_bond.order,
                                 aromatic=molecule_bond.aromatic,
-                                stereo=None,
-                                stereo_sites=None,
+                                stereo=molecule_bond.stereo,
+                                stereo_sites=(
+                                    None
+                                    if molecule_bond.stereo_atoms is None
+                                    else (
+                                        AtomSite(instance_id, *molecule_bond.stereo_atoms[0]),
+                                        AtomSite(instance_id, *molecule_bond.stereo_atoms[1]),
+                                    )
+                                ),
                                 origin="molecule",
                             )
                         )
@@ -667,8 +740,10 @@ class MolecularSystem:
                                 )
                             )
 
-        # Stored assembly bonds win over intrinsic duplicates; sort so that conflicting
-        # or reversed stored edges reconcile to the same deterministic representative.
+        # Fold stored assembly bonds into their physical edge. Sort so that reversed or
+        # multiple stored edges materialize to the same deterministic representative;
+        # a stored bond that contradicts an intrinsic edge has already failed at
+        # construction, so the fold only agrees with or refines each edge here.
         for bond in sorted(
             self.bonds,
             key=lambda stored: (
@@ -681,7 +756,7 @@ class MolecularSystem:
         ):
             reconcile(bond)
 
-        yield from reconciled.values()
+        return reconciled
 
     def replace_components(
         self,
