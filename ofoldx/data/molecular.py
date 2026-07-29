@@ -5,7 +5,7 @@ Coordinate-free molecular values and exact occurrence references.
 from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal, TypeAlias
 
 #: Supported polymer chemistries.
@@ -581,13 +581,36 @@ class MolecularSystem:
 
     def iter_bonds(self) -> Iterator[SystemBond]:
         r"""
-        Iterate the complete known covalent graph.
+        Iterate the complete known covalent graph as well-formed physical edges.
+
+        Component, molecule, polymer, and assembly-level bonds are reconciled into a
+        single undirected edge per atom pair: endpoints are canonically ordered, a
+        self-edge is dropped, and a duplicated or reversed edge is emitted once with a
+        later assembly-level bond overriding an earlier intrinsic one.
 
         Yields:
-            Component, molecule, polymer, and assembly-level bonds as system bonds.
+            One canonicalized system bond per physical edge.
         """
 
         realized = {site for site, _ in self.iter_atoms()}
+        reconciled: dict[frozenset[tuple[str, int, str]], SystemBond] = {}
+
+        def site_key(site: AtomSite) -> tuple[str, int, str]:
+            return site.instance_id, site.component_index, site.atom_id
+
+        def reconcile(bond: SystemBond) -> None:
+            key_a, key_b = site_key(bond.site_a), site_key(bond.site_b)
+            if key_a == key_b:
+                return  # a physical edge never connects an atom to itself
+            if key_b < key_a:
+                bond = replace(
+                    bond,
+                    site_a=bond.site_b,
+                    site_b=bond.site_a,
+                    stereo_sites=None if bond.stereo_sites is None else bond.stereo_sites[::-1],
+                )
+            reconciled[frozenset((key_a, key_b))] = bond
+
         for instance_id, entity_id in self.instances.items():
             entity = self.entities[entity_id]
             for component_index, component in enumerate(entity.components):
@@ -597,28 +620,32 @@ class MolecularSystem:
                     site_a = AtomSite(instance_id, component_index, bond.atom_a)
                     site_b = AtomSite(instance_id, component_index, bond.atom_b)
                     if site_a in realized and site_b in realized:
-                        yield SystemBond(
-                            site_a,
-                            site_b,
-                            order=bond.order,
-                            aromatic=bond.aromatic,
-                            stereo=None,
-                            stereo_sites=None,
-                            origin="component",
+                        reconcile(
+                            SystemBond(
+                                site_a,
+                                site_b,
+                                order=bond.order,
+                                aromatic=bond.aromatic,
+                                stereo=None,
+                                stereo_sites=None,
+                                origin="component",
+                            )
                         )
             if isinstance(entity, Molecule):
                 for molecule_bond in entity.bonds:
                     site_a = AtomSite(instance_id, molecule_bond.component_a, molecule_bond.atom_a)
                     site_b = AtomSite(instance_id, molecule_bond.component_b, molecule_bond.atom_b)
                     if site_a in realized and site_b in realized:
-                        yield SystemBond(
-                            site_a,
-                            site_b,
-                            order=molecule_bond.order,
-                            aromatic=molecule_bond.aromatic,
-                            stereo=None,
-                            stereo_sites=None,
-                            origin="molecule",
+                        reconcile(
+                            SystemBond(
+                                site_a,
+                                site_b,
+                                order=molecule_bond.order,
+                                aromatic=molecule_bond.aromatic,
+                                stereo=None,
+                                stereo_sites=None,
+                                origin="molecule",
+                            )
                         )
             elif isinstance(entity, PolymerSequence):
                 for component_index in range(len(entity.components) - 1):
@@ -628,17 +655,33 @@ class MolecularSystem:
                         site_a = AtomSite(instance_id, component_index, left.next_attachment.atom_id)
                         site_b = AtomSite(instance_id, component_index + 1, right.previous_attachment.atom_id)
                         if site_a in realized and site_b in realized:
-                            yield SystemBond(
-                                site_a,
-                                site_b,
-                                order=1.0,
-                                aromatic=False,
-                                stereo=None,
-                                stereo_sites=None,
-                                origin="polymer_rule",
+                            reconcile(
+                                SystemBond(
+                                    site_a,
+                                    site_b,
+                                    order=1.0,
+                                    aromatic=False,
+                                    stereo=None,
+                                    stereo_sites=None,
+                                    origin="polymer_rule",
+                                )
                             )
 
-        yield from self.bonds
+        # Stored assembly bonds win over intrinsic duplicates; sort so that conflicting
+        # or reversed stored edges reconcile to the same deterministic representative.
+        for bond in sorted(
+            self.bonds,
+            key=lambda stored: (
+                tuple(sorted((site_key(stored.site_a), site_key(stored.site_b)))),
+                stored.order,
+                stored.aromatic,
+                stored.origin,
+                stored.stereo or "",
+            ),
+        ):
+            reconcile(bond)
+
+        yield from reconciled.values()
 
     def replace_components(
         self,
@@ -667,7 +710,7 @@ class MolecularSystem:
         changed_references = frozenset(
             reference
             for reference, replacement in replacements.items()
-            if self.component(reference).component_id != replacement.component_id
+            if self.component(reference) != replacement
         )
         instances_by_entity: dict[str, list[str]] = {entity_id: [] for entity_id in self.entities}
         for instance_id, entity_id in self.instances.items():
@@ -677,8 +720,11 @@ class MolecularSystem:
         entities: dict[str, PolymerSequence | Molecule] = {}
         instance_entities: dict[str, str] = {}
         for entity_id, original in self.entities.items():
-            original_signature = tuple(component.component_id for component in original.components)
-            groups: dict[tuple[str, ...], tuple[PolymerSequence | Molecule, list[str]]] = {}
+            # Group instances by the realized entity *value*: two occurrences that
+            # share a component_id signature but differ in chemical content diverge,
+            # and a same-id/different-content replacement is materialized rather than
+            # collapsed back onto the original.
+            groups: dict[PolymerSequence | Molecule, list[str]] = {}
             for instance_id in instances_by_entity[entity_id]:
                 components = tuple(
                     replacements.get((instance_id, index), component)
@@ -690,20 +736,16 @@ class MolecularSystem:
                     realized = PolymerSequence(original.polymer_type, components)
                 else:
                     realized = Molecule(components, original.bonds)
-                signature = tuple(component.component_id for component in components)
-                if signature in groups:
-                    groups[signature][1].append(instance_id)
+                if realized in groups:
+                    groups[realized].append(instance_id)
                 else:
-                    groups[signature] = (realized, [instance_id])
+                    groups[realized] = [instance_id]
 
-            primary_signature = original_signature if original_signature in groups else next(iter(groups))
-            ordered_signatures = (
-                primary_signature,
-                *(signature for signature in groups if signature != primary_signature),
-            )
-            for signature in ordered_signatures:
-                entity, instance_ids = groups[signature]
-                if signature == primary_signature:
+            primary = original if original in groups else next(iter(groups))
+            ordered_entities = (primary, *(entity for entity in groups if entity != primary))
+            for entity in ordered_entities:
+                instance_ids = groups[entity]
+                if entity == primary:
                     output_id = entity_id
                 else:
                     suffix = 2
@@ -712,7 +754,7 @@ class MolecularSystem:
                         suffix += 1
                         output_id = f"{entity_id}_{suffix}"
                     used_ids.add(output_id)
-                entities[output_id] = original if signature == original_signature else entity
+                entities[output_id] = entity
                 for instance_id in instance_ids:
                     instance_entities[instance_id] = output_id
 
