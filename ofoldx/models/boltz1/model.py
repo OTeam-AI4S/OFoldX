@@ -3578,7 +3578,7 @@ def _boltz1_confidence_scores(
         Mapping from score name to tensor (per-token metrics and per-sample complex/interface aggregates).
     """
 
-    plddt = _expected_metric(logits["plddt_logits"])
+    plddt = _expected_metric(logits["plddt_logits"], end=100.0)  # 0-100, shared with AF3/Protenix
     token_mask = input.token_mask.repeat_interleave(multiplicity, 0).to(plddt)
     complex_plddt = (plddt * token_mask).sum(dim=-1) / token_mask.sum(dim=-1).clamp_min(1)
 
@@ -3634,11 +3634,11 @@ def _boltz1_confidence_scores(
             ptm_scores["ptm"],
             ptm_scores["iptm"],
         )
-        scores["confidence_score"] = (ranking_plddt_weight * complex_plddt + ranking_ptm_weight * ptm_for_ranking) / (
-            ranking_plddt_weight + ranking_ptm_weight
-        )
+        scores["confidence_score"] = (
+            ranking_plddt_weight * (complex_plddt / 100.0) + ranking_ptm_weight * ptm_for_ranking
+        ) / (ranking_plddt_weight + ranking_ptm_weight)
     else:
-        scores["confidence_score"] = complex_plddt
+        scores["confidence_score"] = complex_plddt / 100.0
     return scores
 
 
@@ -3961,10 +3961,9 @@ def _decode_boltz1_fold_result(output: _Boltz1FoldOutput, input: Boltz1Input) ->
 
         sample_scores: dict[str, Score] = {}
         if complex_plddt is not None:
-            # Published pLDDT uses the shared 0-100 scale; the expected pLDDT is 0-1.
-            sample_scores["plddt"] = Score(float(complex_plddt[sample_index]) * 100.0, preferred="higher")
+            sample_scores["plddt"] = Score(float(complex_plddt[sample_index]), preferred="higher")
         if complex_iplddt is not None:
-            sample_scores["iplddt"] = Score(float(complex_iplddt[sample_index]) * 100.0, preferred="higher")
+            sample_scores["iplddt"] = Score(float(complex_iplddt[sample_index]), preferred="higher")
         if complex_pde is not None:
             sample_scores["pde"] = Score(float(complex_pde[sample_index]), unit="angstrom", preferred="lower")
         if complex_ipde is not None:
@@ -3982,7 +3981,7 @@ def _decode_boltz1_fold_result(output: _Boltz1FoldOutput, input: Boltz1Input) ->
 
         sample_metrics: dict[str, Metric] = {}
         if plddt is not None:
-            sample_metrics["plddt"] = Metric(values=plddt[sample_index] * 100.0, axis=token_axis)
+            sample_metrics["plddt"] = Metric(values=plddt[sample_index], axis=token_axis)
         if resolved_probability is not None:
             sample_metrics["resolved_probability"] = Metric(values=resolved_probability[sample_index], axis=token_axis)
 

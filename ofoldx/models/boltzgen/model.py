@@ -4022,7 +4022,7 @@ def _boltzgen_confidence_output(
     is_ligand_token = (molecule_type == 3).to(pae_logits)
     is_protein_token = (molecule_type == 0).to(pae_logits)
 
-    plddt = _boltzgen_expected_metric(plddt_logits)
+    plddt = _boltzgen_expected_metric(plddt_logits, end=100.0)  # 0-100, shared with AF3/Protenix
     if token_level_confidence:
         confidence_mask = token_mask
         complex_plddt = (plddt * confidence_mask).sum(dim=-1) / confidence_mask.sum(dim=-1)
@@ -4134,7 +4134,7 @@ def _boltzgen_confidence_output(
         tm_scores["ptm"],
         tm_scores["iptm"],
     )
-    confidence_score = (4 * complex_plddt + ranking_tm) / 5
+    confidence_score = (4 * (complex_plddt / 100.0) + ranking_tm) / 5
 
     def unflatten(value: Tensor) -> Tensor:
         return value.reshape(batch_size, multiplicity, *value.shape[1:])

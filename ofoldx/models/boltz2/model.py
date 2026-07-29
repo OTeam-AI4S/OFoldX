@@ -3269,13 +3269,13 @@ def _decode_boltz2_fold_result(output: Boltz2ConfidenceOutput, input: Boltz2Inpu
     protein_iptm = output.protein_iptm[0].float().cpu()
 
     # Interface confidence uses iPTM unless every iPTM value is zero, in which case it falls back to pTM.
-    # The confidence score combines that interface term with complex pLDDT on the 0-1 scale.
+    # The confidence score combines that interface term with complex pLDDT normalized back to 0-1.
     complex_plddt = output.complex_plddt[0].float().cpu()
     complex_iplddt = output.complex_iplddt[0].float().cpu()
     complex_pde = output.complex_pde[0].float().cpu()
     complex_ipde = output.complex_ipde[0].float().cpu()
     interface = ptm if torch.allclose(iptm, torch.zeros_like(iptm)) else iptm
-    confidence_score = (4.0 * complex_plddt + interface) / 5.0
+    confidence_score = (4.0 * (complex_plddt / 100.0) + interface) / 5.0
     has_design = bool(input.design_mask[0].any())
     design_scores = {
         "design_to_target_iptm": output.design_to_target_iptm[0].float().cpu(),
@@ -3305,7 +3305,7 @@ def _decode_boltz2_fold_result(output: Boltz2ConfidenceOutput, input: Boltz2Inpu
             coordinate_mask=coordinate_mask,
         )
         scores = {
-            "plddt": Score(float(complex_plddt[sample_index]) * 100.0, preferred="higher"),
+            "plddt": Score(float(complex_plddt[sample_index]), preferred="higher"),
             "ptm": Score(float(ptm[sample_index]), preferred="higher"),
             "iptm": Score(float(iptm[sample_index]), preferred="higher"),
             "ligand_iptm": Score(float(ligand_iptm[sample_index]), preferred="higher"),
@@ -3334,7 +3334,7 @@ def _decode_boltz2_fold_result(output: Boltz2ConfidenceOutput, input: Boltz2Inpu
                 structure=structure,
                 scores=scores,
                 metrics={
-                    "plddt": Metric(values=plddt_fraction[sample_index].numpy() * 100.0, axis=token_axis),
+                    "plddt": Metric(values=plddt_fraction[sample_index].numpy(), axis=token_axis),
                     "resolved_probability": Metric(values=resolved_probability[sample_index].numpy(), axis=token_axis),
                 },
                 pair_metrics={
@@ -3391,7 +3391,7 @@ def _boltz2_confidence_values(
         )
         + 0.5
     ) / plddt_bins
-    plddt = (plddt_logits.softmax(dim=-1) * plddt_centers).sum(dim=-1)
+    plddt = (plddt_logits.softmax(dim=-1) * plddt_centers).sum(dim=-1) * 100.0  # 0-100, shared with AF3/Protenix
     pae = _boltz2_expected_angstrom(pae_logits)
     pde = _boltz2_expected_angstrom(pde_logits)
 
