@@ -331,6 +331,13 @@ def load_model(
     """
 
     registration, values = model_values(repository.path)
+    unknown = sorted(set(values) - set(registration.model_config().keys()))
+    if unknown:
+        raise ValueError(
+            f"{registration.id} model.json has unknown config key(s) {unknown}: not fields of "
+            f"{registration.model_config.__name__}. A stale or misspelled key would otherwise be kept "
+            "verbatim while the real field silently used its default."
+        )
     config = registration.model_config(values)
     with torch.device("meta"):
         model = registration.model(config)

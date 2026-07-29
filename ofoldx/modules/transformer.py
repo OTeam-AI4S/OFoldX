@@ -388,6 +388,11 @@ def _run_blocks(
     if not blocks:
         return hidden
     *prefix, packed = bias.shape
+    if packed % len(blocks) != 0:
+        raise ValueError(
+            f"bias last-axis width {packed} is not divisible by the {len(blocks)} blocks; each block's bias "
+            "must be concatenated on the last axis (shape [..., num_blocks * per_block_width])"
+        )
     bias = bias.view(*prefix, len(blocks), packed // len(blocks))
     for index, block in enumerate(blocks):
         hidden = block(hidden, conditioning, bias[..., index, :], mask, to_keys)
