@@ -3633,8 +3633,16 @@ class EsmFold2DiffusionStructureHead(nn.Module):
         token_representations: Tensor | None = None
         atom_representations: Tensor | None = None
 
-        step_pairs = list(zip(schedule[:-1], schedule[1:], gammas[1:]))
+        # The schedule and gammas are precomputed and do not depend on the per-step denoiser output, so move
+        # them to host once (a single transfer) and iterate over plain Python floats. Reading them as tensors
+        # would otherwise force a device->host `.item()` sync on every sampling step.
+        schedule_values = schedule.tolist()
+        gamma_values = gammas.tolist()
+        step_pairs = list(zip(schedule_values[:-1], schedule_values[1:], gamma_values[1:]))
         num_steps = len(step_pairs)
+        # Reverse-diffusion alignment runs in full precision; derive the autocast device from the coordinate
+        # tensor so the sampler is correct on CPU (and any non-CUDA device) rather than hardcoding "cuda".
+        autocast_device_type = coordinates.device.type
 
         # The schedule is truncated at max_inference_sigma, and sampling may stop when
         # denoised-coordinate RMSD stabilizes, so the loop has a data-dependent step count.
@@ -3646,8 +3654,8 @@ class EsmFold2DiffusionStructureHead(nn.Module):
                 generator=generator,
             )
 
-            current_noise = float(current_noise_level.item())
-            augmented_noise = current_noise * (1.0 + float(churn_rate.item()))
+            current_noise = current_noise_level
+            augmented_noise = current_noise * (1.0 + churn_rate)
             churn_noise_std = applied_noise_scale * max(augmented_noise**2 - current_noise**2, 0.0) ** 0.5
             churn_noise = torch.randn(
                 coordinates.shape,
@@ -3684,7 +3692,7 @@ class EsmFold2DiffusionStructureHead(nn.Module):
                 atom_representations = cast(Tensor | None, denoiser_output["atom_intermediates"])
 
             # Reverse diffusion alignment (Kabsch)
-            with torch.autocast(device_type="cuda", enabled=False):
+            with torch.autocast(device_type=autocast_device_type, enabled=False):
                 noisy_coordinates = self._weighted_rigid_align(
                     noisy_coordinates.float(),
                     denoised_coordinates.float(),
@@ -3694,13 +3702,13 @@ class EsmFold2DiffusionStructureHead(nn.Module):
             noisy_coordinates = noisy_coordinates.to(dtype=denoised_coordinates.dtype)
 
             # ODE/SDE step
-            next_noise = float(next_noise_level.item())
+            next_noise = next_noise_level
             derivative = (noisy_coordinates - denoised_coordinates) / augmented_noise
             coordinates = noisy_coordinates + applied_step_scale * (next_noise - augmented_noise) * derivative
 
             # Denoising early-exit: stop when consecutive predictions converge
             if denoising_early_exit_rmsd is not None and previous_denoised_coordinates is not None and step_index >= 1:
-                with torch.autocast(device_type="cuda", enabled=False):
+                with torch.autocast(device_type=autocast_device_type, enabled=False):
                     aligned = self._weighted_rigid_align(
                         previous_denoised_coordinates.float(),
                         denoised_coordinates.float(),

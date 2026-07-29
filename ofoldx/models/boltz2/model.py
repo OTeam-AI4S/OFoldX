@@ -2521,6 +2521,18 @@ class Boltz2CoordinateDiffusion(nn.Module):
         scaled_guidance_update = (
             torch.zeros(shape, device=device, dtype=dtype) if physical_guidance or contact_guidance else None
         )
+        # `contact_guidance` defaults True, so the inner guidance loop would otherwise run its full
+        # `num_guidance_steps` sweep of gradient evaluations every step even when the input carries no
+        # constraint to guide toward. Physical potentials are coordinate-only and always contribute, but the
+        # contact and forced-template fields produce exactly zero gradient when absent, so decide once whether
+        # there is anything to guide (a single template `.any()` sync, hoisted out of the sampling loop).
+        guidance_active = physical_guidance or (
+            contact_guidance
+            and (
+                input.contact_pair_index.shape[-1] > 0
+                or (input.template_force is not None and bool(input.template_force.any()))
+            )
+        )
         denoised = None
         for index in range(len(sigmas) - 1):
             sigma_current, sigma_next, gamma = sigmas[index], sigmas[index + 1], gammas[index + 1]
@@ -2668,7 +2680,7 @@ class Boltz2CoordinateDiffusion(nn.Module):
                     dim=1,
                 )
 
-            if (physical_guidance or contact_guidance) and index < len(sigmas) - 2:
+            if guidance_active and index < len(sigmas) - 2:
                 guidance_update = torch.zeros_like(denoised)
                 for guidance_step in range(num_guidance_steps):
                     guidance_update = guidance_update - _boltz2_potential_gradient(
@@ -4419,7 +4431,9 @@ def _boltz2_template_gradient(
     for batch_index in range(batch_size):
         row_coordinates = coordinates_by_batch[batch_index]
         row_gradient = torch.zeros_like(row_coordinates)
-        if input.template_force is not None and bool(input.template_force[batch_index].any()):
+        # An all-False row selects zero templates below, so the template loop runs zero times and the row
+        # gradient stays zero; drop the per-row `.any()` guard, which forced a host sync on every step.
+        if input.template_force is not None:
             force = input.template_force[batch_index].to(
                 device=coordinates.device,
                 dtype=torch.bool,
