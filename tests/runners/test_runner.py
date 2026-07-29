@@ -165,9 +165,9 @@ def test_infer_step_returns_dataclass_output(tmp_path: Path) -> None:
     # output; the override runs the family inference entry point and returns the output(s).
     runner = Runner(_config(tmp_path, _write(tmp_path / "chain.pdb"), name="proteinmpnn"))
     try:
-        # Inference runs the ragged NestedTensor collate (what the infer dataloader uses), not the dense
-        # training collate: each structure runs at its own length for a topology-invariant forward.
-        batch = runner._infer_collate([runner.datasets["train"][0]])
+        # The sequence families collate to a ragged NestedTensor batch (train and infer alike); infer_step
+        # forwards it and un-nests one output per structure.
+        batch = runner.collate_fn([runner.datasets["train"][0]])
         output = runner.infer_step(batch)
         assert isinstance(output, list) and len(output) == 1
         assert type(output[0]).__name__ == "ProteinMpnnOutput"

@@ -20,7 +20,6 @@ native ``to_device``, and an ``infer_step`` that runs the family's inference ent
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import fields
 from typing import Any, cast
 
 import danling as dl
@@ -45,20 +44,24 @@ Infer = Callable[..., Any]
 
 def _decoding_priority(model_input: Any, indices: Any, base_seed: Any, device: Any) -> Any:
     r"""
-    Per-structure decoding priority ``(B, N)`` for the sequence families, one random draw per residue, seeded
+    Per-structure decoding priority ``(B, N)`` for a ragged sequence batch, one random draw per residue seeded
     by ``base_seed + global_index`` for each structure. Supplying it (rather than letting the model draw from a
     shared generator, whose sequential draws depend on batch order) is what makes a batched forward reproducible
     and independent of batch composition. Returns a ragged ``NestedTensor`` matching the ragged input, or
-    ``None`` (leaving the model to draw) when no seed/index is available or the batch is not a tensorclass.
+    ``None`` when there is no seed/index, the batch is not a tensorclass, or the batch is dense (a batch=1
+    single-structure family, which has no batch to be invariant to -- ``_forward_infer`` seeds its draw with a
+    generator instead).
     """
+
+    from danling import NestedTensor
 
     if base_seed is None or indices is None or not (is_tensorclass(model_input) and model_input.batch_size):
         return None
-    from danling import NestedTensor
-
+    if not isinstance(model_input.sequence_tokens, NestedTensor):
+        return None
     priorities = []
     for position, index in enumerate(indices):
-        length = int(model_input[position].residue_mask.shape[0])
+        length = int(model_input[position].sequence_tokens.shape[0])
         generator = torch.Generator(device=device).manual_seed(int(base_seed) + int(index))
         priorities.append(torch.rand(length, device=device, generator=generator))
     return NestedTensor(priorities)
@@ -67,10 +70,17 @@ def _decoding_priority(model_input: Any, indices: Any, base_seed: Any, device: A
 def _forward_infer(
     model: Any, model_input: Any, *, indices: Any = None, base_seed: Any = None, device: Any = None
 ) -> Any:
-    r"""Sequence inference is the plain forward over the whole (ragged) batch; the Runner seeds the
-    per-structure decoding priority by global index so each structure's design is topology-invariant."""
+    r"""Sequence inference is the plain forward over the whole batch. For a ragged batch the Runner supplies a
+    per-structure decoding priority seeded by global index; for a dense batch=1 family it seeds the model's own
+    draw with a generator (also by global index). Either way each structure's design is reproducible."""
 
-    return model(model_input, decoding_priority=_decoding_priority(model_input, indices, base_seed, device))
+    priority = _decoding_priority(model_input, indices, base_seed, device)
+    if priority is not None:
+        return model(model_input, decoding_priority=priority)
+    generator = None
+    if base_seed is not None and indices is not None:
+        generator = torch.Generator(device=device).manual_seed(int(base_seed) + int(indices[0]))
+    return model(model_input, generator=generator)
 
 
 def _sample_infer(
@@ -100,56 +110,23 @@ def _with_indices(collate: Collate) -> Collate:
     return collate_with_indices
 
 
-def _trim_tail_padding(output: Any, length: int, padded_length: int) -> Any:
-    r"""
-    Drop the collate's tail padding from one per-structure sequence Output: keep the first ``length`` rows
-    of every residue-aligned tensor field (leading axis == ``padded_length``). This removes only padding, so
-    unresolved/gap residues WITHIN ``length`` are preserved -- unlike a ``residue_mask`` index, which would
-    also delete those real rows. Non-residue fields pass through unchanged.
-    """
-
-    if length == padded_length:
-        return output
-    kept = {}
-    for field in fields(output):
-        value = getattr(output, field.name)
-        if isinstance(value, Tensor) and value.dim() >= 1 and value.shape[0] == padded_length:
-            kept[field.name] = value[:length]
-        else:
-            kept[field.name] = value
-    return type(output)(**kept, batch_size=[])
-
-
-#: Strategy name -> (build the TRAIN/eval collate, build the INFER collate, train-split lowering, infer-split
-#: lowering, inference entry point). Training reduces a masked loss whose softmax needs autograd, so the
-#: sequence families train on a dense (padded) batch; inference wants each structure at its own length, so it
-#: runs a ragged ``NestedTensor`` batch that is topology-invariant (no padding contamination). The diffusion
-#: families are batch=1 either way. The diffusion families lower the training splits to the ``(input, target)``
-#: the denoising loss needs, but the ``infer`` split to the plain Processor call so inference-only kwargs
-#: (``tfg_guidance``, ``placement``, ...) flow and no target is built. The only generic Runner-side training
-#: knowledge; a trainable arch registers a strategy.
-_STRATEGIES: dict[str, tuple[CollateBuilder, CollateBuilder, str, str, Infer]] = {
+#: Strategy name -> (build the collate from the registration's options, train-split lowering, infer-split
+#: lowering, inference entry point). The sequence families collate to a ragged ``NestedTensor`` batch for
+#: BOTH training and inference: each structure runs at its own length, so the training loss and inference are
+#: topology-invariant (no padding to contaminate the k-NN/attention), and inference un-nests per structure.
+#: The diffusion families are batch=1 and lower the training splits to the ``(input, target)`` the denoising
+#: loss needs, but the ``infer`` split to the plain Processor call so inference-only kwargs (``tfg_guidance``,
+#: ``placement``, ...) flow and no target is built. The only generic Runner-side training knowledge; a
+#: trainable arch registers a strategy.
+_STRATEGIES: dict[str, tuple[CollateBuilder, str, str, Infer]] = {
     "sequence": (
         lambda options: (lambda batch: _collate.collate_sequence(batch, **options)),
-        lambda options: (lambda batch: _collate.collate_sequence_ragged(batch, **options)),
         "call",
         "call",
         _forward_infer,
     ),
-    "sequence_single": (
-        lambda options: _collate.collate_sequence_single,
-        lambda options: (lambda batch: _collate.collate_sequence_ragged(batch)),
-        "call",
-        "call",
-        _forward_infer,
-    ),
-    "denoising": (
-        lambda options: _collate.collate_denoising,
-        lambda options: _collate.collate_denoising,
-        "process_training",
-        "call",
-        _sample_infer,
-    ),
+    "sequence_single": (lambda options: _collate.collate_sequence_single, "call", "call", _forward_infer),
+    "denoising": (lambda options: _collate.collate_denoising, "process_training", "call", _sample_infer),
 }
 
 
@@ -215,32 +192,13 @@ class Runner(dl.Runner):
         criterion, strategy = registration.criterion, registration.strategy
         assert criterion is not None and strategy is not None  # _resolve_registration enforced trainability
         self.criterion = criterion(self.model, self.processor)
-        build_train_collate, build_infer_collate, self._train_lower, self._infer_lower, self._infer = _STRATEGIES[
-            strategy
-        ]
-        self.collate_fn = _with_indices(build_train_collate(registration.collate_options))
-        self._infer_collate = _with_indices(build_infer_collate(registration.collate_options))
+        build_collate, self._train_lower, self._infer_lower, self._infer = _STRATEGIES[strategy]
+        self.collate_fn = _with_indices(build_collate(registration.collate_options))
         # DanLing toggles module mode from its ``mode`` setter (train_epoch/evaluate_epoch/infer set it), but
         # it fixed ``mode=train`` before this model existed, so the first train_epoch's mode=train is a no-op
         # that will not force train mode -- and a repository model loads in eval(). Establish train mode here.
         self.model.train()
         self.datasets.update(self.build_datasets())
-
-    def build_dataloaders(self) -> None:
-        r"""
-        Build the split dataloaders, then swap the non-train splits onto the ragged inference collate.
-
-        Training and evaluation reduce a masked per-residue loss whose softmax needs autograd, which a dense
-        (padded) forward supports, so they keep the dense ``collate_fn``. Inference wants each structure at its
-        own length: the pure-inference splits run the ragged ``NestedTensor`` collate, whose forward is
-        topology-invariant (independent of batch composition, no padding to contaminate the k-NN/attention).
-        ``collate_fn`` is set before any iterator is created, so the swap takes effect for every pass.
-        """
-
-        super().build_dataloaders()
-        for split, dataloader in self.dataloaders.items():
-            if split not in self.train_splits:
-                dataloader.collate_fn = self._infer_collate
 
     # -- construction --------------------------------------------------------
 

@@ -157,25 +157,16 @@ def _design_count(batched: Any) -> int:
     return int((batched.residue_mask & batched.design_positions).sum())
 
 
-def collate_sequence(batch: list[Any], *, token_pad_id: int, pair_bias_fields: Collection[str] = ()) -> dict[str, Any]:
-    r"""
-    Collate a batch_size>1 sequence family to DanLing's *training* batch (padded), normalized by designable
-    residues. Training reduces a masked per-residue loss whose softmax needs autograd, which a dense (padded)
-    forward supports; inference uses ``collate_sequence_ragged`` for the topology-invariant ragged forward.
-    """
-
-    batched = pad_and_collate(batch, token_pad_id=token_pad_id, pair_bias_fields=pair_bias_fields)
-    return {"input": batched, "target": batched, "loss_normalizer": _design_count(batched)}
-
-
-def collate_sequence_ragged(
+def collate_sequence(
     batch: list[Any], *, token_pad_id: int = 0, pair_bias_fields: Collection[str] = ()
 ) -> dict[str, Any]:
     r"""
-    Collate a sequence family to a ragged ``NestedTensor`` batch for INFERENCE: each structure runs at its own
-    length, so a prediction is topology-invariant (independent of what shared the batch) and un-nests with
-    ``prediction[i]`` -- no padding to trim. ``token_pad_id`` / ``pair_bias_fields`` are accepted for
-    registration compatibility but unused (a ragged batch has no padding to place).
+    Collate a sequence family to a ragged ``NestedTensor`` batch, normalized by designable residues. Each
+    structure runs at its own length, so BOTH the training loss and inference are topology-invariant
+    (independent of what shared the batch, no padded rows to contaminate the k-NN/attention); inference
+    un-nests per structure (``prediction[i]``) with no tail-padding to trim. ``token_pad_id`` /
+    ``pair_bias_fields`` are accepted for registration compatibility but unused (a ragged batch has no
+    padding to place).
     """
 
     del token_pad_id, pair_bias_fields
@@ -185,16 +176,13 @@ def collate_sequence_ragged(
 
 def collate_sequence_single(batch: list[Any]) -> dict[str, Any]:
     r"""
-    Collate a batch_size=1 sequence family (e.g. LigandMPNN's single-structure Input) to DanLing's batch.
+    Collate a batch_size=1 sequence family (e.g. LigandMPNN's single-structure Input) to DanLing's batch. A
+    single structure has no batch to be topology-invariant to and no padding, so it stays dense; the Runner
+    seeds its decoding-order draw by the structure's global index for reproducibility.
     """
 
     batched = collate_single(batch)
-    return {
-        "input": batched,
-        "target": batched,
-        "loss_normalizer": _design_count(batched),
-        "lengths": [int(batched.sequence_tokens.shape[1])],
-    }
+    return {"input": batched, "target": batched, "loss_normalizer": _design_count(batched)}
 
 
 def collate_denoising(batch: list[Any]) -> dict[str, Any]:
