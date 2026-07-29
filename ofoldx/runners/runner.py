@@ -228,11 +228,14 @@ class Runner(dl.Runner):
     def _build(self, repository: Any, registration: ModelRegistration) -> tuple[Model, Processor]:
         r"""Instantiate the resolved architecture: load the repository snapshot, or build a fresh pair."""
 
+        from ..hub import build_registered_config
+
         model_config = self.config.model
         if model_config.pretrained:
             return self._build_from_repository(repository)
         overrides = {key: value for key, value in model_config.items() if key not in ("name", "pretrained", "revision")}
-        model = registration.model(registration.model_config(**overrides))
+        config = build_registered_config(registration.model_config, overrides, f"{registration.id} config overrides")
+        model = registration.model(config)
         processor = self._build_processor(registration, model)
         return model, processor
 

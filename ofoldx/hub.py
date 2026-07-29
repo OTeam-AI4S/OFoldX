@@ -6,10 +6,10 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from os import PathLike
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import TYPE_CHECKING, NamedTuple, NoReturn, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, NoReturn, cast
 
 import torch
 
@@ -310,6 +310,37 @@ def model_values(path: Path) -> tuple[ModelRegistration, dict[str, object]]:
     return registered, values
 
 
+def build_registered_config(config_class: Any, values: Mapping[str, object], source: str) -> Any:
+    r"""
+    Construct a registered config from repository or override values, rejecting unknown keys.
+
+    Every path that reconstructs a config from untrusted values (a loaded model.json,
+    processor.json, or fresh-training overrides) must reject a key that is not a field of the
+    config, so a stale or misspelled key fails loudly here instead of being kept verbatim while
+    the real field silently uses its default.
+
+    Args:
+        config_class: The registered ``Config`` subclass to construct.
+        values: The candidate key/value pairs.
+        source: A human-readable origin used in the error (e.g. ``"boltz1 model.json"``).
+
+    Returns:
+        The constructed config.
+
+    Raises:
+        ValueError: If ``values`` contains a key that is not a field of ``config_class``.
+    """
+
+    unknown = sorted(set(values) - set(config_class().keys()))
+    if unknown:
+        raise ValueError(
+            f"{source} has unknown config key(s) {unknown}: not fields of {config_class.__name__}. "
+            "A stale or misspelled key would otherwise be kept verbatim while the real field silently "
+            "used its default."
+        )
+    return config_class(dict(values))
+
+
 def load_model(
     repository: ResolvedRepository,
     *,
@@ -331,14 +362,7 @@ def load_model(
     """
 
     registration, values = model_values(repository.path)
-    unknown = sorted(set(values) - set(registration.model_config().keys()))
-    if unknown:
-        raise ValueError(
-            f"{registration.id} model.json has unknown config key(s) {unknown}: not fields of "
-            f"{registration.model_config.__name__}. A stale or misspelled key would otherwise be kept "
-            "verbatim while the real field silently used its default."
-        )
-    config = registration.model_config(values)
+    config = build_registered_config(registration.model_config, values, f"{registration.id} model.json")
     with torch.device("meta"):
         model = registration.model(config)
     return load_registered_model(
@@ -467,7 +491,8 @@ def load_registered_processor(
         return registration.processor(device=device, dtype=resolved_dtype)
 
     processor = cast(Callable[..., Processor], registration.processor)
-    return processor(processor_config(values), device=device, dtype=resolved_dtype)
+    config = build_registered_config(processor_config, values, f"{registration.id} processor.json")
+    return processor(config, device=device, dtype=resolved_dtype)
 
 
 def _weight_map(path: Path) -> dict[str, str]:

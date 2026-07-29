@@ -19,6 +19,7 @@ from ..artifacts import clear_model_subrepositories, save_model
 from ..hub import (
     PROCESSOR_METADATA,
     ResolvedRepository,
+    build_registered_config,
     hydrate_weights,
     load_registered_model,
     load_registered_processor,
@@ -239,7 +240,7 @@ class CompositePipeline:
                     f"{cls.__name__} {pair.subdirectory or 'root'} requires architecture {pair.architecture!r}; "
                     f"repository declares {registration.id!r}"
                 )
-            config = registration.model_config(values)
+            config = build_registered_config(registration.model_config, values, f"{registration.id} model.json")
             with torch.device("meta"):
                 model = registration.model(config)
             processor = load_registered_processor(
