@@ -720,10 +720,30 @@ def _author_dense_index(source: Structure) -> dict[str, dict[tuple[int, str], in
     return author_dense
 
 
+def _resolve_author_numbering(
+    source: Structure | None,
+    author_numbering: Mapping[str, Mapping[tuple[int, str], int]] | None,
+) -> Mapping[str, Mapping[tuple[int, str], int]]:
+    r"""
+    Resolve the author-number → dense-index mapping used to rebase existing subcons.
+
+    A ``source`` structure is inverted through [`_author_dense_index`][]; otherwise the caller's
+    explicit ``author_numbering`` map is used verbatim. When neither is supplied the mapping is
+    empty and any author-numbered existing subcon is rejected.
+    """
+
+    if source is not None:
+        return _author_dense_index(source)
+    if author_numbering is not None:
+        return author_numbering
+    return {}
+
+
 def _source_chain_length(
     instance_id: str,
     source: Structure | None,
     source_instances: Mapping[str, int] | None,
+    author_dense: Mapping[str, Mapping[tuple[int, str], int]],
 ) -> int:
     r"""
     Resolve a bare source chain to its dense component count.
@@ -734,9 +754,12 @@ def _source_chain_length(
         if entity_id is None:
             raise ValueError(f"bare source chain {instance_id!r} is absent from the source structure")
         return len(source.system.entities[entity_id].components)
-    if source_instances is None or instance_id not in source_instances:
-        raise ValueError(f"bare source chain {instance_id!r} needs its length in source_instances")
-    return source_instances[instance_id]
+    if source_instances is not None and instance_id in source_instances:
+        return source_instances[instance_id]
+    chain = author_dense.get(instance_id)
+    if chain is not None:
+        return len(chain)
+    raise ValueError(f"bare source chain {instance_id!r} needs its length in source_instances or author_numbering")
 
 
 def _existing_bounds(sub: str, extent: str) -> tuple[int, int]:
@@ -788,11 +811,30 @@ def _rebase_existing_span(
     return dense_start, dense_end + 1
 
 
+def _dense_author_index(
+    author_dense: Mapping[str, Mapping[tuple[int, str], int]],
+) -> dict[str, dict[int, int]]:
+    r"""
+    Invert an author → dense mapping to ``instance_id -> dense index -> author number``.
+
+    Insertion codes are dropped: the contig grammar names only the bare author number, mirroring the
+    ``(number, "")`` lookup that [`_rebase_existing_span`][] performs on the parse side.
+    """
+
+    dense_author: dict[str, dict[int, int]] = {}
+    for instance_id, chain in author_dense.items():
+        inverse = dense_author.setdefault(instance_id, {})
+        for (number, _insertion), dense in chain.items():
+            inverse[dense] = number
+    return dense_author
+
+
 def from_contig_string(
     contigs: str,
     *,
     source: Structure | None = None,
     source_instances: Mapping[str, int] | None = None,
+    author_numbering: Mapping[str, Mapping[tuple[int, str], int]] | None = None,
 ) -> tuple[PlacementSpec, tuple[int, int] | None]:
     r"""
     Parse an RFdiffusion contig string into a core ``PlacementSpec``.
@@ -813,16 +855,19 @@ def from_contig_string(
     [`RfDiffusionLayout.combined_length`][] and is ``None`` when the string generates
     nothing.
 
-    RFdiffusion contig residue numbers are author (external PDB) labels, whereas
+    RFdiffusion contig residue numbers are ALWAYS author (external PDB) labels, whereas
     [`ExistingSpan`][ofoldx.data.placement.ExistingSpan] extents are the core's zero-based dense
-    component indices. When ``source`` is given, explicit extents such as ``A163-181`` are rebased
-    onto that structure's dense indices — mirroring upstream RFdiffusion's ``pdb_idx`` lookup and
-    handling insertion codes — and bare chains resolve to their whole dense length. When ``source``
-    is absent the numbers are taken to already be dense (e.g. a ``to_contig_string`` round-trip) and
-    ``source_instances`` (source chain-letter → dense length) resolves the bare-chain ``A`` form to
-    ``ExistingSpan("A", 0, length)``. Lossless into ``(PlacementSpec, combined_length)``
-    (the precise reference/output permutation, when needed, projects to ordered length-1
-    spans).
+    component indices. An explicit extent such as ``A163-181`` therefore always denotes author
+    numbering and requires either a ``source`` structure or an explicit ``author_numbering`` map to
+    rebase it onto dense indices — mirroring upstream RFdiffusion's ``pdb_idx`` lookup and handling
+    insertion codes. The contig token never silently switches to a dense-literal meaning based on
+    whether ``source`` was supplied; ``ExistingSpan`` keeps its single zero-based dense contract, and
+    [`to_contig_string`][ofoldx.models.rfdiffusion.to_contig_string] consumes the same mapping to
+    re-emit author numbers, so the string is symmetric under a round-trip. Bare chains resolve to
+    their whole dense length via ``source``, ``source_instances`` (chain-letter → dense length) or
+    the length of the chain's ``author_numbering`` entry. Lossless into
+    ``(PlacementSpec, combined_length)`` (the precise reference/output permutation, when needed,
+    projects to ordered length-1 spans).
 
     Args:
         contigs: Space- and slash-delimited RFdiffusion contig expression.
@@ -830,20 +875,24 @@ def from_contig_string(
             existing subcons onto dense component indices.
         source_instances: Optional source-chain dense lengths used to resolve bare chain references
             when no ``source`` structure is supplied.
+        author_numbering: Optional explicit ``instance_id -> (author number, insertion code) ->
+            dense index`` mapping, used in place of ``source`` to rebase author-numbered existing
+            subcons (e.g. a ``to_contig_string`` round-trip without a full structure).
 
     Returns:
         The placement specification and optional combined generated-length bounds.
 
     Raises:
         ValueError: If a contig is malformed, a bare chain has no supplied length, or an
-            author-numbered subcon does not map onto a contiguous dense run of ``source``.
+            author-numbered existing subcon has no numbering mapping or does not map onto a
+            contiguous dense run.
     """
 
     placement: PlacementSpec = {}
     generated_min = 0
     generated_max = 0
     has_generated = False
-    author_dense = _author_dense_index(source) if source is not None else {}
+    author_dense = _resolve_author_numbering(source, author_numbering)
     blocks = contigs.split()
     for block_index, block in enumerate(blocks):
         group_key = f"chain_{block_index + 1}"
@@ -860,19 +909,19 @@ def from_contig_string(
                 instance_id = sub[:split]
                 extent = sub[split:]
                 if extent == "":
-                    start, stop = 0, _source_chain_length(instance_id, source, source_instances)
-                elif source is None:
-                    # Without a source structure the contig numbers are already the core's 0-based
-                    # dense component indices (e.g. a ``to_contig_string`` round-trip), so they are
-                    # carried literally: ``A0-18 -> ExistingSpan("A", 0, 19)``.
-                    author_start, author_end = _existing_bounds(sub, extent)
-                    start, stop = author_start, author_end + 1
+                    start, stop = 0, _source_chain_length(instance_id, source, source_instances, author_dense)
                 else:
-                    # RFdiffusion ``contig`` residue numbers are author (external PDB) labels; rebase
-                    # them onto the source's dense 0-based component indices, mirroring upstream
+                    # RFdiffusion ``contig`` residue numbers are ALWAYS author (external PDB) labels;
+                    # rebase them onto the core's dense 0-based component indices, mirroring upstream
                     # RFdiffusion's ``pdb_idx`` lookup: ``A163-181`` over dense rows ``0..18`` becomes
-                    # ``ExistingSpan("A", 0, 19)``.
+                    # ``ExistingSpan("A", 0, 19)``. There is no source-less dense-literal shortcut —
+                    # an author extent needs its numbering mapping regardless of how it was supplied.
                     author_start, author_end = _existing_bounds(sub, extent)
+                    if not author_dense:
+                        raise ValueError(
+                            f"existing subcon {sub!r} is author-numbered and needs a source structure "
+                            f"or author_numbering mapping to rebase onto dense component indices"
+                        )
                     start, stop = _rebase_existing_span(instance_id, author_start, author_end, author_dense, sub)
                 if start < 0 or stop < start:
                     raise ValueError(f"malformed existing subcon {sub!r}")
@@ -900,31 +949,60 @@ def from_contig_string(
 
 def to_contig_string(
     placement: PlacementSpec,
+    *,
+    source: Structure | None = None,
+    author_numbering: Mapping[str, Mapping[tuple[int, str], int]] | None = None,
 ) -> str:
     r"""
     Re-emit an RFdiffusion ``contigs`` string from a core ``PlacementSpec``.
 
-    Each declaration group → one space-separated block; each placement → one ``/``-subcon
-    (``ExistingSpan("A", 163, 182)`` → ``A163-181`` half-open → inclusive;
-    ``GeneratedSegment(min, max)`` → ``min-max`` or the bare ``min`` when fixed, so a
-    zero-length placement emits ``0``). The combined-length setting is not part of
-    the ``contigs`` grammar. The re-emission is lossless for TOPOLOGY (fixed vs
-    generated, order, lengths) and lossy for RF-index spacing and receptor-vs-inpaint role,
-    which the contig string does not encode.
+    Each declaration group → one space-separated block; each placement → one ``/``-subcon.
+    ``ExistingSpan`` extents are the core's zero-based dense component indices, whereas the contig
+    grammar names author (external PDB) residue numbers, so each existing span's dense endpoints are
+    mapped back to author numbers through the same ``source`` / ``author_numbering`` mapping that
+    [`from_contig_string`][ofoldx.models.rfdiffusion.from_contig_string] consumes — an existing span
+    over dense rows ``0..18`` numbered ``163..181`` re-emits as ``A163-181`` (half-open → inclusive).
+    ``GeneratedSegment(min, max)`` → ``min-max`` or the bare ``min`` when fixed, so a zero-length
+    placement emits ``0``. The combined-length setting is not part of the ``contigs`` grammar. The
+    re-emission is lossless for TOPOLOGY (fixed vs generated, order, lengths) and lossy for RF-index
+    spacing and receptor-vs-inpaint role, which the contig string does not encode.
 
     Args:
         placement: Core placement specification to encode.
+        source: Optional source structure whose author numbering re-emits existing spans as author
+            numbers.
+        author_numbering: Optional explicit ``instance_id -> (author number, insertion code) ->
+            dense index`` mapping, used in place of ``source`` to name existing-span endpoints.
 
     Returns:
         The equivalent RFdiffusion contig expression.
+
+    Raises:
+        ValueError: If the placement holds an existing span but no ``source`` / ``author_numbering``
+            mapping names that chain, or the span's dense endpoints have no author number.
     """
 
+    dense_author = _dense_author_index(_resolve_author_numbering(source, author_numbering))
     blocks: list[str] = []
     for group in placement.values():
         subcons: list[str] = []
         for value in group.values():
             if isinstance(value, ExistingSpan):
-                subcons.append(f"{value.instance_id}{value.start}-{value.stop - 1}")
+                chain = dense_author.get(value.instance_id)
+                if chain is None:
+                    raise ValueError(
+                        f"existing span over chain {value.instance_id!r} needs a source structure or "
+                        f"author_numbering mapping to re-emit author numbers"
+                    )
+                try:
+                    start_number = chain[value.start]
+                    end_number = chain[value.stop - 1]
+                except KeyError as missing:
+                    raise ValueError(
+                        f"existing span over chain {value.instance_id!r} has dense index "
+                        f"{missing.args[0]} absent from its author numbering"
+                    ) from None
+                subcons.append(f"{value.instance_id}{start_number}-{end_number}")
             else:
                 if value.min_length == value.max_length:
                     subcons.append(str(value.min_length))
