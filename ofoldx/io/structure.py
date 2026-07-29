@@ -666,7 +666,12 @@ def _build_structure(
             raise ValueError(
                 f"source element {row.element!r} disagrees with component atom {atom.element!r} at {site!r}"
             )
-        if row.charge is not None and row.charge != atom.formal_charge:
+        # ``pdbx_formal_charge`` defaults to 0 in deposited mmCIF and is rarely assigned, so a
+        # source 0 is "unspecified", not a claim of neutrality: it must not conflict with an
+        # audited ionization charge (e.g. ARG ``NH2`` / HIS ``ND1`` / LYS ``NZ`` carry +1). The
+        # audited component charge is authoritative and is the value actually used; only a
+        # genuinely conflicting *nonzero* source charge is a real disagreement worth rejecting.
+        if row.charge not in (None, 0) and row.charge != atom.formal_charge:
             raise ValueError(
                 f"source formal charge {row.charge!r} disagrees with component atom "
                 f"{atom.formal_charge!r} at {site!r}"
