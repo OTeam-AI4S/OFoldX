@@ -15,7 +15,7 @@ from torch import Tensor
 
 from ...data.components import get_component
 from ...data.conditions import Contact, Endpoint
-from ...data.evidence import MSA, MSACollection, Template
+from ...data.evidence import MSA, MSACollection, Template, msa_bindings
 from ...data.molecular import (
     AtomSite,
     ChemicalComponent,
@@ -2384,12 +2384,16 @@ def _template_channels(
     # Resolve a query token index for a polymer residue named by instance or by entity (a copy count).
     instance_residue: dict[tuple[str, int], int] = {}
     entity_residue: dict[tuple[str, int], list[int]] = {}
+    instance_entities: dict[str, str] = {}
     for token_index, token in enumerate(tokens):
         monomer_index = cast("int | None", token["monomer_index"])
         if monomer_index is None:
             continue
-        instance_residue[(cast(str, token["instance_id"]), monomer_index)] = token_index
-        entity_residue.setdefault((cast(str, token["entity_id"]), monomer_index), []).append(token_index)
+        instance_id = cast(str, token["instance_id"])
+        entity_id = cast(str, token["entity_id"])
+        instance_entities[instance_id] = entity_id
+        instance_residue[(instance_id, monomer_index)] = token_index
+        entity_residue.setdefault((entity_id, monomer_index), []).append(token_index)
 
     tdim = len(templates)
     residue_type_ids = torch.zeros(tdim, token_count, dtype=torch.long)
@@ -2416,11 +2420,27 @@ def _template_channels(
             if not isinstance(template_entity, PolymerSequence):
                 raise ValueError("a BoltzGen template alignment must reference a polymer instance")
             polymer_type = template_entity.polymer_type
+            if alignment.target_instance_id is not None:
+                actual_entity_id = instance_entities.get(alignment.target_instance_id)
+                if actual_entity_id is None:
+                    raise ValueError(
+                        f"BoltzGen template alignment targets unknown instance {alignment.target_instance_id!r}"
+                    )
+                if actual_entity_id != alignment.target_entity_id:
+                    raise ValueError(
+                        f"BoltzGen template alignment instance {alignment.target_instance_id!r} belongs to entity "
+                        f"{actual_entity_id!r}, not {alignment.target_entity_id!r}"
+                    )
             for target_component, template_component in alignment.residue_pairs:
                 targets: tuple[int, ...]
                 if alignment.target_instance_id is not None:
                     hit = instance_residue.get((alignment.target_instance_id, target_component))
-                    targets = () if hit is None else (hit,)
+                    if hit is None:
+                        raise ValueError(
+                            f"BoltzGen template alignment target {alignment.target_instance_id!r}:"
+                            f"{target_component} does not resolve to a token"
+                        )
+                    targets = (hit,)
                 else:
                     targets = tuple(entity_residue.get((alignment.target_entity_id, target_component), ()))
                 if not targets:
@@ -2655,7 +2675,8 @@ def _msa_features(
         # a token's monomer index is directly the aligned-row column, and cells are UPPERCASE one-letter
         # symbols (or ``-``). A bare MSA is a single-chain plan over its unpaired pool; a collection replays
         # its dense ``row_pairing`` and ``row_is_paired`` plan across the paired and unpaired pools.
-        columns = (msa,) if isinstance(msa, MSA) else msa.msas
+        bindings = msa_bindings(msa)
+        columns = tuple(value for value, _target_instance_id in bindings)
         if isinstance(msa, MSA):
             plan_rows: list[tuple[tuple[int, int, bool], ...]] = [
                 ((0, row_index, False),) for row_index in range(len(msa.unpaired_sequences))
@@ -2688,13 +2709,18 @@ def _msa_features(
             )
             for column_index, source_row, is_paired in selections:
                 value = columns[column_index]
+                target_instance_id = bindings[column_index][1]
                 polymer_type = polymer_types[value.entity_id]
                 aligned = value.paired_sequences[source_row] if is_paired else value.unpaired_sequences[source_row]
                 deletion_source = (value.paired_deletion_counts if is_paired else value.unpaired_deletion_counts)[
                     source_row
                 ]
                 for token_index, token in enumerate(tokens):
-                    if token["entity_id"] != value.entity_id or token["monomer_index"] is None:
+                    if (
+                        token["entity_id"] != value.entity_id
+                        or (target_instance_id is not None and token["instance_id"] != target_instance_id)
+                        or token["monomer_index"] is None
+                    ):
                         continue
                     monomer_index = cast(int, token["monomer_index"])
                     row[token_index] = _msa_symbol_restype(aligned[monomer_index], polymer_type)

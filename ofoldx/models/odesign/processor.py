@@ -16,7 +16,7 @@ from torch import Tensor
 from ...data.bonds import SymbolicBond
 from ...data.components import get_component
 from ...data.conditions import Hotspot
-from ...data.evidence import MSA, MSACollection
+from ...data.evidence import MSA, MSACollection, msa_bindings
 from ...data.molecular import (
     AtomSite,
     ChemicalComponent,
@@ -2123,17 +2123,18 @@ def _msa_features(
             dim=-1,
         ).unsqueeze(0)
         return features, torch.ones(1, token_count, dtype=torch.bool), profile, deletion_mean
-    msas = (msa,) if isinstance(msa, MSA) else msa.msas
+    bindings = msa_bindings(msa)
+    msas = tuple(value for value, _target_instance_id in bindings)
     # The MSA holds no PolymerSequence: column ``c`` binds ``msas[c].entity_id`` to a system entity and
     # ``query_to_entity`` is the identity map, so a token's component index is the aligned-row column.
-    # ``polymer_types[c]`` resolves the one-letter-symbol lowering; ``tokens_by_entity`` groups every
-    # token (across all instances of an entity, matching the old value-equality broadcast) by entity_id.
+    # ``polymer_types[c]`` resolves the one-letter-symbol lowering; ``tokens_by_entity`` groups every token
+    # by entity_id and keeps each token's instance, so a column bound to one exact instance skips its siblings.
     polymer_types = [cast(PolymerSequence, system.entities[value.entity_id]).polymer_type for value in msas]
-    tokens_by_entity: dict[str, list[tuple[int, int]]] = {}
+    tokens_by_entity: dict[str, list[tuple[int, int, str]]] = {}
     for token_index, residue in enumerate(token_residues):
         if residue is None:
             continue
-        tokens_by_entity.setdefault(system.instances[residue[0]], []).append((token_index, residue[1]))
+        tokens_by_entity.setdefault(system.instances[residue[0]], []).append((token_index, residue[1], residue[0]))
     # A bare MSA replays its unpaired pool (row 0 is the query); a collection replays its dense
     # row_pairing/row_is_paired plan, selecting the paired or unpaired pool per column (``-1`` = gap).
     if isinstance(msa, MSA):
@@ -2158,12 +2159,15 @@ def _msa_features(
         deletion_row = torch.zeros(token_count)
         for column_index, source_row, is_paired in selections:
             value = msas[column_index]
+            target_instance_id = bindings[column_index][1]
             polymer_type = polymer_types[column_index]
             aligned = value.paired_sequences[source_row] if is_paired else value.unpaired_sequences[source_row]
             aligned_deletions = (value.paired_deletion_counts if is_paired else value.unpaired_deletion_counts)[
                 source_row
             ]
-            for token_index, column in tokens_by_entity.get(value.entity_id, ()):
+            for token_index, column, instance_id in tokens_by_entity.get(value.entity_id, ()):
+                if target_instance_id is not None and instance_id != target_instance_id:
+                    continue
                 token_row[token_index] = _msa_symbol_token(aligned[column], polymer_type)
                 deletion_row[token_index] = float(aligned_deletions[column])
         rows.append(token_row)
