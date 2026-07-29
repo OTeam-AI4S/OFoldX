@@ -708,9 +708,90 @@ def _fold_features(
     return secondary, F.one_hot(block, num_classes=3).to(torch.float32)
 
 
+def _author_dense_index(source: Structure) -> dict[str, dict[tuple[int, str], int]]:
+    r"""
+    Invert ``Structure.residue_numbers`` to ``instance_id -> (author number, insertion) -> dense``.
+    """
+
+    author_dense: dict[str, dict[tuple[int, str], int]] = {}
+    for (instance_id, component_index), residue_number in (source.residue_numbers or {}).items():
+        chain = author_dense.setdefault(instance_id, {})
+        chain[(residue_number.number, residue_number.insertion_code)] = component_index
+    return author_dense
+
+
+def _source_chain_length(
+    instance_id: str,
+    source: Structure | None,
+    source_instances: Mapping[str, int] | None,
+) -> int:
+    r"""
+    Resolve a bare source chain to its dense component count.
+    """
+
+    if source is not None:
+        entity_id = source.system.instances.get(instance_id)
+        if entity_id is None:
+            raise ValueError(f"bare source chain {instance_id!r} is absent from the source structure")
+        return len(source.system.entities[entity_id].components)
+    if source_instances is None or instance_id not in source_instances:
+        raise ValueError(f"bare source chain {instance_id!r} needs its length in source_instances")
+    return source_instances[instance_id]
+
+
+def _existing_bounds(sub: str, extent: str) -> tuple[int, int]:
+    r"""
+    Parse an existing subcon extent into inclusive lower and upper residue numbers.
+    """
+
+    bounds = extent.split("-")
+    if len(bounds) == 1:
+        low = high = int(bounds[0])
+    elif len(bounds) == 2:
+        low, high = int(bounds[0]), int(bounds[1])
+    else:
+        raise ValueError(f"malformed existing subcon {sub!r}")
+    if high < low:
+        raise ValueError(f"malformed existing subcon {sub!r}")
+    return low, high
+
+
+def _rebase_existing_span(
+    instance_id: str,
+    author_start: int,
+    author_end: int,
+    author_dense: Mapping[str, Mapping[tuple[int, str], int]],
+    sub: str,
+) -> tuple[int, int]:
+    r"""
+    Rebase an inclusive author-numbered range onto a half-open dense component span.
+    """
+
+    chain = author_dense.get(instance_id)
+    if chain is None:
+        raise ValueError(f"existing subcon {sub!r} references source chain {instance_id!r} with no author numbering")
+    try:
+        dense_start = chain[(author_start, "")]
+        dense_end = chain[(author_end, "")]
+    except KeyError as missing:
+        raise ValueError(
+            f"existing subcon {sub!r} names author residue {missing.args[0][0]} "
+            f"absent from source chain {instance_id!r}"
+        ) from None
+    # The contiguous dense span the endpoints bound must hold exactly the residues whose author
+    # number falls in the range; otherwise the span would silently pull in unrelated dense rows.
+    selected = sorted(dense for (number, _), dense in chain.items() if author_start <= number <= author_end)
+    if selected != list(range(dense_start, dense_end + 1)):
+        raise ValueError(
+            f"existing subcon {sub!r} does not map to a contiguous residue run of source chain {instance_id!r}"
+        )
+    return dense_start, dense_end + 1
+
+
 def from_contig_string(
     contigs: str,
     *,
+    source: Structure | None = None,
     source_instances: Mapping[str, int] | None = None,
 ) -> tuple[PlacementSpec, tuple[int, int] | None]:
     r"""
@@ -720,9 +801,9 @@ def from_contig_string(
     Each space-separated block becomes one declaration group (``chain_1``, ``chain_2``,
     …); each ``/``-subcon becomes one placement:
 
-    * ``A163-181`` → ``ExistingSpan("A", 163, 182)`` (inclusive → half-open), ``A5`` →
-      ``ExistingSpan("A", 5, 6)``, a bare ``A`` → the whole source chain
-      ``ExistingSpan("A", 0, source_instances["A"])``;
+    * ``A163-181`` → an ``ExistingSpan`` over chain ``"A"`` (inclusive → half-open), ``A5`` → a
+      single-residue span, a bare ``A`` → the whole source chain
+      ``ExistingSpan("A", 0, chain_length)``;
     * ``10-40`` → ``GeneratedSegment("protein", 10, 40)``; ``10`` → ``min == max == 10``;
       ``0`` → ``min == max == 0`` (chain break / receptor terminator).
 
@@ -730,28 +811,39 @@ def from_contig_string(
     the combined generated-length bounds ``(Σ min, Σ max)``
     across every generated subcon, excluding ``ExistingSpan`` rows. It is stored on
     [`RfDiffusionLayout.combined_length`][] and is ``None`` when the string generates
-    nothing. ``source_instances`` (source chain-letter →
-    length) resolves the bare-chain ``A`` form to ``ExistingSpan("A", 0, length)``; explicit
-    ``A163-181`` extents are carried literally rather than rebased to zero-based component indices.
-    Lossless into ``(PlacementSpec, combined_length)``
+    nothing.
+
+    RFdiffusion contig residue numbers are author (external PDB) labels, whereas
+    [`ExistingSpan`][ofoldx.data.placement.ExistingSpan] extents are the core's zero-based dense
+    component indices. When ``source`` is given, explicit extents such as ``A163-181`` are rebased
+    onto that structure's dense indices — mirroring upstream RFdiffusion's ``pdb_idx`` lookup and
+    handling insertion codes — and bare chains resolve to their whole dense length. When ``source``
+    is absent the numbers are taken to already be dense (e.g. a ``to_contig_string`` round-trip) and
+    ``source_instances`` (source chain-letter → dense length) resolves the bare-chain ``A`` form to
+    ``ExistingSpan("A", 0, length)``. Lossless into ``(PlacementSpec, combined_length)``
     (the precise reference/output permutation, when needed, projects to ordered length-1
     spans).
 
     Args:
         contigs: Space- and slash-delimited RFdiffusion contig expression.
-        source_instances: Optional source-chain lengths used to resolve bare chain references.
+        source: Optional source structure whose retained author numbering rebases author-numbered
+            existing subcons onto dense component indices.
+        source_instances: Optional source-chain dense lengths used to resolve bare chain references
+            when no ``source`` structure is supplied.
 
     Returns:
         The placement specification and optional combined generated-length bounds.
 
     Raises:
-        ValueError: If a contig is malformed or a bare chain has no supplied length.
+        ValueError: If a contig is malformed, a bare chain has no supplied length, or an
+            author-numbered subcon does not map onto a contiguous dense run of ``source``.
     """
 
     placement: PlacementSpec = {}
     generated_min = 0
     generated_max = 0
     has_generated = False
+    author_dense = _author_dense_index(source) if source is not None else {}
     blocks = contigs.split()
     for block_index, block in enumerate(blocks):
         group_key = f"chain_{block_index + 1}"
@@ -768,24 +860,22 @@ def from_contig_string(
                 instance_id = sub[:split]
                 extent = sub[split:]
                 if extent == "":
-                    if source_instances is None or instance_id not in source_instances:
-                        raise ValueError(f"bare source chain {instance_id!r} needs its length in source_instances")
-                    start, stop = 0, source_instances[instance_id]
+                    start, stop = 0, _source_chain_length(instance_id, source, source_instances)
+                elif source is None:
+                    # Without a source structure the contig numbers are already the core's 0-based
+                    # dense component indices (e.g. a ``to_contig_string`` round-trip), so they are
+                    # carried literally: ``A0-18 -> ExistingSpan("A", 0, 19)``.
+                    author_start, author_end = _existing_bounds(sub, extent)
+                    start, stop = author_start, author_end + 1
                 else:
-                    bounds = extent.split("-")
-                    if len(bounds) == 1:
-                        start = stop = int(bounds[0])
-                    elif len(bounds) == 2:
-                        start, stop = int(bounds[0]), int(bounds[1])
-                    else:
-                        raise ValueError(f"malformed existing subcon {sub!r}")
-                    stop += 1  # inclusive bound -> half-open stop
+                    # RFdiffusion ``contig`` residue numbers are author (external PDB) labels; rebase
+                    # them onto the source's dense 0-based component indices, mirroring upstream
+                    # RFdiffusion's ``pdb_idx`` lookup: ``A163-181`` over dense rows ``0..18`` becomes
+                    # ``ExistingSpan("A", 0, 19)``.
+                    author_start, author_end = _existing_bounds(sub, extent)
+                    start, stop = _rebase_existing_span(instance_id, author_start, author_end, author_dense, sub)
                 if start < 0 or stop < start:
                     raise ValueError(f"malformed existing subcon {sub!r}")
-                # RFdiffusion ``contig`` residue numbers are external PDB labels and are carried
-                # literally into the ExistingSpan
-                # ``A163-181 -> ExistingSpan("A", 163, 182)``), so no upper-bound check against
-                # source length is applied — the numbering base is not the core's 0-based index.
                 group[placement_id] = ExistingSpan(instance_id, start, stop)
             else:
                 bounds = sub.split("-")
