@@ -362,6 +362,7 @@ class CoordinateEdmSampler(nn.Module):
                     coords, augmentation_transform = self._center_random_augmentation(
                         coords,
                         num_samples=1,
+                        atom_mask=context.atom_mask,
                         generator=generator,
                     )
                     coords = coords.squeeze(dim=-3)
