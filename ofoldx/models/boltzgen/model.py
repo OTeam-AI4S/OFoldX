@@ -3642,16 +3642,16 @@ class BoltzGenInverseFoldingDecoder(nn.Module):
         src, dst = edge_index[0], edge_index[1]
         with torch.no_grad():
             # Teacher forcing with random per-edge visibility: an edge reveals its source residue type only when
-            # rand[src] < rand[dst], so each node sees a random subset of neighbour identities.
+            # rand[src] < rand[dst], so each node sees a random subset of neighbor identities.
             rand = torch.rand(node.shape[0], device=node.device, generator=generator)
             visibility = rand[src] < rand[dst]
             known = target_residue_type.bool()[valid_mask][src] * visibility[:, None]
             known = known.to(edge.dtype)
         residue_rep = self.residue_type_projection(known)
-        neighbours = torch.cat([edge, node[src] + residue_rep], dim=-1)
+        neighbors = torch.cat([edge, node[src] + residue_rep], dim=-1)
 
         for block in self.blocks:
-            node = block(node, neighbours, edge_index)
+            node = block(node, neighbors, edge_index)
 
         logits = self.residue_type_head(node)
         batch_size, num_tokens = valid_mask.shape
@@ -3731,13 +3731,13 @@ class BoltzGenInverseFoldingDecoder(nn.Module):
             aggregated_logits: Tensor | None = None
             for pos in positions:
                 incoming = dst == pos
-                neighbours = torch.cat(
+                neighbors = torch.cat(
                     [edge[incoming], node[src[incoming]] + self.residue_type_projection(decoded[src[incoming]])],
                     dim=-1,
                 )
                 state = node[pos : pos + 1]
                 for block in self.blocks:
-                    state = block.sample(state, neighbours)
+                    state = block.sample(state, neighbors)
                 position_logits = self.residue_type_head(state)
                 aggregated_logits = (
                     position_logits if aggregated_logits is None else aggregated_logits + position_logits
