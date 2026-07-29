@@ -172,6 +172,7 @@ def test_mmcif_writes_finite_placeholder_for_masked_coordinates(tmp_path: Path) 
         coordinates,
         coordinate_mask,
         structure.occupancy,
+        structure.b_factor,
         structure.residue_numbers,
     )
     path = tmp_path / "masked.cif"

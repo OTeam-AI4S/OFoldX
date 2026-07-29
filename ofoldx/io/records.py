@@ -215,6 +215,11 @@ def atom_records_from_array(
                 raise ValueError("ofoldx_coordinate_mask values must be 0 or 1")
             coordinate_present = mask_text == "1"
         x, y, z = array.coord[index]
+        if coordinate_present and not np.all(np.isfinite((x, y, z))):
+            raise ValueError(
+                f"atom record {index} has a non-finite present coordinate {(float(x), float(y), float(z))}; "
+                "a present coordinate must be finite (mask it with ofoldx_coordinate_mask=0 or drop the atom)"
+            )
         coordinate = (float(x), float(y), float(z))
         charge = optional_integer(_at(charges, index))
         if format_name == "pdb" and charge == 0:

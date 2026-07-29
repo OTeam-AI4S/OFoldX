@@ -336,6 +336,26 @@ def _add_observed_components(
     )
 
 
+def _altloc_position_key(record: AtomRecord) -> tuple[object, ...]:
+    r"""
+    Structural-position key for altloc grouping -- the residue key WITHOUT ``component_id``.
+
+    Alternate locations compete for one structural position regardless of residue type, so this grouping
+    ignores ``component_id``; otherwise microheterogeneity (e.g. ALA/SER alternates at one author position)
+    keys as two residues and both survive, silently doubling the residue. The full
+    ``atom_record_residue_key`` keeps ``component_id`` because residue-boundary detection and residue
+    grouping genuinely distinguish residue types -- only altloc selection must not.
+    """
+
+    return (
+        record.symmetry_id,
+        record.chain_id,
+        record.residue_id,
+        record.auth_residue_id,
+        record.insertion_code,
+    )
+
+
 def _select_altloc(
     rows: tuple[AtomRecord, ...],
     policy: Literal["highest_occupancy", "first"],
@@ -346,7 +366,7 @@ def _select_altloc(
         if policy == "first":
             selected_labels[residue_key] = labels[0]
             continue
-        residue_rows = [row for row in rows if atom_record_residue_key(row) == residue_key]
+        residue_rows = [row for row in rows if _altloc_position_key(row) == residue_key]
         scores = {
             label: sum((row.occupancy or 0.0) for row in residue_rows if row.altloc_id == label) for label in labels
         }
@@ -354,7 +374,7 @@ def _select_altloc(
     return tuple(
         row
         for row in rows
-        if row.altloc_id is None or selected_labels.get(atom_record_residue_key(row), row.altloc_id) == row.altloc_id
+        if row.altloc_id is None or selected_labels.get(_altloc_position_key(row), row.altloc_id) == row.altloc_id
     )
 
 
@@ -369,7 +389,7 @@ def _expand_altlocs(rows: tuple[AtomRecord, ...]) -> tuple[tuple[AtomRecord, ...
             tuple(
                 row
                 for row in rows
-                if row.altloc_id is None or selection.get(atom_record_residue_key(row), row.altloc_id) == row.altloc_id
+                if row.altloc_id is None or selection.get(_altloc_position_key(row), row.altloc_id) == row.altloc_id
             )
         )
     return tuple(expanded)
@@ -382,7 +402,7 @@ def _altloc_choices(
     for row in rows:
         if row.altloc_id is None:
             continue
-        labels = labels_by_residue.setdefault(atom_record_residue_key(row), [])
+        labels = labels_by_residue.setdefault(_altloc_position_key(row), [])
         if row.altloc_id not in labels:
             labels.append(row.altloc_id)
     return tuple((key, tuple(labels)) for key, labels in labels_by_residue.items() if labels)
