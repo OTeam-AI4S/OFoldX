@@ -1490,8 +1490,36 @@ class RfDiffusionStructureUpdate(nn.Module):
         nn.init.zeros_(self.pair_projection.bias)
         nn.init.zeros_(self.geometry_projection.bias)
 
-    @torch.amp.autocast("cuda", enabled=False)
     def forward(
+        self,
+        msa: Tensor,
+        pair: Tensor,
+        input_rotations: Tensor,
+        input_translations: Tensor,
+        coords: Tensor,
+        state: Tensor,
+        residue_index: Tensor,
+        fixed_structure_mask: Tensor | None,
+        cyclic_mask: Tensor | None = None,
+        top_k: int = 64,
+    ) -> _RfDiffusionStructureUpdateOutput:
+        # SE(3)/frame geometry must run in fp32; disable autocast device-generically. A "cuda"-hardcoded
+        # guard is a no-op on CPU/MPS/XPU, where an ambient autocast would silently downcast this math.
+        with torch.autocast(device_type=msa.device.type, enabled=False):
+            return self._structure_update(
+                msa,
+                pair,
+                input_rotations,
+                input_translations,
+                coords,
+                state,
+                residue_index,
+                fixed_structure_mask,
+                cyclic_mask,
+                top_k,
+            )
+
+    def _structure_update(
         self,
         msa: Tensor,
         pair: Tensor,

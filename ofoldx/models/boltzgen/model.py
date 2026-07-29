@@ -2317,7 +2317,7 @@ class BoltzGenBidirectionalTriangleMultiplication(nn.Module):
         update = self.input_projection(normalized) * torch.sigmoid(self.input_gate_projection(normalized))
         if pair_mask is not None:
             update = update * pair_mask.unsqueeze(-1).to(dtype=update.dtype, device=update.device)
-        with torch.autocast("cuda", enabled=False):
+        with torch.autocast(device_type=update.device.type, enabled=False):
             left_out, right_out, left_in, right_in = torch.chunk(update.float(), 4, dim=-1)
             outgoing = torch.einsum("...ikd,...jkd->...ijd", left_out, right_out)
             incoming = torch.einsum("...kid,...kjd->...ijd", left_in, right_in)
