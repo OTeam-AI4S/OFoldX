@@ -74,32 +74,67 @@ def nearest_neighbors(
     residue_mask: Tensor,
     num_neighbors: int,
     eps: float = 1e-6,
-) -> tuple[Tensor, Tensor]:
+) -> tuple[Tensor, Tensor, Tensor]:
     r"""
-    Return masked nearest-neighbor distances and indices.
+    Return masked nearest-neighbor distances, indices, and a real-neighbor mask.
+
+    Exactly ``num_neighbors`` neighbors are selected per residue. A structure shorter than ``num_neighbors``
+    fills the remaining slots with masked padding rows -- never a real neighbor -- so the neighbor count is
+    uniform and a residue's real neighbors are its own nearest valid residues regardless of what shared the
+    batch (topology-invariant). The selection is computed densely (a ragged ``NestedTensor`` batch is unpacked
+    to dense rows padded to at least ``num_neighbors``, its own padding masked out) and re-nested; the message
+    passing stays ragged and masks the filler slots via the returned ``neighbor_valid``.
 
     Args:
-        coordinates: Residue coordinates with shape ``(B, N, 3)``.
-        residue_mask: Valid-residue mask with shape ``(B, N)``.
-        num_neighbors: Maximum number of neighbors selected per residue.
+        coordinates: Residue coordinates ``(B, N, 3)`` -- a ragged ``NestedTensor`` batch or a dense tensor.
+        residue_mask: Valid-residue mask ``(B, N)``.
+        num_neighbors: Number of neighbors selected per residue.
         eps: Additive epsilon inside the distance square root.
 
     Returns:
-        Neighbor distances and indices, each with shape ``(B, N, min(num_neighbors, N))``.
+        Neighbor distances, indices, and validity, each ``(B, N, num_neighbors)``. ``neighbor_valid`` is 1 for
+        a real neighbor and 0 for a filler slot -- it is exactly the encoder's ``attend_mask``.
     """
 
-    pair_mask = residue_mask[:, :, None] * residue_mask[:, None, :]
-    distances = torch.sqrt(torch.sum((coordinates[:, :, None] - coordinates[:, None, :]) ** 2, dim=-1) + eps)
+    from danling import NestedTensor
+
+    ragged = isinstance(coordinates, NestedTensor)
+    if ragged:
+        lengths = [int(row.shape[0]) for row in coordinates]
+        coords, mask = coordinates.tensor, residue_mask.tensor
+    else:
+        coords, mask = coordinates, residue_mask
+    # Guarantee at least ``num_neighbors`` candidate columns per structure so the single top-k always fits;
+    # the extra rows are masked, so they can only ever be selected as filler.
+    shortfall = num_neighbors - coords.shape[1]
+    if shortfall > 0:
+        coords = F.pad(coords, (0, 0, 0, shortfall))
+        mask = F.pad(mask, (0, shortfall))
+    pair_mask = mask[:, :, None] * mask[:, None, :]
+    distances = torch.sqrt(torch.sum((coords[:, :, None] - coords[:, None, :]) ** 2, dim=-1) + eps)
     distances = pair_mask * distances
     maximum = distances.max(dim=-1, keepdim=True).values
     adjusted = distances + (1.0 - pair_mask) * maximum
-    # A single top-k count must fit every structure in the batch. ``coordinates.shape[1]`` is the padded
-    # maximum for a ragged NestedTensor, so bound by the SHORTEST structure instead -- iterating yields each
-    # structure's own length (a plain tensor iterates to identical per-row lengths, so dense behavior is
-    # unchanged). This equals ``num_neighbors`` whenever every structure is at least that long -- the usual
-    # regime, where a prediction is then independent of what shared the batch.
-    shortest = min(int(structure.shape[0]) for structure in coordinates)
-    return torch.topk(adjusted, min(num_neighbors, shortest), dim=-1, largest=False)
+    neighbor_distances, neighbor_indices = torch.topk(adjusted, num_neighbors, dim=-1, largest=False)
+    # A neighbor is real only when both it and the query residue are valid; a filler (masked padding row) is 0.
+    neighbor_valid = gather_nodes(mask.unsqueeze(-1), neighbor_indices).squeeze(-1) * mask[:, :, None]
+    if ragged:
+        count = len(lengths)
+        neighbor_distances = NestedTensor([neighbor_distances[i, : lengths[i]] for i in range(count)])
+        # Real neighbors index into the structure's own residues; clamp filler indices back in range (they are
+        # masked by ``neighbor_valid``, so the clamped position never contributes).
+        neighbor_indices = NestedTensor(
+            [neighbor_indices[i, : lengths[i]].clamp(max=max(lengths[i] - 1, 0)) for i in range(count)]
+        )
+        neighbor_valid = NestedTensor([neighbor_valid[i, : lengths[i]] for i in range(count)])
+    elif shortfall > 0:
+        # A dense structure shorter than ``num_neighbors``: drop the padded query rows and clamp filler indices
+        # back into the real residue range (masked by ``neighbor_valid``).
+        length = coordinates.shape[1]
+        neighbor_distances = neighbor_distances[:, :length]
+        neighbor_indices = neighbor_indices[:, :length].clamp(max=length - 1)
+        neighbor_valid = neighbor_valid[:, :length]
+    return neighbor_distances, neighbor_indices, neighbor_valid
 
 
 def radial_basis(
@@ -577,7 +612,7 @@ class MpnnProteinFeatures(nn.Module):
         residue_mask: Tensor,
         residue_index: Tensor,
         chain_index: Tensor,
-    ) -> tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor]:
         r"""
         Build neighbor-aligned geometric and relative-position edge features.
 
@@ -588,8 +623,9 @@ class MpnnProteinFeatures(nn.Module):
             chain_index: Chain indices ``[batch, residues]`` used to separate inter-chain offsets.
 
         Returns:
-            Edge features ``[batch, residues, neighbors, edge_size]`` and their residue indices
-            ``[batch, residues, neighbors]``.
+            Edge features ``[batch, residues, neighbors, edge_size]``, their residue indices
+            ``[batch, residues, neighbors]``, and the real-neighbor mask ``[batch, residues, neighbors]`` (the
+            encoder's ``attend_mask``: 1 for a real neighbor, 0 for a filler slot).
         """
 
         nitrogen = backbone_coordinates[:, :, 0]
@@ -598,7 +634,7 @@ class MpnnProteinFeatures(nn.Module):
         oxygen = backbone_coordinates[:, :, 3]
         beta_carbon = virtual_beta_carbon(nitrogen, alpha_carbon, carbon)
         atoms = torch.stack((alpha_carbon, nitrogen, carbon, oxygen, beta_carbon), dim=2)
-        neighbor_distances, neighbor_indices = nearest_neighbors(
+        neighbor_distances, neighbor_indices, neighbor_valid = nearest_neighbors(
             alpha_carbon,
             residue_mask,
             self.num_neighbors,
@@ -626,7 +662,7 @@ class MpnnProteinFeatures(nn.Module):
         same_chain = (chain_index.unsqueeze(-1) == neighbor_chain_index).long()
         position_features = self.relative_position(residue_offsets.long(), same_chain)
         edges = torch.cat((position_features, distance_features), dim=-1)
-        return self.edge_norm(self.edge_projection(edges)), neighbor_indices
+        return self.edge_norm(self.edge_projection(edges)), neighbor_indices, neighbor_valid
 
 
 def periodic_group_period(*, device: torch.device | str | None = None) -> tuple[Tensor, Tensor]:

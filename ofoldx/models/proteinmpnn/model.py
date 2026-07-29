@@ -304,7 +304,9 @@ class ProteinMpnnModel(Model):
                 generator=generator,
             )
         mask = residue_mask.to(dtype=backbone_coordinates.dtype)
-        edge_features, neighbor_indices = self.feature_encoder(
+        # ``attend_mask`` comes from the k-NN: it is the real-neighbor mask, which also zeroes filler slots when
+        # a structure is shorter than ``num_neighbors`` (the encoder must not attend to a filler neighbor).
+        edge_features, neighbor_indices, attend_mask = self.feature_encoder(
             backbone_coordinates,
             mask,
             residue_index,
@@ -315,8 +317,6 @@ class ProteinMpnnModel(Model):
         # deriving them this way keeps a ragged NestedTensor batch ragged, where ``new_zeros`` with an explicit
         # ``(B, N, hidden)`` shape would materialize a dense, padded tensor that no longer aligns with the edges.
         node_states = torch.zeros_like(edge_states[:, :, 0, :])
-        attend_mask = gather_nodes(mask.unsqueeze(-1), neighbor_indices).squeeze(-1)
-        attend_mask = mask.unsqueeze(-1) * attend_mask
         for block in self.encoder_blocks:
             node_states, edge_states = block(
                 node_states,
@@ -1371,7 +1371,7 @@ class ProteinMpnnCaFeatures(nn.Module):
         residue_mask: Tensor,
         residue_index: Tensor,
         chain_index: Tensor,
-    ) -> tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor]:
         r"""
         Build C-alpha-only residue edge features.
 
@@ -1382,11 +1382,11 @@ class ProteinMpnnCaFeatures(nn.Module):
             chain_index: Chain indices with shape ``(B, L)``.
 
         Returns:
-            Edge features with shape ``(B, L, K, H)`` and neighbor indices with
-            shape ``(B, L, K)``.
+            Edge features ``(B, L, K, H)``, neighbor indices ``(B, L, K)``, and the real-neighbor mask
+            ``(B, L, K)`` (the encoder's ``attend_mask``).
         """
 
-        neighbor_distances, neighbor_indices = nearest_neighbors(
+        neighbor_distances, neighbor_indices, neighbor_valid = nearest_neighbors(
             backbone_coordinates,
             residue_mask,
             self.num_neighbors,
@@ -1416,7 +1416,7 @@ class ProteinMpnnCaFeatures(nn.Module):
         same_chain = gather_edges(same_chain.unsqueeze(-1), neighbor_indices).squeeze(-1)
         position_features = self.relative_position(residue_offsets.long(), same_chain)
         edges = torch.cat((position_features, distance_features, orientation), dim=-1)
-        return self.edge_norm(self.edge_projection(edges)), neighbor_indices
+        return self.edge_norm(self.edge_projection(edges)), neighbor_indices, neighbor_valid
 
 
 def _pair_radial_basis(

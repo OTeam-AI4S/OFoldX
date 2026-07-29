@@ -315,7 +315,17 @@ class LigandMpnnModel(Model):
                 generator=generator,
             )
         mask = input.residue_mask.to(dtype=backbone_coordinates.dtype)
-        atom_features, edges, neighbor_indices, atom_nodes, atom_edges, atom_mask = self.feature_encoder.encode(
+        # ``attend_mask`` is the k-NN's real-neighbor mask, which also zeroes filler slots when a structure is
+        # shorter than ``num_neighbors`` (the k-NN's ``residue_mask`` is ``mask``, so it matches).
+        (
+            atom_features,
+            edges,
+            neighbor_indices,
+            atom_nodes,
+            atom_edges,
+            atom_mask,
+            attend_mask,
+        ) = self.feature_encoder.encode(
             backbone_coordinates,
             mask,
             input.residue_index,
@@ -335,8 +345,6 @@ class LigandMpnnModel(Model):
         node_states = torch.zeros_like(edges[:, :, 0, :])
         edge_states = self.edge_embedding(edges)
         atom_context = self.atom_context_embedding(atom_features)
-        attend_mask = gather_nodes(mask.unsqueeze(-1), neighbor_indices).squeeze(-1)
-        attend_mask = mask.unsqueeze(-1) * attend_mask
         for block in self.encoder_blocks:
             node_states, edge_states = block(node_states, edge_states, neighbor_indices, mask, attend_mask)
         residue_context = self.residue_context_input(node_states)
@@ -1258,7 +1266,7 @@ class LigandMpnnFeatures(MpnnProteinFeatures):
 
         num_context_atoms = context_coordinates.shape[2]
         atoms = _backbone_atoms(backbone_coordinates)
-        edges, neighbor_indices = super().forward(
+        edges, neighbor_indices, neighbor_valid = super().forward(
             backbone_coordinates,
             residue_mask,
             residue_index,
@@ -1308,7 +1316,7 @@ class LigandMpnnFeatures(MpnnProteinFeatures):
         context_nodes = self.context_node_norm(
             self.context_node_projection(element_features.to(dtype=backbone_coordinates.dtype))
         )
-        return atom_features, edges, neighbor_indices, context_nodes, context_edges, context_mask
+        return atom_features, edges, neighbor_indices, context_nodes, context_edges, context_mask, neighbor_valid
 
     def _append_sidechain_context(
         self,

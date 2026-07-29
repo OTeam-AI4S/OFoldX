@@ -353,7 +353,9 @@ class NaMpnnModel(Model):
                 generator=generator,
             )
             coordinates = coordinates + scale[:, :, None, None] * noise
-        node_features, edge_features, neighbor_indices = self.feature_encoder(
+        # ``attend_mask`` comes from the k-NN: the real-neighbor mask, which also zeroes filler slots when a
+        # structure is shorter than ``num_neighbors`` (``valid`` there is ``residue_mask``, matching ``mask``).
+        node_features, edge_features, neighbor_indices, attend_mask = self.feature_encoder(
             coordinates,
             input.atom_mask,
             input.residue_mask,
@@ -367,8 +369,6 @@ class NaMpnnModel(Model):
         node_states = self.node_embedding(node_features)
         edge_states = self.edge_embedding(edge_features)
         mask = input.residue_mask.to(dtype=node_states.dtype)
-        attend_mask = gather_nodes(mask.unsqueeze(-1), neighbor_indices).squeeze(-1)
-        attend_mask = mask.unsqueeze(-1) * attend_mask
         for block in self.encoder_blocks:
             node_states, edge_states = block(node_states, edge_states, neighbor_indices, mask, attend_mask)
         return node_states, edge_states, neighbor_indices
@@ -1139,11 +1139,11 @@ class NaMpnnFeatures(nn.Module):
         all_coordinates = torch.cat(augmented_coordinates, dim=-2)
         all_mask = torch.cat(augmented_mask, dim=-1)
 
-        neighbor_indices = nearest_neighbors(
+        _, neighbor_indices, neighbor_valid = nearest_neighbors(
             alpha_carbon + reference,
             valid,
             self.num_neighbors,
-        )[1]
+        )
         pair_rbf = _all_pair_rbf(all_coordinates, all_mask, neighbor_indices, self.num_rbf)
         residue_offset = residue_index[:, :, None] - residue_index[:, None, :]
         residue_offset = gather_edges(residue_offset[:, :, :, None], neighbor_indices)[:, :, :, 0]
@@ -1157,7 +1157,7 @@ class NaMpnnFeatures(nn.Module):
             num_classes=self.num_polymer_types,
         ).to(dtype=dtype)
         node_features = self.node_norm(self.node_projection(polymer_one_hot))
-        return node_features, edge_features, neighbor_indices
+        return node_features, edge_features, neighbor_indices, neighbor_valid
 
 
 def _virtual_na_n(o4prime: Tensor, c1prime: Tensor, c2prime: Tensor) -> Tensor:
