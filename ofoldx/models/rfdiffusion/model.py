@@ -59,7 +59,7 @@ from ...modules.backend import (
     WeightedTensorProduct,
 )
 from ...modules.diffusion.ddpm import ddpm_forward_step, ddpm_posterior
-from ...modules.diffusion.igso3 import calculate_igso3, so3_exp_map
+from ...modules.diffusion.igso3 import calculate_igso3, so3_exp_map, so3_log_map, so3_project_to_rotation
 from ...modules.dropout import StructuredDropout
 from ...modules.geometry import rigid_from_three_points
 from ...modules.potential import (
@@ -2689,6 +2689,31 @@ class RfDiffusionTranslationDiffuser:
         return x + delta[:, None], delta
 
 
+def _interp1d(x: Tensor, xp: Tensor, fp: Tensor) -> Tensor:
+    r"""
+    One-dimensional linear interpolation matching ``numpy.interp`` for increasing ``xp``.
+
+    Query points outside ``[xp[0], xp[-1]]`` clamp to the corresponding endpoint value.
+
+    Args:
+        x: Query points `[...]`.
+        xp: Strictly increasing sample locations `[M]`.
+        fp: Sample values `[M]`.
+
+    Returns:
+        Interpolated values with the shape of ``x``.
+    """
+
+    index = torch.searchsorted(xp, x, right=True).clamp(1, xp.shape[-1] - 1)
+    left = xp[index - 1]
+    right = xp[index]
+    slope = (fp[index] - fp[index - 1]) / (right - left)
+    interpolated = fp[index - 1] + slope * (x - left)
+    interpolated = torch.where(x <= xp[0], fp[0], interpolated)
+    interpolated = torch.where(x >= xp[-1], fp[-1], interpolated)
+    return interpolated
+
+
 class RfDiffusionIgso3Diffuser:
     r"""
     Isotropic-Gaussian-on-SO(3) (IGSO3) rotation diffuser and reverse sampler.
@@ -2724,6 +2749,9 @@ class RfDiffusionIgso3Diffuser:
         self.truncation_level = integer_index(truncation_level)
         self.igso3_vals = self._calc_igso3_vals()
         self.step_size = 1 / self.num_timesteps
+        # Per-device float64 views of the lookup table, materialised on first use so the reverse
+        # sampler never round-trips through NumPy on the hot path.
+        self._igso3_torch_cache: dict[torch.device, dict[str, Tensor]] = {}
 
     @property
     def discrete_sigma(self) -> np.ndarray:
@@ -2787,6 +2815,41 @@ class RfDiffusionIgso3Diffuser:
         sigma_idx = int(np.asarray(self.t_to_idx(t)).item())
         return np.interp(omega, self.igso3_vals["discrete_omega"], self.igso3_vals["score_norm"][sigma_idx])
 
+    def _igso3_tensors(self, device: torch.device) -> dict[str, Tensor]:
+        r"""
+        Return the float64 lookup table as device tensors, materialising once per device.
+        """
+
+        cached = self._igso3_torch_cache.get(device)
+        if cached is None:
+            cached = {
+                key: torch.as_tensor(np.asarray(value), dtype=torch.float64, device=device)
+                for key, value in self.igso3_vals.items()
+            }
+            self._igso3_torch_cache[device] = cached
+        return cached
+
+    def _sigma_idx_tensor(self, t: int) -> int:
+        r"""
+        Torch equivalent of ``t_to_idx``: the lookup-table row for timestep ``t``.
+
+        Depends only on ``t`` and the fixed schedule, so it runs on the CPU and never
+        synchronises the per-step device tensors.
+        """
+
+        sigma = self.sigma(torch.as_tensor(t, dtype=torch.float32) / self.num_timesteps).to(torch.float64)
+        discrete_sigma = self._igso3_tensors(sigma.device)["discrete_sigma"]
+        return int(torch.searchsorted(discrete_sigma, sigma.reshape(1), right=True).item()) - 1
+
+    def _score_norm_tensor(self, t: int, omega: Tensor) -> Tensor:
+        r"""
+        Torch equivalent of ``score_norm``: linear interpolation of the float64 score table.
+        """
+
+        tables = self._igso3_tensors(omega.device)
+        sigma_idx = self._sigma_idx_tensor(t)
+        return _interp1d(omega, tables["discrete_omega"], tables["score_norm"][sigma_idx])
+
     def diffuse_frames(
         self,
         coords: Tensor | np.ndarray,
@@ -2832,17 +2895,15 @@ class RfDiffusionIgso3Diffuser:
         R_t_t = torch.as_tensor(rotations_t, dtype=torch.float32)
         R_0_t = torch.as_tensor(rotations_0, dtype=torch.float32, device=R_t_t.device)
         R_0t = torch.einsum("...ij,...kj->...ik", R_t_t, R_0_t)
-        rotvec = torch.as_tensor(
-            Rotation.from_matrix(R_0t.detach().cpu().numpy()).as_rotvec(), dtype=R_t_t.dtype, device=R_t_t.device
-        )
-        omega_value = torch.linalg.norm(rotvec, dim=-1).detach().cpu().numpy()
-        denom = np.maximum(omega_value, 1e-8)
-        score = (
-            rotvec
-            * torch.as_tensor(self.score_norm(t, omega_value) / denom, dtype=rotvec.dtype, device=rotvec.device)[
-                :, None
-            ]
-        )
+        # ``Rotation.from_matrix(R_0t).as_rotvec()`` in pure torch: SVD-orthonormalise the (float32)
+        # relative rotation in float64, then take the rotation logarithm.
+        rotvec = so3_log_map(so3_project_to_rotation(R_0t.double())).to(dtype=R_t_t.dtype)
+        omega_value = torch.linalg.norm(rotvec, dim=-1)
+        denom = omega_value.double().clamp_min(1e-8)
+        # ``score_norm`` interpolates the float64 lookup table; keep the division in float64 to
+        # mirror ``np.interp`` promoting the float32 angles before dividing.
+        scale = self._score_norm_tensor(t, omega_value.double()) / denom
+        score = rotvec * scale.to(dtype=rotvec.dtype)[:, None]
         rot_g = self.diffusion_coefficient(t / self.num_timesteps).to(device=score.device, dtype=score.dtype)
         rng_device = score.device if generator is None else generator.device
         z = torch.randn(score.shape, dtype=score.dtype, device=rng_device, generator=generator).to(score.device)
@@ -4646,40 +4707,34 @@ def _next_frames(
     rotations_t, Ca_t = rigid_from_three_points(
         noisy_coords[None, :, 0], noisy_coords[None, :, 1], noisy_coords[None, :, 2]
     )
-    R_0_np = Rotation.from_matrix(
-        rotations_0.squeeze(0).detach().to(device="cpu", dtype=torch.float64).numpy()
-    ).as_matrix()
-    R_t_np = Rotation.from_matrix(
-        rotations_t.squeeze(0).detach().to(device="cpu", dtype=torch.float64).numpy()
-    ).as_matrix()
-    length = R_t_np.shape[0]
-    transitions = np.broadcast_to(np.eye(3), (length, 3, 3)).copy()
-    mask_cpu = diffusion_mask.detach().cpu().bool()
-    mobile = ~mask_cpu.numpy()
+    device = noisy_coords.device
+    # ``Rotation.from_matrix(...).as_matrix()`` in pure torch: project the near-orthonormal frames
+    # onto the nearest proper rotation in float64.
+    R_0 = so3_project_to_rotation(rotations_0.squeeze(0).to(dtype=torch.float64))
+    R_t = so3_project_to_rotation(rotations_t.squeeze(0).to(dtype=torch.float64))
+    length = R_t.shape[0]
+    diffusion_mask = diffusion_mask.to(device=device).bool()
+    mobile = ~diffusion_mask
+    transitions = torch.eye(3, dtype=torch.float64, device=device).expand(length, 3, 3).clone()
     if so3_type == "igso3":
-        if mobile.any():
-            transitions[mobile] = (
-                diffuser.so3_diffuser.reverse_sample_vectorized(
-                    R_t_np[mobile],
-                    R_0_np[mobile],
-                    t,
-                    noise_level=noise_scale,
-                    return_perturb=True,
-                    generator=generator,
-                )
-                .detach()
-                .cpu()
-                .numpy()
-            )
+        if bool(mobile.any()):
+            transitions[mobile] = diffuser.so3_diffuser.reverse_sample_vectorized(
+                R_t[mobile],
+                R_0[mobile],
+                t,
+                noise_level=noise_scale,
+                return_perturb=True,
+                generator=generator,
+            ).to(dtype=torch.float64)
     else:
         raise ValueError(f"unsupported SO(3) diffusion type {so3_type!r}")
     transitions = transitions[:, None]
-    ca_t_np = Ca_t.squeeze(0).detach().to(device="cpu", dtype=torch.float64).numpy()
-    noisy_coords_np = noisy_coords[:, :3].detach().to(device="cpu", dtype=torch.float64).numpy()
+    ca_t = Ca_t.squeeze(0).to(dtype=torch.float64)
+    noisy_bb = noisy_coords[:, :3].to(dtype=torch.float64)
     next_coords = (
-        np.einsum("lrij,laj->lrai", transitions, noisy_coords_np - ca_t_np[:, None]) + ca_t_np[:, None, None]
+        torch.einsum("lrij,laj->lrai", transitions, noisy_bb - ca_t[:, None]) + ca_t[:, None, None]
     ).squeeze(1)
-    return torch.as_tensor(next_coords, dtype=noisy_coords.dtype, device=noisy_coords.device)
+    return next_coords.to(dtype=noisy_coords.dtype, device=noisy_coords.device)
 
 
 def _next_alpha_carbon(

@@ -34,6 +34,87 @@ def so3_exp_map(rotation_vector: Tensor) -> Tensor:
     return identity + scale[..., None] * skew + second_order_scale[..., None] * (skew @ skew)
 
 
+def so3_log_map(rotation_matrix: Tensor) -> Tensor:
+    r"""
+    Map rotation matrices to axis-angle rotation vectors.
+
+    Inverse of [`so3_exp_map`][ofoldx.modules.diffusion.igso3.so3_exp_map]: recovers the
+    rotation vector (axis times angle in :math:`[0, \pi]`) from a rotation matrix. This matches
+    ``scipy.spatial.transform.Rotation.from_matrix(...).as_rotvec()`` for an orthonormal input;
+    feed a near-orthonormal matrix through
+    [`so3_project_to_rotation`][ofoldx.modules.diffusion.igso3.so3_project_to_rotation] first to
+    reproduce SciPy's implicit orthonormalization. Like any SO(3) logarithm the map is continuous
+    but not differentiable at the axis-angle singularities :math:`\theta \in \{0, \pi\}`.
+
+    Args:
+        rotation_matrix: Rotation matrices `[..., 3, 3]`.
+
+    Returns:
+        Rotation vectors `[..., 3]` represented as axis times angle.
+    """
+
+    trace = rotation_matrix[..., 0, 0] + rotation_matrix[..., 1, 1] + rotation_matrix[..., 2, 2]
+    cos_angle = ((trace - 1) * 0.5).clamp(-1.0, 1.0)
+    angle = torch.arccos(cos_angle)
+    # ``antisymmetric`` holds ``2 sin(angle)`` times the unit rotation axis.
+    antisymmetric = torch.stack(
+        (
+            rotation_matrix[..., 2, 1] - rotation_matrix[..., 1, 2],
+            rotation_matrix[..., 0, 2] - rotation_matrix[..., 2, 0],
+            rotation_matrix[..., 1, 0] - rotation_matrix[..., 0, 1],
+        ),
+        dim=-1,
+    )
+    # Generic branch: the rotation vector is ``angle / (2 sin(angle))`` times ``antisymmetric``.
+    # The small-angle branch is the Taylor series of that scale, avoiding the ``0 / 0`` at
+    # ``angle == 0``.
+    small_angle = angle < 1e-3
+    scale_small = 0.5 * (1 + angle.square() / 6.0 + 7.0 * angle.square().square() / 360.0)
+    scale = torch.where(small_angle, scale_small, angle / (2 * torch.sin(angle)).clamp_min(1e-30))
+    rotation_vector = scale[..., None] * antisymmetric
+    # Near ``angle == pi`` the antisymmetric part vanishes (``sin(angle) -> 0``), so the axis above
+    # is ill-conditioned there. Recover it from the symmetric part instead:
+    # ``S = sym - cos(angle) I`` equals ``(1 - cos(angle)) axis (x) axis``, a rank-1 matrix whose
+    # every column is parallel to the axis; take the largest column for stability and fix the sign
+    # from the antisymmetric part (which still carries the correct sign for ``angle < pi``). This
+    # matches SciPy's quaternion ``as_rotvec`` except at the exact ``angle == pi`` singularity,
+    # where the axis sign is genuinely ambiguous (measure zero).
+    identity = torch.eye(3, dtype=rotation_matrix.dtype, device=rotation_matrix.device)
+    symmetric = 0.5 * (rotation_matrix + rotation_matrix.transpose(-1, -2)) - cos_angle[..., None, None] * identity
+    strongest = torch.linalg.vector_norm(symmetric, dim=-2).argmax(dim=-1)
+    column = symmetric.gather(-1, strongest[..., None, None].expand(symmetric.shape[:-1] + (1,))).squeeze(-1)
+    axis = column / torch.linalg.vector_norm(column, dim=-1, keepdim=True).clamp_min(1e-30)
+    sign = torch.sign((axis * antisymmetric).sum(dim=-1, keepdim=True))
+    sign = torch.where(sign == 0, torch.ones_like(sign), sign)
+    rotation_vector_near_pi = angle[..., None] * axis * sign
+    return torch.where((angle > math.pi - 1e-1)[..., None], rotation_vector_near_pi, rotation_vector)
+
+
+def so3_project_to_rotation(matrix: Tensor) -> Tensor:
+    r"""
+    Project square matrices onto the nearest proper rotation.
+
+    Computes the orthogonal polar factor with a sign correction so the determinant is ``+1``,
+    matching ``scipy.spatial.transform.Rotation.from_matrix(...).as_matrix()``. Used to clean up
+    the near-orthonormal frames produced by
+    [`rigid_from_three_points`][ofoldx.modules.geometry.rigid_from_three_points] before taking a
+    rotation logarithm.
+
+    Args:
+        matrix: Near-orthonormal matrices `[..., 3, 3]`.
+
+    Returns:
+        Proper rotation matrices `[..., 3, 3]`.
+    """
+
+    u, _s, vh = torch.linalg.svd(matrix)
+    determinant = torch.linalg.det(torch.matmul(u, vh))
+    correction = torch.eye(matrix.shape[-1], dtype=matrix.dtype, device=matrix.device)
+    correction = correction.expand(matrix.shape[:-2] + correction.shape).clone()
+    correction[..., -1, -1] = torch.sign(determinant)
+    return torch.matmul(torch.matmul(u, correction), vh)
+
+
 def igso3_expansion(omega: Tensor, variance: float | Tensor, num_terms: int = DEFAULT_NUM_TERMS) -> Tensor:
     r"""
     Evaluate the truncated IGSO(3) density power series.
