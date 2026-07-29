@@ -1075,26 +1075,25 @@ def _experimental_fold_prediction(
                 preferred="higher",
             ),
             "mean_plddt": Score(
-                float(confidence.mean_plddt[batch_index, sample_index].detach().cpu()) * 100.0,
+                float(confidence.mean_plddt[batch_index, sample_index].detach().cpu()),
                 preferred="higher",
             ),
             "complex_iplddt": Score(
-                float(confidence.complex_iplddt[batch_index, sample_index].detach().cpu()) * 100.0,
+                float(confidence.complex_iplddt[batch_index, sample_index].detach().cpu()),
                 preferred="higher",
             ),
         },
         metrics={
             "plddt": Metric(
-                values=confidence.plddt[batch_index, sample_index].detach().float().cpu().numpy() * 100.0,
+                values=confidence.plddt[batch_index, sample_index].detach().float().cpu().numpy(),
                 axis=layout.token_sites,
             ),
             "plddt_per_atom": Metric(
-                values=confidence.plddt_per_atom[batch_index, sample_index, :atom_count].detach().float().cpu().numpy()
-                * 100.0,
+                values=confidence.plddt_per_atom[batch_index, sample_index, :atom_count].detach().float().cpu().numpy(),
                 axis=layout.atom_sites,
             ),
             "plddt_ca": Metric(
-                values=confidence.plddt_ca[batch_index, sample_index].detach().float().cpu().numpy() * 100.0,
+                values=confidence.plddt_ca[batch_index, sample_index].detach().float().cpu().numpy(),
                 axis=layout.token_sites,
             ),
         },

@@ -840,8 +840,8 @@ class EsmFold2Model(Model):
         layout = input.layout
         atom_count = len(layout.atom_sites)
         raw_coordinates = raw["coordinates"][:, :atom_count].to(device="cpu", dtype=torch.float32).numpy()
-        raw_plddt = raw["plddt"].to(device="cpu", dtype=torch.float32).numpy() * 100.0
-        raw_plddt_ca = raw["plddt_ca"].to(device="cpu", dtype=torch.float32).numpy() * 100.0
+        raw_plddt = raw["plddt"].to(device="cpu", dtype=torch.float32).numpy()
+        raw_plddt_ca = raw["plddt_ca"].to(device="cpu", dtype=torch.float32).numpy()
         raw_pae = raw["pae"].to(device="cpu", dtype=torch.float32).numpy()
         resolved_probability = raw["resolved_logits"][:, :atom_count].float().softmax(dim=-1)[..., 1].cpu().numpy()
         complete_sites = tuple(site for site, atom in layout.system.iter_atoms() if atom.element != "H")
@@ -869,11 +869,11 @@ class EsmFold2Model(Model):
                 "ptm": Score(float(raw["ptm"][sample_index].item()), preferred="higher"),
                 "iptm": Score(float(raw["iptm"][sample_index].item()), preferred="higher"),
                 "mean_plddt": Score(
-                    float(raw["mean_plddt"][sample_index].item()) * 100.0,
+                    float(raw["mean_plddt"][sample_index].item()),
                     preferred="higher",
                 ),
                 "complex_iplddt": Score(
-                    float(raw["complex_iplddt"][sample_index].item()) * 100.0,
+                    float(raw["complex_iplddt"][sample_index].item()),
                     preferred="higher",
                 ),
             }
@@ -886,7 +886,7 @@ class EsmFold2Model(Model):
                         # Per-atom pLDDT is not recoverable from token pLDDT and is
                         # therefore preserved on the AtomSite axis.
                         "plddt_per_atom": Metric(
-                            values=raw["plddt_per_atom"][sample_index, :atom_count].float().cpu().numpy() * 100.0,
+                            values=raw["plddt_per_atom"][sample_index, :atom_count].float().cpu().numpy(),
                             axis=layout.atom_sites,
                         ),
                         "plddt_ca": Metric(
@@ -3849,7 +3849,7 @@ class EsmFold2ConfidenceHead(nn.Module):
         intra_token_index = intra_token_index.clamp(max=self.plddt_projection_weight.shape[0] - 1)
         plddt_weights = self.plddt_projection_weight[intra_token_index]
         plddt_logits = torch.einsum("...c,...cb->...b", normalized_atom_single, plddt_weights)
-        plddt_per_atom = _categorical_mean(plddt_logits, start=0.0, end=1.0)
+        plddt_per_atom = _categorical_mean(plddt_logits, start=0.0, end=100.0)
 
         num_tokens = single.shape[1]
         plddt_sum = torch.zeros(batch_size, num_tokens, device=single.device, dtype=plddt_per_atom.dtype)
@@ -4074,7 +4074,7 @@ class EsmFold2ExperimentalConfidenceHead(nn.Module):
         intra_token_index = intra_token_index.clamp(max=self.plddt_projection_weight.shape[0] - 1)
         plddt_weights = self.plddt_projection_weight[intra_token_index]
         plddt_logits = torch.einsum("...c,...cb->...b", normalized_atom_single, plddt_weights)
-        plddt_per_atom = _categorical_mean(plddt_logits, start=0.0, end=1.0)
+        plddt_per_atom = _categorical_mean(plddt_logits, start=0.0, end=100.0)
 
         num_tokens = single.shape[1]
         plddt_sum = torch.zeros(flat_batch_size, num_tokens, device=single.device, dtype=plddt_per_atom.dtype)
