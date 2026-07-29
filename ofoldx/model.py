@@ -70,7 +70,7 @@ class Model(nn.Module):
         """
 
         if backend not in PUBLIC_BACKENDS:
-            raise ValueError("backend must be exactly one of: auto, eager, sdpa, oops, cueq, apex, deepspeed")
+            raise ValueError(f"backend must be one of: {', '.join(sorted(PUBLIC_BACKENDS))}")
         self._set_backend(backend)
         self.backend = backend
         return self

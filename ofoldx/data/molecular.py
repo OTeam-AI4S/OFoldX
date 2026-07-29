@@ -101,35 +101,8 @@ AMINO_ACID_ONE_TO_THREE: dict[str, str] = dict(_STANDARD_COMPONENTS["protein"])
 AMINO_ACID_THREE_TO_ONE: dict[str, str] = {component: letter for letter, component in AMINO_ACID_ONE_TO_THREE.items()}
 #: The 20 standard amino-acid component IDs as an order-independent set.
 STANDARD_AMINO_ACID_IDS: frozenset[str] = frozenset(AMINO_ACID_THREE_TO_ONE)
-# ``AMINO_ACID_ONE_TO_THREE`` extended with the unknown-residue letter ``X`` -> ``UNK``. Kept
-# distinct so callers opt in to ``X``.
-AMINO_ACID_ONE_TO_THREE_WITH_UNKNOWN: dict[str, str] = {
-    **AMINO_ACID_ONE_TO_THREE,
-    "X": "UNK",
-}
-# One-letter -> CCD-code maps for nucleic polymers: standard core plus the strict
-# extensions and permissive unknowns.
-DNA_ONE_TO_THREE: dict[str, str] = {
-    **_STANDARD_COMPONENTS["dna"],
-    **_EXTENDED_COMPONENTS["dna"],
-    "X": _UNKNOWN_COMPONENT["dna"],
-    "N": _UNKNOWN_COMPONENT["dna"],
-}
-RNA_ONE_TO_THREE: dict[str, str] = {
-    **_STANDARD_COMPONENTS["rna"],
-    **_EXTENDED_COMPONENTS["rna"],
-    "X": _UNKNOWN_COMPONENT["rna"],
-    "N": _UNKNOWN_COMPONENT["rna"],
-}
 
-# Heavy leaving atoms trimmed at internal (non-terminal) residues, kept at chain termini
-# (verified from the CCD: protein C-terminal ``OXT``, nucleic 5'-terminal ``OP3``). Keyed
-# by molecule-type name so structure processing and heavy-atom selection share one table.
-LEAVING_ATOMS: dict[str, frozenset[str]] = {
-    "protein": frozenset({"OXT"}),
-    "rna": frozenset({"OP3"}),
-    "dna": frozenset({"OP3"}),
-}
+
 # Element symbols treated as hydrogen (protium and deuterium), dropped from heavy-atom sets.
 HYDROGEN_ELEMENTS: frozenset[str] = frozenset({"H", "D"})
 
