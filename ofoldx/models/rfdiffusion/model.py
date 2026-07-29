@@ -5783,16 +5783,25 @@ def _decode_structure(
             entities[entity_id] = source.entities[entity_id]
             instances[instance_id] = entity_id
             entity_ids.add(entity_id)
+    # Group instances by their realized sequence value so symmetric copies (which share one
+    # sequence) collapse to a single entity instantiated N times -- the canonical homo-oligomer
+    # representation -- instead of one distinct entity per copy (a spurious heterotrimer).
+    # Genuinely divergent chains still resolve to separate entities.
+    instances_by_sequence: dict[PolymerSequence, list[str]] = {}
     for instance_id, sequence_components in output_sequences.items():
-        base = f"{instance_id}_rfdesign"
+        realized = PolymerSequence("protein", sequence_components)
+        instances_by_sequence.setdefault(realized, []).append(instance_id)
+    for realized, grouped_instance_ids in instances_by_sequence.items():
+        base = f"{grouped_instance_ids[0]}_rfdesign"
         entity_id = base
         suffix = 2
         while entity_id in entity_ids:
             entity_id = f"{base}_{suffix}"
             suffix += 1
         entity_ids.add(entity_id)
-        entities[entity_id] = PolymerSequence("protein", sequence_components)
-        instances[instance_id] = entity_id
+        entities[entity_id] = realized
+        for instance_id in grouped_instance_ids:
+            instances[instance_id] = entity_id
 
     valid_instance_ids = set(instances)
     bonds: set[SystemBond] = set()
