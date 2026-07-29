@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, cast
 
@@ -248,6 +249,103 @@ def _cif_column(category: _CifCategory, name: str) -> tuple[str | None, ...]:
     if name not in category:
         return (None,) * category.row_count
     return tuple(present_string(value) for value in category[name].as_array())
+
+
+@dataclass(frozen=True)
+class MmcifEntityDeclarations:
+    r"""
+    Authoritative entity declarations parsed from an mmCIF document.
+
+    Args:
+        entity_types: ``_entity.type`` (``"polymer"``, ``"non-polymer"``, ``"water"``,
+            ``"branched"``, ``"macrolide"``) keyed by ``_entity.id``, lower-cased.
+        polymer_monomers: For each polymer ``_entity.id`` its ordered
+            ``_entity_poly_seq`` ``(num, mon_id)`` monomers, including residues that are
+            declared but unmodeled in the coordinates.
+        entity_poly_types: ``_entity_poly.type`` keyed by ``_entity.id``, lower-cased.
+        author_numbering: ``pdbx_poly_seq_scheme`` author numbering
+            ``(auth_seq_num, pdb_ins_code)`` keyed by ``(asym_id, seq_id)`` for every
+            declared polymer residue.
+    """
+
+    entity_types: dict[str, str]
+    polymer_monomers: dict[str, tuple[tuple[int, str], ...]]
+    entity_poly_types: dict[str, str]
+    author_numbering: dict[tuple[str, int], tuple[int | None, str | None]]
+
+
+def read_mmcif_entity_declarations(parsed: ParsedStructure) -> MmcifEntityDeclarations:
+    r"""
+    Decode mmCIF entity-type, polymer-sequence, and author-numbering declarations.
+
+    The ``_entity.type`` declaration is the authoritative polymer/non-polymer/water
+    classification, and ``_entity_poly_seq`` is the ordered canonical monomer sequence
+    per polymer entity including residues unmodeled in the coordinates.
+
+    Args:
+        parsed: Parsed mmCIF records and source document.
+
+    Returns:
+        Entity declarations gathered defensively from the source; missing categories or
+        columns yield empty mappings rather than errors.
+    """
+
+    cif_file = parsed.mmcif_file
+    if cif_file is None:
+        return MmcifEntityDeclarations({}, {}, {}, {})
+    block = cast(_CifFile, cif_file).block
+
+    entity_types: dict[str, str] = {}
+    if "entity" in block:
+        category = block["entity"]
+        for entity_id, entity_type in zip(_cif_column(category, "id"), _cif_column(category, "type")):
+            if entity_id is not None and entity_type is not None:
+                entity_types[entity_id] = entity_type.lower()
+
+    polymer_monomers: dict[str, list[tuple[int, str]]] = {}
+    if "entity_poly_seq" in block:
+        category = block["entity_poly_seq"]
+        for entity_id, number, monomer in zip(
+            _cif_column(category, "entity_id"),
+            _cif_column(category, "num"),
+            _cif_column(category, "mon_id"),
+        ):
+            index = optional_integer(number)
+            if entity_id is None or index is None or monomer is None:
+                continue
+            polymer_monomers.setdefault(entity_id, []).append((index, monomer))
+
+    entity_poly_types: dict[str, str] = {}
+    if "entity_poly" in block:
+        category = block["entity_poly"]
+        for entity_id, poly_type in zip(_cif_column(category, "entity_id"), _cif_column(category, "type")):
+            if entity_id is not None and poly_type is not None:
+                entity_poly_types[entity_id] = poly_type.lower()
+
+    author_numbering: dict[tuple[str, int], tuple[int | None, str | None]] = {}
+    if "pdbx_poly_seq_scheme" in block:
+        category = block["pdbx_poly_seq_scheme"]
+        for asym_id, seq_id, auth_number, pdb_number, ins_code in zip(
+            _cif_column(category, "asym_id"),
+            _cif_column(category, "seq_id"),
+            _cif_column(category, "auth_seq_num"),
+            _cif_column(category, "pdb_seq_num"),
+            _cif_column(category, "pdb_ins_code"),
+        ):
+            seq = optional_integer(seq_id)
+            if asym_id is None or seq is None:
+                continue
+            number = optional_integer(auth_number)
+            if number is None:
+                number = optional_integer(pdb_number)
+            author_numbering[(asym_id, seq)] = (number, ins_code)
+
+    return MmcifEntityDeclarations(
+        entity_types=entity_types,
+        polymer_monomers={entity_id: tuple(sorted(monomers)) for entity_id, monomers in polymer_monomers.items()},
+        entity_poly_types=entity_poly_types,
+        author_numbering=author_numbering,
+    )
 
 
 def _cif_bond_order(value: str | None) -> tuple[float, bool]:

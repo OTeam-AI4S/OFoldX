@@ -122,6 +122,35 @@ def parse_pdb(path: Path, *, model: int, assembly_id: str | None) -> ParsedStruc
     )
 
 
+def pdb_segment_by_serial(pdb_lines: tuple[str, ...]) -> dict[str, int]:
+    r"""
+    Map each PDB atom serial to a zero-based polymer segment index.
+
+    A PDB lacks an ``_entity.type`` declaration, so ``TER`` records mark polymer
+    boundaries. The segment counter advances at every ``TER``; because a PDB lists each
+    chain's atoms contiguously, an internal ``TER`` splits one chain id into segments
+    while inter-chain ``TER`` records leave each chain a single segment.
+
+    Args:
+        pdb_lines: Original PDB source lines.
+
+    Returns:
+        Segment index keyed by atom serial.
+    """
+
+    mapping: dict[str, int] = {}
+    segment = 0
+    for line in pdb_lines:
+        record = line[:6].strip()
+        if record in ("ATOM", "HETATM"):
+            serial = line[6:11].strip()
+            if serial:
+                mapping[serial] = segment
+        elif record == "TER":
+            segment += 1
+    return mapping
+
+
 def read_pdb_bonds(
     parsed: ParsedStructure,
     selected_rows: tuple[AtomRecord, ...],
