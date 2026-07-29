@@ -206,17 +206,18 @@ class RfDiffusionModel(Model):
         )
         self.post_init()
 
-    def _igso3_schedule(self) -> dict[str, np.ndarray] | None:
+    def _igso3_schedule(self) -> dict[str, Tensor] | None:
         r"""
         Return the populated IGSO(3) lookup table, if one was converted.
+
+        The float64 tables are handed to the diffuser as the persistent buffers
+        themselves (no per-design NumPy round-trip); the diffuser holds them as its
+        own buffers on the same device.
         """
 
         if not bool(self.igso3_schedule_present):
             return None
-        return {
-            name: getattr(self, f"igso3_{name}").detach().to(device="cpu", dtype=torch.float64).numpy()
-            for name, _ in _IGSO3_FIELDS
-        }
+        return {name: getattr(self, f"igso3_{name}") for name, _ in _IGSO3_FIELDS}
 
     def forward(
         self,
@@ -2742,10 +2743,18 @@ def _interp1d(x: Tensor, xp: Tensor, fp: Tensor) -> Tensor:
     return interpolated
 
 
-class RfDiffusionIgso3Diffuser:
+class RfDiffusionIgso3Diffuser(nn.Module):
     r"""
     Isotropic-Gaussian-on-SO(3) (IGSO3) rotation diffuser and reverse sampler.
+
+    The float64 IGSO(3) lookup table is owned as persistent-free buffers so both the
+    forward frame diffusion and the reverse sampler run in pure PyTorch on the tables'
+    device without round-tripping through NumPy per design.
     """
+
+    # The score-norm table buffer avoids the ``score_norm`` method name; every other
+    # ``calculate_igso3`` key registers under its own name.
+    _BUFFER_NAMES: dict[str, str] = {"score_norm": "score_norm_table"}
 
     def __init__(
         self,
@@ -2759,11 +2768,11 @@ class RfDiffusionIgso3Diffuser:
         num_sigma: int = 500,
         schedule: str = "linear",
         truncation_level: int = 2000,
-        igso3_schedule: dict[str, np.ndarray] | None = None,
+        igso3_schedule: dict[str, Tensor] | None = None,
     ) -> None:
+        super().__init__()
         self.num_timesteps = integer_index(num_timesteps)
         self.schedule = schedule
-        self.igso3_schedule = igso3_schedule
         self.min_sigma = float(min_sigma)
         self.max_sigma = float(max_sigma)
         self.min_b = float(min_b)
@@ -2775,23 +2784,25 @@ class RfDiffusionIgso3Diffuser:
         self.num_omega = integer_index(num_omega)
         self.num_sigma = integer_index(num_sigma)
         self.truncation_level = integer_index(truncation_level)
-        self.igso3_vals = self._calc_igso3_vals()
         self.step_size = 1 / self.num_timesteps
-        # Per-device float64 views of the lookup table, materialised on first use so the reverse
-        # sampler never round-trips through NumPy on the hot path.
-        self._igso3_torch_cache: dict[torch.device, dict[str, Tensor]] = {}
+        # Own the released (or offline-computed) lookup table as float64 buffers on its native
+        # device; nothing round-trips through NumPy on the per-design path.
+        for key, value in self._calc_igso3_vals(igso3_schedule).items():
+            self.register_buffer(
+                self._BUFFER_NAMES.get(key, key),
+                torch.as_tensor(value, dtype=torch.float64),
+                persistent=False,
+            )
 
-    @property
-    def discrete_sigma(self) -> np.ndarray:
-        return self.igso3_vals["discrete_sigma"]
+    def sigma_idx(self, sigma: Tensor | float) -> Tensor:
+        sigma_tensor = torch.as_tensor(sigma, dtype=torch.float64, device=self.discrete_sigma.device)
+        return torch.searchsorted(self.discrete_sigma, sigma_tensor, right=True) - 1
 
-    def sigma_idx(self, sigma: np.ndarray | Tensor | float) -> np.ndarray:
-        return np.digitize(np.asarray(sigma), self.discrete_sigma) - 1
-
-    def t_to_idx(self, t: int | np.ndarray | Tensor) -> np.ndarray:
-        return self.sigma_idx(
-            self.sigma(torch.as_tensor(t, dtype=torch.float32) / self.num_timesteps).detach().cpu().numpy()
+    def t_to_idx(self, t: int | Tensor) -> Tensor:
+        sigma = self.sigma(torch.as_tensor(t, dtype=torch.float32) / self.num_timesteps).to(
+            dtype=torch.float64, device=self.discrete_sigma.device
         )
+        return self.sigma_idx(sigma)
 
     def sigma(self, t: Tensor | float) -> Tensor:
         t_tensor = torch.as_tensor(t, dtype=torch.float32)
@@ -2815,17 +2826,18 @@ class RfDiffusionIgso3Diffuser:
         *,
         n_samples: int = 1,
         generator: torch.Generator | None = None,
-    ) -> np.ndarray:
-        if np.any(ts == 0):
+    ) -> Tensor:
+        if np.any(np.asarray(ts) == 0):
             raise ValueError("IGSO3 sample expects one-indexed timesteps")
+        device = self.discrete_omega.device
         all_samples = []
         for t in ts:
-            sigma_idx = int(np.asarray(self.t_to_idx(int(t))).item())
-            cdf = self.igso3_vals["cdf"][sigma_idx]
+            sigma_idx = int(self.t_to_idx(int(t)))
+            cdf = self.cdf[sigma_idx]
             rng_device = torch.device("cpu") if generator is None else generator.device
-            uniform = torch.rand(n_samples, device=rng_device, generator=generator).cpu().numpy()
-            all_samples.append(np.interp(uniform, cdf, self.igso3_vals["discrete_omega"]))
-        return np.stack(all_samples, axis=0)
+            uniform = torch.rand(n_samples, device=rng_device, generator=generator)
+            all_samples.append(_interp1d(uniform.to(device=device).double(), cdf, self.discrete_omega))
+        return torch.stack(all_samples, dim=0)
 
     def sample_vec(
         self,
@@ -2833,50 +2845,37 @@ class RfDiffusionIgso3Diffuser:
         *,
         n_samples: int = 1,
         generator: torch.Generator | None = None,
-    ) -> np.ndarray:
+    ) -> Tensor:
         rng_device = torch.device("cpu") if generator is None else generator.device
-        axes = torch.randn((len(ts), n_samples, 3), device=rng_device, generator=generator).cpu().numpy()
-        axes /= np.linalg.norm(axes, axis=-1, keepdims=True)
+        axes = torch.randn((len(ts), n_samples, 3), device=rng_device, generator=generator)
+        axes = axes.to(device=self.discrete_omega.device)
+        axes = axes / torch.linalg.vector_norm(axes, dim=-1, keepdim=True)
         return axes * self.sample(ts, n_samples=n_samples, generator=generator)[..., None]
 
-    def score_norm(self, t: int, omega: np.ndarray) -> np.ndarray:
-        sigma_idx = int(np.asarray(self.t_to_idx(t)).item())
-        return np.interp(omega, self.igso3_vals["discrete_omega"], self.igso3_vals["score_norm"][sigma_idx])
-
-    def _igso3_tensors(self, device: torch.device) -> dict[str, Tensor]:
-        r"""
-        Return the float64 lookup table as device tensors, materialising once per device.
-        """
-
-        cached = self._igso3_torch_cache.get(device)
-        if cached is None:
-            cached = {
-                key: torch.as_tensor(np.asarray(value), dtype=torch.float64, device=device)
-                for key, value in self.igso3_vals.items()
-            }
-            self._igso3_torch_cache[device] = cached
-        return cached
+    def score_norm(self, t: int, omega: Tensor) -> Tensor:
+        omega_tensor = torch.as_tensor(omega, dtype=torch.float64, device=self.discrete_omega.device)
+        sigma_idx = int(self.t_to_idx(t))
+        return _interp1d(omega_tensor, self.discrete_omega, self.score_norm_table[sigma_idx])
 
     def _sigma_idx_tensor(self, t: int) -> int:
         r"""
-        Torch equivalent of ``t_to_idx``: the lookup-table row for timestep ``t``.
-
-        Depends only on ``t`` and the fixed schedule, so it runs on the CPU and never
-        synchronises the per-step device tensors.
+        The lookup-table row for timestep ``t``; a scalar host int with no per-step sync.
         """
 
-        sigma = self.sigma(torch.as_tensor(t, dtype=torch.float32) / self.num_timesteps).to(torch.float64)
-        discrete_sigma = self._igso3_tensors(sigma.device)["discrete_sigma"]
-        return int(torch.searchsorted(discrete_sigma, sigma.reshape(1), right=True).item()) - 1
+        return int(self.t_to_idx(t))
 
     def _score_norm_tensor(self, t: int, omega: Tensor) -> Tensor:
         r"""
         Torch equivalent of ``score_norm``: linear interpolation of the float64 score table.
+
+        Interpolates on ``omega``'s device so the reverse sampler keeps following the query
+        tensors, even if the tables live elsewhere.
         """
 
-        tables = self._igso3_tensors(omega.device)
         sigma_idx = self._sigma_idx_tensor(t)
-        return _interp1d(omega, tables["discrete_omega"], tables["score_norm"][sigma_idx])
+        discrete_omega = self.discrete_omega.to(device=omega.device)
+        score_row = self.score_norm_table[sigma_idx].to(device=omega.device)
+        return _interp1d(omega, discrete_omega, score_row)
 
     def diffuse_frames(
         self,
@@ -2885,29 +2884,27 @@ class RfDiffusionIgso3Diffuser:
         t_list: np.ndarray | None = None,
         diffusion_mask: np.ndarray | Tensor | None = None,
         generator: torch.Generator | None = None,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        if torch.is_tensor(coords):
-            coords_np = coords.detach().to(device="cpu", dtype=torch.float64).numpy()
-        else:
-            coords_np = coords
+    ) -> tuple[Tensor, Tensor]:
+        device = self.discrete_omega.device
+        coords_tensor = torch.as_tensor(coords, dtype=torch.float64, device=device)
         t_values = np.arange(self.num_timesteps) + 1 if t_list is None else np.asarray(t_list, dtype=np.int64)
-        num_res = len(coords_np)
-        N = torch.from_numpy(coords_np[None, :, 0])
-        Ca = torch.from_numpy(coords_np[None, :, 1])
-        C = torch.from_numpy(coords_np[None, :, 2])
+        num_res = coords_tensor.shape[0]
+        N = coords_tensor[None, :, 0]
+        Ca = coords_tensor[None, :, 1]
+        C = coords_tensor[None, :, 2]
         R_true, Ca_true = rigid_from_three_points(N, Ca, C)
-        R_true_np = R_true[0].detach().to(device="cpu", dtype=torch.float64).numpy()
-        Ca_np = Ca_true[0].detach().to(device="cpu", dtype=torch.float64).numpy()
+        R_true = R_true[0]
+        Ca_true = Ca_true[0]
         sampled_rots = self.sample_vec(t_values, n_samples=num_res, generator=generator)
         if diffusion_mask is not None:
-            mask_np = (
-                diffusion_mask.detach().cpu().numpy() if torch.is_tensor(diffusion_mask) else np.asarray(diffusion_mask)
-            )
-            sampled_rots = sampled_rots * (1 - mask_np[None, :, None])
-        R_sampled = Rotation.from_rotvec(sampled_rots.reshape(-1, 3)).as_matrix().reshape(len(t_values), num_res, 3, 3)
-        R_perturbed = np.einsum("tnij,njk->tnik", R_sampled, R_true_np)
-        perturbed = np.einsum("tnij,naj->tnai", R_sampled, coords_np[:, :3] - Ca_np[:, None]) + Ca_np[None, :, None]
-        return perturbed.transpose(1, 0, 2, 3), R_perturbed.transpose(1, 0, 2, 3)
+            mask = torch.as_tensor(diffusion_mask, dtype=torch.float64, device=device)
+            sampled_rots = sampled_rots * (1 - mask[None, :, None])
+        R_sampled = so3_exp_map(sampled_rots.reshape(-1, 3)).reshape(len(t_values), num_res, 3, 3)
+        R_perturbed = torch.einsum("tnij,njk->tnik", R_sampled, R_true)
+        perturbed = (
+            torch.einsum("tnij,naj->tnai", R_sampled, coords_tensor[:, :3] - Ca_true[:, None]) + Ca_true[None, :, None]
+        )
+        return perturbed.transpose(0, 1), R_perturbed.transpose(0, 1)
 
     def reverse_sample_vectorized(
         self,
@@ -2945,9 +2942,9 @@ class RfDiffusionIgso3Diffuser:
             return perturb
         return torch.einsum("...ij,...jk->...ik", perturb, R_t_t)
 
-    def _calc_igso3_vals(self) -> dict[str, np.ndarray]:
+    def _calc_igso3_vals(self, igso3_schedule: dict[str, Tensor] | None) -> dict[str, Tensor] | dict[str, np.ndarray]:
         if (
-            self.igso3_schedule is not None
+            igso3_schedule is not None
             and self.num_timesteps == 50
             and self.num_omega == 1000
             and self.num_sigma == 500
@@ -2957,7 +2954,7 @@ class RfDiffusionIgso3Diffuser:
             and self.min_b == 1.5
             and self.max_b == 2.5
         ):
-            return self.igso3_schedule
+            return igso3_schedule
         return calculate_igso3(
             num_sigma=self.num_sigma,
             min_sigma=self.min_sigma,
@@ -2991,7 +2988,7 @@ class RfDiffusionDiffuser:
         truncation_level: int = 2000,
         igso3_num_omega: int = 1000,
         igso3_num_sigma: int = 500,
-        igso3_schedule: dict[str, np.ndarray] | None = None,
+        igso3_schedule: dict[str, Tensor] | None = None,
     ) -> None:
         if so3_type != "igso3":
             raise ValueError(f"unsupported SO(3) diffuser {so3_type!r}")
@@ -3060,11 +3057,11 @@ class RfDiffusionDiffuser:
         deltas = deltas / self.crd_scale
         frame_coords, _frames = self.so3_diffuser.diffuse_frames(
             scaled[:, :3],
-            diffusion_mask=diffusion_mask.detach().cpu().numpy(),
+            diffusion_mask=diffusion_mask,
             t_list=t_values,
             generator=generator,
         )
-        frame_coords = torch.from_numpy(frame_coords).to(device=coords.device, dtype=coords.dtype) / self.crd_scale
+        frame_coords = frame_coords.to(device=coords.device, dtype=coords.dtype) / self.crd_scale
         cum_delta = deltas.cumsum(dim=1)
         requested = torch.as_tensor(t_values - 1, dtype=torch.long, device=cum_delta.device)
         cum_delta = cum_delta.index_select(1, requested)
@@ -3094,7 +3091,7 @@ class RfDiffusionSampler:
         *,
         denoiser: RfDiffusionDenoiser,
         all_atom_reconstruction: RfDiffusionAllAtomReconstruction,
-        igso3_schedule: dict[str, np.ndarray] | None = None,
+        igso3_schedule: dict[str, Tensor] | None = None,
         final_step: int = 1,
         partial_steps: int | None = None,
         noise_scale_ca: float = 1.0,
