@@ -16,7 +16,7 @@ from torch import Tensor
 from ...data.bonds import SymbolicBond
 from ...data.components import get_component
 from ...data.conditions import Hotspot
-from ...data.evidence import MSA, MSACollection, msa_bindings
+from ...data.evidence import MSA, MSACollection, msa_bindings, resolve_msa_bindings
 from ...data.molecular import (
     AtomSite,
     ChemicalComponent,
@@ -1521,11 +1521,9 @@ def _realize_ranges(input: ODesignInput, generator: torch.Generator | None) -> O
         for placement_id, part in chain.items()
         if isinstance(part, GeneratedSegment) and part.min_length != part.max_length
     }
-    if not ranged:
-        return input
     lengths = {}
     chain_lengths = placement.chain_lengths or (None,) * len(placement.placements)
-    for chain, chain_length in zip(placement.placements.values(), chain_lengths):
+    for chain, chain_length in zip(placement.placements.values(), chain_lengths, strict=True):
         chain_ranges = [
             (placement_id, part)
             for placement_id, part in chain.items()
@@ -1544,11 +1542,28 @@ def _realize_ranges(input: ODesignInput, generator: torch.Generator | None) -> O
                 )
             continue
 
+        # A requested chain length must fall inside the window realizable by this chain's
+        # components: every segment at its minimum through every segment at its maximum. When the
+        # chain carries no variable GeneratedSegment this window collapses to the fixed/Existing sum,
+        # so an exact-match check falls out of the same bounds. Outside the window there is no length
+        # assignment to realize the request, mirroring the rfdiffusion "cannot be realized" contract.
+        minimum = sum(
+            part.min_length if isinstance(part, GeneratedSegment) else part.stop - part.start
+            for part in chain.values()
+        )
+        maximum = sum(
+            part.max_length if isinstance(part, GeneratedSegment) else part.stop - part.start
+            for part in chain.values()
+        )
+        if not minimum <= chain_length <= maximum:
+            raise ValueError(
+                f"ODesign placement chain length {chain_length} cannot be realized by its segments "
+                f"(realizable range [{minimum}, {maximum}])"
+            )
+
         for placement_id, segment in chain_ranges:
             lengths[placement_id] = segment.min_length
-        remaining = chain_length - sum(
-            part.min_length if isinstance(part, GeneratedSegment) else part.stop - part.start for part in chain.values()
-        )
+        remaining = chain_length - minimum
         for _ in range(remaining):
             available = [
                 (placement_id, segment)
@@ -1954,19 +1969,11 @@ def _validate_msa(
 ) -> MSA | MSACollection | None:
     if msa is None:
         return msa
-    values = (msa,) if isinstance(msa, MSA) else msa.msas
-    # Evidence holds no PolymerSequence: each column names one entity by ``entity_id`` and closes
-    # over this system, so the Processor resolves the entity and checks the query width (the
-    # MSA validates neither against an entity). Column ``i`` binds to ``entity.components[i]``.
-    for value in values:
-        entity = system.entities.get(value.entity_id)
-        if not isinstance(entity, PolymerSequence):
-            raise ValueError("MSA entity disagrees with ODesign input")
-        if len(value.unpaired_sequences[0]) != len(entity):
-            raise ValueError(
-                f"MSA for entity {value.entity_id!r} spans {len(value.unpaired_sequences[0])} columns "
-                f"but the entity has {len(entity)} components"
-            )
+    # Evidence holds no PolymerSequence: each column names one entity by ``entity_id`` (and an optional
+    # exact target instance) and closes over this system. The shared resolver binds the entity, verifies any
+    # exact target instance, and checks the query width and chemistry against the target -- so an MSA bound to
+    # an unknown instance raises here instead of silently lowering to an all-gap row.
+    resolve_msa_bindings(msa, system)
     return msa
 
 

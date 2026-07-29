@@ -1116,6 +1116,13 @@ class ODesignPlacements:
     def __post_init__(self) -> None:
         # A placement_id must be globally unique across the whole PlacementSpec.
         validate_placement(self.placements)
+        # One requested output length per declaration group, so the arity mismatch cannot reach the
+        # per-chain zip in _realize_ranges.
+        if self.chain_lengths is not None and len(self.chain_lengths) != len(self.placements):
+            raise ValueError(
+                f"chain_lengths arity {len(self.chain_lengths)} does not match the number of "
+                f"placement chains {len(self.placements)}"
+            )
 
 
 @dataclass(frozen=True)
