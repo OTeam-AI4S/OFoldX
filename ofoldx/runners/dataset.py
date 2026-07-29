@@ -55,8 +55,12 @@ class StructureDataset(Dataset):
 
         structure = read_structure(self.records[index])
         if self.lower == "process_training":
-            return self.processor.process_training(structure, **self.processor_kwargs)
-        return self.processor(structure, **self.processor_kwargs)
+            item = self.processor.process_training(structure, **self.processor_kwargs)
+        else:
+            item = self.processor(structure, **self.processor_kwargs)
+        # Pair each item with its global dataset index (the sampler-assigned ``index``, independent of batch
+        # size and DDP sharding) so inference can seed a per-sample generator reproducibly.
+        return index, item
 
 
 def _resolve_records(source: Any) -> list[str]:

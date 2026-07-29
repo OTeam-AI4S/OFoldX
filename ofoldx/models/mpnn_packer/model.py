@@ -6,12 +6,12 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from tensordict import tensorclass
 
 import numpy as np
 import torch
 import torch.distributions as distributions
 import torch.nn.functional as F
+from tensordict import tensorclass
 from torch import Tensor, nn
 
 from ...data.molecular import AMINO_ACID_THREE_TO_ONE, AtomSite, ComponentReference
@@ -364,7 +364,9 @@ class MpnnPackerModel(Model):
             node_states = block(node_states, neighbor_states, residue_mask, attend_mask)
 
         torsions = self.torsion_projection(node_states)
-        torsions = torsions.reshape(node_states.shape[0], node_states.shape[1], 4, self.num_mix, 3)
+        # Unflatten the projected channel axis into (4 torsions, mixtures, 3 parameters) instead of a
+        # ``reshape`` that names the ragged residue axis (``node_states.shape[1]``); identical for a dense batch.
+        torsions = torsions.unflatten(-1, (4, self.num_mix, 3))
         return MpnnPackerOutput(
             mean=torsions[..., 0],
             concentration=0.1 + self.softplus(torsions[..., 1]),
@@ -804,10 +806,12 @@ class MpnnPackerFeatureEncoder(nn.Module):
             self.lower_bound,
             self.upper_bound,
         ).flatten(start_dim=-3)
-        batch = torch.arange(coordinates.shape[0], device=coordinates.device)[:, None, None]
-        neighbor_residue_index = residue_index[batch, neighbor_indices]
+        # Gather neighbor residue/chain indices along the (ragged for a NestedTensor) residue axis with
+        # ``gather_nodes`` instead of the ``residue_index[batch, neighbor_indices]`` advanced index, which
+        # flattens that axis and only aligns for a rectangular batch. Dense results are unchanged.
+        neighbor_residue_index = gather_nodes(residue_index.unsqueeze(-1), neighbor_indices).squeeze(-1)
         offset = residue_index[:, :, None] - neighbor_residue_index
-        neighbor_chain = chain_index[batch, neighbor_indices]
+        neighbor_chain = gather_nodes(chain_index.unsqueeze(-1), neighbor_indices).squeeze(-1)
         same_chain = (chain_index[:, :, None] == neighbor_chain).long()
         edges = self.edge_norm(
             self.edge_projection(torch.cat([self.relative_position(offset.long(), same_chain), pair_rbf], dim=-1))
@@ -878,7 +882,6 @@ class MpnnPackerFeatureEncoder(nn.Module):
         context_coordinates = context_coordinates[:, :, : self.num_context_atoms]
         context_mask = context_mask[:, :, : self.num_context_atoms]
         context_atomic_numbers = context_atomic_numbers[:, :, : self.num_context_atoms].long()
-        batch, length = coordinates.shape[:2]
 
         gathered_mask = gather_nodes(atom_mask, neighbor_indices)
         sidechain_distances = _neighbor_atom_distances(coordinates, neighbor_indices)
@@ -906,7 +909,10 @@ class MpnnPackerFeatureEncoder(nn.Module):
         combined = torch.cat(
             [atom_context_features, context_types_1hot[:, :, None].expand(-1, -1, _ATOM14, -1, -1)], dim=-1
         )
-        node_features = self.context_down_projection(combined).view(batch, length, -1)
+        # Flatten the trailing atom/context/RBF axes rather than ``.view(batch, length, -1)``: an explicit
+        # ``length`` is the ragged residue axis for a NestedTensor. ``flatten`` collapses the same trailing
+        # dimensions and is identical for a dense batch.
+        node_features = self.context_down_projection(combined).flatten(start_dim=2)
         sidechain_nodes = self.decode_node_norm(self.decode_node_projection(node_features))
 
         sequence_1hot = F.one_hot(sequence_tokens.long(), len(AMINO_ACID_COMPONENT_IDS) + 1).to(dtype=coordinates.dtype)
@@ -1142,8 +1148,11 @@ def _neighbor_atom_distances(atoms: Tensor, neighbor_idx: Tensor) -> Tensor:
         Distances `[B, L, K, A, A]`, with source atom before target atom.
     """
 
-    batch = torch.arange(atoms.shape[0], device=atoms.device)[:, None, None]
-    neighbors = atoms[batch, neighbor_idx]
+    # Gather each residue's neighbor atoms along the (ragged for a NestedTensor) residue axis with
+    # ``gather_nodes`` rather than a ``atoms[batch, neighbor_idx]`` advanced index: the latter flattens the
+    # residue axis, which only aligns for a rectangular batch. For a dense batch the two are identical.
+    num_atoms = atoms.shape[-2]
+    neighbors = gather_nodes(atoms.flatten(start_dim=-2), neighbor_idx).unflatten(-1, (num_atoms, 3))
     distances = torch.sqrt(torch.sum((atoms[:, :, None, :, None] - neighbors[:, :, :, None]) ** 2, dim=-1) + 1e-6)
     return distances
 

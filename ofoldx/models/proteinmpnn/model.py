@@ -6,10 +6,10 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from tensordict import tensorclass
 
 import torch
 import torch.nn.functional as F
+from tensordict import tensorclass
 from torch import Tensor, nn
 
 from ...data.components import get_component
@@ -232,6 +232,7 @@ class ProteinMpnnModel(Model):
         design_positions: Tensor,
         tied_group_ids: Tensor,
         generator: torch.Generator | None,
+        decoding_priority: Tensor | None = None,
     ) -> Tensor:
         r"""
         Draw fixed-first causal ranks directly from aligned causal-unit IDs.
@@ -240,22 +241,31 @@ class ProteinMpnnModel(Model):
         priority through ``tied_group_ids`` and therefore share its rank, while every
         distinct unit receives a distinct rank. A unit is a generated unit only when
         all of its members are designed; those units sort after every fixed unit.
+
+        ``decoding_priority`` is the per-residue random priority. The Runner supplies it, seeded per structure
+        by global index, so a batched (and ragged) forward stays reproducible and independent of batch
+        composition; only a standalone call falls back to drawing it from ``generator``. Every tensor is
+        derived from ``tied_group_ids`` (``ones_like``/``cumsum``, out-of-place scatter) so a ragged
+        ``NestedTensor`` batch keeps each structure's order over its own residues, with no padded rows.
         """
 
-        device = tied_group_ids.device
-        batch, length = tied_group_ids.shape
         designed = (residue_mask & design_positions).to(torch.long)
-        unit_designed = torch.ones(batch, length, dtype=torch.long, device=device)
-        unit_designed.scatter_reduce_(1, tied_group_ids, designed, reduce="amin", include_self=True)
-        priority = torch.rand(batch, length, device=device, generator=generator)
-        unit_key = priority + 2 * unit_designed.to(priority.dtype)
-        unit_order = torch.argsort(unit_key, dim=1)
-        unit_rank = torch.empty_like(unit_order)
-        unit_rank.scatter_(
-            1,
-            unit_order,
-            torch.arange(length, device=device).expand(batch, length),
+        unit_designed = torch.ones_like(tied_group_ids).scatter_reduce(
+            1, tied_group_ids, designed, reduce="amin", include_self=True
         )
+        if decoding_priority is None:
+            # ``empty_like().uniform_`` matches ``tied_group_ids`` whether the batch is dense or a ragged
+            # NestedTensor and still honors ``generator``; ``torch.rand(shape)`` would build a dense tensor
+            # that cannot align with a ragged batch's packed values (e.g. an in-model draw during training).
+            decoding_priority = torch.empty_like(tied_group_ids, dtype=torch.get_default_dtype()).uniform_(
+                generator=generator
+            )
+        unit_key = decoding_priority + 2 * unit_designed.to(decoding_priority.dtype)
+        unit_order = torch.argsort(unit_key, dim=1)
+        # Inverse permutation: the position at ``unit_order[r]`` decodes at step ``r``. ``cumsum`` of ones is
+        # the per-row 0..L-1 step index without a dense ``arange`` that a ragged batch could not align.
+        positions = torch.ones_like(tied_group_ids).cumsum(dim=1) - 1
+        unit_rank = torch.zeros_like(unit_order).scatter(1, unit_order, positions)
         return torch.gather(unit_rank, 1, tied_group_ids)
 
     @staticmethod
@@ -300,12 +310,11 @@ class ProteinMpnnModel(Model):
             residue_index,
             chain_index,
         )
-        node_states = edge_features.new_zeros(
-            edge_features.shape[0],
-            edge_features.shape[1],
-            self.config.hidden_size,
-        )
         edge_states = self.edge_embedding(edge_features)
+        # Zero node states with the residue structure of ``edge_states`` (one neighbor slot, embedding width):
+        # deriving them this way keeps a ragged NestedTensor batch ragged, where ``new_zeros`` with an explicit
+        # ``(B, N, hidden)`` shape would materialize a dense, padded tensor that no longer aligns with the edges.
+        node_states = torch.zeros_like(edge_states[:, :, 0, :])
         attend_mask = gather_nodes(mask.unsqueeze(-1), neighbor_indices).squeeze(-1)
         attend_mask = mask.unsqueeze(-1) * attend_mask
         for block in self.encoder_blocks:
@@ -411,6 +420,7 @@ class ProteinMpnnModel(Model):
         input: ProteinMpnnInput,
         *,
         decoding_ranks: Tensor | None = None,
+        decoding_priority: Tensor | None = None,
         coordinate_noise: float = 0.0,
         generator: torch.Generator | None = None,
     ) -> ProteinMpnnOutput:
@@ -421,8 +431,12 @@ class ProteinMpnnModel(Model):
             input: ProteinMPNN tensors with batch size ``B`` and ``L`` residue rows.
             decoding_ranks: Optional ranks with shape ``(B, L)``; smaller values
                 decode earlier. A fixed-first random order is drawn when omitted.
+            decoding_priority: Optional per-residue random priority ``(B, L)`` the order is drawn from. The
+                Runner seeds it per structure by global index; supplying it (rather than a ``generator``) keeps
+                a batched forward reproducible and independent of batch composition. Ignored when
+                ``decoding_ranks`` is given.
             coordinate_noise: Standard deviation of Gaussian coordinate noise.
-            generator: Random generator used for the order and coordinate noise.
+            generator: Random generator used for the order (when no priority is supplied) and coordinate noise.
 
         Returns:
             Vocabulary logits and the decoding ranks used for the forward pass.
@@ -444,6 +458,7 @@ class ProteinMpnnModel(Model):
                 input.design_positions,
                 input.tied_group_ids,
                 generator,
+                decoding_priority,
             )
         logits = self._decode_logits(
             node_states,

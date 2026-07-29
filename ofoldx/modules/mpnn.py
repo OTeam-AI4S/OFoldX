@@ -41,12 +41,16 @@ def gather_nodes(nodes: Tensor, neighbor_indices: Tensor) -> Tensor:
         Neighbor-aligned node features with shape ``(B, N, K, C)``.
     """
 
-    indices = neighbor_indices.reshape(neighbor_indices.shape[0], -1, 1).expand(
-        -1,
-        -1,
-        nodes.shape[-1],
+    channels = nodes.shape[-1]
+    neighbors = neighbor_indices.shape[-1]
+    # Gather along the residue axis (ragged for a NestedTensor batch) without flattening ``N*K`` -- that
+    # flatten assumes a rectangular batch. ``expand(-1, ...)`` keeps the batch and residue axes as they are,
+    # so one formulation serves both dense and ragged inputs: out[b, i, k, c] = nodes[b, neighbor[b, i, k], c].
+    return torch.gather(
+        nodes[:, :, None, :].expand(-1, -1, neighbors, -1),
+        1,
+        neighbor_indices[..., None].expand(-1, -1, -1, channels),
     )
-    return torch.gather(nodes, 1, indices).reshape(*neighbor_indices.shape, nodes.shape[-1])
 
 
 def cat_neighbors_nodes(node_states: Tensor, neighbor_states: Tensor, neighbor_indices: Tensor) -> Tensor:
@@ -89,12 +93,13 @@ def nearest_neighbors(
     distances = pair_mask * distances
     maximum = distances.max(dim=-1, keepdim=True).values
     adjusted = distances + (1.0 - pair_mask) * maximum
-    return torch.topk(
-        adjusted,
-        min(num_neighbors, coordinates.shape[1]),
-        dim=-1,
-        largest=False,
-    )
+    # A single top-k count must fit every structure in the batch. ``coordinates.shape[1]`` is the padded
+    # maximum for a ragged NestedTensor, so bound by the SHORTEST structure instead -- iterating yields each
+    # structure's own length (a plain tensor iterates to identical per-row lengths, so dense behavior is
+    # unchanged). This equals ``num_neighbors`` whenever every structure is at least that long -- the usual
+    # regime, where a prediction is then independent of what shared the batch.
+    shortest = min(int(structure.shape[0]) for structure in coordinates)
+    return torch.topk(adjusted, min(num_neighbors, shortest), dim=-1, largest=False)
 
 
 def radial_basis(
@@ -123,8 +128,10 @@ def radial_basis(
         device=distances.device,
         dtype=distances.dtype,
     )
-    centers = centers.view(*((1,) * distances.ndim), num_bins)
     width = (upper_bound - lower_bound) / num_bins
+    # ``centers`` stays 1-D and broadcasts against the appended trailing axis of ``distances[..., None]``.
+    # An explicit reshape to ``distances.ndim`` dims would build a dense tensor that cannot broadcast against
+    # a ragged NestedTensor's packed values; the trailing broadcast is equivalent for a dense ``distances``.
     return torch.exp(-(((distances.unsqueeze(-1) - centers) / width) ** 2))
 
 
@@ -523,7 +530,7 @@ class MpnnDecoderBlock(nn.Module):
             Updated node states with the same shape as ``node_states``.
         """
 
-        source_states = node_states.unsqueeze(-2).expand(*node_states.shape[:-1], edge_context.shape[-2], -1)
+        source_states = node_states.unsqueeze(-2).expand(*([-1] * (node_states.ndim - 1)), edge_context.shape[-2], -1)
         message = self.message(torch.cat((source_states, edge_context), dim=-1))
         if attend_mask is not None:
             message = message * attend_mask.unsqueeze(-1)
@@ -597,11 +604,7 @@ class MpnnProteinFeatures(nn.Module):
             self.num_neighbors,
         )
 
-        neighbor_atoms = gather_nodes(atoms.flatten(start_dim=-2), neighbor_indices).reshape(
-            *neighbor_indices.shape,
-            5,
-            3,
-        )
+        neighbor_atoms = gather_nodes(atoms.flatten(start_dim=-2), neighbor_indices).unflatten(-1, (5, 3))
         pair_distances = torch.sqrt(
             torch.sum(
                 (atoms[:, :, None, :, None] - neighbor_atoms[:, :, :, None]) ** 2,

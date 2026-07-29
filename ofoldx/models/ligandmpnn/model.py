@@ -6,10 +6,10 @@ from __future__ import annotations
 
 import itertools
 import math
-from tensordict import tensorclass
 
 import torch
 import torch.nn.functional as F
+from tensordict import tensorclass
 from torch import Tensor, nn
 
 from ...data.components import get_component
@@ -232,17 +232,42 @@ class LigandMpnnModel(Model):
         residue_mask: Tensor,
         design_positions: Tensor,
         generator: torch.Generator | None,
+        decoding_priority: Tensor | None = None,
     ) -> Tensor:
         r"""
         Draw the fixed-first decoding orders directly from aligned masks.
 
         Fixed rows receive a near-zero weight and therefore decode before every designed row; each row
         of the returned ``[B, L]`` permutation is an independent order.
+
+        ``decoding_priority`` is the per-residue nonnegative random priority. The Runner supplies it,
+        seeded per structure by global index, so a batched (and ragged) forward stays reproducible and
+        independent of batch composition; only a standalone call falls back to drawing it from
+        ``generator`` as ``randn.abs()``. Both the priority and the chain mask are derived from the
+        aligned ``residue_mask``/``design_positions``, so a ragged ``NestedTensor`` batch keeps each
+        structure's order over its own residues with no padded rows.
         """
 
         chain_mask = residue_mask.to(dtype=torch.float32) * design_positions.to(dtype=torch.float32)
-        randn = torch.randn(chain_mask.shape, device=chain_mask.device, generator=generator)
-        return torch.argsort((chain_mask + 0.0001) * randn.abs(), dim=-1)
+        if decoding_priority is None:
+            decoding_priority = torch.randn(chain_mask.shape, device=chain_mask.device, generator=generator).abs()
+        return torch.argsort((chain_mask + 0.0001) * decoding_priority, dim=-1)
+
+    @staticmethod
+    def _ranks_from_order(decode_order: Tensor) -> Tensor:
+        r"""
+        Invert a drawn decoding permutation to per-residue ranks, ragged-natively.
+
+        Equivalent to :func:`decoding_order_to_ranks` for a full permutation, but every tensor is
+        derived from ``decode_order`` (``ones_like``/``cumsum``, out-of-place ``scatter``) so a ragged
+        ``NestedTensor`` batch keeps each structure's order over its own residues. The shared helper's
+        ``torch.arange(L).expand_as(...)`` would materialize a dense ``0..L-1`` row that cannot align
+        with a packed ragged batch. ``cumsum`` of ones is the per-row step index; scattering it through
+        the permutation places each residue's decode step at its own row.
+        """
+
+        positions = torch.ones_like(decode_order).cumsum(dim=-1) - 1
+        return torch.zeros_like(decode_order).scatter(-1, decode_order, positions)
 
     def _generate_ranks(self, input: LigandMpnnInput, generator: torch.Generator | None) -> Tensor:
         r"""
@@ -303,7 +328,11 @@ class LigandMpnnModel(Model):
             input.design_positions.to(dtype=backbone_coordinates.dtype),
             use_sidechain_context=use_sidechain_context,
         )
-        node_states = edges.new_zeros(edges.shape[0], edges.shape[1], self.hidden_size)
+        # Zero node states with the residue structure of ``edges`` (one neighbor slot, edge width, which
+        # equals ``hidden_size``): deriving them from a ragged slice keeps a NestedTensor batch ragged,
+        # where ``new_zeros`` with an explicit ``(B, L, hidden)`` shape would materialize a dense, padded
+        # tensor that no longer aligns with the edges.
+        node_states = torch.zeros_like(edges[:, :, 0, :])
         edge_states = self.edge_embedding(edges)
         atom_context = self.atom_context_embedding(atom_features)
         attend_mask = gather_nodes(mask.unsqueeze(-1), neighbor_indices).squeeze(-1)
@@ -405,6 +434,7 @@ class LigandMpnnModel(Model):
         input: LigandMpnnInput,
         *,
         decoding_ranks: Tensor | None = None,
+        decoding_priority: Tensor | None = None,
         coordinate_noise: float = 0.0,
         use_sidechain_context: bool = False,
         generator: torch.Generator | None = None,
@@ -416,9 +446,13 @@ class LigandMpnnModel(Model):
             input: LigandMPNN tensors with batch size ``B`` and ``L`` residue rows.
             decoding_ranks: Optional ranks with shape ``(B, L)``; smaller values
                 decode earlier. A fixed-first random order is drawn when omitted.
+            decoding_priority: Optional per-residue nonnegative random priority ``(B, L)`` the order is
+                drawn from. The Runner seeds it per structure by global index; supplying it (rather than a
+                ``generator``) keeps a batched forward reproducible and independent of batch composition.
+                Ignored when ``decoding_ranks`` is given.
             coordinate_noise: Standard deviation of Gaussian noise in coordinate units.
             use_sidechain_context: Whether fixed protein side chains contribute context atoms.
-            generator: Random generator used for the order and coordinate noise.
+            generator: Random generator used for the order (when no priority is supplied) and coordinate noise.
 
         Returns:
             Vocabulary logits and the decoding ranks used for the forward pass.
@@ -432,8 +466,8 @@ class LigandMpnnModel(Model):
             generator=generator,
         )
         if decoding_ranks is None:
-            decoding_ranks = decoding_order_to_ranks(
-                self._draw_decode_orders(input.residue_mask, input.design_positions, generator)
+            decoding_ranks = self._ranks_from_order(
+                self._draw_decode_orders(input.residue_mask, input.design_positions, generator, decoding_priority)
             )
         logits = self._decode_logits(
             node_states,

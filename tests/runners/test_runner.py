@@ -165,7 +165,9 @@ def test_infer_step_returns_dataclass_output(tmp_path: Path) -> None:
     # output; the override runs the family inference entry point and returns the output(s).
     runner = Runner(_config(tmp_path, _write(tmp_path / "chain.pdb"), name="proteinmpnn"))
     try:
-        batch = runner.collate_fn([runner.datasets["train"][0]])
+        # Inference runs the ragged NestedTensor collate (what the infer dataloader uses), not the dense
+        # training collate: each structure runs at its own length for a topology-invariant forward.
+        batch = runner._infer_collate([runner.datasets["train"][0]])
         output = runner.infer_step(batch)
         assert isinstance(output, list) and len(output) == 1
         assert type(output[0]).__name__ == "ProteinMpnnOutput"
@@ -184,10 +186,10 @@ def test_diffusion_infer_split_lowers_via_plain_call(tmp_path: Path) -> None:
     try:
         assert runner.datasets["train"].lower == "process_training"
         assert runner.datasets["infer"].lower == "call"
-        item = runner.datasets["infer"][0]
+        index, item = runner.datasets["infer"][0]  # the Dataset pairs each item with its global index
         assert not isinstance(item, tuple)  # a bare model input, not (input, target)
-        batch = runner.collate_fn([item])
-        assert set(batch) == {"input"}  # no target / loss_normalizer at inference
+        batch = runner.collate_fn([(index, item)])
+        assert set(batch) == {"input", "indices"}  # bare input + per-sample index; no target / loss_normalizer
         assert len(runner.infer_step(batch)) == 1
     finally:
         runner.close()

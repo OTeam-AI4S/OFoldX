@@ -5,11 +5,11 @@ NA-MPNN inverse-folding model for protein, DNA, RNA, and mixed-polymer structure
 from __future__ import annotations
 
 import math
-from tensordict import tensorclass
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+from tensordict import tensorclass
 from torch import Tensor, nn
 
 from ...data.components import get_component
@@ -269,6 +269,7 @@ class NaMpnnModel(Model):
         design_positions: Tensor,
         tied_group_ids: Tensor,
         generator: torch.Generator | None,
+        decoding_priority: Tensor | None = None,
     ) -> Tensor:
         r"""
         Draw fixed-first causal ranks directly from aligned causal-unit IDs.
@@ -277,18 +278,26 @@ class NaMpnnModel(Model):
         priority through ``tied_group_ids`` and therefore share its rank, while
         every distinct unit receives a distinct rank. A unit is generated only when
         all of its members are designed; those units sort after every fixed unit.
+
+        ``decoding_priority`` is the per-residue random priority. The Runner supplies it, seeded per structure
+        by global index, so a batched (and ragged) forward stays reproducible and independent of batch
+        composition; only a standalone call falls back to drawing it from ``generator``. Every tensor is
+        derived from ``tied_group_ids`` (``ones_like``/``cumsum``, out-of-place scatter) so a ragged
+        ``NestedTensor`` batch keeps each structure's order over its own residues, with no padded rows.
         """
 
-        device = tied_group_ids.device
-        batch, length = tied_group_ids.shape
         designed = (residue_mask & design_positions).to(torch.long)
-        unit_designed = torch.ones(batch, length, dtype=torch.long, device=device)
-        unit_designed.scatter_reduce_(1, tied_group_ids, designed, reduce="amin", include_self=True)
-        priority = torch.rand(batch, length, device=device, generator=generator)
-        unit_key = priority + 2 * unit_designed.to(priority.dtype)
+        unit_designed = torch.ones_like(tied_group_ids).scatter_reduce(
+            1, tied_group_ids, designed, reduce="amin", include_self=True
+        )
+        if decoding_priority is None:
+            decoding_priority = torch.rand(tied_group_ids.shape, device=tied_group_ids.device, generator=generator)
+        unit_key = decoding_priority + 2 * unit_designed.to(decoding_priority.dtype)
         unit_order = torch.argsort(unit_key, dim=1)
-        unit_rank = torch.empty_like(unit_order)
-        unit_rank.scatter_(1, unit_order, torch.arange(length, device=device).expand(batch, length))
+        # ``cumsum`` of ones is the per-row 0..L-1 step index without a dense ``arange`` that a ragged batch
+        # could not align; the out-of-place scatter inverts the permutation into per-position ranks.
+        positions = torch.ones_like(tied_group_ids).cumsum(dim=1) - 1
+        unit_rank = torch.zeros_like(unit_order).scatter(1, unit_order, positions)
         return torch.gather(unit_rank, 1, tied_group_ids)
 
     @staticmethod
@@ -452,6 +461,7 @@ class NaMpnnModel(Model):
         input: NaMpnnInput,
         *,
         decoding_ranks: Tensor | None = None,
+        decoding_priority: Tensor | None = None,
         decode_protein_first: bool = False,
         protein_coordinate_noise: float = 0.0,
         dna_coordinate_noise: float = 0.0,
@@ -465,12 +475,16 @@ class NaMpnnModel(Model):
             input: NA-MPNN tensors with batch size ``B`` and ``L`` residue rows.
             decoding_ranks: Optional ranks with shape ``(B, L)``; smaller values
                 decode earlier.
+            decoding_priority: Optional per-residue random priority ``(B, L)`` the order is drawn from. The
+                Runner seeds it per structure by global index; supplying it (rather than a ``generator``) keeps
+                a batched forward reproducible and independent of batch composition. Ignored when
+                ``decoding_ranks`` is given.
             decode_protein_first: Whether generated protein rows precede generated
                 nucleic-acid rows when ranks are drawn.
             protein_coordinate_noise: Gaussian coordinate-noise standard deviation for proteins.
             dna_coordinate_noise: Gaussian coordinate-noise standard deviation for DNA.
             rna_coordinate_noise: Gaussian coordinate-noise standard deviation for RNA.
-            generator: Random generator used for the order and coordinate noise.
+            generator: Random generator used for the order (when no priority is supplied) and coordinate noise.
 
         Returns:
             Vocabulary logits and the decoding ranks used for the forward pass.
@@ -486,7 +500,7 @@ class NaMpnnModel(Model):
             generator=generator,
         )
         if decoding_ranks is None:
-            decoding_ranks = self._training_ranks(input, decode_protein_first, generator)
+            decoding_ranks = self._training_ranks(input, decode_protein_first, generator, decoding_priority)
         logits = self._decode_logits(
             node_states,
             edge_states,
@@ -502,19 +516,28 @@ class NaMpnnModel(Model):
         input: NaMpnnInput,
         decode_protein_first: bool,
         generator: torch.Generator | None,
+        decoding_priority: Tensor | None = None,
     ) -> Tensor:
         r"""
         Draw the noised training decode order, protein-first when asked.
+
+        ``decoding_priority`` is the per-residue random priority. The Runner supplies it, seeded per structure
+        by global index, so a batched (and ragged) forward stays reproducible and independent of batch
+        composition; only a standalone call falls back to drawing it from ``generator``. The order is inverted
+        with a ``cumsum``-of-ones step index and an out-of-place scatter, so a ragged ``NestedTensor`` batch
+        keeps each structure's order over its own residues with no dense ``arange`` and no padded rows.
         """
 
-        device = input.residue_mask.device
         decode_mask = (input.residue_mask & input.design_positions).to(torch.float32)
         if decode_protein_first:
             decode_mask = decode_mask * (~input.protein_mask.bool()).to(torch.float32)
-        noise = torch.rand(input.residue_mask.shape, device=device, generator=generator)
-        order = torch.argsort((decode_mask + 1e-4) * noise, dim=1)
-        ranks = torch.empty_like(order)
-        ranks.scatter_(1, order, torch.arange(order.shape[1], device=device).expand_as(order))
+        if decoding_priority is None:
+            decoding_priority = torch.rand(
+                input.residue_mask.shape, device=input.residue_mask.device, generator=generator
+            )
+        order = torch.argsort((decode_mask + 1e-4) * decoding_priority, dim=1)
+        positions = torch.ones_like(order).cumsum(dim=1) - 1
+        ranks = torch.zeros_like(order).scatter(1, order, positions)
         return ranks
 
     # ------------------------------------------------------------------

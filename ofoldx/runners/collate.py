@@ -96,6 +96,51 @@ def pad_and_collate(batch: list[Any], *, token_pad_id: int, pair_bias_fields: Co
     return type(first)(**merged, batch_size=[len(batch)])
 
 
+def nested_collate(batch: list[Any]) -> Any:
+    r"""
+    Collate a batch of one MPNN-family Input dataclass into a ragged ``NestedTensor`` batch (no padding).
+
+    Every residue-aligned tensor field becomes a ``danling.NestedTensor`` carrying each structure at its own
+    length; the model runs on the packed values, so a prediction is independent of what shared the batch
+    (topology-invariant) with no padded rows to contaminate the k-NN or attention. ``NestedTensor`` handles
+    multi-axis raggedness natively, so pair fields (ragged on two residue axes) need no special handling and
+    ``tied_group_ids`` need no padded-unit extension -- each structure's causal units stay local to it.
+    """
+
+    from danling import NestedTensor
+
+    if not batch:
+        raise ValueError("collate requires a non-empty batch")
+    first = batch[0]
+    if not is_dataclass(first) or isinstance(first, type):
+        raise TypeError("MPNN collate expects family Input dataclass instances")
+    input_type = type(first)
+    for item in batch:
+        if type(item) is not input_type:
+            raise TypeError(
+                f"collate requires one Input type per batch; got {input_type.__name__} and {type(item).__name__}"
+            )
+
+    merged: dict[str, Any] = {}
+    for field in fields(first):
+        values = [getattr(item, field.name) for item in batch]
+        present = [value is not None for value in values]
+        if not any(present):
+            merged[field.name] = None
+            continue
+        if not all(present):
+            raise ValueError(f"optional field {field.name!r} must be present on every item or on none")
+        if isinstance(values[0], Tensor):
+            # Each item is ``(1, N_i, ...)`` from the Processor; drop the singleton batch axis so the
+            # NestedTensor's leading axis concatenates the structures, ragged on the residue axis.
+            merged[field.name] = NestedTensor([value.squeeze(0) for value in values])
+        else:
+            # A list (not a tuple) becomes a batched NonTensorStack so ``input[i]`` selects item ``i``'s
+            # metadata; a tuple would be one shared blob that does not track the batch axis.
+            merged[field.name] = [element for value in values for element in value]
+    return input_type(**merged, batch_size=[len(batch)])
+
+
 def collate_single(batch: list[Any]) -> Any:
     r"""
     Batch-size-1 collate for large structure models: return the sole already-batched Input.
@@ -114,14 +159,28 @@ def _design_count(batched: Any) -> int:
 
 def collate_sequence(batch: list[Any], *, token_pad_id: int, pair_bias_fields: Collection[str] = ()) -> dict[str, Any]:
     r"""
-    Collate a batch_size>1 sequence family to DanLing's batch, normalized by designable residues.
+    Collate a batch_size>1 sequence family to DanLing's *training* batch (padded), normalized by designable
+    residues. Training reduces a masked per-residue loss whose softmax needs autograd, which a dense (padded)
+    forward supports; inference uses ``collate_sequence_ragged`` for the topology-invariant ragged forward.
     """
 
     batched = pad_and_collate(batch, token_pad_id=token_pad_id, pair_bias_fields=pair_bias_fields)
-    # Per-item pre-padding residue counts, so inference can drop each output's tail padding by its own
-    # length (not by residue_mask, which would delete unresolved/gap rows).
-    lengths = [int(item.sequence_tokens.shape[1]) for item in batch]
-    return {"input": batched, "target": batched, "loss_normalizer": _design_count(batched), "lengths": lengths}
+    return {"input": batched, "target": batched, "loss_normalizer": _design_count(batched)}
+
+
+def collate_sequence_ragged(
+    batch: list[Any], *, token_pad_id: int = 0, pair_bias_fields: Collection[str] = ()
+) -> dict[str, Any]:
+    r"""
+    Collate a sequence family to a ragged ``NestedTensor`` batch for INFERENCE: each structure runs at its own
+    length, so a prediction is topology-invariant (independent of what shared the batch) and un-nests with
+    ``prediction[i]`` -- no padding to trim. ``token_pad_id`` / ``pair_bias_fields`` are accepted for
+    registration compatibility but unused (a ragged batch has no padding to place).
+    """
+
+    del token_pad_id, pair_bias_fields
+    batched = nested_collate(batch)
+    return {"input": batched, "target": batched, "loss_normalizer": _design_count(batched)}
 
 
 def collate_sequence_single(batch: list[Any]) -> dict[str, Any]:
