@@ -28,7 +28,7 @@ from ...modules.backend.resolve import resolve_tensor_backend
 from ...modules.backend.triangle_multiplication import triangle_multiplication as dispatch_triangle_multiplication
 from ...modules.feed_forward import SwiGluFeedForward
 from ...modules.transition import ConditionedTransition, Transition
-from ...modules.trunk.msa import MsaPairWeightedAveraging
+from ...modules.trunk.msa import MsaPairWeightedAveraging, OuterProductMean
 from ...results import FoldPrediction, FoldResult, Metric, PairMetric, Score
 from .config import EsmFold2Config, EsmFold2ExperimentalConfig
 
@@ -3001,108 +3001,80 @@ class EsmFold2TriangleMultiplication(nn.Module):
         return mixed * output_gate
 
 
-class EsmFold2OuterProductMean(nn.Module):
+class EsmFold2OuterProductMean(OuterProductMean):
     r"""
-    Outer-product mean: maps an MSA representation into a pair update.
+    Outer-product mean: maps a token-major MSA representation into a pair update.
+
+    Differs from [`OuterProductMean`][ofoldx.modules.trunk.msa.OuterProductMean] only in the
+    forward contract: the MSA arrives token-major (``[B, N_token, N_seq, msa_size]``) and the
+    mask-weighted mean is taken *after* the affine output projection, so the projection bias is
+    divided by the clamped valid-row count.
     """
 
-    def __init__(
-        self,
-        msa_size: int,
-        hidden_size: int,
-        pair_size: int,
-        backend: str = "auto",
-    ) -> None:
-        super().__init__()
-        self.backend = backend
-        self.msa_norm = LayerNorm(msa_size)
-        self.left_projection = nn.Linear(msa_size, hidden_size, bias=False)
-        self.right_projection = nn.Linear(msa_size, hidden_size, bias=False)
-        self.output_projection = nn.Linear(hidden_size * hidden_size, pair_size, bias=True)
-
     def forward(self, m: Tensor, msa_mask: Tensor) -> Tensor:
-        resolved = resolve_tensor_backend(
-            self.backend,
-            tensors=(m, msa_mask),
-            supported=("oops", "eager"),
-            public_default="eager",
+        r"""
+        Project the masked outer-product sum, then divide by the clamped valid-row count.
+
+        Args:
+            m: MSA representation `[B, N_token, N_seq, msa_size]`.
+            msa_mask: MSA validity mask `[B, N_token, N_seq]`.
+
+        Returns:
+            The pair contribution `[B, N_token, N_token, pair_size]`.
+        """
+
+        return dispatch_outer_product_mean(
+            m.transpose(1, 2),
+            msa_mask.transpose(1, 2),
+            msa_norm_weight=self.msa_norm.weight,
+            msa_norm_bias=self.msa_norm.bias,
+            proj_left_weight=self.left_projection.weight,
+            proj_right_weight=self.right_projection.weight,
+            proj_out_weight=self.output_projection.weight,
+            proj_out_bias=self.output_projection.bias,
+            msa_norm_eps=self.msa_norm.eps,
+            denom_eps=0.0,
+            divide_before_projection=False,
+            clamp_denominator=True,
+            backend=self.backend,
         )
-        if resolved == "oops":
-            return dispatch_outer_product_mean(
-                m.transpose(1, 2),
-                msa_mask.transpose(1, 2),
-                msa_norm_weight=self.msa_norm.weight,
-                msa_norm_bias=self.msa_norm.bias,
-                proj_left_weight=self.left_projection.weight,
-                proj_right_weight=self.right_projection.weight,
-                proj_out_weight=self.output_projection.weight,
-                proj_out_bias=self.output_projection.bias,
-                msa_norm_eps=self.msa_norm.eps,
-                denom_eps=0.0,
-                divide_before_projection=False,
-                clamp_denominator=True,
-                backend="oops",
-            )
-        m_norm = self.msa_norm(m)
-        mask = msa_mask.unsqueeze(-1).to(m_norm.dtype)
-        a = self.left_projection(m_norm) * mask
-        b = self.right_projection(m_norm) * mask
-        mask_f = msa_mask.to(a.dtype)
-        n_valid = (mask_f @ mask_f.transpose(-1, -2)).unsqueeze(-1).clamp(min=1.0)
-        outer = torch.einsum("bimc,bjmd->bijcd", a, b).flatten(-2)
-        return self.output_projection(outer) / n_valid
 
 
-class EsmFold2ExperimentalOuterProductMean(nn.Module):
+class EsmFold2ExperimentalOuterProductMean(OuterProductMean):
     r"""
     Experimental ESMFold2 outer-product mean with normalization before the biased projection.
+
+    Shares the token-major layout of [`EsmFold2OuterProductMean`][] but divides by the clamped
+    valid-row count *before* the affine output projection, so the projection bias is added once.
     """
 
-    def __init__(
-        self,
-        msa_size: int,
-        hidden_size: int,
-        pair_size: int,
-        backend: str = "auto",
-    ) -> None:
-        super().__init__()
-        self.backend = backend
-        self.msa_norm = LayerNorm(msa_size)
-        self.left_projection = nn.Linear(msa_size, hidden_size, bias=False)
-        self.right_projection = nn.Linear(msa_size, hidden_size, bias=False)
-        self.output_projection = nn.Linear(hidden_size * hidden_size, pair_size, bias=True)
-
     def forward(self, m: Tensor, msa_mask: Tensor) -> Tensor:
-        resolved = resolve_tensor_backend(
-            self.backend,
-            tensors=(m, msa_mask),
-            supported=("oops", "eager"),
-            public_default="eager",
+        r"""
+        Divide the masked outer-product sum by the clamped valid-row count, then project.
+
+        Args:
+            m: MSA representation `[B, N_token, N_seq, msa_size]`.
+            msa_mask: MSA validity mask `[B, N_token, N_seq]`.
+
+        Returns:
+            The pair contribution `[B, N_token, N_token, pair_size]`.
+        """
+
+        return dispatch_outer_product_mean(
+            m.transpose(1, 2),
+            msa_mask.transpose(1, 2),
+            msa_norm_weight=self.msa_norm.weight,
+            msa_norm_bias=self.msa_norm.bias,
+            proj_left_weight=self.left_projection.weight,
+            proj_right_weight=self.right_projection.weight,
+            proj_out_weight=self.output_projection.weight,
+            proj_out_bias=self.output_projection.bias,
+            msa_norm_eps=self.msa_norm.eps,
+            denom_eps=0.0,
+            divide_before_projection=True,
+            clamp_denominator=True,
+            backend=self.backend,
         )
-        if resolved == "oops":
-            return dispatch_outer_product_mean(
-                m.transpose(1, 2),
-                msa_mask.transpose(1, 2),
-                msa_norm_weight=self.msa_norm.weight,
-                msa_norm_bias=self.msa_norm.bias,
-                proj_left_weight=self.left_projection.weight,
-                proj_right_weight=self.right_projection.weight,
-                proj_out_weight=self.output_projection.weight,
-                proj_out_bias=self.output_projection.bias,
-                msa_norm_eps=self.msa_norm.eps,
-                denom_eps=0.0,
-                divide_before_projection=True,
-                clamp_denominator=True,
-                backend="oops",
-            )
-        m_norm = self.msa_norm(m)
-        mask = msa_mask.unsqueeze(-1).to(m_norm.dtype)
-        a = self.left_projection(m_norm) * mask
-        b = self.right_projection(m_norm) * mask
-        mask_f = msa_mask.to(a.dtype)
-        n_valid = (mask_f @ mask_f.transpose(-1, -2)).unsqueeze(-1).clamp(min=1.0)
-        outer = torch.einsum("bimc,bjmd->bijcd", a, b).flatten(-2)
-        return self.output_projection(outer / n_valid)
 
 
 _NONPOLYMER_ID = 3
