@@ -14,7 +14,7 @@ import torch
 from torch import Tensor
 
 from ...data.components import get_component
-from ...data.conditions import Contact, Endpoint
+from ...data.conditions import Endpoint
 from ...data.evidence import MSA, MSACollection, Template, msa_bindings, resolve_msa_bindings
 from ...data.molecular import (
     AtomSite,
@@ -42,9 +42,9 @@ from .model import (
     CANONICAL_TOKENS,
     NUM_CANONICAL_TOKENS,
     BoltzGenBinding,
+    BoltzGenContact,
     BoltzGenCovalentBond,
     BoltzGenDesignMask,
-    BoltzGenDirectionalContact,
     BoltzGenInput,
     BoltzGenInverseFoldingInput,
     BoltzGenInverseFoldingLayout,
@@ -1902,25 +1902,19 @@ def _contact_channels(
     Realize contact records into the ``[N, N, 5]`` one-hot + ``[N, N]`` threshold.
     """
 
-    selected: list[tuple[Contact, str, tuple[int, ...], tuple[int, ...]]] = []
+    selected: list[tuple[BoltzGenContact, tuple[int, ...], tuple[int, ...]]] = []
     for condition in conditions:
-        if isinstance(condition, Contact):
-            contact = condition
-            kind = "contact"
-        elif isinstance(condition, BoltzGenDirectionalContact):
-            contact = condition.contact
-            kind = condition.direction
-        else:
+        if not isinstance(condition, BoltzGenContact):
             continue
         rows = _endpoint_tokens(
-            contact.side_a,
+            condition.side_a,
             token_index_by_residue,
             site_to_token,
             placement_map,
             instance_of,
         )
         columns = _endpoint_tokens(
-            contact.side_b,
+            condition.side_b,
             token_index_by_residue,
             site_to_token,
             placement_map,
@@ -1928,13 +1922,13 @@ def _contact_channels(
         )
         if not rows or not columns:
             raise ValueError("a BoltzGen contact must resolve to at least one token on each side")
-        selected.append((contact, kind, rows, columns))
+        selected.append((condition, rows, columns))
 
     # An absent contact request is UNSPECIFIED; background pairs in a request are UNSELECTED.
     classes = torch.full((token_count, token_count), int(bool(selected)), dtype=torch.long)
     threshold = torch.zeros(token_count, token_count)
-    for contact, kind, rows, columns in selected:
-        forward_class = _CONTACT_KIND_TO_CLASS[kind]
+    for contact, rows, columns in selected:
+        forward_class = _CONTACT_KIND_TO_CLASS[contact.kind]
         reverse_class = {2: 3, 3: 2}.get(forward_class, forward_class)
         for row in rows:
             for column in columns:

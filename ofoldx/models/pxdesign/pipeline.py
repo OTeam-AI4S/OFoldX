@@ -28,7 +28,7 @@ from ...data.molecular import (
 from ...data.structure import Structure
 from ...io import read_msa, read_structure
 from ...pipelines import CompositePair, CompositePipeline, PairedPipeline, resolve_generator
-from ...results import FoldPrediction, Score
+from ...results import FoldPrediction, Score, best
 from ..alphafold2 import (
     AlphaFold2InitialGuessPipeline,
     AlphaFold2Pipeline,
@@ -189,6 +189,13 @@ class PxDesignResult:
         """
 
         return tuple(self.candidates[index] for index in self.ranked_indices)
+
+    def best(self, score: str) -> PxDesignCandidate:
+        r"""
+        Return the earliest best candidate under one named score.
+        """
+
+        return best(self.candidates, score)
 
 
 class PxDesignPipeline(CompositePipeline):

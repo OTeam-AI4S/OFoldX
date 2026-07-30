@@ -148,6 +148,16 @@ class AlphaFold3Processor(Processor):
             ``AlphaFold3ProcessorConfig()``.
         device: Device for produced tensors.
         dtype: Floating-point dtype for produced tensors.
+
+    Examples:
+        >>> from ofoldx.data import MolecularSystem, Molecule, get_component
+        >>> molecule = Molecule((get_component("GLY"), get_component("ALA")))
+        >>> system = MolecularSystem({"ligand": molecule}, {"L": "ligand"})
+        >>> input = AlphaFold3Processor()(system)
+        >>> input.residue_index.unique().tolist()
+        [0, 1]
+        >>> input.reference_space_id.unique().tolist()
+        [0, 1]
     """
 
     config_class = AlphaFold3ProcessorConfig
@@ -445,34 +455,39 @@ def _tokenize(system: MolecularSystem) -> list[dict[str, object]]:
                     )
                 reference_space += 1
         else:
-            atom_sites = tuple(
-                site
-                for component_index, component in enumerate(entity.components)
-                for atom in component.atoms
-                if atom.element != "H" and (site := AtomSite(instance_id, component_index, atom.atom_id)) in available
-            )
-            if not atom_sites:
-                raise ValueError(f"AlphaFold 3 molecule {instance_id!r} has no model-visible heavy atoms")
-            for site in atom_sites:
-                tokens.append(
-                    {
-                        "atoms": (site,),
-                        "site": site,
-                        "instance_id": instance_id,
-                        "entity_id": entity_id,
-                        "monomer_index": None,
-                        "residue_index": 0,
-                        "chain_index": chain_index,
-                        "entity_index": entity_index,
-                        "symmetry_index": symmetry_index,
-                        "residue_type": _UNKNOWN,
-                        "center": site,
-                        "representative": site,
-                        "standard": False,
-                        "reference_space": reference_space,
-                    }
+            molecule_has_atoms = False
+            for component_index, component in enumerate(entity.components):
+                atom_sites = tuple(
+                    site
+                    for atom in component.atoms
+                    if atom.element != "H"
+                    and (site := AtomSite(instance_id, component_index, atom.atom_id)) in available
                 )
-            reference_space += 1
+                if not atom_sites:
+                    continue
+                molecule_has_atoms = True
+                for site in atom_sites:
+                    tokens.append(
+                        {
+                            "atoms": (site,),
+                            "site": site,
+                            "instance_id": instance_id,
+                            "entity_id": entity_id,
+                            "monomer_index": None,
+                            "residue_index": component_index,
+                            "chain_index": chain_index,
+                            "entity_index": entity_index,
+                            "symmetry_index": symmetry_index,
+                            "residue_type": _UNKNOWN,
+                            "center": site,
+                            "representative": site,
+                            "standard": False,
+                            "reference_space": reference_space,
+                        }
+                    )
+                reference_space += 1
+            if not molecule_has_atoms:
+                raise ValueError(f"AlphaFold 3 molecule {instance_id!r} has no model-visible heavy atoms")
     return tokens
 
 
@@ -619,25 +634,19 @@ def _reference_features(
     positions = torch.zeros(len(atom_sites), 3)
     mask = torch.zeros(len(atom_sites), dtype=torch.bool)
     charges = torch.tensor([system.atom(site).formal_charge for site in atom_sites], dtype=torch.float32)
-    grouped: dict[tuple[str, int | None], list[AtomSite]] = {}
+    grouped: dict[ComponentReference, list[AtomSite]] = {}
     for site in atom_sites:
-        entity = system.entities[system.instances[site.instance_id]]
-        space = None if isinstance(entity, Molecule) else site.component_index
-        grouped.setdefault((site.instance_id, space), []).append(site)
+        grouped.setdefault((site.instance_id, site.component_index), []).append(site)
 
-    for (instance_id, _space), sites in grouped.items():
-        entity = system.entities[system.instances[instance_id]]
-        checked: set[int] = set()
+    for component_reference, sites in grouped.items():
+        component = system.component(component_reference)
+        if not any(coordinate is not None for coordinate in component.reference_coordinates):
+            raise ValueError(
+                f"AlphaFold 3 requires explicit reference_coordinates for {component.component_id!r}; "
+                "the Processor does not generate conformers implicitly"
+            )
+        atom_by_name = {atom.atom_id: index for index, atom in enumerate(component.atoms)}
         for site in sites:
-            component = entity.components[site.component_index]
-            if site.component_index not in checked:
-                checked.add(site.component_index)
-                if not any(coordinate is not None for coordinate in component.reference_coordinates):
-                    raise ValueError(
-                        f"AlphaFold 3 requires explicit reference_coordinates for {component.component_id!r}; "
-                        "the Processor does not generate conformers implicitly"
-                    )
-            atom_by_name = {atom.atom_id: index for index, atom in enumerate(component.atoms)}
             global_index = site_to_atom[site]
             coordinate = component.reference_coordinates[atom_by_name[site.atom_id]]
             if coordinate is not None:

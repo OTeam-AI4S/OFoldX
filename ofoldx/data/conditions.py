@@ -1,5 +1,5 @@
 r"""
-Residue-identity, hotspot, and contact conditions.
+Residue-identity and hotspot conditions, with shared endpoint references.
 """
 
 from __future__ import annotations
@@ -58,38 +58,3 @@ class Hotspot:
     """
 
     residues: tuple[Endpoint, ...]
-
-
-@dataclass(frozen=True, eq=False)
-class Contact:
-    r"""
-    A pairwise proximity condition between two endpoint sets.
-
-    Equality and hashing treat ``side_a`` and ``side_b`` as unordered.
-
-    Args:
-        side_a: Endpoints on one side of the requested contact.
-        side_b: Endpoints on the other side of the requested contact.
-        cutoff_angstrom: Maximum contact distance in angstroms.
-        tolerance_angstrom: Additional accepted distance in angstroms.
-    """
-
-    side_a: tuple[Endpoint, ...]
-    side_b: tuple[Endpoint, ...]
-    cutoff_angstrom: float
-    tolerance_angstrom: float = 0.0
-
-    def _identity(self) -> tuple[object, ...]:
-        return (
-            frozenset((self.side_a, self.side_b)),
-            self.cutoff_angstrom,
-            self.tolerance_angstrom,
-        )
-
-    def __eq__(self, other: object) -> bool:
-        if not isinstance(other, Contact):
-            return NotImplemented
-        return self._identity() == other._identity()
-
-    def __hash__(self) -> int:
-        return hash(self._identity())

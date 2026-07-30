@@ -15,7 +15,7 @@ from tensordict import tensorclass
 from torch import Tensor, nn
 
 from ...data.bonds import SymbolicBond
-from ...data.conditions import Contact, Hotspot
+from ...data.conditions import Endpoint, Hotspot
 from ...data.molecular import AtomSite, ComponentReference, MolecularSystem
 from ...data.placement import (
     PlacementMap,
@@ -4888,40 +4888,23 @@ class BoltzGenResidueConstraint:
     allowed: tuple[str, ...]
 
 
-@dataclass(frozen=True, eq=False)
-class BoltzGenDirectionalContact:
+@dataclass(frozen=True)
+class BoltzGenContact:
     r"""
-    Add BoltzGen's directional pocket/binder meaning to a shared contact.
-
-    The shared [`Contact`][] owns the endpoints, cutoff, and symmetric proximity
-    meaning. This wrapper owns only which ordered side is the pocket.
+    A BoltzGen pairwise proximity condition between two endpoint sets.
 
     Args:
-        contact: Shared two-sided proximity condition.
-        direction: Direction of the pocket-to-binder relation across the contact's
-            declared ``side_a`` and ``side_b``.
+        side_a: Endpoints on one side of the requested contact.
+        side_b: Endpoints on the other side of the requested contact.
+        cutoff_angstrom: Maximum contact distance in angstroms.
+        kind: Directional pocket/binder meaning across the declared sides, or
+            ``"contact"`` for symmetric proximity.
     """
 
-    contact: Contact
-    direction: Literal["pocket>binder", "binder>pocket"]
-
-    def _identity(self) -> tuple[object, ...]:
-        contact = self.contact
-        return (
-            contact.side_a,
-            contact.side_b,
-            contact.cutoff_angstrom,
-            contact.tolerance_angstrom,
-            self.direction,
-        )
-
-    def __eq__(self, other: object) -> bool:
-        if not isinstance(other, BoltzGenDirectionalContact):
-            return NotImplemented
-        return self._identity() == other._identity()
-
-    def __hash__(self) -> int:
-        return hash(self._identity())
+    side_a: tuple[Endpoint, ...]
+    side_b: tuple[Endpoint, ...]
+    cutoff_angstrom: float
+    kind: Literal["contact", "pocket>binder", "binder>pocket"] = "contact"
 
 
 @dataclass(frozen=True)
@@ -4953,8 +4936,7 @@ BoltzGenSchema = (
     | BoltzGenBinding
     | BoltzGenSecondaryStructure
     | BoltzGenStructureGroup
-    | Contact
-    | BoltzGenDirectionalContact
+    | BoltzGenContact
     | BoltzGenCovalentBond
     | BoltzGenSymmetry
 )

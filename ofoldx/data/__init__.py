@@ -20,7 +20,6 @@ from .components import get_component
 from .conditions import (
     AllowedResidueIdentities,
     AtomEndpoint,
-    Contact,
     Endpoint,
     Hotspot,
     ResidueEndpoint,

@@ -8,7 +8,7 @@ from ._version import __version__, version
 from .api import TASKS, Task, pipeline
 from .artifacts import save_model
 from .auto import AutoModel, AutoProcessor
-from .data.conditions import Contact, Hotspot
+from .data.conditions import Hotspot
 from .data.evidence import MSA, Template
 from .data.molecular import MolecularSystem, PolymerSequence
 from .data.structure import Structure

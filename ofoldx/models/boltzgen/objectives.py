@@ -17,6 +17,7 @@ from torch import Tensor
 
 from ...modules.geometry import weighted_rigid_align
 from ...modules.head.tm import tm_length_scale
+from ...modules.symmetry import match_symmetric_truth
 from .model import (
     BoltzGenConfidenceOutput,
     BoltzGenInput,
@@ -94,20 +95,35 @@ class BoltzGenDiffusionLoss:
 def confidence_loss(
     output: BoltzGenConfidenceOutput,
     predicted_coordinates: Tensor,
-    target_coordinates: Tensor,
-    target_mask: Tensor,
+    target: BoltzGenStructureTarget,
     input: BoltzGenInput,
     *,
     token_level_confidence: bool,
     pae_weight: float = 0.0,
+    max_chain_assignments: int | None = 100,
+    generator: torch.Generator | None = None,
 ) -> BoltzGenConfidenceLoss:
     r"""
     Compose the released BoltzGen categorical confidence objectives.
 
-    Coordinates and the target mask have shapes ``(B, S, A, 3)`` and
-    ``(B, S, A)``. Targets must already have undergone truth-symmetry matching.
+    Prediction-dependent chain and local-atom truth assignments are selected
+    independently for every sample before the confidence targets are computed.
     """
 
+    if target.coordinates.shape[1] != 1:
+        raise ValueError("BoltzGen confidence loss requires exactly one target conformer")
+    target_coordinates, target_mask = match_symmetric_truth(
+        predicted_coordinates,
+        target.coordinates[:, 0],
+        target.coordinate_mask,
+        target.atom_index,
+        target.chain_span,
+        target.chain_equivalence_index,
+        target.symmetry_atom_index,
+        target.symmetry_permutation,
+        max_chain_assignments=max_chain_assignments,
+        generator=generator,
+    )
     plddt = plddt_loss(
         output.plddt_logits,
         predicted_coordinates,
