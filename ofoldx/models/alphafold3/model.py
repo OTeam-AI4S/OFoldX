@@ -30,7 +30,7 @@ from ...modules.atom import (
     TokenToAtomDecoder,
 )
 from ...modules.atom.window import gather_key_windows
-from ...modules.attention import PairBiasedSelfAttention, TriangleAttention, TriangleMultiplication
+from ...modules.attention import TriangleAttention
 from ...modules.backend import LayerNorm
 from ...modules.backend.attention import triangle_attention as dispatch_triangle_attention
 from ...modules.denoiser import DenoisingTokenRefiner
@@ -49,7 +49,7 @@ from ...modules.embedding import (
     generate_relative_position_features,
 )
 from ...modules.embedding.factorized import FactorizedPairLinear
-from ...modules.functional import pair_mask_from_msa_mask, pair_mask_from_token_mask
+from ...modules.functional import pair_mask_from_token_mask
 from ...modules.geometry import uniform_random_rotation
 from ...modules.head import (
     AtomConfidenceProjector,
@@ -60,9 +60,13 @@ from ...modules.head import (
 from ...modules.head.frames import gather_atoms_by_index, insert_sample_axis
 from ...modules.transition import Transition
 from ...modules.trunk.msa import (
-    MsaPairWeightedAveraging,
-    PostProjectionOuterProductMean,
+    FinalMsaPairUpdate,
+    MsaPairBlock,
+    MsaTrunk,
+    MsaUpdateBlock,
+    TrianglePairUpdateBlock,
 )
+from ...modules.trunk.pairformer import PairformerBlock, PairformerStack
 from ...results import FoldPrediction, FoldResult, Metric, PairMetric, Score
 from .config import AlphaFold3Config
 
@@ -1401,11 +1405,14 @@ class AlphaFold3BinnedDistancePairEmbedder(nn.Module):
         return pair + self.distance_one_hot_projection(distance_bins)
 
 
-class AlphaFold3MsaTrunk(nn.Module):
+class AlphaFold3MsaTrunk(MsaTrunk):
     r"""
     AlphaFold 3 MSA trunk with homogeneous family-owned joint blocks and a final pair-only update.
 
     ``num_stages`` counts both the joint MSA/pair blocks and the distinct final pair-only stage.
+    AlphaFold 3 runs no structured dropout and refines the pair with its own ending-node
+    triangle-bias equation, so the base contributes only the MSA and token projections and the
+    stage loop: it is built with no stages, and the family-owned stages take their place.
     """
 
     def __init__(
@@ -1423,9 +1430,22 @@ class AlphaFold3MsaTrunk(nn.Module):
         expansion: int = 4,
         backend: str = "auto",
     ) -> None:
-        super().__init__()
-        self.msa_projection = nn.Linear(msa_feature_size, msa_size, bias=False)
-        self.token_projection = nn.Linear(token_feature_size, msa_size, bias=False)
+        super().__init__(
+            msa_size=msa_size,
+            pair_size=pair_size,
+            msa_feature_size=msa_feature_size,
+            token_feature_size=token_feature_size,
+            num_stages=0,
+            outer_product_hidden_size=outer_product_hidden_size,
+            num_msa_attention_heads=num_msa_attention_heads,
+            triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
+            triangle_attention_hidden_size=triangle_attention_hidden_size,
+            num_triangle_attention_heads=num_triangle_attention_heads,
+            expansion=expansion,
+            msa_dropout=0.0,
+            pair_dropout=0.0,
+            backend=backend,
+        )
         self.num_stages = num_stages
         self.blocks = nn.ModuleList(
             AlphaFold3MsaPairBlock(
@@ -1456,30 +1476,13 @@ class AlphaFold3MsaTrunk(nn.Module):
             else None
         )
 
-    def forward(
-        self,
-        msa: Tensor,
-        pair: Tensor,
-        token_embedding: Tensor | None = None,
-        *,
-        msa_mask: Tensor | None = None,
-        pair_mask: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor]:
-        msa = self.msa_projection(msa)
-        if token_embedding is not None:
-            msa = msa + self.token_projection(token_embedding).unsqueeze(-3)
-        if pair_mask is None and msa_mask is not None:
-            pair_mask = pair_mask_from_msa_mask(msa_mask)
-        for block in self.blocks:
-            msa, pair = block(msa, pair, msa_mask=msa_mask, pair_mask=pair_mask)
-        if self.final_pair_update is not None:
-            pair = self.final_pair_update(msa, pair, msa_mask=msa_mask, pair_mask=pair_mask)
-        return msa, pair
 
-
-class AlphaFold3MsaPairBlock(nn.Module):
+class AlphaFold3MsaPairBlock(MsaPairBlock):
     r"""
     Joint AlphaFold 3 MSA/pair block with the family-owned triangle-bias equation.
+
+    The outer-product mean and the residual order are inherited; the MSA and pair updates are
+    replaced by the dropout-free AlphaFold 3 forms.
     """
 
     def __init__(
@@ -1494,11 +1497,17 @@ class AlphaFold3MsaPairBlock(nn.Module):
         expansion: int = 4,
         backend: str = "auto",
     ) -> None:
-        super().__init__()
-        self.outer_product_mean = PostProjectionOuterProductMean(
+        super().__init__(
             msa_size=msa_size,
-            hidden_size=outer_product_hidden_size,
             pair_size=pair_size,
+            outer_product_hidden_size=outer_product_hidden_size,
+            num_msa_attention_heads=num_msa_attention_heads,
+            triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
+            triangle_attention_hidden_size=triangle_attention_hidden_size,
+            num_triangle_attention_heads=num_triangle_attention_heads,
+            expansion=expansion,
+            msa_dropout=0.0,
+            pair_dropout=0.0,
             backend=backend,
         )
         self.msa_update = AlphaFold3MsaUpdateBlock(
@@ -1517,23 +1526,13 @@ class AlphaFold3MsaPairBlock(nn.Module):
             backend=backend,
         )
 
-    def forward(
-        self,
-        msa: Tensor,
-        pair: Tensor,
-        *,
-        msa_mask: Tensor | None = None,
-        pair_mask: Tensor | None = None,
-    ) -> tuple[Tensor, Tensor]:
-        pair = pair + self.outer_product_mean(msa, msa_mask=msa_mask)
-        msa = self.msa_update(msa, pair, pair_mask=pair_mask)
-        pair = self.triangle_pair_update(pair, pair_mask=pair_mask)
-        return msa, pair
 
-
-class AlphaFold3FinalMsaPairUpdate(nn.Module):
+class AlphaFold3FinalMsaPairUpdate(FinalMsaPairUpdate):
     r"""
     Final AlphaFold 3 MSA-stage update that refines only the pair representation.
+
+    The outer-product mean is inherited; the pair update is replaced by the dropout-free
+    AlphaFold 3 form.
     """
 
     def __init__(
@@ -1547,11 +1546,15 @@ class AlphaFold3FinalMsaPairUpdate(nn.Module):
         expansion: int = 4,
         backend: str = "auto",
     ) -> None:
-        super().__init__()
-        self.outer_product_mean = PostProjectionOuterProductMean(
+        super().__init__(
             msa_size=msa_size,
-            hidden_size=outer_product_hidden_size,
             pair_size=pair_size,
+            outer_product_hidden_size=outer_product_hidden_size,
+            triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
+            triangle_attention_hidden_size=triangle_attention_hidden_size,
+            num_triangle_attention_heads=num_triangle_attention_heads,
+            expansion=expansion,
+            pair_dropout=0.0,
             backend=backend,
         )
         self.triangle_pair_update = AlphaFold3TrianglePairUpdateBlock(
@@ -1563,19 +1566,8 @@ class AlphaFold3FinalMsaPairUpdate(nn.Module):
             backend=backend,
         )
 
-    def forward(
-        self,
-        msa: Tensor,
-        pair: Tensor,
-        *,
-        msa_mask: Tensor | None = None,
-        pair_mask: Tensor | None = None,
-    ) -> Tensor:
-        pair = pair + self.outer_product_mean(msa, msa_mask=msa_mask)
-        return self.triangle_pair_update(pair, pair_mask=pair_mask)
 
-
-class AlphaFold3MsaUpdateBlock(nn.Module):
+class AlphaFold3MsaUpdateBlock(MsaUpdateBlock):
     r"""
     AlphaFold 3 MSA update without structured dropout.
     """
@@ -1588,23 +1580,22 @@ class AlphaFold3MsaUpdateBlock(nn.Module):
         expansion: int = 4,
         backend: str = "auto",
     ) -> None:
-        super().__init__()
-        self.msa_pair_weighted_averaging = MsaPairWeightedAveraging(
+        super().__init__(
             msa_size=msa_size,
             pair_size=pair_size,
             num_attention_heads=num_attention_heads,
+            expansion=expansion,
+            dropout=0.0,
             backend=backend,
         )
-        self.transition = Transition(msa_size, expansion=expansion, backend=backend)
-
-    def forward(self, msa: Tensor, pair: Tensor, pair_mask: Tensor | None = None) -> Tensor:
-        msa = msa + self.msa_pair_weighted_averaging(msa, pair, pair_mask=pair_mask)
-        return msa + self.transition(msa)
 
 
-class AlphaFold3PairformerStack(nn.Module):
+class AlphaFold3PairformerStack(PairformerStack):
     r"""
     Homogeneous stack of AlphaFold 3 Pairformer blocks.
+
+    The base contributes only the stack loop, so it is built with no blocks and the family-owned
+    blocks take their place.
     """
 
     def __init__(
@@ -1619,7 +1610,18 @@ class AlphaFold3PairformerStack(nn.Module):
         expansion: int = 4,
         backend: str = "auto",
     ) -> None:
-        super().__init__()
+        super().__init__(
+            num_blocks=0,
+            single_size=single_size,
+            pair_size=pair_size,
+            triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
+            triangle_attention_hidden_size=triangle_attention_hidden_size,
+            num_triangle_attention_heads=num_triangle_attention_heads,
+            num_pair_attention_heads=num_pair_attention_heads,
+            expansion=expansion,
+            dropout=0.0,
+            backend=backend,
+        )
         self.num_blocks = num_blocks
         self.blocks = nn.ModuleList(
             AlphaFold3PairformerBlock(
@@ -1635,15 +1637,13 @@ class AlphaFold3PairformerStack(nn.Module):
             for _ in range(num_blocks)
         )
 
-    def forward(self, single: Tensor, pair: Tensor, pair_mask: Tensor | None = None) -> tuple[Tensor, Tensor]:
-        for block in self.blocks:
-            single, pair = block(single, pair, pair_mask=pair_mask)
-        return single, pair
 
-
-class AlphaFold3PairformerBlock(nn.Module):
+class AlphaFold3PairformerBlock(PairformerBlock):
     r"""
     One AlphaFold 3 Pairformer block with the family-owned triangle-bias equation.
+
+    The pair-biased single attention and the single transition are inherited; only the pair
+    update is replaced by the dropout-free AlphaFold 3 form.
     """
 
     def __init__(
@@ -1657,7 +1657,17 @@ class AlphaFold3PairformerBlock(nn.Module):
         expansion: int = 4,
         backend: str = "auto",
     ) -> None:
-        super().__init__()
+        super().__init__(
+            single_size=single_size,
+            pair_size=pair_size,
+            triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
+            triangle_attention_hidden_size=triangle_attention_hidden_size,
+            num_triangle_attention_heads=num_triangle_attention_heads,
+            num_pair_attention_heads=num_pair_attention_heads,
+            expansion=expansion,
+            dropout=0.0,
+            backend=backend,
+        )
         self.pair_update = AlphaFold3TrianglePairUpdateBlock(
             pair_size=pair_size,
             triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
@@ -1666,24 +1676,15 @@ class AlphaFold3PairformerBlock(nn.Module):
             expansion=expansion,
             backend=backend,
         )
-        self.pair_attention = PairBiasedSelfAttention(
-            hidden_size=single_size,
-            pair_size=pair_size,
-            num_attention_heads=num_pair_attention_heads,
-            backend=backend,
-        )
-        self.single_transition = Transition(single_size, expansion=expansion, backend=backend)
-
-    def forward(self, single: Tensor, pair: Tensor, pair_mask: Tensor | None = None) -> tuple[Tensor, Tensor]:
-        pair = self.pair_update(pair, pair_mask=pair_mask)
-        single = single + self.pair_attention(single, pair, pair_mask=pair_mask)
-        single = single + self.single_transition(single)
-        return single, pair
 
 
-class AlphaFold3TrianglePairUpdateBlock(nn.Module):
+class AlphaFold3TrianglePairUpdateBlock(TrianglePairUpdateBlock):
     r"""
     AlphaFold 3 pair update with its exact ending-node triangle-bias equation.
+
+    AlphaFold 3 runs the four triangle branches and the pair transition without dropout, and
+    biases the ending-node attention from the pre-transpose pair orientation, so the shared
+    block is built with ``dropout=0`` and only its ending-node attention is replaced.
     """
 
     def __init__(
@@ -1695,23 +1696,13 @@ class AlphaFold3TrianglePairUpdateBlock(nn.Module):
         expansion: int = 4,
         backend: str = "auto",
     ) -> None:
-        super().__init__()
-        self.triangle_multiplication_outgoing = TriangleMultiplication(
+        super().__init__(
             pair_size=pair_size,
-            hidden_size=triangle_multiplication_hidden_size,
-            outgoing=True,
-            backend=backend,
-        )
-        self.triangle_multiplication_incoming = TriangleMultiplication(
-            pair_size=pair_size,
-            hidden_size=triangle_multiplication_hidden_size,
-            outgoing=False,
-            backend=backend,
-        )
-        self.triangle_attention_starting_node = TriangleAttention(
-            pair_size=pair_size,
-            head_dim=triangle_attention_hidden_size,
-            num_attention_heads=num_triangle_attention_heads,
+            triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
+            triangle_attention_hidden_size=triangle_attention_hidden_size,
+            num_triangle_attention_heads=num_triangle_attention_heads,
+            expansion=expansion,
+            dropout=0.0,
             backend=backend,
         )
         self.triangle_attention_ending_node = AlphaFold3EndingNodeTriangleAttention(
@@ -1720,22 +1711,6 @@ class AlphaFold3TrianglePairUpdateBlock(nn.Module):
             num_attention_heads=num_triangle_attention_heads,
             backend=backend,
         )
-        self.transition = Transition(pair_size, expansion=expansion, backend=backend)
-
-    def forward(self, pair: Tensor, pair_mask: Tensor | None = None) -> Tensor:
-        pair = self.triangle_update(pair, pair_mask=pair_mask)
-        return pair + self.transition(pair)
-
-    def triangle_update(self, pair: Tensor, pair_mask: Tensor | None = None) -> Tensor:
-        pair = pair + self.triangle_multiplication_outgoing(pair, pair_mask=pair_mask)
-        pair = pair + self.triangle_multiplication_incoming(pair, pair_mask=pair_mask)
-        pair = pair + self.triangle_attention_starting_node(pair, pair_mask=pair_mask)
-        end_pair_mask = None if pair_mask is None else pair_mask.transpose(-1, -2)
-        ending_update = self.triangle_attention_ending_node(
-            pair.transpose(-3, -2),
-            pair_mask=end_pair_mask,
-        ).transpose(-3, -2)
-        return pair + ending_update
 
 
 class AlphaFold3EndingNodeTriangleAttention(TriangleAttention):
