@@ -62,6 +62,7 @@ def _resolve_objective(
 
         return criterion_factory, _collate.collate_sequence, False, False
     if architecture in {
+        "alphafold3",
         "boltz1",
         "boltz2",
         "boltzgen",

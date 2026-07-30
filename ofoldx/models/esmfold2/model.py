@@ -57,7 +57,7 @@ class EsmFold2Model(Model):
         ...             "input_size": 75,
         ...             "atom_encoder": {
         ...                 "atom_hidden_size": 8,
-        ...                 "token_hidden_size": 8,
+        ...                 "token_hidden_size": 16,
         ...                 "num_blocks": 1,
         ...                 "num_attention_heads": 1,
         ...                 "sliding_window_size": 8,
@@ -1073,7 +1073,7 @@ class EsmFold2ExperimentalModel(Model):
         ...             "input_size": 75,
         ...             "atom_encoder": {
         ...                 "atom_hidden_size": 8,
-        ...                 "token_hidden_size": 8,
+        ...                 "token_hidden_size": 16,
         ...                 "num_blocks": 1,
         ...                 "num_attention_heads": 1,
         ...                 "sliding_window_size": 8,

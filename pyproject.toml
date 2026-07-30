@@ -83,7 +83,7 @@ profile = "black"
 
 [tool.mypy]
 ignore_missing_imports = true
-python_version = "3.14"
+python_version = "3.12"
 
 [tool.pytest]
 ini_options.addopts = "--import-mode=importlib --doctest-modules --cov=ofoldx"

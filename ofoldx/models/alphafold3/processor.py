@@ -27,6 +27,7 @@ from ...data.evidence import (
     select_msa_binding,
 )
 from ...data.molecular import (
+    HYDROGEN_ELEMENTS,
     AtomSite,
     ChemicalComponent,
     ComponentReference,
@@ -37,7 +38,7 @@ from ...data.molecular import (
 from ...data.structure import Structure
 from ...processor import Processor
 from .config import AlphaFold3ProcessorConfig
-from .model import AlphaFold3Input, TemplateFeatures
+from .model import AlphaFold3Input, AlphaFold3StructureTarget, TemplateFeatures
 
 # AlphaFold 3 target residue-type vocabulary (POLYMER_TYPES_WITH_UNKNOWN_AND_GAP, 31 classes):
 # 20 standard amino acids, UNK, the gap, then A G C U (RNA) DA DG DC DT (DNA) and the shared
@@ -204,6 +205,64 @@ class AlphaFold3Processor(Processor):
             device=self.device,
             dtype=self.dtype,
         )
+
+    def process_training(
+        self,
+        input: Structure,
+        *,
+        msa: MSA | MSACollection | None = None,
+        templates: Sequence[Template] = (),
+    ) -> tuple[AlphaFold3Input, AlphaFold3StructureTarget]:
+        r"""
+        Lower one structure into model input and separate coordinate truth.
+        """
+
+        processed = self(
+            input,
+            msa=msa,
+            templates=templates,
+        )
+        return processed, _structure_target(
+            input,
+            processed,
+            device=self.device,
+            dtype=self.dtype,
+        )
+
+
+def _structure_target(
+    structure: Structure,
+    input: AlphaFold3Input,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> AlphaFold3StructureTarget:
+    r"""
+    Lower the retained heavy-atom coordinate pool from a Structure.
+    """
+
+    coordinate_indices = [
+        index
+        for index, site in enumerate(structure.sites)
+        if structure.system.atom(site).element not in HYDROGEN_ELEMENTS
+    ]
+    coordinate_index = {
+        structure.sites[source_index]: target_index for target_index, source_index in enumerate(coordinate_indices)
+    }
+    atom_index = torch.tensor(
+        [coordinate_index.get(site, -1) for site in input.atom_sites],
+        dtype=torch.int64,
+    )
+    return AlphaFold3StructureTarget(  # type: ignore[call-arg]
+        coordinates=torch.from_numpy(structure.coordinates[coordinate_indices].copy())
+        .to(device=device, dtype=dtype)
+        .unsqueeze(0),
+        coordinate_mask=torch.from_numpy(structure.coordinate_mask[coordinate_indices].copy())
+        .to(device=device)
+        .unsqueeze(0),
+        atom_index=atom_index.to(device=device).unsqueeze(0),
+        batch_size=[1],
+    )
 
 
 def molecular_system_from_input(
@@ -612,10 +671,10 @@ def _msa_descriptors(
     bindings = msa_bindings(msa)
     plan_rows = int(row_pairing.shape[0])
 
-    is_query = np.all(row_pairing == 0, axis=1)
-    populated = np.count_nonzero(row_pairing != -1, axis=1)
-    paired = [row for row in range(plan_rows) if not is_query[row] and populated[row] >= 2]
-    unpaired = [row for row in range(plan_rows) if not is_query[row] and populated[row] < 2]
+    paired_cells = np.count_nonzero((row_pairing != -1) & row_is_paired, axis=1)
+    paired = [row for row in range(1, plan_rows) if paired_cells[row] >= 2]
+    paired_rows = set(paired)
+    unpaired = [row for row in range(1, plan_rows) if row not in paired_rows]
 
     pair_limit = max_rows // 2
     ordered: list[int | None] = [None]

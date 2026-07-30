@@ -93,7 +93,7 @@ class ProtenixModel(Model):
         ...     "pair_size": 8,
         ...     "trunk": {
         ...         "msa_size": 8,
-        ...         "num_msa_blocks": 1,
+        ...         "num_msa_stages": 1,
         ...         "msa_outer_product_hidden_size": 4,
         ...         "num_msa_attention_heads": 1,
         ...         "msa_triangle_multiplication_hidden_size": 4,
@@ -243,7 +243,7 @@ class ProtenixModel(Model):
             msa_size=config.trunk.msa_size,
             pair_size=config.pair_size,
             token_feature_size=config.token_feature_size,
-            num_stages=config.trunk.num_msa_blocks,
+            num_stages=config.trunk.num_msa_stages,
             outer_product_hidden_size=config.trunk.msa_outer_product_hidden_size,
             num_msa_attention_heads=config.trunk.num_msa_attention_heads,
             triangle_multiplication_hidden_size=config.trunk.msa_triangle_multiplication_hidden_size,
@@ -1305,7 +1305,7 @@ class ProtenixStructureConditionModel(ProtenixModel):
         ...     "pair_size": 8,
         ...     "trunk": {
         ...         "msa_size": 8,
-        ...         "num_msa_blocks": 1,
+        ...         "num_msa_stages": 1,
         ...         "msa_outer_product_hidden_size": 4,
         ...         "num_msa_attention_heads": 1,
         ...         "msa_triangle_multiplication_hidden_size": 4,
@@ -1438,7 +1438,7 @@ class ProtenixConstraintModel(ProtenixModel):
         ...     "pair_size": 8,
         ...     "trunk": {
         ...         "msa_size": 8,
-        ...         "num_msa_blocks": 1,
+        ...         "num_msa_stages": 1,
         ...         "msa_outer_product_hidden_size": 4,
         ...         "num_msa_attention_heads": 1,
         ...         "msa_triangle_multiplication_hidden_size": 4,

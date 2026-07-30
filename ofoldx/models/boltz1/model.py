@@ -57,6 +57,23 @@ from ...modules.trunk.msa import MsaPairWeightedAveraging, OuterProductMean
 from ...results import FoldPrediction, FoldResult, Metric, PairMetric, Score
 from .config import Boltz1Config
 
+_Boltz1PotentialArguments: TypeAlias = tuple[Tensor, Tensor | None, Tensor | None]
+_Boltz1PotentialLowering: TypeAlias = tuple[
+    Tensor,
+    tuple[Tensor, ...],
+    tuple[Tensor, Tensor, int] | None,
+]
+_Boltz1ResolvedPotential: TypeAlias = tuple[
+    Tensor,
+    _Boltz1PotentialArguments,
+    tuple[Tensor, Tensor, int] | None,
+]
+_Boltz1PotentialEvaluation: TypeAlias = tuple[
+    Tensor,
+    _Boltz1PotentialArguments,
+    tuple[Tensor, Tensor] | tuple[Tensor, Tensor, int] | None,
+]
+
 
 class Boltz1Model(Model):
     r"""
@@ -1996,7 +2013,8 @@ class Boltz1CoordinateDiffusion(nn.Module):
         device, dtype = single_trunk.device, single_trunk.dtype
         step_scale = self.step_scale if step_scale is None else step_scale
         feats = cast(dict[str, Tensor] | None, conditioning.pop("feats", None))
-        potentials = _boltz1_potentials(physical_guidance) if feynman_kac or physical_guidance else ()
+        guidance_active = physical_guidance and num_guidance_steps > 0
+        potentials = _boltz1_potentials(physical_guidance) if feynman_kac or guidance_active else ()
         requested_multiplicity = multiplicity
         effective_multiplicity = multiplicity * num_particles if feynman_kac else multiplicity
         base_atom_mask = atom_mask
@@ -2004,6 +2022,55 @@ class Boltz1CoordinateDiffusion(nn.Module):
         shape = (*expanded_atom_mask.shape, 3)
         sigmas = self.sample_schedule(num_sampling_steps, device=device, dtype=dtype)
         gammas = torch.where(sigmas > self.min_churn_noise_level, self.churn_rate, 0.0)
+        sigma_current_hp = sigmas[:-1].double()
+        sigma_hats_hp = sigma_current_hp * (1 + gammas[1:].double())
+        sigma_next_hp_values = sigmas[1:].double()
+        noise_variances = self.noise_scale**2 * (sigma_hats_hp**2 - sigma_current_hp**2)
+        noise_active = tuple((noise_variances > 0).tolist()) if feynman_kac else ()
+        potential_inputs: list[
+            tuple[
+                Boltz1Potential,
+                tuple[_Boltz1PotentialLowering, ...],
+                tuple[_Boltz1ResolvedPotential, ...] | None,
+            ]
+        ] = []
+        potential_schedule: list[tuple[dict[str, float | int], ...]] = []
+        steering_slices: tuple[slice, ...] = ()
+        if potentials:
+            steering_feats = cast(dict[str, Tensor], feats)
+            for potential in potentials:
+                lowerings = tuple(
+                    potential._lower(steering_feats, batch_index) for batch_index in range(atom_mask.shape[0])
+                )
+                scientific_parameters_are_scheduled = any(
+                    isinstance(value, Boltz1ParameterSchedule)
+                    for name, value in potential.parameters.items()
+                    if name not in {"guidance_interval", "guidance_weight", "resampling_weight"}
+                )
+                resolved = None
+                if not scientific_parameters_are_scheduled:
+                    parameters = potential.compute_parameters(1.0)
+                    resolved = tuple(
+                        potential._cast_arguments(
+                            potential._resolve_parameters(lowering, parameters),
+                            device=device,
+                            dtype=dtype,
+                        )
+                        for lowering in lowerings
+                    )
+                potential_inputs.append((potential, lowerings, resolved))
+            for index in range(len(sigmas) - 1):
+                steering_t = 1.0 - (index / max(len(sigmas) - 1, 1))
+                potential_schedule.append(
+                    tuple(potential.compute_parameters(steering_t) for potential, _, _ in potential_inputs)
+                )
+            steering_slices = tuple(
+                slice(
+                    batch_index * effective_multiplicity,
+                    (batch_index + 1) * effective_multiplicity,
+                )
+                for batch_index in range(atom_mask.shape[0])
+            )
 
         def randn() -> Tensor:
             r"""
@@ -2020,7 +2087,7 @@ class Boltz1CoordinateDiffusion(nn.Module):
         else:
             energy_traj = torch.empty((0, 0), device=device, dtype=dtype)
             resample_weights = torch.empty((0, 0), device=device, dtype=dtype)
-        if physical_guidance:
+        if guidance_active:
             scaled_guidance_update = torch.zeros(shape, dtype=dtype, device=device)
         else:
             scaled_guidance_update = None
@@ -2053,14 +2120,9 @@ class Boltz1CoordinateDiffusion(nn.Module):
                 scaled_guidance_update = torch.einsum("bmd,bds->bms", scaled_guidance_update, rotation)
 
             sigma_hat = sigma_current * (1 + gamma)
-            steering_t = 1.0 - (index / max(len(sigmas) - 1, 1))
-            # Compute schedule-derived churn and reverse-step scalars in float64 to prevent cumulative rounding
-            # drift. The score network still receives float32 ``sigma_hat``; scalar tensors stay on-device so the
-            # sampling loop remains graph-break-free.
-            sigma_current_hp = sigma_current.double()
-            sigma_hat_hp = sigma_current_hp * (1 + gamma.double())
-            sigma_next_hp = sigma_next.double()
-            noise_var = self.noise_scale**2 * (sigma_hat_hp**2 - sigma_current_hp**2)
+            sigma_hat_hp = sigma_hats_hp[index]
+            sigma_next_hp = sigma_next_hp_values[index]
+            noise_var = noise_variances[index]
             noisy = coords + torch.sqrt(torch.clamp(noise_var, min=0.0)).to(coords.dtype) * randn()
             with torch.no_grad():
                 denoised_out = self.preconditioned_network_forward(
@@ -2078,21 +2140,54 @@ class Boltz1CoordinateDiffusion(nn.Module):
                 denoised = cast(Tensor, denoised_out)
 
             should_resample = feynman_kac and (
-                (index % feynman_kac_resampling_interval == 0 and noise_var > 0) or index == len(sigmas) - 2
+                (index % feynman_kac_resampling_interval == 0 and noise_active[index]) or index == len(sigmas) - 2
             )
+            active_potentials: list[
+                tuple[
+                    Boltz1Potential,
+                    tuple[_Boltz1ResolvedPotential, ...],
+                    float,
+                    float,
+                    int,
+                ]
+            ] = []
+            if should_resample or (guidance_active and index < len(sigmas) - 2):
+                for (potential, lowerings, static_arguments), parameters in zip(
+                    potential_inputs,
+                    potential_schedule[index],
+                    strict=True,
+                ):
+                    arguments = static_arguments
+                    if arguments is None:
+                        arguments = tuple(
+                            potential._cast_arguments(
+                                potential._resolve_parameters(lowering, parameters),
+                                device=device,
+                                dtype=dtype,
+                            )
+                            for lowering in lowerings
+                        )
+                    active_potentials.append(
+                        (
+                            potential,
+                            arguments,
+                            float(parameters["resampling_weight"]),
+                            float(parameters["guidance_weight"]),
+                            max(int(parameters["guidance_interval"]), 1),
+                        )
+                    )
             if should_resample:
                 energy = torch.zeros(denoised.shape[0], device=device, dtype=denoised.dtype)
-                for potential in potentials:
-                    parameters = potential.compute_parameters(steering_t)
-                    if float(parameters["resampling_weight"]) > 0:
-                        energy = energy + float(parameters["resampling_weight"]) * potential.compute(
-                            denoised,
-                            cast(dict[str, Tensor], feats),
-                            parameters,
-                        )
+                for potential, arguments, resampling_weight, _, _ in active_potentials:
+                    if resampling_weight > 0:
+                        for row_arguments, row_slice in zip(arguments, steering_slices, strict=True):
+                            energy[row_slice] = energy[row_slice] + resampling_weight * potential._compute(
+                                denoised[row_slice],
+                                row_arguments,
+                            )
                 energy_traj = torch.cat((energy_traj, energy.unsqueeze(1)), dim=1)
                 log_g = -energy if energy_traj.shape[1] == 1 else energy_traj[:, -2] - energy_traj[:, -1]
-                if scaled_guidance_update is not None and noise_var > 0:
+                if scaled_guidance_update is not None and noise_active[index]:
                     ll_difference = ((noisy - coords) ** 2 - (noisy - coords + scaled_guidance_update) ** 2).sum(
                         dim=(-1, -2)
                     ) / (2 * noise_var)
@@ -2103,19 +2198,20 @@ class Boltz1CoordinateDiffusion(nn.Module):
                     dim=1,
                 )
 
-            if physical_guidance and index < len(sigmas) - 2:
+            if guidance_active and index < len(sigmas) - 2:
                 guidance_update = torch.zeros_like(denoised)
                 for guidance_step in range(num_guidance_steps):
                     energy_gradient = torch.zeros_like(denoised)
-                    for potential in potentials:
-                        parameters = potential.compute_parameters(steering_t)
-                        interval = max(int(parameters["guidance_interval"]), 1)
-                        if float(parameters["guidance_weight"]) > 0 and guidance_step % interval == 0:
-                            energy_gradient = energy_gradient + float(
-                                parameters["guidance_weight"]
-                            ) * potential.compute_gradient(
-                                denoised + guidance_update, cast(dict[str, Tensor], feats), parameters
-                            )
+                    guided_coordinates = denoised + guidance_update
+                    for potential, arguments, _, guidance_weight, interval in active_potentials:
+                        if guidance_weight > 0 and guidance_step % interval == 0:
+                            for row_arguments, row_slice in zip(arguments, steering_slices, strict=True):
+                                energy_gradient[row_slice] = energy_gradient[
+                                    row_slice
+                                ] + guidance_weight * potential._compute_gradient(
+                                    guided_coordinates[row_slice],
+                                    row_arguments,
+                                )
                     guidance_update = guidance_update - energy_gradient
                 denoised = denoised + guidance_update
                 scaled_guidance_update = guidance_update * -step_scale * (sigma_next - sigma_hat) / sigma_hat
@@ -2145,7 +2241,7 @@ class Boltz1CoordinateDiffusion(nn.Module):
                     if token_repr is None:
                         token_repr = torch.zeros_like(cast(Tensor, token_a))
                     token_a = cast(Tensor, token_a)
-                    sigma = torch.full((token_a.shape[0],), sigma_hat, device=token_a.device, dtype=token_a.dtype)
+                    sigma = sigma_hat.expand(token_a.shape[0]).to(device=token_a.device, dtype=token_a.dtype)
                     token_repr = output_token_feature_update(
                         noise_level=self.preconditioner.c_noise(sigma),
                         accumulated=token_repr,
@@ -2161,7 +2257,7 @@ class Boltz1CoordinateDiffusion(nn.Module):
                 )
             derivative = (noisy - denoised) / sigma_hat_hp
             coords = (noisy + step_scale * (sigma_next_hp - sigma_hat_hp) * derivative).to(coords.dtype)
-        return (coords, token_repr) if return_token_repr else coords
+        return (coords, cast(Tensor, token_repr)) if return_token_repr else coords
 
 
 class Boltz1DenoiserAtomEncoder(nn.Module):
@@ -3023,9 +3119,6 @@ class Boltz1PiecewiseStepSchedule(Boltz1ParameterSchedule):
         return self.values[index]
 
 
-_Boltz1PotentialArguments: TypeAlias = tuple[Tensor, Tensor | None, Tensor | None]
-
-
 class Boltz1Potential:
     r"""
     Base class for a Boltz-1x physical potential over predicted coordinates.
@@ -3041,18 +3134,25 @@ class Boltz1Potential:
         }
 
     def compute(self, coords: Tensor, feats: dict[str, Tensor], parameters: Mapping[str, float | int]) -> Tensor:
-        index, args, com_args = self.compute_args(feats, parameters)
+        return self._compute(coords, self.compute_args(feats, parameters))
+
+    def _compute(self, coords: Tensor, arguments: _Boltz1PotentialEvaluation) -> Tensor:
+        index, args, com_args = arguments
         if index.shape[1] == 0:
             return torch.zeros(coords.shape[:-2], dtype=coords.dtype, device=coords.device)
         local_coords = coords
         if com_args is not None:
-            com_index, atom_mask = com_args
-            if not torch.any(atom_mask):
-                return torch.zeros(coords.shape[:-2], dtype=coords.dtype, device=coords.device)
+            com_index, atom_mask = com_args[:2]
+            if len(com_args) == 2:
+                if not torch.any(atom_mask):
+                    return torch.zeros(coords.shape[:-2], dtype=coords.dtype, device=coords.device)
+                num_coms = int(com_index[atom_mask].max().item()) + 1
+            else:
+                num_coms = cast(tuple[Tensor, Tensor, int], com_args)[2]
             unpad_com_index = com_index[atom_mask]
             unpad_coords = local_coords[..., atom_mask, :]
             local_coords = torch.zeros(
-                (*unpad_coords.shape[:-2], int(unpad_com_index.max().item()) + 1, 3),
+                (*unpad_coords.shape[:-2], num_coms, 3),
                 dtype=coords.dtype,
                 device=coords.device,
             ).scatter_reduce(
@@ -3061,7 +3161,7 @@ class Boltz1Potential:
                 unpad_coords,
                 "mean",
             )
-        value = self.compute_variable(local_coords, index, compute_gradient=False)
+        value = cast(Tensor, self.compute_variable(local_coords, index, compute_gradient=False))
         energy = cast(Tensor, self.compute_function(value, *args, compute_derivative=False))
         return energy.sum(dim=-1)
 
@@ -3071,19 +3171,26 @@ class Boltz1Potential:
         feats: dict[str, Tensor],
         parameters: Mapping[str, float | int],
     ) -> Tensor:
-        index, args, com_args = self.compute_args(feats, parameters)
+        return self._compute_gradient(coords, self.compute_args(feats, parameters))
+
+    def _compute_gradient(self, coords: Tensor, arguments: _Boltz1PotentialEvaluation) -> Tensor:
+        index, args, com_args = arguments
         if index.shape[1] == 0:
             return torch.zeros_like(coords)
         local_coords = coords
         com_index = None
         if com_args is not None:
-            com_index, atom_mask = com_args
-            if not torch.any(atom_mask):
-                return torch.zeros_like(coords)
+            com_index, atom_mask = com_args[:2]
+            if len(com_args) == 2:
+                if not torch.any(atom_mask):
+                    return torch.zeros_like(coords)
+                num_coms = int(com_index[atom_mask].max().item()) + 1
+            else:
+                num_coms = cast(tuple[Tensor, Tensor, int], com_args)[2]
             unpad_com_index = com_index[atom_mask]
             unpad_coords = local_coords[..., atom_mask, :]
             local_coords = torch.zeros(
-                (*unpad_coords.shape[:-2], int(unpad_com_index.max().item()) + 1, 3),
+                (*unpad_coords.shape[:-2], num_coms, 3),
                 dtype=coords.dtype,
                 device=coords.device,
             ).scatter_reduce(
@@ -3108,9 +3215,46 @@ class Boltz1Potential:
         return grad_atom
 
     def compute_args(
-        self, feats: dict[str, Tensor], parameters: Mapping[str, float | int]
+        self,
+        feats: dict[str, Tensor],
+        parameters: Mapping[str, float | int],
     ) -> tuple[Tensor, _Boltz1PotentialArguments, tuple[Tensor, Tensor] | None]:
+        index, arguments, com_args = self._resolve_parameters(
+            self._lower(feats, 0),
+            parameters,
+        )
+        if com_args is not None:
+            com_index, atom_mask, _ = com_args
+            return index, arguments, (com_index, atom_mask)
+        return index, arguments, None
+
+    def _lower(self, feats: dict[str, Tensor], batch_index: int) -> _Boltz1PotentialLowering:
         raise NotImplementedError
+
+    def _resolve_parameters(
+        self,
+        lowering: _Boltz1PotentialLowering,
+        parameters: Mapping[str, float | int],
+    ) -> _Boltz1ResolvedPotential:
+        raise NotImplementedError
+
+    def _cast_arguments(
+        self,
+        arguments: _Boltz1ResolvedPotential,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> _Boltz1ResolvedPotential:
+        index, (k, lower_bounds, upper_bounds), com_args = arguments
+        return (
+            index,
+            (
+                k.to(device=device, dtype=dtype),
+                None if lower_bounds is None else lower_bounds.to(device=device, dtype=dtype),
+                None if upper_bounds is None else upper_bounds.to(device=device, dtype=dtype),
+            ),
+            com_args,
+        )
 
     def compute_function(
         self,
@@ -3202,14 +3346,27 @@ class Boltz1PoseBustersPotential(Boltz1DistancePotential, Boltz1FlatBottomPotent
     PoseBusters bond/angle/clash potential over molecular distance bounds.
     """
 
-    def compute_args(
-        self, feats: dict[str, Tensor], parameters: Mapping[str, float | int]
-    ) -> tuple[Tensor, _Boltz1PotentialArguments, None]:
-        pair_index = feats["geometry_pair_index"][0]
-        lower_bounds = feats["geometry_lower_bounds"][0].clone()
-        upper_bounds = feats["geometry_upper_bounds"][0].clone()
-        bond_mask = feats["geometry_bond_mask"][0]
-        angle_mask = feats["geometry_angle_mask"][0]
+    def _lower(self, feats: dict[str, Tensor], batch_index: int) -> _Boltz1PotentialLowering:
+        pair_index = feats["geometry_pair_index"][batch_index]
+        lower_bounds = feats["geometry_lower_bounds"][batch_index]
+        upper_bounds = feats["geometry_upper_bounds"][batch_index]
+        bond_mask = feats["geometry_bond_mask"][batch_index]
+        angle_mask = feats["geometry_angle_mask"][batch_index]
+        atom_vdw_radii = (feats["reference_elements"].float() @ _vdw_radii(pair_index.device).unsqueeze(-1)).squeeze(
+            -1
+        )[batch_index]
+        bond_cutoffs = 0.35 + atom_vdw_radii[pair_index].mean(dim=0)
+        return pair_index, (lower_bounds, upper_bounds, bond_mask, angle_mask, bond_cutoffs), None
+
+    def _resolve_parameters(
+        self,
+        lowering: _Boltz1PotentialLowering,
+        parameters: Mapping[str, float | int],
+    ) -> _Boltz1ResolvedPotential:
+        pair_index, raw_arguments, com_args = lowering
+        lower_bounds, upper_bounds, bond_mask, angle_mask, bond_cutoffs = raw_arguments
+        lower_bounds = lower_bounds.clone()
+        upper_bounds = upper_bounds.clone()
         bond_buffer = float(parameters["bond_buffer"])
         angle_buffer = float(parameters["angle_buffer"])
         clash_buffer = float(parameters["clash_buffer"])
@@ -3221,10 +3378,6 @@ class Boltz1PoseBustersPotential(Boltz1DistancePotential, Boltz1FlatBottomPotent
         upper_bounds[bond_mask & angle_mask] *= 1.0 + min(bond_buffer, angle_buffer)
         lower_bounds[~bond_mask & ~angle_mask] *= 1.0 - clash_buffer
         upper_bounds[~bond_mask & ~angle_mask] = float("inf")
-        atom_vdw_radii = (feats["reference_elements"].float() @ _vdw_radii(pair_index.device).unsqueeze(-1)).squeeze(
-            -1
-        )[0]
-        bond_cutoffs = 0.35 + atom_vdw_radii[pair_index].mean(dim=0)
         lower_bounds[~bond_mask] = torch.max(
             lower_bounds[~bond_mask],
             bond_cutoffs[~bond_mask],
@@ -3233,7 +3386,7 @@ class Boltz1PoseBustersPotential(Boltz1DistancePotential, Boltz1FlatBottomPotent
             upper_bounds[bond_mask],
             bond_cutoffs[bond_mask],
         )
-        return pair_index, (torch.ones_like(lower_bounds), lower_bounds, upper_bounds), None
+        return pair_index, (torch.ones_like(lower_bounds), lower_bounds, upper_bounds), com_args
 
 
 class Boltz1ConnectionsPotential(Boltz1DistancePotential, Boltz1FlatBottomPotential):
@@ -3241,12 +3394,18 @@ class Boltz1ConnectionsPotential(Boltz1DistancePotential, Boltz1FlatBottomPotent
     Distance potential pulling cross-chain connected atom pairs within a fixed upper-bound buffer.
     """
 
-    def compute_args(
-        self, feats: dict[str, Tensor], parameters: Mapping[str, float | int]
-    ) -> tuple[Tensor, _Boltz1PotentialArguments, None]:
-        pair_index = feats["connected_atom_index"][0]
-        upper_bounds = torch.full((pair_index.shape[1],), float(parameters["buffer"]), device=pair_index.device)
-        return pair_index, (torch.ones_like(upper_bounds), None, upper_bounds), None
+    def _lower(self, feats: dict[str, Tensor], batch_index: int) -> _Boltz1PotentialLowering:
+        pair_index = feats["connected_atom_index"][batch_index]
+        return pair_index, (torch.ones(pair_index.shape[1], device=pair_index.device),), None
+
+    def _resolve_parameters(
+        self,
+        lowering: _Boltz1PotentialLowering,
+        parameters: Mapping[str, float | int],
+    ) -> _Boltz1ResolvedPotential:
+        pair_index, (template,), com_args = lowering
+        upper_bounds = template * float(parameters["buffer"])
+        return pair_index, (torch.ones_like(upper_bounds), None, upper_bounds), com_args
 
 
 class Boltz1VdwOverlapPotential(Boltz1DistancePotential, Boltz1FlatBottomPotential):
@@ -3254,23 +3413,18 @@ class Boltz1VdwOverlapPotential(Boltz1DistancePotential, Boltz1FlatBottomPotenti
     Van-der-Waals clash potential penalizing non-bonded, cross-chain atom pairs closer than their summed radii.
     """
 
-    def compute_args(
-        self, feats: dict[str, Tensor], parameters: Mapping[str, float | int]
-    ) -> tuple[Tensor, _Boltz1PotentialArguments, None]:
-        atom_chain_index = feats["chain_index"].gather(1, feats["atom_to_token"])[0]
-        atom_mask = feats["atom_mask"][0].bool()
-        if not torch.any(atom_mask):
-            pair_index = torch.empty(2, 0, dtype=torch.long, device=atom_chain_index.device)
-            empty = torch.empty(0, device=atom_chain_index.device)
-            return pair_index, (empty, empty, None), None
+    def _lower(self, feats: dict[str, Tensor], batch_index: int) -> _Boltz1PotentialLowering:
+        atom_chain_index = feats["chain_index"].gather(1, feats["atom_to_token"])[batch_index]
+        atom_mask = feats["atom_mask"][batch_index].bool()
+        num_chains = torch.bincount(atom_chain_index).shape[0]
         chain_sizes = torch.bincount(
             atom_chain_index[atom_mask],
-            minlength=int(atom_chain_index.max().item()) + 1,
+            minlength=num_chains,
         )
         single_ion_mask = (chain_sizes > 1)[atom_chain_index]
         reference_elements = feats["reference_elements"]
         atom_vdw_radii = (reference_elements.float() @ _vdw_radii(reference_elements.device).unsqueeze(-1)).squeeze(-1)[
-            0
+            batch_index
         ]
         pair_index = torch.triu_indices(
             atom_chain_index.shape[0],
@@ -3280,8 +3434,7 @@ class Boltz1VdwOverlapPotential(Boltz1DistancePotential, Boltz1FlatBottomPotenti
         )
         pair_mask = atom_mask[pair_index].all(dim=0)
         pair_ion_mask = single_ion_mask[pair_index[0]] & single_ion_mask[pair_index[1]]
-        num_chains = int(atom_chain_index.max().item()) + 1
-        connected_chain_index = feats["connected_chain_index"][0]
+        connected_chain_index = feats["connected_chain_index"][batch_index]
         connected_chain_matrix = torch.eye(
             num_chains,
             device=atom_chain_index.device,
@@ -3295,8 +3448,17 @@ class Boltz1VdwOverlapPotential(Boltz1DistancePotential, Boltz1FlatBottomPotenti
             atom_chain_index[pair_index[1]],
         ]
         pair_index = pair_index[:, pair_mask & pair_ion_mask & ~connected_chain_mask]
-        lower_bounds = atom_vdw_radii[pair_index].sum(dim=0) * (1.0 - float(parameters["buffer"]))
-        return pair_index, (torch.ones_like(lower_bounds), lower_bounds, None), None
+        unbuffered_bounds = atom_vdw_radii[pair_index].sum(dim=0)
+        return pair_index, (unbuffered_bounds,), None
+
+    def _resolve_parameters(
+        self,
+        lowering: _Boltz1PotentialLowering,
+        parameters: Mapping[str, float | int],
+    ) -> _Boltz1ResolvedPotential:
+        pair_index, (unbuffered_bounds,), com_args = lowering
+        lower_bounds = unbuffered_bounds * (1.0 - float(parameters["buffer"]))
+        return pair_index, (torch.ones_like(lower_bounds), lower_bounds, None), com_args
 
 
 class Boltz1SymmetricChainComPotential(Boltz1DistancePotential, Boltz1FlatBottomPotential):
@@ -3304,23 +3466,32 @@ class Boltz1SymmetricChainComPotential(Boltz1DistancePotential, Boltz1FlatBottom
     Distance potential separating the centers of mass of same-entity symmetric chain pairs.
     """
 
-    def compute_args(
-        self, feats: dict[str, Tensor], parameters: Mapping[str, float | int]
-    ) -> tuple[Tensor, _Boltz1PotentialArguments, tuple[Tensor, Tensor] | None]:
-        atom_chain_index = feats["chain_index"].gather(1, feats["atom_to_token"])[0]
-        atom_mask = feats["atom_mask"][0].bool()
-        pair_index = feats["symmetric_chain_index"][0]
-        if pair_index.shape[1] == 0 or not torch.any(atom_mask):
+    def _lower(self, feats: dict[str, Tensor], batch_index: int) -> _Boltz1PotentialLowering:
+        atom_chain_index = feats["chain_index"].gather(1, feats["atom_to_token"])[batch_index]
+        atom_mask = feats["atom_mask"][batch_index].bool()
+        pair_index = feats["symmetric_chain_index"][batch_index]
+        if pair_index.shape[1] == 0:
+            pair_index = pair_index[:, :0]
             lower_bounds = torch.empty(0, dtype=torch.float32, device=atom_chain_index.device)
-            return pair_index, (torch.ones_like(lower_bounds), lower_bounds, None), None
+            return pair_index, (lower_bounds,), None
+        num_chains = torch.bincount(atom_chain_index).shape[0]
         chain_sizes = torch.bincount(
             atom_chain_index[atom_mask],
-            minlength=int(atom_chain_index.max().item()) + 1,
+            minlength=num_chains,
         )
         single_ion_mask = chain_sizes > 1
         pair_index = pair_index[:, single_ion_mask[pair_index[0]] & single_ion_mask[pair_index[1]]]
-        lower_bounds = torch.full((pair_index.shape[1],), float(parameters["buffer"]), device=pair_index.device)
-        return pair_index, (torch.ones_like(lower_bounds), lower_bounds, None), (atom_chain_index, atom_mask)
+        lower_bounds = torch.ones(pair_index.shape[1], device=pair_index.device)
+        return pair_index, (lower_bounds,), (atom_chain_index, atom_mask, num_chains)
+
+    def _resolve_parameters(
+        self,
+        lowering: _Boltz1PotentialLowering,
+        parameters: Mapping[str, float | int],
+    ) -> _Boltz1ResolvedPotential:
+        pair_index, (template,), com_args = lowering
+        lower_bounds = template * float(parameters["buffer"])
+        return pair_index, (torch.ones_like(lower_bounds), lower_bounds, None), com_args
 
 
 class Boltz1StereoBondPotential(Boltz1AbsoluteDihedralPotential, Boltz1FlatBottomPotential):
@@ -3328,18 +3499,25 @@ class Boltz1StereoBondPotential(Boltz1AbsoluteDihedralPotential, Boltz1FlatBotto
     Absolute-dihedral potential enforcing E/Z stereo-bond orientations toward 0 or pi.
     """
 
-    def compute_args(
-        self, feats: dict[str, Tensor], parameters: Mapping[str, float | int]
-    ) -> tuple[Tensor, _Boltz1PotentialArguments, None]:
-        index = feats["stereo_bond_index"][0]
-        orientation = feats["stereo_bond_is_e"][0].bool()
+    def _lower(self, feats: dict[str, Tensor], batch_index: int) -> _Boltz1PotentialLowering:
+        index = feats["stereo_bond_index"][batch_index]
+        orientation = feats["stereo_bond_is_e"][batch_index].bool()
+        return index, (orientation,), None
+
+    def _resolve_parameters(
+        self,
+        lowering: _Boltz1PotentialLowering,
+        parameters: Mapping[str, float | int],
+    ) -> _Boltz1ResolvedPotential:
+        index, (orientation,), com_args = lowering
+        buffer = float(parameters["buffer"])
         lower_bounds = torch.zeros(orientation.shape, device=orientation.device)
         upper_bounds = torch.zeros(orientation.shape, device=orientation.device)
-        lower_bounds[orientation] = torch.pi - float(parameters["buffer"])
+        lower_bounds[orientation] = torch.pi - buffer
         upper_bounds[orientation] = float("inf")
         lower_bounds[~orientation] = float("-inf")
-        upper_bounds[~orientation] = float(parameters["buffer"])
-        return index, (torch.ones_like(lower_bounds), lower_bounds, upper_bounds), None
+        upper_bounds[~orientation] = buffer
+        return index, (torch.ones_like(lower_bounds), lower_bounds, upper_bounds), com_args
 
 
 class Boltz1ChiralAtomPotential(Boltz1DihedralPotential, Boltz1FlatBottomPotential):
@@ -3347,18 +3525,25 @@ class Boltz1ChiralAtomPotential(Boltz1DihedralPotential, Boltz1FlatBottomPotenti
     Signed-dihedral potential enforcing chiral-center handedness by sign of the improper dihedral.
     """
 
-    def compute_args(
-        self, feats: dict[str, Tensor], parameters: Mapping[str, float | int]
-    ) -> tuple[Tensor, _Boltz1PotentialArguments, None]:
-        index = feats["chiral_atom_index"][0]
-        orientation = feats["chiral_atom_is_r"][0].bool()
+    def _lower(self, feats: dict[str, Tensor], batch_index: int) -> _Boltz1PotentialLowering:
+        index = feats["chiral_atom_index"][batch_index]
+        orientation = feats["chiral_atom_is_r"][batch_index].bool()
+        return index, (orientation,), None
+
+    def _resolve_parameters(
+        self,
+        lowering: _Boltz1PotentialLowering,
+        parameters: Mapping[str, float | int],
+    ) -> _Boltz1ResolvedPotential:
+        index, (orientation,), com_args = lowering
+        buffer = float(parameters["buffer"])
         lower_bounds = torch.zeros(orientation.shape, device=orientation.device)
         upper_bounds = torch.zeros(orientation.shape, device=orientation.device)
-        lower_bounds[orientation] = float(parameters["buffer"])
+        lower_bounds[orientation] = buffer
         upper_bounds[orientation] = float("inf")
         lower_bounds[~orientation] = float("-inf")
-        upper_bounds[~orientation] = -float(parameters["buffer"])
-        return index, (torch.ones_like(lower_bounds), lower_bounds, upper_bounds), None
+        upper_bounds[~orientation] = -buffer
+        return index, (torch.ones_like(lower_bounds), lower_bounds, upper_bounds), com_args
 
 
 class Boltz1PlanarBondPotential(Boltz1AbsoluteDihedralPotential, Boltz1FlatBottomPotential):
@@ -3366,18 +3551,24 @@ class Boltz1PlanarBondPotential(Boltz1AbsoluteDihedralPotential, Boltz1FlatBotto
     Absolute-dihedral potential enforcing planarity around double bonds via improper dihedrals near zero.
     """
 
-    def compute_args(
-        self, feats: dict[str, Tensor], parameters: Mapping[str, float | int]
-    ) -> tuple[Tensor, _Boltz1PotentialArguments, None]:
-        double_bond_index = feats["planar_bond_index"][0].T
+    def _lower(self, feats: dict[str, Tensor], batch_index: int) -> _Boltz1PotentialLowering:
+        double_bond_index = feats["planar_bond_index"][batch_index].T
         improper_map = torch.tensor([[1, 2, 3, 0], [4, 5, 0, 3]], device=double_bond_index.device).T
         improper_index = double_bond_index[:, improper_map].swapaxes(0, 1).flatten(start_dim=1)
+        return improper_index, (), None
+
+    def _resolve_parameters(
+        self,
+        lowering: _Boltz1PotentialLowering,
+        parameters: Mapping[str, float | int],
+    ) -> _Boltz1ResolvedPotential:
+        improper_index, _, com_args = lowering
         upper_bounds = torch.full(
             (improper_index.shape[1],),
             float(parameters["buffer"]),
             device=improper_index.device,
         )
-        return improper_index, (torch.ones_like(upper_bounds), None, upper_bounds), None
+        return improper_index, (torch.ones_like(upper_bounds), None, upper_bounds), com_args
 
 
 def _boltz1_potentials(physical_guidance: bool) -> tuple[Boltz1Potential, ...]:

@@ -36,6 +36,21 @@ def test_external_mmcif_struct_conn_becomes_source_origin_overlay(tmp_path: Path
     path.write_text(
         """data_external
 loop_
+_entity.id
+_entity.type
+1 polymer
+2 non-polymer
+loop_
+_entity_poly.entity_id
+_entity_poly.type
+1 'polypeptide(L)'
+loop_
+_entity_poly_seq.entity_id
+_entity_poly_seq.num
+_entity_poly_seq.mon_id
+1 1 ACE
+1 2 ALA
+loop_
 _atom_site.group_PDB
 _atom_site.id
 _atom_site.type_symbol
@@ -57,8 +72,8 @@ _atom_site.auth_comp_id
 _atom_site.auth_asym_id
 _atom_site.auth_atom_id
 _atom_site.pdbx_PDB_model_num
-ATOM   1 N N  . ALA A 1 1 ? 0 0 0 1 10 0 1 ALA X N  1
-ATOM   2 C CA . ALA A 1 1 ? 1 0 0 1 10 0 1 ALA X CA 1
+ATOM   1 N N  . ALA A 1 2 ? 0 0 0 1 10 0 1 ALA X N  1
+ATOM   2 C CA . ALA A 1 2 ? 1 0 0 1 10 0 1 ALA X CA 1
 HETATM 3 C C1 . LIG L 2 . ? 2 0 0 1 10 0 7 LIG Z C1 1
 loop_
 _struct_conn.id
@@ -80,18 +95,21 @@ _struct_conn.ptnr2_auth_seq_id
 _struct_conn.ptnr2_auth_comp_id
 _struct_conn.ptnr2_auth_atom_id
 _struct_conn.pdbx_value_order
-1 covale A 1 ALA CA L . LIG C1 X 1 ALA CA Z 7 LIG C1 sing
+1 covale A 2 ALA CA L . LIG C1 X 1 ALA CA Z 7 LIG C1 ?
+2 covale A 1 ACE C  A 2 ALA N  X 0 ACE C  X 1 ALA N  ?
 """,
         encoding="utf-8",
     )
     ligand = ChemicalComponent("LIG", atoms=(ChemicalAtom("C1", "C", formal_charge=0),), bonds=frozenset())
+    acetyl = ChemicalComponent("ACE", atoms=(ChemicalAtom("C", "C", formal_charge=0),), bonds=frozenset())
 
-    structure = read_structure(path, components={"LIG": ligand})
+    structure = read_structure(path, components={"LIG": ligand, "ACE": acetyl})
 
-    assert len(structure.system.bonds) == 1
-    bond = next(iter(structure.system.bonds))
-    assert bond.origin == "source"
-    assert {bond.site_a.atom_id, bond.site_b.atom_id} == {"CA", "C1"}
+    assert len(structure.system.bonds) == 2
+    assert all(bond.origin == "source" and bond.order == 1.0 and not bond.aromatic for bond in structure.system.bonds)
+    endpoints = [{bond.site_a.atom_id, bond.site_b.atom_id} for bond in structure.system.bonds]
+    assert {"CA", "C1"} in endpoints
+    assert {"C", "N"} in endpoints
 
 
 def test_external_mmcif_rejects_conflicting_nonpolymer_definitions_for_one_entity(tmp_path: Path) -> None:

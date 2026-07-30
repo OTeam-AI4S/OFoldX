@@ -1625,7 +1625,6 @@ def _msa_descriptors(
 
     # RNA contributes only its unpaired pool. Protein paired rows keep the RNA query
     # sequence instead of treating RNA columns as another paired alignment.
-    is_query = np.all(row_pairing == 0, axis=1)
     protein_columns = np.asarray(
         [_msa_polymer_type(system, value.entity_id) == "protein" for value, _target in bindings],
         dtype=np.bool_,
@@ -1634,9 +1633,9 @@ def _msa_descriptors(
         (row_pairing != -1) & row_is_paired & protein_columns[None, :],
         axis=1,
     )
-    paired = [row for row in range(plan_rows) if not is_query[row] and protein_paired[row] >= 2]
+    paired = [row for row in range(1, plan_rows) if protein_paired[row] >= 2]
     paired_rows = set(paired)
-    unpaired = [row for row in range(plan_rows) if not is_query[row] and row not in paired_rows]
+    unpaired = [row for row in range(1, plan_rows) if row not in paired_rows]
 
     pair_limit = max_rows // 2
     ordered: list[int | None] = [None]

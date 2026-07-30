@@ -383,9 +383,7 @@ def _read_mmcif_entity_declarations(parsed: ParsedStructure) -> _MmcifEntityDecl
 
 
 def _cif_bond_order(value: str | None) -> tuple[float, bool]:
-    if value is None:
-        raise ValueError("mmCIF covalent bond order is missing")
-    key = value.lower()
+    key = "sing" if value is None else value.lower()
     try:
         return _CIF_BOND_ORDERS[key]
     except KeyError:
@@ -625,6 +623,7 @@ def read_mmcif_bonds(
     parsed: ParsedStructure,
     selected_rows: tuple[AtomRecord, ...],
     site_by_row_index: dict[int, AtomSite],
+    unmodeled_source_sites: dict[tuple[object, ...], AtomSite],
     excluded_water_rows: tuple[AtomRecord, ...],
 ) -> tuple[SystemBond, ...]:
     r"""
@@ -634,6 +633,8 @@ def read_mmcif_bonds(
         parsed: Parsed mmCIF records and source document.
         selected_rows: Atom rows retained for the selected structure.
         site_by_row_index: Canonical atom sites indexed by source row.
+        unmodeled_source_sites: Declared but unobserved polymer atoms indexed by
+            their label identities.
         excluded_water_rows: Source rows omitted by the reader's water projection.
 
     Returns:
@@ -672,10 +673,9 @@ def read_mmcif_bonds(
     ins_2 = _cif_column(category, "pdbx_ptnr2_PDB_ins_code")
     symmetry_1 = _cif_column(category, "ptnr1_symmetry")
     symmetry_2 = _cif_column(category, "ptnr2_symmetry")
-    value_orders = (
-        _cif_column(category, "pdbx_value_order") if "pdbx_value_order" in category else ("sing",) * category.row_count
-    )
+    value_orders = _cif_column(category, "pdbx_value_order")
     selected_sites = selected_source_sites(selected_rows, site_by_row_index)
+    selected_sites.update(unmodeled_source_sites)
     excluded_water_keys = {
         key
         for row in excluded_water_rows

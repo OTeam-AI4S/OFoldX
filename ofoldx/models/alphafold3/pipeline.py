@@ -4,16 +4,18 @@ AlphaFold 3 folding Pipeline.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import re
+from collections.abc import Mapping, Sequence
 from os import PathLike
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from ...data.evidence import MSA, MSACollection, Template
 from ...data.molecular import MolecularSystem, PolymerSequence
 from ...data.structure import Structure
-from ...io import read_fasta_records, read_msa, read_structure
+from ...io import pair_msa_rows_by_key, read_fasta_records, read_msa, read_msa_with_headers, read_structure
 from ...pipelines import PairedPipeline, resolve_generator
 from ...references import classify_reference
 from ...results import FoldResult
@@ -25,6 +27,89 @@ from .processor import (
 )
 
 _FASTA_SUFFIXES = frozenset((".fa", ".faa", ".fasta", ".fna", ".seq"))
+_UNIPROT_ENTRY_NAME = re.compile(
+    r"(?:tr|sp)\|(?:[A-Z0-9]{6,10})(?:_\d+)?\|(?:[A-Z0-9]{1,10}_)(?P<SpeciesId>[A-Z0-9]{1,5})"
+)
+_MAX_PAIRED_ROWS = 16384 // 2
+_MAX_ROWS_PER_KEY = 600
+
+
+def pair_msas(
+    unpaired_msa_paths: Mapping[str, str | PathLike[str]],
+    paired_msa_paths: Mapping[str, str | PathLike[str]],
+    *,
+    remove_paired_from_unpaired: bool = True,
+) -> MSACollection:
+    r"""
+    Pair independent protein alignments by AlphaFold 3's UniProt entry key.
+
+    The first mapping supplies the complete unpaired pools and fixes column
+    order. The second supplies header-bearing paired candidates for the same
+    entities.
+    """
+
+    entity_ids = tuple(unpaired_msa_paths)
+    if paired_msa_paths.keys() != unpaired_msa_paths.keys():
+        raise ValueError("unpaired and paired MSA mappings must have the same entities")
+
+    msas: list[MSA] = []
+    keys_by_msa: list[tuple[str, ...]] = []
+    for entity_id in entity_ids:
+        unpaired = read_msa(unpaired_msa_paths[entity_id], entity_id=entity_id)
+        paired, headers = read_msa_with_headers(paired_msa_paths[entity_id], entity_id=entity_id)
+        if unpaired.unpaired_sequences[0] != paired.unpaired_sequences[0]:
+            raise ValueError(f"unpaired and paired MSA queries differ for entity {entity_id!r}")
+        msas.append(
+            MSA(
+                entity_id=entity_id,
+                unpaired_sequences=unpaired.unpaired_sequences,
+                unpaired_deletion_counts=unpaired.unpaired_deletion_counts,
+                paired_sequences=paired.unpaired_sequences,
+                paired_deletion_counts=paired.unpaired_deletion_counts,
+            )
+        )
+        keys_by_msa.append(
+            tuple(
+                match.group("SpeciesId") if (match := _UNIPROT_ENTRY_NAME.match(header.strip())) else ""
+                for header in headers
+            )
+        )
+
+    paired_blocks = [np.zeros((1, len(msas)), dtype=np.int64)]
+    paired_count = 1
+    if len({msa.unpaired_sequences[0] for msa in msas}) > 1:
+        for rows in pair_msa_rows_by_key(keys_by_msa, max_rows_per_key=_MAX_ROWS_PER_KEY):
+            rank = np.abs(np.prod(rows.astype(np.float32), axis=1))
+            paired_blocks.append(rows[np.argsort(rank)])
+            paired_count += len(rows)
+            if paired_count >= _MAX_PAIRED_ROWS:
+                break
+    paired_plan = np.concatenate(paired_blocks, axis=0)[:_MAX_PAIRED_ROWS]
+
+    unpaired_sources: list[list[int]] = []
+    for column, msa in enumerate(msas):
+        if remove_paired_from_unpaired:
+            paired_sequences = {msa.paired_sequences[int(row)] for row in paired_plan[:, column] if row != -1}
+            unpaired_sources.append(
+                [row for row, sequence in enumerate(msa.unpaired_sequences) if sequence not in paired_sequences]
+            )
+        else:
+            unpaired_sources.append(list(range(len(msa.unpaired_sequences))))
+
+    unpaired_plan = np.full(
+        (max((len(rows) for rows in unpaired_sources), default=0), len(msas)),
+        -1,
+        dtype=np.int64,
+    )
+    for column, rows in enumerate(unpaired_sources):
+        unpaired_plan[: len(rows), column] = rows
+
+    row_pairing = np.concatenate((paired_plan, unpaired_plan), axis=0)
+    row_is_paired = np.concatenate(
+        (paired_plan != -1, np.zeros_like(unpaired_plan, dtype=np.bool_)),
+        axis=0,
+    )
+    return MSACollection(tuple(msas), row_pairing, row_is_paired)
 
 
 class AlphaFold3Pipeline(PairedPipeline[AlphaFold3Model, AlphaFold3Processor]):

@@ -288,7 +288,7 @@ class LocalAtomWindowing(nn.Module):
             key_index = starts.unsqueeze(-1) + torch.arange(self.num_key_atoms, device=device)
             in_bounds = (key_index >= 0) & (key_index < num_atoms)
             safe_index = key_index.clamp(0, num_atoms - 1)
-            key_valid = in_bounds & atom_mask.unsqueeze(-2).gather(-1, safe_index)
+            key_valid = in_bounds & torch.take_along_dim(atom_mask.unsqueeze(-2), safe_index, dim=-1)
             key_index = torch.where(key_valid, safe_index, -1)
             query_valid = F.pad(atom_mask, (0, query_padding)).reshape(
                 *atom_mask.shape[:-1], num_windows, self.num_query_atoms

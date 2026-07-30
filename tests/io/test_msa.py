@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from ofoldx.io.msa import read_msa
+from ofoldx.io.msa import read_msa, read_msa_with_headers
 
 # §3.6 (frozen): read_msa(path, *, entity_id) picks the grammar from the filename suffix
 # (.a3m -> A3M, MultiMolecule aligned-FASTA suffixes -> aligned FASTA, anything else
@@ -72,3 +72,92 @@ def test_row_that_does_not_project_to_query_width_raises(tmp_path: Path) -> None
     path = _write(tmp_path, "aln.a3m", ">query\nAGV\n>short\nAG\n")
     with pytest.raises(ValueError, match="project to the query width"):
         read_msa(path, entity_id="A")
+
+
+def test_read_msa_with_headers_keeps_headers_aligned_to_biological_rows(tmp_path: Path) -> None:
+    path = _write(
+        tmp_path,
+        "aln.a3m",
+        ">ss_pred\nHHH\n>query target sequence\nAGV\n>sp|P12345|FOO_HUMAN source note\nAGkV\n",
+    )
+
+    msa, headers = read_msa_with_headers(path, entity_id="A")
+
+    assert msa.unpaired_sequences == ("AGV", "AGV")
+    assert headers == ("query target sequence", "sp|P12345|FOO_HUMAN source note")
+
+
+def test_alphafold3_pairing_handles_missing_chains_and_unsupported_headers(tmp_path: Path) -> None:
+    from ofoldx.models.alphafold3.pipeline import pair_msas
+
+    unpaired = {
+        "A": _write(tmp_path, "a_unpaired.a3m", ">query\nAAA\n>human\nA-A\n>other\nAA-\n"),
+        "B": _write(tmp_path, "b_unpaired.a3m", ">query\nCCC\n>human\nC-C\n>other\nCC-\n"),
+        "C": _write(tmp_path, "c_unpaired.a3m", ">query\nDDD\n>other\nD-D\n"),
+    }
+    paired = {
+        "C": _write(tmp_path, "c_paired.a3m", ">query\nDDD\n>unsupported\nD-D\n"),
+        "B": _write(
+            tmp_path,
+            "b_paired.a3m",
+            ">query\nCCC\n>sp|Q12345|BAR_HUMAN\nC-C\n>OX=9606\nCC-\n",
+        ),
+        "A": _write(
+            tmp_path,
+            "a_paired.a3m",
+            ">query\nAAA\n>sp|P12345|FOO_HUMAN\nA-A\n>organism prose HUMAN\nAA-\n",
+        ),
+    }
+
+    collection = pair_msas(unpaired, paired)
+
+    assert tuple(msa.unpaired_sequences for msa in collection.msas) == (
+        ("AAA", "A-A", "AA-"),
+        ("CCC", "C-C", "CC-"),
+        ("DDD", "D-D"),
+    )
+    assert np.array_equal(
+        collection.row_pairing,
+        np.array([[0, 0, 0], [1, 1, -1], [2, 2, 1]], dtype=np.int64),
+    )
+    assert np.array_equal(
+        collection.row_is_paired,
+        np.array([[True, True, True], [True, True, False], [False, False, False]], dtype=np.bool_),
+    )
+    assert collection.row_pairing.dtype == np.int64
+    assert collection.row_is_paired.dtype == np.bool_
+
+
+def test_pairing_keeps_protenix_uniref_support_family_owned_and_skips_homomers(tmp_path: Path) -> None:
+    from ofoldx.models.alphafold3.pipeline import pair_msas as pair_alphafold3_msas
+    from ofoldx.models.protenix.pipeline import pair_msas as pair_protenix_msas
+
+    unpaired = {
+        "A": _write(tmp_path, "a_unpaired.a3m", ">query\nAAA\n"),
+        "B": _write(tmp_path, "b_unpaired.a3m", ">query\nCCC\n"),
+    }
+    paired = {
+        "A": _write(tmp_path, "a_paired.a3m", ">query\nAAA\n>UniRef100_A_HUMAN\nA-A\n"),
+        "B": _write(tmp_path, "b_paired.a3m", ">query\nCCC\n>UniRef100_B_HUMAN\nC-C\n"),
+    }
+
+    alphafold3 = pair_alphafold3_msas(unpaired, paired)
+    protenix = pair_protenix_msas(unpaired, paired)
+
+    assert alphafold3.row_pairing.shape == (1, 2)
+    assert np.array_equal(protenix.row_pairing, np.array([[0, 0], [1, 1]], dtype=np.int64))
+    assert np.array_equal(protenix.row_is_paired, np.ones((2, 2), dtype=np.bool_))
+
+    homomer_unpaired = {
+        "A": _write(tmp_path, "ha_unpaired.a3m", ">query\nAAA\n"),
+        "B": _write(tmp_path, "hb_unpaired.a3m", ">query\nAAA\n"),
+    }
+    homomer_paired = {
+        "A": _write(tmp_path, "ha_paired.a3m", ">query\nAAA\n>sp|P12345|FOO_HUMAN\nA-A\n"),
+        "B": _write(tmp_path, "hb_paired.a3m", ">query\nAAA\n>sp|Q12345|BAR_HUMAN\nA-A\n"),
+    }
+
+    homomer = pair_alphafold3_msas(homomer_unpaired, homomer_paired)
+
+    assert np.array_equal(homomer.row_pairing, np.zeros((1, 2), dtype=np.int64))
+    assert np.array_equal(homomer.row_is_paired, np.ones((1, 2), dtype=np.bool_))

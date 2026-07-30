@@ -1,12 +1,14 @@
 r"""
 Shared EDM coordinate-denoising training loss for the diffusion structure families.
 
-The internally-noising diffusion models (Boltz-1, Boltz-2, BoltzGen, Protenix) expose their denoised
-coordinates, the augmented training target, and the per-sample noise level, so the canonical EDM
-denoising objective -- the ``1/c_out(sigma)**2``-weighted squared error -- grounds directly against the
-model output. The target is rigidly aligned onto the prediction first (detached weighted Kabsch, as in
-AF3/Boltz/Protenix): the denoiser output is not exactly equivariant, so its global pose is not anchored
-to the augmented frame and the arbitrary augmentation rotation would otherwise be penalized.
+The internally-noising diffusion models (AlphaFold 3, Boltz-1, Boltz-2,
+BoltzGen, Protenix) expose their denoised coordinates, the augmented training
+target, and the per-sample noise level, so the canonical EDM denoising objective
+-- the ``1/c_out(sigma)**2``-weighted squared error -- grounds directly against
+the model output. The target is rigidly aligned onto the prediction first
+(detached weighted Kabsch, as in AF3/Boltz/Protenix): the denoiser output is not
+exactly equivariant, so its global pose is not anchored to the augmented frame
+and the arbitrary augmentation rotation would otherwise be penalized.
 
 The loss is reduced over the *resolved* atoms only. ``input.atom_mask`` marks every atom slot in the
 padded layout, but unresolved/missing atoms carry no ground truth, so their augmented target coordinates

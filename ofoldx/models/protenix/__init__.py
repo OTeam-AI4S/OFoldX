@@ -58,6 +58,7 @@ from .pipeline import (
     ProtenixPipeline,
     ProtenixStructureConditionPipeline,
     ProtenixTemplatePipeline,
+    pair_msas,
 )
 from .processor import (
     ProtenixConstraintProcessor,

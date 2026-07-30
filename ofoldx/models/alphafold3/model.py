@@ -4,6 +4,7 @@ AlphaFold 3 top-level model.
 
 from __future__ import annotations
 
+import operator
 from typing import Literal, cast
 
 import numpy as np
@@ -49,6 +50,7 @@ from ...modules.embedding import (
 )
 from ...modules.embedding.factorized import FactorizedPairLinear
 from ...modules.functional import pair_mask_from_msa_mask, pair_mask_from_token_mask
+from ...modules.geometry import uniform_random_rotation
 from ...modules.head import (
     AtomConfidenceProjector,
     DistogramHead,
@@ -69,8 +71,9 @@ class AlphaFold3Model(Model):
     r"""
     Predict biomolecular complex structures with AlphaFold 3.
 
-    Accepts [`AlphaFold3Input`][ofoldx.models.alphafold3.model.AlphaFold3Input] and returns
-    [`AlphaFold3Output`][ofoldx.models.alphafold3.model.AlphaFold3Output].
+    Training ``forward`` accepts [`AlphaFold3Input`][] and
+    [`AlphaFold3StructureTarget`][] and returns [`AlphaFold3Output`][].
+    Explicit denoising and sampling return [`AlphaFold3RawOutput`][].
 
     Args:
         config: Model architecture and inference configuration.
@@ -121,7 +124,7 @@ class AlphaFold3Model(Model):
         >>> atom_count = inputs.atom_features.shape[1]
         >>> model = AlphaFold3Model(config).eval()
         >>> with torch.inference_mode():
-        ...     output = model(
+        ...     output = model.denoise(
         ...         inputs,
         ...         noisy_coordinates=torch.zeros(1, 1, atom_count, 3),
         ...         noise_level=torch.ones(1, 1),
@@ -245,15 +248,130 @@ class AlphaFold3Model(Model):
     def forward(
         self,
         input: AlphaFold3Input,
+        target: AlphaFold3StructureTarget,
+        *,
+        num_samples: int = 1,
+        synchronize_noise_levels: bool = False,
+        coordinate_augmentation: bool = True,
+        augmentation_translation_scale: float = 1.0,
+        noise_log_mean: float = -1.2,
+        noise_log_std: float = 1.5,
+        use_conditioning: bool = True,
+        recycling_steps: int | None = None,
+        generator: torch.Generator | None = None,
+    ) -> AlphaFold3Output:
+        r"""
+        Denoise randomly corrupted target coordinates for diffusion training.
+
+        Args:
+            input: Model features with batch, token, and atom axes ``(B, N, A)``.
+            target: Heavy-atom truth-pool coordinates and their current atom-axis
+                mapping.
+            num_samples: Number ``S`` of independently corrupted copies per input.
+            synchronize_noise_levels: Whether samples from one example share sigma.
+            coordinate_augmentation: Whether to apply random rigid augmentation.
+            augmentation_translation_scale: Standard deviation of augmentation
+                translations in angstroms.
+            noise_log_mean: Mean of the log-normal noise distribution.
+            noise_log_std: Standard deviation of the log-normal noise distribution.
+            use_conditioning: Whether trunk single and pair values condition the
+                diffusion head. The atom path always receives the trunk single.
+            recycling_steps: Number of complete trunk passes. ``None`` uses
+                the configured value.
+            generator: Optional generator for MSA realization, rigid augmentation,
+                noise levels, and Gaussian coordinate noise.
+
+        Returns:
+            Denoised and augmented target coordinates with shape ``(B, S, A, 3)``,
+            noise levels with shape ``(B, S)``, final trunk representations,
+            distogram logits, and confidence logits.
+
+        Raises:
+            ValueError: If ``num_samples`` or ``recycling_steps`` is not positive.
+        """
+
+        num_samples = operator.index(num_samples)
+        if num_samples < 1:
+            raise ValueError("num_samples must be positive")
+        recycling_steps = self._recycling_steps if recycling_steps is None else recycling_steps
+        if recycling_steps < 1:
+            raise ValueError("recycling_steps must be positive")
+        representations = self._run_trunk(input, recycling_steps=recycling_steps, generator=generator)
+        target_coordinates, target_mask = _gather_alphafold3_structure_target(target, input)
+        target_coordinates = target_coordinates.to(representations.single)
+        target_mask = target_mask.to(device=target_coordinates.device)
+        batch_size, atom_count = target_coordinates.shape[:2]
+        flat_target = target_coordinates.repeat_interleave(num_samples, dim=0)
+        flat_target_mask = target_mask.repeat_interleave(num_samples, dim=0)
+        augmented_target_coordinates = _center_random_augmentation(
+            flat_target,
+            flat_target_mask,
+            augmentation=coordinate_augmentation,
+            translation_scale=augmentation_translation_scale,
+            generator=generator,
+        )
+        noise_count = batch_size if synchronize_noise_levels else batch_size * num_samples
+        normal = torch.empty(
+            noise_count,
+            device=augmented_target_coordinates.device,
+            dtype=augmented_target_coordinates.dtype,
+        ).normal_(generator=generator)
+        noise_level = (
+            self.coordinate_denoiser.preconditioner.sigma_data * (noise_log_mean + noise_log_std * normal).exp()
+        )
+        if synchronize_noise_levels:
+            noise_level = noise_level.repeat_interleave(num_samples)
+        coordinate_noise = torch.empty_like(augmented_target_coordinates).normal_(generator=generator)
+        noisy_coordinates = augmented_target_coordinates + noise_level[:, None, None] * coordinate_noise
+        augmented_target_coordinates = augmented_target_coordinates.reshape(
+            batch_size,
+            num_samples,
+            atom_count,
+            3,
+        )
+        noise_level = noise_level.reshape(batch_size, num_samples)
+        coordinates = self._denoise(
+            self._denoise_context(
+                input,
+                representations,
+                use_conditioning=use_conditioning,
+            ).to_denoising_input(
+                noisy_coords=noisy_coordinates.reshape(
+                    batch_size,
+                    num_samples,
+                    atom_count,
+                    3,
+                ),
+                noise_level=noise_level,
+            )
+        )
+        raw_output = self._assemble_output(input, representations, coordinates)
+        return AlphaFold3Output(  # type: ignore[call-arg]
+            single=raw_output.single,
+            pair=raw_output.pair,
+            coordinates=raw_output.coordinates,
+            distogram_logits=raw_output.distogram_logits,
+            plddt_logits=raw_output.plddt_logits,
+            pae_logits=raw_output.pae_logits,
+            pde_logits=raw_output.pde_logits,
+            resolved_logits=raw_output.resolved_logits,
+            augmented_target_coordinates=augmented_target_coordinates,
+            noise_level=noise_level,
+            batch_size=[augmented_target_coordinates.shape[0]],
+        )
+
+    def denoise(
+        self,
+        input: AlphaFold3Input,
         *,
         noisy_coordinates: Tensor,
         noise_level: Tensor,
         use_conditioning: bool = True,
         recycling_steps: int | None = None,
         generator: torch.Generator | None = None,
-    ) -> AlphaFold3Output:
+    ) -> AlphaFold3RawOutput:
         r"""
-        Denoise atom coordinates at specified EDM noise levels.
+        Denoise atom coordinates at explicitly supplied EDM noise levels.
 
         Args:
             input: Model features with batch, token, and atom axes ``(B, N, A)``.
@@ -265,11 +383,11 @@ class AlphaFold3Model(Model):
                 diffusion head. The atom path always receives the trunk single.
             recycling_steps: Number of complete trunk passes. ``None`` uses
                 the configured value.
-            generator: Optional generator for the per-recycle MSA permutations.
+            generator: Optional generator for per-recycle MSA realization.
 
         Returns:
-            Denoised coordinates and confidence tensors with the shapes described
-            by [`AlphaFold3Output`][]. No diffusion sampling is performed.
+            Raw denoised coordinates, trunk representations, distogram logits,
+            and confidence logits. No diffusion sampling is performed.
 
         Raises:
             ValueError: If ``recycling_steps`` is not positive.
@@ -300,7 +418,7 @@ class AlphaFold3Model(Model):
         num_samples: int | None = None,
         num_sampling_steps: int | None = None,
         generator: torch.Generator | None = None,
-    ) -> AlphaFold3Output:
+    ) -> AlphaFold3RawOutput:
         r"""
         Run the recycled trunk, coordinate sampling, and prediction heads.
 
@@ -579,7 +697,7 @@ class AlphaFold3Model(Model):
         input: AlphaFold3Input,
         representations: _AlphaFold3TrunkOutput,
         coordinates: Tensor,
-    ) -> AlphaFold3Output:
+    ) -> AlphaFold3RawOutput:
         r"""
         Compute distogram and confidence predictions.
         """
@@ -599,7 +717,7 @@ class AlphaFold3Model(Model):
         )
         with torch.autocast(device_type=pair.device.type, enabled=False):
             distogram_logits = self.distogram_head(pair.to(dtype=self.distogram_head.projection.weight.dtype))
-        return AlphaFold3Output(  # type: ignore[call-arg]
+        return AlphaFold3RawOutput(  # type: ignore[call-arg]
             single=single,
             pair=pair,
             coordinates=coordinates,
@@ -656,7 +774,7 @@ class AlphaFold3Model(Model):
 
     def confidence_summary(
         self,
-        output: AlphaFold3Output,
+        output: AlphaFold3RawOutput,
         input: AlphaFold3Input,
         *,
         max_error_bin: float = 31.0,
@@ -2595,6 +2713,63 @@ def _query_ball(coordinates: np.ndarray, cutoff_radius: float) -> list[list[int]
     return tree.query_ball_point(coordinates, p=2.0, r=cutoff_radius)
 
 
+def _gather_alphafold3_structure_target(
+    target: AlphaFold3StructureTarget,
+    input: AlphaFold3Input,
+) -> tuple[Tensor, Tensor]:
+    r"""
+    Gather heavy-atom truth onto the current atom axis.
+    """
+
+    atom_index = target.atom_index.long()
+    valid = atom_index >= 0
+    gather_index = atom_index.clamp_min(0)
+    coordinates = target.coordinates.gather(
+        1,
+        gather_index.unsqueeze(-1).expand(-1, -1, 3),
+    )
+    coordinate_mask = target.coordinate_mask.gather(1, gather_index)
+    coordinate_mask = coordinate_mask & valid & input.atom_mask.bool()
+    coordinates = coordinates.masked_fill(~coordinate_mask.unsqueeze(-1), 0)
+    return coordinates, coordinate_mask
+
+
+def _center_random_augmentation(
+    coordinates: Tensor,
+    coordinate_mask: Tensor,
+    *,
+    augmentation: bool,
+    translation_scale: float,
+    generator: torch.Generator | None,
+) -> Tensor:
+    r"""
+    Center masked coordinates and optionally apply one rigid transform per sample.
+    """
+
+    weight = coordinate_mask.unsqueeze(-1).to(dtype=coordinates.dtype)
+    centroid = (coordinates * weight).sum(dim=-2, keepdim=True) / weight.sum(
+        dim=-2,
+        keepdim=True,
+    ).clamp_min(1.0)
+    centered = coordinates - centroid
+    if not augmentation:
+        return centered
+    rotation = uniform_random_rotation(
+        coordinates.shape[0],
+        device=coordinates.device,
+        dtype=coordinates.dtype,
+        generator=generator,
+    )
+    translation = torch.empty(
+        coordinates.shape[0],
+        1,
+        3,
+        device=coordinates.device,
+        dtype=coordinates.dtype,
+    ).normal_(generator=generator)
+    return torch.einsum("bmd,bds->bms", centered, rotation) + translation_scale * translation
+
+
 @tensorclass
 class TemplateFeatures:
     r"""
@@ -2630,6 +2805,24 @@ class _AlphaFold3TrunkOutput:
     single: Tensor
     pair: Tensor
     relative_features: RelativePositionBuckets
+
+
+@tensorclass
+class AlphaFold3StructureTarget:
+    r"""
+    Heavy-atom structure truth for AlphaFold 3 training.
+
+    Args:
+        coordinates: Heavy-atom truth coordinates with shape ``(B, T, 3)`` in
+            angstroms.
+        coordinate_mask: Resolved-coordinate mask with shape ``(B, T)``.
+        atom_index: Current model-atom to truth-pool mapping with shape
+            ``(B, A)``; ``-1`` marks padding.
+    """
+
+    coordinates: Tensor
+    coordinate_mask: Tensor
+    atom_index: Tensor
 
 
 @tensorclass
@@ -2694,9 +2887,9 @@ class AlphaFold3Input:
 
 
 @tensorclass
-class AlphaFold3Output:
+class AlphaFold3RawOutput:
     r"""
-    Predictions from one AlphaFold 3 denoising call.
+    Raw predictions from one AlphaFold 3 denoising or sampling call.
 
     Args:
         single: Final trunk single representation with shape ``(B, N, 384)``.
@@ -2732,3 +2925,19 @@ class AlphaFold3Output:
         """
 
         return expected_plddt(self.plddt_logits)
+
+
+@tensorclass
+class AlphaFold3Output(AlphaFold3RawOutput):
+    r"""
+    Predictions from one AlphaFold 3 training denoising pass.
+
+    Args:
+        augmented_target_coordinates: Training targets after rigid augmentation,
+            with shape ``(B, S, A, 3)`` in angstroms.
+        noise_level: Training noise standard deviations with shape ``(B, S)`` in
+            angstroms.
+    """
+
+    augmented_target_coordinates: Tensor
+    noise_level: Tensor

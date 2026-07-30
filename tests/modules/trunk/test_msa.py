@@ -66,7 +66,7 @@ def test_msa_trunk_one_block_runs_only_final_pair_update() -> None:
         pair_size=4,
         msa_feature_size=5,
         token_feature_size=3,
-        num_blocks=1,
+        num_stages=1,
         outer_product_hidden_size=2,
         triangle_multiplication_hidden_size=4,
         triangle_attention_hidden_size=2,

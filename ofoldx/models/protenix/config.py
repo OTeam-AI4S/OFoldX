@@ -38,7 +38,7 @@ class ProtenixTrunkConfig(Config):
         msa_dropout: Dropout probability applied along the MSA path.
         pair_dropout: Dropout probability applied along the pair path.
         msa_size: Width of the projected MSA representation.
-        num_msa_blocks: Number of MSA stages, including the final pair-only update.
+        num_msa_stages: Number of MSA stages, including the final pair-only update.
         msa_outer_product_hidden_size: Hidden width of the MSA outer-product mean.
         num_msa_attention_heads: Number of heads in MSA pair-weighted averaging.
         msa_triangle_multiplication_hidden_size: Hidden width of MSA-path triangle multiplication.
@@ -57,7 +57,7 @@ class ProtenixTrunkConfig(Config):
     msa_dropout: float = 0.15
     pair_dropout: float = 0.25
     msa_size: int = 64
-    num_msa_blocks: int = 4
+    num_msa_stages: int = 4
     msa_outer_product_hidden_size: int = 32
     num_msa_attention_heads: int = 8
     msa_triangle_multiplication_hidden_size: int = 128
@@ -240,7 +240,7 @@ class ProtenixConfig(Config):
         }:
             return ProtenixConfig(
                 trunk=ProtenixTrunkConfig(
-                    num_msa_blocks=1,
+                    num_msa_stages=1,
                     num_pairformer_blocks=16,
                 ),
                 esm=(
@@ -261,7 +261,7 @@ class ProtenixConfig(Config):
         if variant == "protenix_tiny_default_v0.5.0":
             return ProtenixConfig(
                 trunk=ProtenixTrunkConfig(
-                    num_msa_blocks=1,
+                    num_msa_stages=1,
                     num_pairformer_blocks=8,
                 ),
                 recycling_steps=4,
@@ -318,7 +318,7 @@ class ProtenixStructureConditionConfig(ProtenixConfig):
     """
 
     trunk: ProtenixTrunkConfig = ProtenixTrunkConfig(
-        num_msa_blocks=1,
+        num_msa_stages=1,
         num_pairformer_blocks=16,
     )
     recycling_steps: int = 4

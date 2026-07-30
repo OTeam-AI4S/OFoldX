@@ -81,6 +81,11 @@ checkpoint's noisy-structure pair update on every recycling pass.
 Direct `ProtenixNoisyStructureEmbedder` callers may enable its released
 `add_noise` distance perturbation and supply a `torch.Generator` for that draw.
 
+`ofoldx.models.protenix.pair_msas` constructs the released cross-chain
+`MSACollection` from explicitly supplied unpaired and paired alignment paths,
+using only the supported UniProt and UniRef100 header grammars. It performs no
+database search and never infers alignment paths from a structure filename.
+
 ### Links
 
 - **Code**: [ofoldx.models.protenix](https://github.com/OTeam-AI4S/OFoldX/tree/main/ofoldx/models/protenix)

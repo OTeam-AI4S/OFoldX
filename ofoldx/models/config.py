@@ -11,7 +11,7 @@ class DistogramConfig(Config):
     r"""
     Configure a head that predicts binned inter-residue distances from pair representations.
 
-    Args:
+    Attributes:
         num_bins: Number of distance bins the head predicts over.
     """
 
@@ -22,7 +22,7 @@ class DenoiserConfig(Config):
     r"""
     Configure the atom and token stacks of the diffusion coordinate denoiser.
 
-    Args:
+    Attributes:
         num_token_encoder_blocks: Number of token-level transformer blocks in the denoiser trunk.
         num_token_encoder_attention_heads: Number of attention heads in the token-level trunk.
         sigma_data: Data noise scale used by the EDM preconditioning.
@@ -55,7 +55,7 @@ class SamplerConfig(Config):
     r"""
     Configure the solver and noise schedule for EDM reverse diffusion.
 
-    Args:
+    Attributes:
         solver: Name of the ODE/SDE solver driving the reverse diffusion (e.g. ``"euler"``).
         num_sampling_steps: Number of reverse-diffusion steps.
         churn_rate: Fraction of steps that re-inject noise (stochastic churn).

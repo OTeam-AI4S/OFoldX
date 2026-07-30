@@ -254,6 +254,10 @@ def _prepare_read(
         excluded_component_ids = {row.component_id for row in excluded_water_rows} - {row.component_id for row in rows}
     if atom_layout in {"observed", "observed_heavy"}:
         _add_observed_components(rows, component_table)
+    else:
+        for row in rows:
+            if row.component_id not in component_table:
+                raise ValueError(f"unknown component {row.component_id!r}")
     if atom_layout == "complete_all":
         component_table = {
             component_id: (
@@ -802,6 +806,7 @@ def _build_structure(
     used_instance_ids: set[str] = set()
     entity_by_id: dict[str, PolymerSequence | Molecule] = {}
     unmodeled_residue_numbers: dict[ComponentReference, ResidueNumber] = {}
+    unmodeled_source_sites: dict[tuple[object, ...], AtomSite] = {}
 
     for (symmetry_id, chain_id), residue_order in chain_residue_order.items():
         base_instance_id = chain_id if symmetry_id is None else f"{chain_id}#{symmetry_id}"
@@ -890,6 +895,20 @@ def _build_structure(
                     if component_index in observed_indices:
                         continue
                     author = entity_declarations.author_numbering.get((chain_id, component_index + 1))
+                    component = declared_entity.components[component_index]
+                    insertion_code = None if author is None else author[1]
+                    for atom in component.atoms:
+                        site = AtomSite(instance_id, component_index, atom.atom_id)
+                        unmodeled_source_sites[
+                            (
+                                symmetry_id,
+                                chain_id,
+                                component_index + 1,
+                                insertion_code,
+                                component.component_id,
+                                atom.atom_id,
+                            )
+                        ] = site
                     if author is not None and author[0] is not None:
                         unmodeled_residue_numbers[(instance_id, component_index)] = ResidueNumber(
                             author[0], author[1] or ""
@@ -1025,6 +1044,7 @@ def _build_structure(
             parsed,
             rows,
             site_by_row_index,
+            unmodeled_source_sites,
             excluded_water_rows,
         )
     system = MolecularSystem(entity_by_id, instances, frozenset(source_bonds))

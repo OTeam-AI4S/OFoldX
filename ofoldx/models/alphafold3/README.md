@@ -91,14 +91,22 @@ information for the authoritative data description.
 ### Training Procedure
 
 AlphaFold 3 is trained end to end with a diffusion coordinate objective and
-auxiliary distogram and confidence objectives. OFoldX preserves the inference
-architecture and exposes the differentiable denoising step.
+auxiliary distogram and confidence objectives. The OFoldX Runner provides a
+bounded built-in objective: it draws the model's log-normal EDM noise and
+centered rigid augmentation, then applies the EDM-weighted coordinate-denoising
+loss over resolved atoms. This trains the trunk and coordinate denoiser; the
+confidence and distogram heads have no built-in loss. It is not a reproduction
+of the unpublished upstream training program.
 
 ## Limitations
 
-The exposed denoising operation is not a reproduction of AlphaFold 3's complete
-end-to-end training program, so this family has no built-in Runner objective.
-OFoldX also does not supply the upstream training corpus or evidence pipelines.
+OFoldX does not supply the upstream training corpus, database search, auxiliary
+confidence and distogram losses, optimizer, curriculum, or complete end-to-end
+training program. `ofoldx.models.alphafold3.pair_msas` performs the released
+UniProt-header pairing on explicitly supplied unpaired and paired alignment
+paths; it does not search databases or infer sidecars. Runner manifests may
+associate a structure with one alignment or an explicitly encoded
+`MSACollection`; the Runner itself does not pair homologs.
 
 ## Citation
 

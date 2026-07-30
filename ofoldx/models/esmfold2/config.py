@@ -13,7 +13,7 @@ class EsmFold2AtomEncoderConfig(Config):
 
     Args:
         atom_hidden_size: Width of atom single features.
-        token_hidden_size: Width of token features emitted by the atom encoder.
+        token_hidden_size: Token projection width; the atom encoder emits half this width.
         num_blocks: Number of atom attention blocks.
         num_attention_heads: Number of atom attention heads.
         sliding_window_size: Width of the local atom attention window.

@@ -60,7 +60,8 @@ processor = AutoProcessor("oteam/model-name")
 model = AutoModel("oteam/model-name")
 ```
 
-Train a family with a built-in Runner objective from one ordinary configuration:
+Train a family with a built-in Runner objective from one ordinary configuration.
+For example, ProteinMPNN trains sequence recovery over designable residues:
 
 ```python
 from ofoldx.runners import Runner
@@ -78,8 +79,59 @@ runner.train()
 runner.close()
 ```
 
-Families without a faithful built-in objective remain available through their
-Model and Pipeline APIs; the Runner does not fabricate a loss for them.
+AlphaFold 3 trains with the EDM-weighted coordinate-denoising loss over resolved
+atoms:
+
+```python
+from ofoldx.runners import Runner
+
+runner = Runner(
+    {
+        "epochs": 1,
+        "model": {"name": "alphafold3"},
+        "data": {"train": {"source": "structures/"}},
+        "optim": {"type": "adamw", "lr": 1e-4},
+        "dataloader": {"batch_size": 1},
+    }
+)
+runner.train()
+runner.close()
+```
+
+ODesign trains its generated atoms with the molecule-weighted EDM objective,
+excluding fixed conditioning atoms:
+
+```python
+from ofoldx.runners import Runner
+
+runner = Runner(
+    {
+        "epochs": 1,
+        "model": {"name": "odesign"},
+        "data": {"train": {"source": "structures/"}},
+        "optim": {"type": "adamw", "lr": 1e-4},
+        "dataloader": {"batch_size": 1},
+    }
+)
+runner.train()
+runner.close()
+```
+
+The AlphaFold 3 objective does not reproduce the unpublished upstream corpus,
+auxiliary confidence and distogram losses, optimizer, or curriculum. Families
+without a faithful built-in objective remain available through their Model and
+Pipeline APIs; the Runner does not fabricate a loss for them.
+
+Per-sample MSA evidence is explicit in a JSON-lines dataset manifest:
+
+```json
+{"structure": "structures/1abc.cif", "msa": {"path": "msa/1abc_A.a3m", "entity_id": "A"}}
+{"structure": "structures/2xyz.cif", "msa_collection": "msa/2xyz_pairing.json"}
+```
+
+Paths are relative to the manifest. `msa_collection` is encoded with
+`ofoldx.data.encode_msa_collection`; the Runner reads the pairing plan but does
+not search for sidecars or pair homologs.
 
 Write one registered Model/Processor pair as a standard repository with the sole
 public artifact writer:

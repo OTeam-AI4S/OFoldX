@@ -8,7 +8,7 @@ import math
 import operator
 from dataclasses import dataclass
 from functools import partial
-from typing import cast
+from typing import NamedTuple, cast
 
 import numpy as np
 import torch
@@ -997,7 +997,7 @@ class Boltz2AffinityModel(Boltz2Model):
         ...     (
         ...         ChemicalComponent(
         ...             "LIG",
-        ...             (ChemicalAtom("C1", "C"),),
+        ...             (ChemicalAtom("C1", "C", formal_charge=0),),
         ...             frozenset(),
         ...             reference_coordinates=((0.0, 0.0, 0.0),),
         ...         ),
@@ -2496,6 +2496,9 @@ class Boltz2CoordinateDiffusion(nn.Module):
         shape = (*expanded_atom_mask.shape, 3)
         sigmas = self.sample_schedule(num_sampling_steps, device=device, dtype=dtype)
         gammas = torch.where(sigmas > self.min_churn_noise_level, self.churn_rate, 0.0)
+        sigma_hats = sigmas[:-1] * (1 + gammas[1:])
+        noise_variances = self.noise_scale**2 * (sigma_hats**2 - sigmas[:-1] ** 2)
+        noise_active = tuple((noise_variances > 0).tolist()) if feynman_kac else ()
 
         def randn() -> Tensor:
             return torch.randn(shape, device=device, dtype=dtype, generator=generator)
@@ -2517,24 +2520,33 @@ class Boltz2CoordinateDiffusion(nn.Module):
         else:
             energy_trajectory = torch.empty(0, 0, device=device, dtype=dtype)
             resample_weights = torch.empty(0, 0, device=device, dtype=dtype)
-        scaled_guidance_update = (
-            torch.zeros(shape, device=device, dtype=dtype) if physical_guidance or contact_guidance else None
+        potential_rows = (
+            _prepare_boltz2_potential_rows(
+                input,
+                device=device,
+                dtype=dtype,
+                physical=feynman_kac or physical_guidance,
+                contact=feynman_kac or contact_guidance,
+            )
+            if feynman_kac or physical_guidance or contact_guidance
+            else ()
         )
         # `contact_guidance` defaults True, so the inner guidance loop would otherwise run its full
         # `num_guidance_steps` sweep of gradient evaluations every step even when the input carries no
-        # constraint to guide toward. Physical potentials are coordinate-only and always contribute, but the
-        # contact and forced-template fields produce exactly zero gradient when absent, so decide once whether
-        # there is anything to guide (a single template `.any()` sync, hoisted out of the sampling loop).
+        # constraint to guide toward. Physical potentials are coordinate-only and always contribute, while
+        # the contact and forced-template fields produce exactly zero gradient when absent.
         guidance_active = physical_guidance or (
             contact_guidance
-            and (
-                input.contact_pair_index.shape[-1] > 0
-                or (input.template_force is not None and bool(input.template_force.any()))
+            and any(
+                row.contact_pair_index.shape[1]
+                or (row.template_reference is not None and row.template_reference.shape[0])
+                for row in potential_rows
             )
         )
+        scaled_guidance_update = torch.zeros(shape, device=device, dtype=dtype) if guidance_active else None
         denoised = None
         for index in range(len(sigmas) - 1):
-            sigma_current, sigma_next, gamma = sigmas[index], sigmas[index + 1], gammas[index + 1]
+            sigma_next = sigmas[index + 1]
             rotation = uniform_random_rotation(
                 expanded_atom_mask.shape[0], device=device, dtype=coords.dtype, generator=generator
             )
@@ -2558,8 +2570,8 @@ class Boltz2CoordinateDiffusion(nn.Module):
                     rotation,
                 )
 
-            sigma_hat = sigma_current * (1 + gamma)
-            noise_var = self.noise_scale**2 * (sigma_hat**2 - sigma_current**2)
+            sigma_hat = sigma_hats[index]
+            noise_var = noise_variances[index]
             epsilon = torch.sqrt(torch.clamp(noise_var, min=0.0)) * randn()
             noisy = coords + epsilon
             noisy_by_sample = noisy.reshape(
@@ -2638,7 +2650,7 @@ class Boltz2CoordinateDiffusion(nn.Module):
 
             steering_t = 1.0 - index / (len(sigmas) - 1)
             should_resample = feynman_kac and (
-                (index % feynman_kac_resampling_interval == 0 and noise_var > 0) or index == len(sigmas) - 2
+                (index % feynman_kac_resampling_interval == 0 and noise_active[index]) or index == len(sigmas) - 2
             )
             if should_resample:
                 active_physical = {0, 2, 3, 4, 5, 6}
@@ -2646,7 +2658,7 @@ class Boltz2CoordinateDiffusion(nn.Module):
                     active_physical.add(1)
                 terms = _boltz2_potential_terms(
                     denoised,
-                    input,
+                    potential_rows,
                     multiplicity=effective_multiplicity,
                     t=steering_t,
                     physical_guidance=physical_guidance,
@@ -2668,7 +2680,7 @@ class Boltz2CoordinateDiffusion(nn.Module):
                 log_g = (
                     -energy if energy_trajectory.shape[1] == 1 else energy_trajectory[:, -2] - energy_trajectory[:, -1]
                 )
-                if scaled_guidance_update is not None and noise_var > 0:
+                if scaled_guidance_update is not None and noise_active[index]:
                     likelihood_difference = (epsilon.square() - (epsilon + scaled_guidance_update).square()).sum(
                         dim=(-1, -2)
                     ) / (2 * noise_var)
@@ -2684,7 +2696,7 @@ class Boltz2CoordinateDiffusion(nn.Module):
                 for guidance_step in range(num_guidance_steps):
                     guidance_update = guidance_update - _boltz2_potential_gradient(
                         denoised + guidance_update,
-                        input,
+                        potential_rows,
                         multiplicity=effective_multiplicity,
                         t=steering_t,
                         guidance_step=guidance_step,
@@ -3767,9 +3779,323 @@ def _boltz2_predicted_frame_mask(
     return valid_geometry & token_mask.repeat_interleave(multiplicity, 0)
 
 
+class _Boltz2PotentialRow(NamedTuple):
+    atom_mask: Tensor
+    atom_chain: Tensor
+    num_chains: int
+    symmetric_chain_index: Tensor
+    vdw_pair_index: Tensor
+    vdw_lower_bound: Tensor
+    connected_atom_index: Tensor
+    geometry_pair_index: Tensor
+    geometry_lower_bound: Tensor
+    geometry_upper_bound: Tensor
+    chiral_atom_index: Tensor
+    chiral_lower_bound: Tensor
+    chiral_upper_bound: Tensor
+    stereo_bond_index: Tensor
+    stereo_lower_bound: Tensor
+    stereo_upper_bound: Tensor
+    planar_bond_index: Tensor
+    contact_pair_index: Tensor
+    contact_threshold: Tensor
+    contact_union_masks: tuple[Tensor, ...]
+    template_reference: Tensor | None
+    template_reference_mask: Tensor | None
+    template_threshold: Tensor | None
+    representative_atom_index: Tensor
+    atom_to_token: Tensor
+
+
+def _prepare_boltz2_potential_rows(
+    input: Boltz2Input,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    physical: bool,
+    contact: bool,
+) -> tuple[_Boltz2PotentialRow, ...]:
+    r"""
+    Lower coordinate-invariant Boltz-2 steering inputs once per sampler call.
+    """
+
+    rows = []
+    vdw_radii = _boltz2_vdw_radii(device=device, dtype=dtype) if physical else None
+    for batch_index in range(input.atom_mask.shape[0]):
+        atom_mask = input.atom_mask[batch_index].to(device=device, dtype=torch.bool)
+        atom_to_token = input.atom_to_token[batch_index].to(device=device, dtype=torch.long)
+        chain_index = input.chain_index[batch_index].to(device=device, dtype=torch.long)
+        atom_chain = chain_index.gather(0, atom_to_token)
+
+        if physical:
+            num_chains = int(chain_index.max().item()) + 1
+            chain_size = torch.bincount(
+                atom_chain[atom_mask],
+                minlength=num_chains,
+            )
+            atom_radii = input.atom_features[
+                batch_index,
+                :,
+                4:132,
+            ].to(
+                device=device, dtype=dtype
+            ) @ cast(Tensor, vdw_radii)
+
+            symmetric_chain_index = input.symmetric_chain_index[batch_index].to(
+                device=device,
+                dtype=torch.long,
+            )
+            symmetric_chain_index = symmetric_chain_index[
+                :,
+                (chain_size[symmetric_chain_index] > 1).all(dim=0),
+            ]
+
+            vdw_pair_index = torch.triu_indices(
+                atom_mask.shape[0],
+                atom_mask.shape[0],
+                1,
+                device=device,
+            )
+            vdw_pair_mask = atom_mask[vdw_pair_index].all(dim=0)
+            vdw_ion_mask = (chain_size > 1)[atom_chain[vdw_pair_index]].all(dim=0)
+            connected_chain_index = input.connected_chain_index[batch_index].to(
+                device=device,
+                dtype=torch.long,
+            )
+            connected_chain = torch.eye(
+                num_chains,
+                device=device,
+                dtype=torch.bool,
+            )
+            if connected_chain_index.shape[1]:
+                connected_chain[
+                    connected_chain_index[0],
+                    connected_chain_index[1],
+                ] = True
+                connected_chain[
+                    connected_chain_index[1],
+                    connected_chain_index[0],
+                ] = True
+            vdw_connected_mask = connected_chain[
+                atom_chain[vdw_pair_index[0]],
+                atom_chain[vdw_pair_index[1]],
+            ]
+            vdw_pair_index = vdw_pair_index[
+                :,
+                vdw_pair_mask & vdw_ion_mask & ~vdw_connected_mask,
+            ]
+            vdw_lower_bound = atom_radii[vdw_pair_index].sum(dim=0) * 0.775
+
+            connected_atom_index = input.connected_atom_index[batch_index].to(
+                device=device,
+                dtype=torch.long,
+            )
+
+            geometry_pair_index = input.geometry_pair_index[batch_index].to(
+                device=device,
+                dtype=torch.long,
+            )
+            geometry_lower_bound = (
+                input.geometry_lower_bounds[batch_index]
+                .to(
+                    device=device,
+                    dtype=dtype,
+                )
+                .clone()
+            )
+            geometry_upper_bound = (
+                input.geometry_upper_bounds[batch_index]
+                .to(
+                    device=device,
+                    dtype=dtype,
+                )
+                .clone()
+            )
+            geometry_bond_mask = input.geometry_bond_mask[batch_index].to(
+                device=device,
+                dtype=torch.bool,
+            )
+            geometry_angle_mask = input.geometry_angle_mask[batch_index].to(
+                device=device,
+                dtype=torch.bool,
+            )
+            geometry_lower_bound[geometry_bond_mask & ~geometry_angle_mask] *= 0.875
+            geometry_upper_bound[geometry_bond_mask & ~geometry_angle_mask] *= 1.125
+            geometry_lower_bound[~geometry_bond_mask & geometry_angle_mask] *= 0.875
+            geometry_upper_bound[~geometry_bond_mask & geometry_angle_mask] *= 1.125
+            geometry_lower_bound[geometry_bond_mask & geometry_angle_mask] *= 0.875
+            geometry_upper_bound[geometry_bond_mask & geometry_angle_mask] *= 1.125
+            geometry_lower_bound[~geometry_bond_mask & ~geometry_angle_mask] *= 0.9
+            geometry_upper_bound[~geometry_bond_mask & ~geometry_angle_mask] = float("inf")
+            geometry_cutoff = 0.35 + atom_radii[geometry_pair_index].mean(dim=0)
+            geometry_lower_bound[~geometry_bond_mask] = torch.maximum(
+                geometry_lower_bound[~geometry_bond_mask],
+                geometry_cutoff[~geometry_bond_mask],
+            )
+            geometry_upper_bound[geometry_bond_mask] = torch.minimum(
+                geometry_upper_bound[geometry_bond_mask],
+                geometry_cutoff[geometry_bond_mask],
+            )
+
+            chiral_atom_index = input.chiral_atom_index[batch_index].to(
+                device=device,
+                dtype=torch.long,
+            )
+            chiral_atom_is_r = input.chiral_atom_is_r[batch_index].to(
+                device=device,
+                dtype=torch.bool,
+            )
+            chiral_lower_bound = torch.where(
+                chiral_atom_is_r,
+                atom_radii.new_tensor(0.52360),
+                atom_radii.new_tensor(float("-inf")),
+            )
+            chiral_upper_bound = torch.where(
+                chiral_atom_is_r,
+                atom_radii.new_tensor(float("inf")),
+                atom_radii.new_tensor(-0.52360),
+            )
+
+            stereo_bond_index = input.stereo_bond_index[batch_index].to(
+                device=device,
+                dtype=torch.long,
+            )
+            stereo_bond_is_e = input.stereo_bond_is_e[batch_index].to(
+                device=device,
+                dtype=torch.bool,
+            )
+            stereo_lower_bound = torch.where(
+                stereo_bond_is_e,
+                atom_radii.new_tensor(torch.pi - 0.52360),
+                atom_radii.new_tensor(float("-inf")),
+            )
+            stereo_upper_bound = torch.where(
+                stereo_bond_is_e,
+                atom_radii.new_tensor(float("inf")),
+                atom_radii.new_tensor(0.52360),
+            )
+
+            planar_bond_index = input.planar_bond_index[batch_index].to(
+                device=device,
+                dtype=torch.long,
+            )
+            planar_bond_index = torch.cat(
+                (
+                    planar_bond_index[[1, 2, 3, 0]],
+                    planar_bond_index[[4, 5, 0, 3]],
+                ),
+                dim=1,
+            )
+        else:
+            num_chains = 0
+            symmetric_chain_index = torch.empty(2, 0, device=device, dtype=torch.long)
+            vdw_pair_index = torch.empty(2, 0, device=device, dtype=torch.long)
+            vdw_lower_bound = torch.empty(0, device=device, dtype=dtype)
+            connected_atom_index = torch.empty(2, 0, device=device, dtype=torch.long)
+            geometry_pair_index = torch.empty(2, 0, device=device, dtype=torch.long)
+            geometry_lower_bound = torch.empty(0, device=device, dtype=dtype)
+            geometry_upper_bound = torch.empty(0, device=device, dtype=dtype)
+            chiral_atom_index = torch.empty(4, 0, device=device, dtype=torch.long)
+            chiral_lower_bound = torch.empty(0, device=device, dtype=dtype)
+            chiral_upper_bound = torch.empty(0, device=device, dtype=dtype)
+            stereo_bond_index = torch.empty(4, 0, device=device, dtype=torch.long)
+            stereo_lower_bound = torch.empty(0, device=device, dtype=dtype)
+            stereo_upper_bound = torch.empty(0, device=device, dtype=dtype)
+            planar_bond_index = torch.empty(4, 0, device=device, dtype=torch.long)
+
+        if contact:
+            contact_pair_index = input.contact_pair_index[batch_index].to(
+                device=device,
+                dtype=torch.long,
+            )
+            contact_threshold = input.contact_thresholds[batch_index].to(
+                device=device,
+                dtype=dtype,
+            )
+            contact_union_index = input.contact_union_index[batch_index].to(
+                device=device,
+                dtype=torch.long,
+            )
+            contact_union_masks = (
+                tuple(contact_union_index == union for union in range(int(contact_union_index.max().item()) + 1))
+                if contact_pair_index.shape[1]
+                else ()
+            )
+            if input.template_force is None:
+                template_reference = None
+                template_reference_mask = None
+                template_threshold = None
+            else:
+                template_force = input.template_force[batch_index].to(
+                    device=device,
+                    dtype=torch.bool,
+                )
+                template_reference = cast(
+                    Tensor,
+                    input.template_beta_carbon_positions,
+                )[
+                    batch_index, template_force
+                ].to(device=device, dtype=dtype)
+                template_reference_mask = cast(
+                    Tensor,
+                    input.template_beta_carbon_mask,
+                )[
+                    batch_index, template_force
+                ].to(device=device, dtype=dtype)
+                template_threshold = cast(
+                    Tensor,
+                    input.template_force_threshold,
+                )[
+                    batch_index, template_force
+                ].to(device=device, dtype=dtype)
+            representative_atom_index = input.token_to_rep_atom[batch_index].to(
+                device=device,
+                dtype=torch.long,
+            )
+        else:
+            contact_pair_index = torch.empty(2, 0, device=device, dtype=torch.long)
+            contact_threshold = torch.empty(0, device=device, dtype=dtype)
+            contact_union_masks = ()
+            template_reference = None
+            template_reference_mask = None
+            template_threshold = None
+            representative_atom_index = torch.empty(0, device=device, dtype=torch.long)
+
+        rows.append(
+            _Boltz2PotentialRow(
+                atom_mask=atom_mask,
+                atom_chain=atom_chain,
+                num_chains=num_chains,
+                symmetric_chain_index=symmetric_chain_index,
+                vdw_pair_index=vdw_pair_index,
+                vdw_lower_bound=vdw_lower_bound,
+                connected_atom_index=connected_atom_index,
+                geometry_pair_index=geometry_pair_index,
+                geometry_lower_bound=geometry_lower_bound,
+                geometry_upper_bound=geometry_upper_bound,
+                chiral_atom_index=chiral_atom_index,
+                chiral_lower_bound=chiral_lower_bound,
+                chiral_upper_bound=chiral_upper_bound,
+                stereo_bond_index=stereo_bond_index,
+                stereo_lower_bound=stereo_lower_bound,
+                stereo_upper_bound=stereo_upper_bound,
+                planar_bond_index=planar_bond_index,
+                contact_pair_index=contact_pair_index,
+                contact_threshold=contact_threshold,
+                contact_union_masks=contact_union_masks,
+                template_reference=template_reference,
+                template_reference_mask=template_reference_mask,
+                template_threshold=template_threshold,
+                representative_atom_index=representative_atom_index,
+                atom_to_token=atom_to_token,
+            )
+        )
+    return tuple(rows)
+
+
 def _boltz2_potential_terms(
     coordinates: Tensor,
-    input: Boltz2Input,
+    rows: tuple[_Boltz2PotentialRow, ...],
     *,
     multiplicity: int,
     t: float,
@@ -3782,7 +4108,7 @@ def _boltz2_potential_terms(
     Evaluate the released Boltz-2 physical, contact, and template energies.
     """
 
-    batch_size = input.atom_mask.shape[0]
+    batch_size = len(rows)
     coordinates = coordinates.reshape(
         batch_size,
         multiplicity,
@@ -3791,8 +4117,7 @@ def _boltz2_potential_terms(
     term_rows = [
         _boltz2_batch_potential_terms(
             coordinates[batch_index],
-            input,
-            batch_index,
+            rows[batch_index],
             t=t,
             include_contact=include_contact,
             active_physical=active_physical,
@@ -3863,7 +4188,7 @@ def _boltz2_potential_terms(
 
 def _boltz2_potential_gradient(
     coordinates: Tensor,
-    input: Boltz2Input,
+    rows: tuple[_Boltz2PotentialRow, ...],
     *,
     multiplicity: int,
     t: float,
@@ -3885,13 +4210,13 @@ def _boltz2_potential_gradient(
         if guidance_step % 4 == 0:
             gradient = gradient + 0.5 * _boltz2_symmetric_chain_com_gradient(
                 coordinates,
-                input,
+                rows,
                 multiplicity=multiplicity,
                 t=t,
             )
         gradient = gradient + _boltz2_local_physical_gradient(
             coordinates,
-            input,
+            rows,
             multiplicity=multiplicity,
             t=t,
             guidance_step=guidance_step,
@@ -3907,14 +4232,14 @@ def _boltz2_potential_gradient(
             if contact_weight:
                 gradient = gradient + contact_weight * _boltz2_contact_gradient(
                     coordinates,
-                    input,
+                    rows,
                     multiplicity=multiplicity,
                     t=t,
                 )
         if guidance_step % 2 == 0:
             gradient = gradient + 0.1 * _boltz2_template_gradient(
                 coordinates,
-                input,
+                rows,
                 multiplicity=multiplicity,
             )
     return gradient
@@ -3922,115 +4247,47 @@ def _boltz2_potential_gradient(
 
 def _boltz2_local_physical_gradient(
     coordinates: Tensor,
-    input: Boltz2Input,
+    potential_rows: tuple[_Boltz2PotentialRow, ...],
     *,
     multiplicity: int,
     t: float,
     guidance_step: int,
 ) -> Tensor:
-    batch_size = input.atom_mask.shape[0]
+    batch_size = len(potential_rows)
     coordinates_by_batch = coordinates.reshape(
         batch_size,
         multiplicity,
         *coordinates.shape[1:],
     )
-    rows = []
-    for batch_index in range(batch_size):
+    gradients = []
+    for batch_index, row in enumerate(potential_rows):
         row_coordinates = coordinates_by_batch[batch_index]
-        device, dtype = row_coordinates.device, row_coordinates.dtype
         row_gradient = torch.zeros_like(row_coordinates)
-        atom_mask = input.atom_mask[batch_index].to(
-            device=device,
-            dtype=torch.bool,
-        )
-        atom_to_token = input.atom_to_token[batch_index].to(
-            device=device,
-            dtype=torch.long,
-        )
-        atom_chain = (
-            input.chain_index[batch_index]
-            .to(
-                device=device,
-                dtype=torch.long,
-            )
-            .gather(0, atom_to_token)
-        )
-        radii = _boltz2_vdw_radii(device=device, dtype=dtype)
-        element = input.atom_features[
-            batch_index,
-            :,
-            4:132,
-        ].to(device=device, dtype=dtype)
-        atom_radii = element @ radii
 
-        if t <= 0.4 and guidance_step % 5 == 0:
-            pair_index = torch.triu_indices(
-                row_coordinates.shape[-2],
-                row_coordinates.shape[-2],
-                1,
-                device=device,
-            )
-            pair_mask = atom_mask[pair_index].all(dim=0)
-            chain_size = torch.bincount(
-                atom_chain[atom_mask],
-                minlength=int(atom_chain.max().item()) + 1,
-            )
-            pair_ion_mask = (chain_size > 1)[atom_chain[pair_index]].all(dim=0)
-            connected_chain = input.connected_chain_index[batch_index].to(
-                device=device,
-                dtype=torch.long,
-            )
-            connected_matrix = torch.eye(
-                chain_size.shape[0],
-                device=device,
-                dtype=torch.bool,
-            )
-            if connected_chain.shape[1]:
-                connected_matrix[
-                    connected_chain[0],
-                    connected_chain[1],
-                ] = True
-                connected_matrix[
-                    connected_chain[1],
-                    connected_chain[0],
-                ] = True
-            connected_pair = connected_matrix[
-                atom_chain[pair_index[0]],
-                atom_chain[pair_index[1]],
-            ]
-            pair_index = pair_index[
-                :,
-                pair_mask & pair_ion_mask & ~connected_pair,
-            ]
-            if pair_index.shape[1]:
-                distance, distance_gradient = indexed_distance_with_gradient(
-                    row_coordinates,
-                    pair_index,
-                )
-                lower = atom_radii[pair_index].sum(dim=0) * 0.775
-                slope = linear_flat_bottom_derivative(
-                    distance,
-                    distance.new_tensor(0.125),
-                    lower,
-                    distance.new_tensor(float("inf")),
-                )
-                row_gradient = row_gradient + (
-                    _boltz2_scatter_potential_gradient(
-                        row_coordinates,
-                        pair_index,
-                        distance_gradient,
-                        slope,
-                    )
-                )
-
-        connected_atom = input.connected_atom_index[batch_index].to(
-            device=device,
-            dtype=torch.long,
-        )
-        if connected_atom.shape[1]:
+        if t <= 0.4 and guidance_step % 5 == 0 and row.vdw_pair_index.shape[1]:
             distance, distance_gradient = indexed_distance_with_gradient(
                 row_coordinates,
-                connected_atom,
+                row.vdw_pair_index,
+            )
+            slope = linear_flat_bottom_derivative(
+                distance,
+                distance.new_tensor(0.125),
+                row.vdw_lower_bound,
+                distance.new_tensor(float("inf")),
+            )
+            row_gradient = row_gradient + (
+                _boltz2_scatter_potential_gradient(
+                    row_coordinates,
+                    row.vdw_pair_index,
+                    distance_gradient,
+                    slope,
+                )
+            )
+
+        if row.connected_atom_index.shape[1]:
+            distance, distance_gradient = indexed_distance_with_gradient(
+                row_coordinates,
+                row.connected_atom_index,
             )
             slope = linear_flat_bottom_derivative(
                 distance,
@@ -4041,123 +4298,56 @@ def _boltz2_local_physical_gradient(
             row_gradient = row_gradient + (
                 _boltz2_scatter_potential_gradient(
                     row_coordinates,
-                    connected_atom,
+                    row.connected_atom_index,
                     distance_gradient,
                     slope,
                 )
             )
 
-        geometry_index = input.geometry_pair_index[batch_index].to(
-            device=device,
-            dtype=torch.long,
-        )
-        if geometry_index.shape[1]:
+        if row.geometry_pair_index.shape[1]:
             distance, distance_gradient = indexed_distance_with_gradient(
                 row_coordinates,
-                geometry_index,
-            )
-            lower = (
-                input.geometry_lower_bounds[batch_index]
-                .to(
-                    device=device,
-                    dtype=dtype,
-                )
-                .clone()
-            )
-            upper = (
-                input.geometry_upper_bounds[batch_index]
-                .to(
-                    device=device,
-                    dtype=dtype,
-                )
-                .clone()
-            )
-            bond = input.geometry_bond_mask[batch_index].to(
-                device=device,
-                dtype=torch.bool,
-            )
-            angle = input.geometry_angle_mask[batch_index].to(
-                device=device,
-                dtype=torch.bool,
-            )
-            lower[bond & ~angle] *= 0.875
-            upper[bond & ~angle] *= 1.125
-            lower[~bond & angle] *= 0.875
-            upper[~bond & angle] *= 1.125
-            lower[bond & angle] *= 0.875
-            upper[bond & angle] *= 1.125
-            lower[~bond & ~angle] *= 0.9
-            upper[~bond & ~angle] = float("inf")
-            cutoff = 0.35 + atom_radii[geometry_index].mean(dim=0)
-            lower[~bond] = torch.maximum(
-                lower[~bond],
-                cutoff[~bond],
-            )
-            upper[bond] = torch.minimum(
-                upper[bond],
-                cutoff[bond],
+                row.geometry_pair_index,
             )
             slope = linear_flat_bottom_derivative(
                 distance,
                 distance.new_tensor(0.01),
-                lower,
-                upper,
+                row.geometry_lower_bound,
+                row.geometry_upper_bound,
             )
             row_gradient = row_gradient + (
                 _boltz2_scatter_potential_gradient(
                     row_coordinates,
-                    geometry_index,
+                    row.geometry_pair_index,
                     distance_gradient,
                     slope,
                 )
             )
 
-        chiral_index = input.chiral_atom_index[batch_index].to(
-            device=device,
-            dtype=torch.long,
-        )
-        if chiral_index.shape[1]:
+        if row.chiral_atom_index.shape[1]:
             dihedral, dihedral_gradient = indexed_signed_dihedral_with_gradient(
                 row_coordinates,
-                chiral_index,
-            )
-            is_r = input.chiral_atom_is_r[batch_index].to(
-                device=device,
-                dtype=torch.bool,
-            )
-            lower = torch.where(
-                is_r,
-                dihedral.new_tensor(0.52360),
-                dihedral.new_tensor(float("-inf")),
-            )
-            upper = torch.where(
-                is_r,
-                dihedral.new_tensor(float("inf")),
-                dihedral.new_tensor(-0.52360),
+                row.chiral_atom_index,
             )
             slope = linear_flat_bottom_derivative(
                 dihedral,
                 dihedral.new_tensor(0.1),
-                lower,
-                upper,
+                row.chiral_lower_bound,
+                row.chiral_upper_bound,
             )
             row_gradient = row_gradient + (
                 _boltz2_scatter_potential_gradient(
                     row_coordinates,
-                    chiral_index,
+                    row.chiral_atom_index,
                     dihedral_gradient,
                     slope,
                 )
             )
 
-        stereo_index = input.stereo_bond_index[batch_index].to(
-            device=device,
-            dtype=torch.long,
-        )
-        if stereo_index.shape[1]:
+        if row.stereo_bond_index.shape[1]:
             dihedral, dihedral_gradient = indexed_signed_dihedral_with_gradient(
                 row_coordinates,
-                stereo_index,
+                row.stereo_bond_index,
             )
             absolute = dihedral.abs()
             absolute_gradient = torch.where(
@@ -4165,50 +4355,25 @@ def _boltz2_local_physical_gradient(
                 -dihedral_gradient,
                 dihedral_gradient,
             )
-            is_e = input.stereo_bond_is_e[batch_index].to(
-                device=device,
-                dtype=torch.bool,
-            )
-            lower = torch.where(
-                is_e,
-                absolute.new_tensor(torch.pi - 0.52360),
-                absolute.new_tensor(float("-inf")),
-            )
-            upper = torch.where(
-                is_e,
-                absolute.new_tensor(float("inf")),
-                absolute.new_tensor(0.52360),
-            )
             slope = linear_flat_bottom_derivative(
                 absolute,
                 absolute.new_tensor(0.05),
-                lower,
-                upper,
+                row.stereo_lower_bound,
+                row.stereo_upper_bound,
             )
             row_gradient = row_gradient + (
                 _boltz2_scatter_potential_gradient(
                     row_coordinates,
-                    stereo_index,
+                    row.stereo_bond_index,
                     absolute_gradient,
                     slope,
                 )
             )
 
-        planar_index = input.planar_bond_index[batch_index].to(
-            device=device,
-            dtype=torch.long,
-        )
-        if planar_index.shape[1]:
-            improper = torch.cat(
-                (
-                    planar_index[[1, 2, 3, 0]],
-                    planar_index[[4, 5, 0, 3]],
-                ),
-                dim=1,
-            )
+        if row.planar_bond_index.shape[1]:
             dihedral, dihedral_gradient = indexed_signed_dihedral_with_gradient(
                 row_coordinates,
-                improper,
+                row.planar_bond_index,
             )
             absolute = dihedral.abs()
             absolute_gradient = torch.where(
@@ -4225,13 +4390,13 @@ def _boltz2_local_physical_gradient(
             row_gradient = row_gradient + (
                 _boltz2_scatter_potential_gradient(
                     row_coordinates,
-                    improper,
+                    row.planar_bond_index,
                     absolute_gradient,
                     slope,
                 )
             )
-        rows.append(row_gradient)
-    return torch.cat(rows)
+        gradients.append(row_gradient)
+    return torch.cat(gradients)
 
 
 def _boltz2_scatter_potential_gradient(
@@ -4254,142 +4419,99 @@ def _boltz2_scatter_potential_gradient(
 
 def _boltz2_symmetric_chain_com_gradient(
     coordinates: Tensor,
-    input: Boltz2Input,
+    potential_rows: tuple[_Boltz2PotentialRow, ...],
     *,
     multiplicity: int,
     t: float,
 ) -> Tensor:
-    batch_size = input.atom_mask.shape[0]
+    batch_size = len(potential_rows)
     coordinates_by_batch = coordinates.reshape(
         batch_size,
         multiplicity,
         *coordinates.shape[1:],
     )
-    rows = []
+    gradients = []
     buffer = 1.0 + 4.0 * (math.exp(-2.0 * t) - 1) / (math.exp(-2.0) - 1)
-    for batch_index in range(batch_size):
+    for batch_index, row in enumerate(potential_rows):
         row_coordinates = coordinates_by_batch[batch_index]
-        atom_mask = input.atom_mask[batch_index].to(
-            device=coordinates.device,
-            dtype=torch.bool,
-        )
-        atom_to_token = input.atom_to_token[batch_index].to(
-            device=coordinates.device,
-            dtype=torch.long,
-        )
-        atom_chain = (
-            input.chain_index[batch_index]
-            .to(
-                device=coordinates.device,
-                dtype=torch.long,
-            )
-            .gather(0, atom_to_token)
-        )
-        pair_index = input.symmetric_chain_index[batch_index].to(
-            device=coordinates.device,
-            dtype=torch.long,
-        )
         row_gradient = torch.zeros_like(row_coordinates)
-        if pair_index.shape[1] and bool(atom_mask.any()):
-            num_chains = int(atom_chain.max().item()) + 1
-            chain_sizes = torch.bincount(
-                atom_chain[atom_mask],
-                minlength=num_chains,
-            )
-            pair_index = pair_index[
-                :,
-                (chain_sizes[pair_index] > 1).all(dim=0),
-            ]
-            if pair_index.shape[1]:
-                unpadded_chain = atom_chain[atom_mask]
-                unpadded_coordinates = row_coordinates[:, atom_mask]
-                centers = torch.zeros(
+        if row.symmetric_chain_index.shape[1]:
+            unpadded_chain = row.atom_chain[row.atom_mask]
+            unpadded_coordinates = row_coordinates[:, row.atom_mask]
+            centers = torch.zeros(
+                multiplicity,
+                row.num_chains,
+                3,
+                device=coordinates.device,
+                dtype=coordinates.dtype,
+            ).scatter_reduce(
+                -2,
+                unpadded_chain[None, :, None].expand(
                     multiplicity,
-                    num_chains,
+                    -1,
                     3,
-                    device=coordinates.device,
-                    dtype=coordinates.dtype,
-                ).scatter_reduce(
-                    -2,
-                    unpadded_chain[None, :, None].expand(
-                        multiplicity,
-                        -1,
-                        3,
-                    ),
-                    unpadded_coordinates,
-                    "mean",
-                )
-                distance, distance_gradient = indexed_distance_with_gradient(
-                    centers,
-                    pair_index,
-                )
-                slope = linear_flat_bottom_derivative(
-                    distance,
-                    distance.new_tensor(1.0),
-                    distance.new_tensor(buffer),
-                    distance.new_tensor(float("inf")),
-                )
-                center_gradient = _boltz2_scatter_potential_gradient(
-                    centers,
-                    pair_index,
-                    distance_gradient,
-                    slope,
-                )
-                row_gradient = center_gradient[:, atom_chain]
-        rows.append(row_gradient)
-    return torch.cat(rows)
+                ),
+                unpadded_coordinates,
+                "mean",
+            )
+            distance, distance_gradient = indexed_distance_with_gradient(
+                centers,
+                row.symmetric_chain_index,
+            )
+            slope = linear_flat_bottom_derivative(
+                distance,
+                distance.new_tensor(1.0),
+                distance.new_tensor(buffer),
+                distance.new_tensor(float("inf")),
+            )
+            center_gradient = _boltz2_scatter_potential_gradient(
+                centers,
+                row.symmetric_chain_index,
+                distance_gradient,
+                slope,
+            )
+            row_gradient = center_gradient[:, row.atom_chain]
+        gradients.append(row_gradient)
+    return torch.cat(gradients)
 
 
 def _boltz2_contact_gradient(
     coordinates: Tensor,
-    input: Boltz2Input,
+    potential_rows: tuple[_Boltz2PotentialRow, ...],
     *,
     multiplicity: int,
     t: float,
 ) -> Tensor:
-    batch_size = input.atom_mask.shape[0]
+    batch_size = len(potential_rows)
     coordinates_by_batch = coordinates.reshape(
         batch_size,
         multiplicity,
         *coordinates.shape[1:],
     )
-    rows = []
+    gradients = []
     union_lambda = 8.0 - 8.0 * (math.exp(-2.0 * t) - 1) / (math.exp(-2.0) - 1)
-    for batch_index in range(batch_size):
+    for batch_index, row in enumerate(potential_rows):
         row_coordinates = coordinates_by_batch[batch_index]
-        pair_index = input.contact_pair_index[batch_index].to(
-            device=coordinates.device,
-            dtype=torch.long,
-        )
         row_gradient = torch.zeros_like(row_coordinates)
-        if pair_index.shape[1]:
+        if row.contact_pair_index.shape[1]:
             distance, distance_gradient = indexed_distance_with_gradient(
                 row_coordinates,
-                pair_index,
-            )
-            threshold = input.contact_thresholds[batch_index].to(
-                device=coordinates.device,
-                dtype=coordinates.dtype,
+                row.contact_pair_index,
             )
             energy = linear_flat_bottom_energy(
                 distance,
                 distance.new_tensor(1.0),
                 distance.new_tensor(float("-inf")),
-                threshold,
+                row.contact_threshold,
             )
             energy_slope = linear_flat_bottom_derivative(
                 distance,
                 distance.new_tensor(1.0),
                 distance.new_tensor(float("-inf")),
-                threshold,
-            )
-            union_index = input.contact_union_index[batch_index].to(
-                device=coordinates.device,
-                dtype=torch.long,
+                row.contact_threshold,
             )
             coefficient = torch.zeros_like(energy)
-            for union in range(int(union_index.max().item()) + 1):
-                union_mask = union_index == union
+            for union_mask in row.contact_union_masks:
                 union_energy = energy[:, union_mask]
                 negative_exponential = torch.exp(
                     -union_lambda * union_energy,
@@ -4413,71 +4535,40 @@ def _boltz2_contact_gradient(
                 )
             row_gradient = _boltz2_scatter_potential_gradient(
                 row_coordinates,
-                pair_index,
+                row.contact_pair_index,
                 distance_gradient,
                 coefficient,
             )
-        rows.append(row_gradient)
-    return torch.cat(rows)
+        gradients.append(row_gradient)
+    return torch.cat(gradients)
 
 
 def _boltz2_template_gradient(
     coordinates: Tensor,
-    input: Boltz2Input,
+    potential_rows: tuple[_Boltz2PotentialRow, ...],
     *,
     multiplicity: int,
 ) -> Tensor:
-    batch_size = input.atom_mask.shape[0]
+    batch_size = len(potential_rows)
     coordinates_by_batch = coordinates.reshape(
         batch_size,
         multiplicity,
         *coordinates.shape[1:],
     )
-    rows = []
-    for batch_index in range(batch_size):
+    gradients = []
+    for batch_index, row in enumerate(potential_rows):
         row_coordinates = coordinates_by_batch[batch_index]
         row_gradient = torch.zeros_like(row_coordinates)
-        # An all-False row selects zero templates below, so the template loop runs zero times and the row
-        # gradient stays zero; drop the per-row `.any()` guard, which forced a host sync on every step.
-        if input.template_force is not None:
-            force = input.template_force[batch_index].to(
-                device=coordinates.device,
-                dtype=torch.bool,
-            )
-            reference = cast(
-                Tensor,
-                input.template_beta_carbon_positions,
-            )[batch_index, force].to(
-                device=coordinates.device,
-                dtype=coordinates.dtype,
-            )
-            reference_mask = cast(
-                Tensor,
-                input.template_beta_carbon_mask,
-            )[batch_index, force].to(
-                device=coordinates.device,
-                dtype=coordinates.dtype,
-            )
-            threshold = cast(
-                Tensor,
-                input.template_force_threshold,
-            )[batch_index, force].to(
-                device=coordinates.device,
-                dtype=coordinates.dtype,
-            )
-            representative_index = input.token_to_rep_atom[batch_index].to(
-                device=coordinates.device,
-                dtype=torch.long,
-            )
-            representative = row_coordinates[:, representative_index]
+        if row.template_reference is not None:
+            representative = row_coordinates[:, row.representative_atom_index]
             token_gradient = torch.zeros_like(representative)
-            for template_index in range(reference.shape[0]):
-                repeated_reference = reference[template_index].expand(
+            for template_index in range(row.template_reference.shape[0]):
+                repeated_reference = row.template_reference[template_index].expand(
                     multiplicity,
                     -1,
                     -1,
                 )
-                repeated_mask = reference_mask[template_index].expand(
+                repeated_mask = cast(Tensor, row.template_reference_mask)[template_index].expand(
                     multiplicity,
                     -1,
                 )
@@ -4497,23 +4588,18 @@ def _boltz2_template_gradient(
                     distance,
                     distance.new_tensor(1.0),
                     distance.new_tensor(float("-inf")),
-                    threshold[template_index],
+                    cast(Tensor, row.template_threshold)[template_index],
                 )
                 slope = slope * repeated_mask
                 token_gradient = token_gradient + slope.unsqueeze(-1) * direction
-            atom_to_token = input.atom_to_token[batch_index].to(
-                device=coordinates.device,
-                dtype=torch.long,
-            )
-            row_gradient = token_gradient[:, atom_to_token]
-        rows.append(row_gradient)
-    return torch.cat(rows)
+            row_gradient = token_gradient[:, row.atom_to_token]
+        gradients.append(row_gradient)
+    return torch.cat(gradients)
 
 
 def _boltz2_batch_potential_terms(
     coordinates: Tensor,
-    input: Boltz2Input,
-    batch_index: int,
+    row: _Boltz2PotentialRow,
     *,
     t: float,
     include_contact: bool,
@@ -4523,45 +4609,18 @@ def _boltz2_batch_potential_terms(
     Evaluate each potential for one batch row and every sample in that row.
     """
 
-    device, dtype = coordinates.device, coordinates.dtype
-    atom_mask = input.atom_mask[batch_index].to(device=device, dtype=torch.bool)
-    atom_to_token = input.atom_to_token[batch_index].to(device=device, dtype=torch.long)
-    atom_chain = (
-        input.chain_index[batch_index]
-        .to(device=device)
-        .gather(
-            0,
-            atom_to_token,
-        )
-    )
-    atom_count = coordinates.shape[-2]
     zero = coordinates.new_zeros(coordinates.shape[0])
     active_physical = frozenset(range(7)) if active_physical is None else active_physical
-    if 1 in active_physical or 3 in active_physical:
-        radii = _boltz2_vdw_radii(device=device, dtype=dtype)
-        element = input.atom_features[
-            batch_index,
-            :,
-            4:132,
-        ].to(device=device, dtype=dtype)
-        atom_radii = element @ radii
-    else:
-        atom_radii = coordinates.new_empty(0)
 
-    symmetric_index = input.symmetric_chain_index[batch_index].to(
-        device=device,
-        dtype=torch.long,
-    )
-    if 0 in active_physical and symmetric_index.shape[1]:
-        num_chains = int(input.chain_index[batch_index].max().item()) + 1
-        unpadded_chain = atom_chain[atom_mask]
-        unpadded_coordinates = coordinates[:, atom_mask]
+    if 0 in active_physical and row.symmetric_chain_index.shape[1]:
+        unpadded_chain = row.atom_chain[row.atom_mask]
+        unpadded_coordinates = coordinates[:, row.atom_mask]
         centers = torch.zeros(
             coordinates.shape[0],
-            num_chains,
+            row.num_chains,
             3,
-            device=device,
-            dtype=dtype,
+            device=coordinates.device,
+            dtype=coordinates.dtype,
         ).scatter_reduce(
             -2,
             unpadded_chain[None, :, None].expand(
@@ -4572,9 +4631,10 @@ def _boltz2_batch_potential_terms(
             unpadded_coordinates,
             "mean",
         )
-        chain_size = torch.stack([(atom_mask & (atom_chain == chain)).sum() for chain in range(num_chains)])
-        pair_mask = (chain_size[symmetric_index] > 1).all(dim=0)
-        symmetric_distance = indexed_distance(centers, symmetric_index[:, pair_mask])
+        symmetric_distance = indexed_distance(
+            centers,
+            row.symmetric_chain_index,
+        )
         symmetric_buffer = 1.0 + 4.0 * (math.exp(-2.0 * t) - 1) / (math.exp(-2.0) - 1)
         symmetric_energy = linear_flat_bottom_energy(
             symmetric_distance,
@@ -4585,65 +4645,19 @@ def _boltz2_batch_potential_terms(
     else:
         symmetric_energy = zero
 
-    if 1 in active_physical:
-        pair_index = torch.triu_indices(
-            atom_count,
-            atom_count,
-            1,
-            device=device,
-        )
-        pair_mask = atom_mask[pair_index].all(dim=0)
-        chain_size = torch.bincount(
-            atom_chain[atom_mask],
-            minlength=int(atom_chain.max().item()) + 1,
-        )
-        pair_ion_mask = (chain_size > 1)[atom_chain[pair_index]].all(dim=0)
-        connected_chain = input.connected_chain_index[batch_index].to(
-            device=device,
-            dtype=torch.long,
-        )
-        connected_matrix = torch.eye(
-            chain_size.shape[0],
-            device=device,
-            dtype=torch.bool,
-        )
-        if connected_chain.shape[1]:
-            connected_matrix[
-                connected_chain[0],
-                connected_chain[1],
-            ] = True
-            connected_matrix[
-                connected_chain[1],
-                connected_chain[0],
-            ] = True
-        connected_pair = connected_matrix[
-            atom_chain[pair_index[0]],
-            atom_chain[pair_index[1]],
-        ]
-        pair_index = pair_index[
-            :,
-            pair_mask & pair_ion_mask & ~connected_pair,
-        ]
-        if pair_index.shape[1]:
-            distance = indexed_distance(coordinates, pair_index)
-            lower = atom_radii[pair_index].sum(dim=0) * 0.775
-            vdw_energy = linear_flat_bottom_energy(
-                distance,
-                distance.new_tensor(1.0),
-                lower,
-                distance.new_tensor(float("inf")),
-            ).sum(dim=-1)
-        else:
-            vdw_energy = zero
+    if 1 in active_physical and row.vdw_pair_index.shape[1]:
+        distance = indexed_distance(coordinates, row.vdw_pair_index)
+        vdw_energy = linear_flat_bottom_energy(
+            distance,
+            distance.new_tensor(1.0),
+            row.vdw_lower_bound,
+            distance.new_tensor(float("inf")),
+        ).sum(dim=-1)
     else:
         vdw_energy = zero
 
-    connected_atom = input.connected_atom_index[batch_index].to(
-        device=device,
-        dtype=torch.long,
-    )
-    if 2 in active_physical and connected_atom.shape[1]:
-        distance = indexed_distance(coordinates, connected_atom)
+    if 2 in active_physical and row.connected_atom_index.shape[1]:
+        distance = indexed_distance(coordinates, row.connected_atom_index)
         connection_energy = linear_flat_bottom_energy(
             distance,
             distance.new_tensor(1.0),
@@ -4653,101 +4667,41 @@ def _boltz2_batch_potential_terms(
     else:
         connection_energy = zero
 
-    geometry_index = input.geometry_pair_index[batch_index].to(
-        device=device,
-        dtype=torch.long,
-    )
-    if 3 in active_physical and geometry_index.shape[1]:
-        distance = indexed_distance(coordinates, geometry_index)
-        lower = input.geometry_lower_bounds[batch_index].to(device=device, dtype=dtype).clone()
-        upper = input.geometry_upper_bounds[batch_index].to(device=device, dtype=dtype).clone()
-        bond = input.geometry_bond_mask[batch_index].to(device=device, dtype=torch.bool)
-        angle = input.geometry_angle_mask[batch_index].to(device=device, dtype=torch.bool)
-        lower[bond & ~angle] *= 0.875
-        upper[bond & ~angle] *= 1.125
-        lower[~bond & angle] *= 0.875
-        upper[~bond & angle] *= 1.125
-        lower[bond & angle] *= 0.875
-        upper[bond & angle] *= 1.125
-        lower[~bond & ~angle] *= 0.9
-        upper[~bond & ~angle] = float("inf")
-        cutoff = 0.35 + atom_radii[geometry_index].mean(dim=0)
-        lower[~bond] = torch.maximum(lower[~bond], cutoff[~bond])
-        upper[bond] = torch.minimum(upper[bond], cutoff[bond])
+    if 3 in active_physical and row.geometry_pair_index.shape[1]:
+        distance = indexed_distance(coordinates, row.geometry_pair_index)
         pose_energy = linear_flat_bottom_energy(
             distance,
             distance.new_tensor(1.0),
-            lower,
-            upper,
+            row.geometry_lower_bound,
+            row.geometry_upper_bound,
         ).sum(dim=-1)
     else:
         pose_energy = zero
 
-    chiral_index = input.chiral_atom_index[batch_index].to(
-        device=device,
-        dtype=torch.long,
-    )
-    if 4 in active_physical and chiral_index.shape[1]:
-        angle = indexed_signed_dihedral(coordinates, chiral_index)
-        is_r = input.chiral_atom_is_r[batch_index].to(device=device, dtype=torch.bool)
-        lower = torch.where(
-            is_r,
-            angle.new_tensor(0.52360),
-            angle.new_tensor(float("-inf")),
-        )
-        upper = torch.where(
-            is_r,
-            angle.new_tensor(float("inf")),
-            angle.new_tensor(-0.52360),
-        )
+    if 4 in active_physical and row.chiral_atom_index.shape[1]:
+        angle = indexed_signed_dihedral(coordinates, row.chiral_atom_index)
         chiral_energy = linear_flat_bottom_energy(
             angle,
             angle.new_tensor(1.0),
-            lower,
-            upper,
+            row.chiral_lower_bound,
+            row.chiral_upper_bound,
         ).sum(dim=-1)
     else:
         chiral_energy = zero
 
-    stereo_index = input.stereo_bond_index[batch_index].to(
-        device=device,
-        dtype=torch.long,
-    )
-    if 5 in active_physical and stereo_index.shape[1]:
-        angle = indexed_signed_dihedral(coordinates, stereo_index).abs()
-        is_e = input.stereo_bond_is_e[batch_index].to(device=device, dtype=torch.bool)
-        lower = torch.where(
-            is_e,
-            angle.new_tensor(torch.pi - 0.52360),
-            angle.new_tensor(float("-inf")),
-        )
-        upper = torch.where(
-            is_e,
-            angle.new_tensor(float("inf")),
-            angle.new_tensor(0.52360),
-        )
+    if 5 in active_physical and row.stereo_bond_index.shape[1]:
+        angle = indexed_signed_dihedral(coordinates, row.stereo_bond_index).abs()
         stereo_energy = linear_flat_bottom_energy(
             angle,
             angle.new_tensor(1.0),
-            lower,
-            upper,
+            row.stereo_lower_bound,
+            row.stereo_upper_bound,
         ).sum(dim=-1)
     else:
         stereo_energy = zero
 
-    planar_index = input.planar_bond_index[batch_index].to(
-        device=device,
-        dtype=torch.long,
-    )
-    if 6 in active_physical and planar_index.shape[1]:
-        improper = torch.cat(
-            (
-                planar_index[[1, 2, 3, 0]],
-                planar_index[[4, 5, 0, 3]],
-            ),
-            dim=1,
-        )
-        angle = indexed_signed_dihedral(coordinates, improper).abs()
+    if 6 in active_physical and row.planar_bond_index.shape[1]:
+        angle = indexed_signed_dihedral(coordinates, row.planar_bond_index).abs()
         planar_energy = linear_flat_bottom_energy(
             angle,
             angle.new_tensor(1.0),
@@ -4757,30 +4711,18 @@ def _boltz2_batch_potential_terms(
     else:
         planar_energy = zero
 
-    forced_index = input.contact_pair_index[batch_index].to(
-        device=device,
-        dtype=torch.long,
-    )
-    if include_contact and forced_index.shape[1]:
-        forced_distance = indexed_distance(coordinates, forced_index)
-        forced_threshold = input.contact_thresholds[batch_index].to(
-            device=device,
-            dtype=dtype,
-        )
+    if include_contact and row.contact_pair_index.shape[1]:
+        forced_distance = indexed_distance(coordinates, row.contact_pair_index)
         forced_energy = linear_flat_bottom_energy(
             forced_distance,
             forced_distance.new_tensor(1.0),
             forced_distance.new_tensor(float("-inf")),
-            forced_threshold,
-        )
-        union_index = input.contact_union_index[batch_index].to(
-            device=device,
-            dtype=torch.long,
+            row.contact_threshold,
         )
         union_lambda = 8.0 - 8.0 * (math.exp(-2.0 * t) - 1) / (math.exp(-2.0) - 1)
         contact_energy = zero
-        for union in range(int(union_index.max().item()) + 1):
-            values = forced_energy[:, union_index == union]
+        for union_mask in row.contact_union_masks:
+            values = forced_energy[:, union_mask]
             negative_exponential = torch.exp(-union_lambda * values)
             normalization = negative_exponential.sum(
                 dim=-1,
@@ -4797,28 +4739,15 @@ def _boltz2_batch_potential_terms(
         contact_energy = zero
 
     template_energy = zero
-    if include_contact and input.template_force is not None and bool(input.template_force[batch_index].any()):
-        force = input.template_force[batch_index].to(device=device, dtype=torch.bool)
-        reference = cast(Tensor, input.template_beta_carbon_positions)[batch_index, force].to(
-            device=device,
-            dtype=dtype,
-        )
-        reference_mask = cast(Tensor, input.template_beta_carbon_mask)[batch_index, force].to(
-            device=device,
-            dtype=dtype,
-        )
-        threshold = cast(Tensor, input.template_force_threshold)[batch_index, force].to(
-            device=device,
-            dtype=dtype,
-        )
-        representative = coordinates[:, input.token_to_rep_atom[batch_index].long()]
-        for template_index in range(reference.shape[0]):
-            repeated_reference = reference[template_index].expand(
+    if include_contact and row.template_reference is not None:
+        representative = coordinates[:, row.representative_atom_index]
+        for template_index in range(row.template_reference.shape[0]):
+            repeated_reference = row.template_reference[template_index].expand(
                 coordinates.shape[0],
                 -1,
                 -1,
             )
-            repeated_mask = reference_mask[template_index].expand(
+            repeated_mask = cast(Tensor, row.template_reference_mask)[template_index].expand(
                 coordinates.shape[0],
                 -1,
             )
@@ -4828,7 +4757,7 @@ def _boltz2_batch_potential_terms(
                     target=representative.float(),
                     weight=repeated_mask.float(),
                 )
-                .to(dtype=dtype)
+                .to(dtype=coordinates.dtype)
                 .detach()
             )
             distance = torch.linalg.vector_norm(representative - aligned, dim=-1)
@@ -4837,7 +4766,7 @@ def _boltz2_batch_potential_terms(
                     distance,
                     distance.new_tensor(1.0),
                     distance.new_tensor(float("-inf")),
-                    threshold[template_index],
+                    cast(Tensor, row.template_threshold)[template_index],
                 )
                 * repeated_mask
             ).sum(dim=-1)

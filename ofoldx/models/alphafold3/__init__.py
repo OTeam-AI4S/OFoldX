@@ -17,6 +17,8 @@ from .model import (
     AlphaFold3Input,
     AlphaFold3Model,
     AlphaFold3Output,
+    AlphaFold3RawOutput,
+    AlphaFold3StructureTarget,
     TemplateFeatures,
     alphafold3_confidence_summary,
     alphafold3_fraction_disordered,
@@ -26,7 +28,7 @@ from .model import (
     alphafold3_ranking_score,
     alphafold3_tm_adjusted_pae,
 )
-from .pipeline import AlphaFold3Pipeline
+from .pipeline import AlphaFold3Pipeline, pair_msas
 from .processor import AlphaFold3Processor
 
 _MODELS.register(

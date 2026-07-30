@@ -81,7 +81,7 @@ class ODesignModel(Model):
         ...         "num_distogram_bins": 4, "dropout": 0.0,
         ...     },
         ...     "trunk": {
-        ...         "num_msa_blocks": 1, "num_pairformer_blocks": 1,
+        ...         "num_msa_stages": 1, "num_pairformer_blocks": 1,
         ...         "pairformer_dropout": 0.0, "msa_dropout": 0.0, "pair_dropout": 0.0,
         ...     },
         ...     "recycling_steps": 1,
@@ -156,7 +156,7 @@ class ODesignModel(Model):
         self.msa_trunk = MsaTrunk(
             pair_size=config.pair_size,
             token_feature_size=config.token_feature_size,
-            num_stages=config.trunk.num_msa_blocks,
+            num_stages=config.trunk.num_msa_stages,
             msa_dropout=config.trunk.msa_dropout,
             pair_dropout=config.trunk.pair_dropout,
         )
