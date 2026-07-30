@@ -14,7 +14,7 @@ from .model import (
     LigandMpnnOutput,
     LigandMpnnSamplingOutput,
 )
-from .objectives import criterion, criterion_factory, nll_loss, smoothed_loss
+from .objectives import criterion, criterion_factory, smoothed_loss
 from .pipeline import LigandMpnnDesignAndPackPipeline, LigandMpnnPipeline
 from .processor import LigandMpnnProcessor
 

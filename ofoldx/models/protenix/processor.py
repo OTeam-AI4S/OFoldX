@@ -27,6 +27,7 @@ from ...data.evidence import (
     select_msa_binding,
 )
 from ...data.molecular import (
+    HYDROGEN_ELEMENTS,
     AtomSite,
     ChemicalComponent,
     ComponentReference,
@@ -246,7 +247,7 @@ class ProtenixProcessor(Processor):
         generator: torch.Generator | None = None,
     ) -> tuple[ProtenixInput, ProtenixStructureTarget]:
         r"""
-        Lower one complete structure into model input and separate coordinate truth.
+        Lower one structure into model input and separate coordinate truth.
         """
 
         processed = self(
@@ -367,7 +368,7 @@ class ProtenixTemplateProcessor(ProtenixProcessor):
         generator: torch.Generator | None = None,
     ) -> tuple[ProtenixInput, ProtenixStructureTarget]:
         r"""
-        Lower template-capable input and separate complete coordinate truth.
+        Lower template-capable input and separate coordinate truth.
         """
 
         processed = self(
@@ -451,7 +452,7 @@ class ProtenixStructureConditionProcessor(ProtenixProcessor):
         generator: torch.Generator | None = None,
     ) -> tuple[ProtenixInput, ProtenixStructureTarget]:
         r"""
-        Lower structure-conditioned input and separate complete coordinate truth.
+        Lower structure-conditioned input and separate coordinate truth.
         """
 
         processed = self(
@@ -540,7 +541,7 @@ class ProtenixConstraintProcessor(ProtenixProcessor):
         generator: torch.Generator | None = None,
     ) -> tuple[ProtenixInput, ProtenixStructureTarget]:
         r"""
-        Lower constrained input and separate complete coordinate truth.
+        Lower constrained input and separate coordinate truth.
         """
 
         processed = self(
@@ -569,17 +570,28 @@ def _structure_target(
     dtype: torch.dtype,
 ) -> ProtenixStructureTarget:
     r"""
-    Lower the complete Structure coordinate pool and current atom-axis mapping.
+    Lower the retained heavy-atom coordinate pool from a Structure.
     """
 
-    coordinate_index = {site: index for index, site in enumerate(structure.sites)}
+    coordinate_indices = [
+        index
+        for index, site in enumerate(structure.sites)
+        if site.instance_id in input.system.instances and structure.system.atom(site).element not in HYDROGEN_ELEMENTS
+    ]
+    coordinate_index = {
+        structure.sites[source_index]: target_index for target_index, source_index in enumerate(coordinate_indices)
+    }
     atom_index = torch.tensor(
         [coordinate_index.get(site, -1) for site in input.atom_sites],
         dtype=torch.int64,
     )
     return ProtenixStructureTarget(  # type: ignore[call-arg]
-        coordinates=torch.from_numpy(structure.coordinates.copy()).to(device=device, dtype=dtype).unsqueeze(0),
-        coordinate_mask=torch.from_numpy(structure.coordinate_mask.copy()).to(device=device).unsqueeze(0),
+        coordinates=torch.from_numpy(structure.coordinates[coordinate_indices].copy())
+        .to(device=device, dtype=dtype)
+        .unsqueeze(0),
+        coordinate_mask=torch.from_numpy(structure.coordinate_mask[coordinate_indices].copy())
+        .to(device=device)
+        .unsqueeze(0),
         atom_index=atom_index.to(device=device).unsqueeze(0),
         batch_size=[1],
     )
@@ -596,29 +608,55 @@ def molecular_system_from_input(
             structure whose topology supplies the system.
 
     Returns:
-        The existing molecular system or one constructed from the supplied
-        polymer sequence values.
+        The normalized molecular system with Protenix-excluded water entities
+        omitted.
     """
 
     # A Structure supplied as the primary input contributes only topology. The
     # constraint Processor lowers coordinates only from its explicit substructure argument.
     if isinstance(input, Structure):
-        return input.system
-    if isinstance(input, MolecularSystem):
-        return input
-    if isinstance(input, PolymerSequence):
-        return molecular_system_from_named_sequences((("A", input),))
-    if isinstance(input, Sequence):
+        system = input.system
+    elif isinstance(input, MolecularSystem):
+        system = input
+    elif isinstance(input, PolymerSequence):
+        system = molecular_system_from_named_sequences((("A", input),))
+    elif isinstance(input, Sequence):
         sequence_values = tuple(cast(Sequence[object], input))
         if not sequence_values or not all(isinstance(sequence, PolymerSequence) for sequence in sequence_values):
             raise TypeError("Protenix sequence collections must contain PolymerSequence values")
         polymer_sequences = cast(tuple[PolymerSequence, ...], sequence_values)
-        return molecular_system_from_named_sequences(
+        system = molecular_system_from_named_sequences(
             tuple((f"chain_{index + 1}", sequence) for index, sequence in enumerate(polymer_sequences))
         )
-    raise TypeError(
-        "Protenix input must be a PolymerSequence, sequence of PolymerSequence " "values, MolecularSystem, or Structure"
+    else:
+        raise TypeError(
+            "Protenix input must be a PolymerSequence, sequence of PolymerSequence "
+            "values, MolecularSystem, or Structure"
+        )
+
+    # Released Protenix removes deposited HOH and DOD before both training and inference features.
+    water_entities = {
+        entity_id
+        for entity_id, entity in system.entities.items()
+        if isinstance(entity, Molecule)
+        and entity.components
+        and all(component.component_id in {"HOH", "DOD"} for component in entity.components)
+    }
+    if not water_entities:
+        return system
+
+    instances = {
+        instance_id: entity_id for instance_id, entity_id in system.instances.items() if entity_id not in water_entities
+    }
+    entities = {entity_id: entity for entity_id, entity in system.entities.items() if entity_id not in water_entities}
+    bonds = frozenset(
+        bond
+        for bond in system.bonds
+        if bond.site_a.instance_id in instances
+        and bond.site_b.instance_id in instances
+        and (bond.stereo_sites is None or all(site.instance_id in instances for site in bond.stereo_sites))
     )
+    return MolecularSystem(entities, instances, bonds)
 
 
 def molecular_system_from_named_sequences(
@@ -673,7 +711,7 @@ def _is_standard(component: ChemicalComponent, polymer_type: str) -> bool:
 
 
 def _tokenize(system: MolecularSystem, expanded: frozenset[tuple[str, int]]) -> list[dict[str, object]]:
-    available = {site for site, atom in system.iter_atoms() if atom.element != "H"}
+    available = {site for site, atom in system.iter_atoms() if atom.element not in HYDROGEN_ELEMENTS}
     tokens: list[dict[str, object]] = []
     entity_indices: dict[str, int] = {}
     entity_copies: dict[str, int] = {}
@@ -690,7 +728,7 @@ def _tokenize(system: MolecularSystem, expanded: frozenset[tuple[str, int]]) -> 
                 atom_sites = tuple(
                     site
                     for atom in component.atoms
-                    if atom.element != "H"
+                    if atom.element not in HYDROGEN_ELEMENTS
                     and not (component_id in {"N", "DN"} and atom.atom_id == "N")
                     and (site := AtomSite(instance_id, monomer_index, atom.atom_id)) in available
                 )
@@ -744,7 +782,8 @@ def _tokenize(system: MolecularSystem, expanded: frozenset[tuple[str, int]]) -> 
                 site
                 for component_index, component in enumerate(entity.components)
                 for atom in component.atoms
-                if atom.element != "H" and (site := AtomSite(instance_id, component_index, atom.atom_id)) in available
+                if atom.element not in HYDROGEN_ELEMENTS
+                and (site := AtomSite(instance_id, component_index, atom.atom_id)) in available
             )
             if not atom_sites:
                 raise ValueError(f"Protenix molecule {instance_id!r} has no model-visible heavy atoms")
@@ -848,7 +887,9 @@ def _features(
             else:
                 heavy_order = {
                     atom.atom_id: index
-                    for index, atom in enumerate(atom for atom in component.atoms if atom.element != "H")
+                    for index, atom in enumerate(
+                        atom for atom in component.atoms if atom.element not in HYDROGEN_ELEMENTS
+                    )
                 }
             for site in group:
                 atom_token_index[site_to_atom[site]] = heavy_order[site.atom_id]

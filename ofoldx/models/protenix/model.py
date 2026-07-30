@@ -17,6 +17,7 @@ from torch import Tensor, nn
 from transformers import EsmConfig, EsmModel
 
 from ...data.molecular import (
+    HYDROGEN_ELEMENTS,
     AtomSite,
     ComponentReference,
     MolecularSystem,
@@ -359,7 +360,7 @@ class ProtenixModel(Model):
 
         Args:
             input: Model features with batch, token, and atom axes ``(B, N, A)``.
-            target: Complete-pool structure coordinates and their current atom-axis
+            target: Heavy-atom truth-pool coordinates and their current atom-axis
                 mapping.
             num_samples: Number ``S`` of independently corrupted copies per input.
             synchronize_noise_levels: Whether samples from one example share sigma.
@@ -651,7 +652,7 @@ class ProtenixModel(Model):
 
         atom_count = len(input.atom_sites)
         token_count = len(input.token_sites)
-        complete_sites = [site for site, atom in input.system.iter_atoms() if atom.element != "H"]
+        complete_sites = [site for site, atom in input.system.iter_atoms() if atom.element not in HYDROGEN_ELEMENTS]
         complete_index = {site: index for index, site in enumerate(complete_sites)}
         model_to_complete = np.asarray(
             [complete_index[site] for site in input.atom_sites],
@@ -4081,7 +4082,7 @@ def _gather_protenix_structure_target(
     input: ProtenixInput,
 ) -> tuple[Tensor, Tensor]:
     r"""
-    Gather complete-pool truth onto the current atom axis.
+    Gather heavy-atom truth onto the current atom axis.
     """
 
     atom_index = target.atom_index.long()
@@ -4298,10 +4299,10 @@ class ProtenixPocket:
 @tensorclass
 class ProtenixStructureTarget:
     r"""
-    Complete-pool structure truth for Protenix training.
+    Heavy-atom structure truth for Protenix training.
 
     Args:
-        coordinates: Complete truth coordinates with shape ``(B, T, 3)`` in
+        coordinates: Heavy-atom truth coordinates with shape ``(B, T, 3)`` in
             angstroms.
         coordinate_mask: Resolved-coordinate mask with shape ``(B, T)``.
         atom_index: Current model-atom to truth-pool mapping with shape

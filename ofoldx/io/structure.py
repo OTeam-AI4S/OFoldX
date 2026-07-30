@@ -17,6 +17,7 @@ import numpy as np
 from ..data.components import get_builtin_component_polymer_type, get_component
 from ..data.elements import ATOMIC_NUMBER_BY_ELEMENT
 from ..data.molecular import (
+    HYDROGEN_ELEMENTS,
     AtomSite,
     ChemicalAtom,
     ChemicalBond,
@@ -26,6 +27,7 @@ from ..data.molecular import (
     Molecule,
     PolymerSequence,
     PolymerType,
+    is_water_component,
 )
 from ..data.structure import ResidueNumber, Structure
 from .records import AtomRecord, ParsedStructure, atom_record_residue_key, unique_identifier
@@ -34,7 +36,7 @@ if TYPE_CHECKING:
     from .mmcif import _MmcifEntityDeclarations
 
 _FORMATS: dict[str, Literal["pdb", "mmcif"]] = {".pdb": "pdb", ".cif": "mmcif", ".mmcif": "mmcif"}
-_ATOM_LAYOUTS = frozenset({"observed", "complete_heavy", "complete_all"})
+_ATOM_LAYOUTS = frozenset({"observed", "observed_heavy", "complete_heavy", "complete_all"})
 _ALTLOC_POLICIES = frozenset({"highest_occupancy", "first"})
 
 
@@ -58,7 +60,8 @@ def read_structure(
     model: int = 1,
     assembly_id: str | None = None,
     altloc: Literal["highest_occupancy", "first"] = "highest_occupancy",
-    atom_layout: Literal["observed", "complete_heavy", "complete_all"] = "observed",
+    atom_layout: Literal["observed", "observed_heavy", "complete_heavy", "complete_all"] = "observed",
+    include_water: bool = True,
     components: Mapping[str, ChemicalComponent] | None = None,
 ) -> Structure:
     r"""
@@ -71,8 +74,10 @@ def read_structure(
         assembly_id: Optional biological assembly identifier.
         altloc: Policy used to choose one alternate location per residue.
         atom_layout: Atoms included in the returned structure. ``"observed"`` keeps
-            source atoms, ``"complete_heavy"`` adds known heavy atoms, and
-            ``"complete_all"`` also materializes known hydrogens.
+            selected source atoms, ``"observed_heavy"`` keeps selected source heavy
+            atoms, ``"complete_heavy"`` adds known heavy atoms, and ``"complete_all"``
+            also materializes known hydrogens.
+        include_water: Whether to retain water molecules.
         components: Optional component definitions overriding built-in chemistry by
             component ID.
 
@@ -85,15 +90,26 @@ def read_structure(
             no atoms.
     """
 
-    parsed, component_table = _prepare_read(path, model, assembly_id, atom_layout, components)
+    parsed, rows, excluded_water_rows, component_table = _prepare_read(
+        path,
+        model,
+        assembly_id,
+        atom_layout,
+        include_water,
+        components,
+    )
     if altloc not in _ALTLOC_POLICIES:
         raise ValueError(f"unsupported altloc policy: {altloc!r}")
     if parsed.canonical_payload is not None:
-        from .mmcif import decode_canonical_mmcif
+        from .mmcif import _read_mmcif_entity_declarations, decode_canonical_mmcif
 
-        return _apply_atom_layout(decode_canonical_mmcif(parsed), atom_layout)
-    selected = _select_altloc(parsed.rows, altloc)
-    return _build_structure(parsed, selected, atom_layout, component_table)
+        structure = decode_canonical_mmcif(parsed)
+        if not include_water:
+            entity_types = _read_mmcif_entity_declarations(parsed).entity_types
+            structure = _exclude_water(structure, entity_types)
+        return _apply_atom_layout(structure, atom_layout)
+    selected = _select_altloc(rows, altloc)
+    return _build_structure(parsed, selected, excluded_water_rows, atom_layout, component_table)
 
 
 def read_structures(
@@ -101,7 +117,8 @@ def read_structures(
     *,
     model: int = 1,
     assembly_id: str | None = None,
-    atom_layout: Literal["observed", "complete_heavy", "complete_all"] = "observed",
+    atom_layout: Literal["observed", "observed_heavy", "complete_heavy", "complete_all"] = "observed",
+    include_water: bool = True,
     components: Mapping[str, ChemicalComponent] | None = None,
 ) -> tuple[Structure, ...]:
     r"""
@@ -112,6 +129,7 @@ def read_structures(
         model: One-based model number.
         assembly_id: Optional biological assembly identifier.
         atom_layout: Atoms included in each returned structure.
+        include_water: Whether to retain water molecules.
         components: Optional component definitions overriding built-in chemistry by
             component ID.
 
@@ -119,13 +137,26 @@ def read_structures(
         One structure per valid combination of residue alternate locations.
     """
 
-    parsed, component_table = _prepare_read(path, model, assembly_id, atom_layout, components)
+    parsed, rows, excluded_water_rows, component_table = _prepare_read(
+        path,
+        model,
+        assembly_id,
+        atom_layout,
+        include_water,
+        components,
+    )
     if parsed.canonical_payload is not None:
-        from .mmcif import decode_canonical_mmcif
+        from .mmcif import _read_mmcif_entity_declarations, decode_canonical_mmcif
 
-        return (_apply_atom_layout(decode_canonical_mmcif(parsed), atom_layout),)
-    selections = _expand_altlocs(parsed.rows)
-    return tuple(_build_structure(parsed, selected, atom_layout, component_table) for selected in selections)
+        structure = decode_canonical_mmcif(parsed)
+        if not include_water:
+            entity_types = _read_mmcif_entity_declarations(parsed).entity_types
+            structure = _exclude_water(structure, entity_types)
+        return (_apply_atom_layout(structure, atom_layout),)
+    selections = _expand_altlocs(rows)
+    return tuple(
+        _build_structure(parsed, selected, excluded_water_rows, atom_layout, component_table) for selected in selections
+    )
 
 
 def write_structure(
@@ -176,8 +207,14 @@ def _prepare_read(
     model: int,
     assembly_id: str | None,
     atom_layout: str,
+    include_water: bool,
     components: Mapping[str, ChemicalComponent] | None,
-) -> tuple[ParsedStructure, dict[str, ChemicalComponent]]:
+) -> tuple[
+    ParsedStructure,
+    tuple[AtomRecord, ...],
+    tuple[AtomRecord, ...],
+    dict[str, ChemicalComponent],
+]:
     source, format_name = _structure_path(path, allow_compressed=True)
     if model <= 0:
         raise ValueError("model must be a positive one-based integer")
@@ -204,14 +241,65 @@ def _prepare_read(
             if component.component_id != component_id:
                 raise ValueError("component mapping keys must equal ChemicalComponent.component_id")
         component_table.update(supplied)
-    if atom_layout == "observed":
-        _add_observed_components(parsed.rows, component_table)
+    if parsed.canonical_payload is not None:
+        return parsed, parsed.rows, (), component_table
+
+    rows = parsed.rows
+    excluded_water_rows: tuple[AtomRecord, ...] = ()
+    excluded_component_ids: set[str] = set()
+    if not include_water:
+        rows = _exclude_water_rows(parsed, component_table)
+        retained_indices = {row.row_index for row in rows}
+        excluded_water_rows = tuple(row for row in parsed.rows if row.row_index not in retained_indices)
+        excluded_component_ids = {row.component_id for row in excluded_water_rows} - {row.component_id for row in rows}
+    if atom_layout in {"observed", "observed_heavy"}:
+        _add_observed_components(rows, component_table)
     if atom_layout == "complete_all":
         component_table = {
-            component_id: _materialize_component_hydrogens(component)
+            component_id: (
+                component if component_id in excluded_component_ids else _materialize_component_hydrogens(component)
+            )
             for component_id, component in component_table.items()
         }
-    return parsed, component_table
+    return parsed, rows, excluded_water_rows, component_table
+
+
+def _exclude_water_rows(
+    parsed: ParsedStructure,
+    component_table: Mapping[str, ChemicalComponent],
+) -> tuple[AtomRecord, ...]:
+    entity_types: Mapping[str, str] = {}
+    if parsed.format == "mmcif":
+        from .mmcif import _read_mmcif_entity_declarations
+
+        entity_types = _read_mmcif_entity_declarations(parsed).entity_types
+
+    fallback_rows = tuple(row for row in parsed.rows if row.entity_id is None or row.entity_id not in entity_types)
+    fallback_components = dict(component_table)
+    _add_observed_components(fallback_rows, fallback_components)
+
+    fallback_groups: dict[tuple[object, ...], list[AtomRecord]] = {}
+    for row in fallback_rows:
+        key = (
+            ("entity", row.entity_id)
+            if parsed.format == "mmcif" and row.entity_id is not None
+            else ("residue", *atom_record_residue_key(row))
+        )
+        fallback_groups.setdefault(key, []).append(row)
+    fallback_water_rows = {
+        row.row_index
+        for rows in fallback_groups.values()
+        if all(
+            is_water_component(fallback_components[component_id]) for component_id in {row.component_id for row in rows}
+        )
+        for row in rows
+    }
+    declared_water_entities = {entity_id for entity_id, entity_type in entity_types.items() if entity_type == "water"}
+    return tuple(
+        row
+        for row in parsed.rows
+        if row.entity_id not in declared_water_entities and row.row_index not in fallback_water_rows
+    )
 
 
 def _materialize_component_hydrogens(component: ChemicalComponent) -> ChemicalComponent:
@@ -410,6 +498,56 @@ def _altloc_choices(
     return tuple((key, tuple(labels)) for key, labels in labels_by_residue.items() if labels)
 
 
+def _exclude_water(
+    structure: Structure,
+    entity_types: Mapping[str, str],
+) -> Structure:
+    water_entities: set[str] = set()
+    for entity_id, entity in structure.system.entities.items():
+        entity_type = entity_types.get(entity_id)
+        if entity_type == "water" or (
+            entity_type is None
+            and isinstance(entity, Molecule)
+            and bool(entity.components)
+            and all(is_water_component(component) for component in entity.components)
+        ):
+            water_entities.add(entity_id)
+    if not water_entities:
+        return structure
+
+    instances = {
+        instance_id: entity_id
+        for instance_id, entity_id in structure.system.instances.items()
+        if entity_id not in water_entities
+    }
+    entities = {
+        entity_id: entity for entity_id, entity in structure.system.entities.items() if entity_id not in water_entities
+    }
+    bonds = frozenset(
+        bond
+        for bond in structure.system.bonds
+        if bond.site_a.instance_id in instances
+        and bond.site_b.instance_id in instances
+        and (bond.stereo_sites is None or all(site.instance_id in instances for site in bond.stereo_sites))
+    )
+    system = MolecularSystem(entities, instances, bonds)
+    indices = [index for index, site in enumerate(structure.sites) if site.instance_id in instances]
+    residue_numbers = (
+        None
+        if structure.residue_numbers is None
+        else {reference: number for reference, number in structure.residue_numbers.items() if reference[0] in instances}
+    )
+    return Structure(
+        system=system,
+        sites=tuple(structure.sites[index] for index in indices),
+        coordinates=structure.coordinates[indices],
+        coordinate_mask=structure.coordinate_mask[indices],
+        occupancy=None if structure.occupancy is None else structure.occupancy[indices],
+        b_factor=None if structure.b_factor is None else structure.b_factor[indices],
+        residue_numbers=residue_numbers,
+    )
+
+
 def _apply_atom_layout(structure: Structure, atom_layout: str) -> Structure:
     if atom_layout == "observed":
         return structure
@@ -423,10 +561,12 @@ def _apply_atom_layout(structure: Structure, atom_layout: str) -> Structure:
             else:
                 entities[entity_id] = Molecule(components, entity.bonds)
         system = MolecularSystem(entities, system.instances, system.bonds)
-    if atom_layout == "complete_all":
+    if atom_layout == "observed_heavy":
+        sites = tuple(site for site in structure.sites if system.atom(site).element not in HYDROGEN_ELEMENTS)
+    elif atom_layout == "complete_all":
         sites = tuple(site for site, _ in system.iter_atoms())
     else:
-        sites = tuple(site for site, atom in system.iter_atoms() if atom.element != "H")
+        sites = tuple(site for site, atom in system.iter_atoms() if atom.element not in HYDROGEN_ELEMENTS)
     source_indices = {site: index for index, site in enumerate(structure.sites)}
     coordinates = np.zeros((len(sites), 3), dtype=structure.coordinates.dtype)
     coordinate_mask = np.zeros(len(sites), dtype=np.bool_)
@@ -621,6 +761,7 @@ def _pdb_polymer_segments(
 def _build_structure(
     parsed: ParsedStructure,
     rows: tuple[AtomRecord, ...],
+    excluded_water_rows: tuple[AtomRecord, ...],
     atom_layout: str,
     component_table: dict[str, ChemicalComponent],
 ) -> Structure:
@@ -880,25 +1021,33 @@ def _build_structure(
     else:
         from .mmcif import read_mmcif_bonds
 
-        source_bonds = read_mmcif_bonds(parsed, rows, site_by_row_index)
+        source_bonds = read_mmcif_bonds(
+            parsed,
+            rows,
+            site_by_row_index,
+            excluded_water_rows,
+        )
     system = MolecularSystem(entity_by_id, instances, frozenset(source_bonds))
     observed_sites = tuple(site_by_row_index[row.row_index] for row in rows)
     # Complete layouts are materialized from MolecularSystem atoms; complete_heavy
     # filters hydrogen atoms here.
     if atom_layout == "observed":
         sites = observed_sites
+    elif atom_layout == "observed_heavy":
+        sites = tuple(site_by_row_index[row.row_index] for row in rows if row.element not in HYDROGEN_ELEMENTS)
     elif atom_layout == "complete_all":
         sites = tuple(site for site, _ in system.iter_atoms())
     else:
-        sites = tuple(site for site, atom in system.iter_atoms() if atom.element != "H")
+        sites = tuple(site for site, atom in system.iter_atoms() if atom.element not in HYDROGEN_ELEMENTS)
     site_indices = {site: index for index, site in enumerate(sites)}
     coordinates = np.zeros((len(sites), 3), dtype=np.float32)
     coordinate_mask = np.zeros(len(sites), dtype=np.bool_)
+    retained_rows = tuple(row for row in rows if site_by_row_index[row.row_index] in site_indices)
     occupancy = (
         np.full(len(sites), np.nan, dtype=np.float32) if any(row.occupancy is not None for row in rows) else None
     )
     b_factor = np.full(len(sites), np.nan, dtype=np.float32) if any(row.b_factor is not None for row in rows) else None
-    for row in rows:
+    for row in retained_rows:
         site = site_by_row_index[row.row_index]
         index = site_indices[site]
         coordinates[index] = row.coordinates

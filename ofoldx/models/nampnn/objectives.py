@@ -10,8 +10,6 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from ...modules.mpnn import nll_loss as nll_loss
-
 _PROTEIN_RESIDUE_TYPE_SPAN = (0, 21)
 _DNA_RESIDUE_TYPE_SPAN = (21, 26)
 _RNA_RESIDUE_TYPE_SPAN = (26, 31)

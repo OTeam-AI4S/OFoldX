@@ -170,7 +170,7 @@ def atom_records_from_array(
         return array.get_annotation(name)
 
     atom_serials = annotation("atom_id")
-    charges = annotation("charge")
+    charges = annotation("charge" if format_name == "pdb" else "pdbx_formal_charge")
     occupancies = annotation("occupancy")
     b_factors = annotation("b_factor")
     altloc_ids = annotation("altloc_id")

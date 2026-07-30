@@ -15,7 +15,7 @@ from .model import (
     ProteinMpnnOutput,
     ProteinMpnnSamplingOutput,
 )
-from .objectives import criterion, criterion_factory, nll_loss, smoothed_loss
+from .objectives import criterion, criterion_factory, smoothed_loss
 from .pipeline import ProteinMpnnDesignAndPackPipeline, ProteinMpnnPipeline
 from .processor import ProteinMpnnProcessor
 

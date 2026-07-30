@@ -130,7 +130,7 @@ def parse_mmcif(path: Path, *, model: int, assembly_id: str | None) -> ParsedStr
         ("atom_id", "id"),
         ("b_factor", "B_iso_or_equiv"),
         ("occupancy", "occupancy"),
-        ("charge", "pdbx_formal_charge"),
+        ("pdbx_formal_charge", "pdbx_formal_charge"),
     ):
         if source_column in available:
             requested.append(special)
@@ -625,6 +625,7 @@ def read_mmcif_bonds(
     parsed: ParsedStructure,
     selected_rows: tuple[AtomRecord, ...],
     site_by_row_index: dict[int, AtomSite],
+    excluded_water_rows: tuple[AtomRecord, ...],
 ) -> tuple[SystemBond, ...]:
     r"""
     Decode selected mmCIF covalent connections into system bonds.
@@ -633,6 +634,7 @@ def read_mmcif_bonds(
         parsed: Parsed mmCIF records and source document.
         selected_rows: Atom rows retained for the selected structure.
         site_by_row_index: Canonical atom sites indexed by source row.
+        excluded_water_rows: Source rows omitted by the reader's water projection.
 
     Returns:
         Resolved covalent system bonds.
@@ -674,6 +676,28 @@ def read_mmcif_bonds(
         _cif_column(category, "pdbx_value_order") if "pdbx_value_order" in category else ("sing",) * category.row_count
     )
     selected_sites = selected_source_sites(selected_rows, site_by_row_index)
+    excluded_water_keys = {
+        key
+        for row in excluded_water_rows
+        for key in (
+            (
+                row.symmetry_id,
+                row.chain_id,
+                row.label_seq_id,
+                row.insertion_code,
+                row.component_id,
+                row.atom_name,
+            ),
+            (
+                row.symmetry_id,
+                row.auth_chain_id,
+                row.auth_residue_id,
+                row.insertion_code,
+                row.auth_component_id,
+                row.auth_atom_name,
+            ),
+        )
+    }
     symmetry_ids = {row.symmetry_id for row in selected_rows}
     bonds: list[SystemBond] = []
     for index, conn_type in enumerate(conn_types):
@@ -718,6 +742,17 @@ def read_mmcif_bonds(
                 (symmetry_id, *auth_endpoint_2)
             )
             if site_a is None or site_b is None:
+                touches_excluded_water = any(
+                    key in excluded_water_keys
+                    for key in (
+                        (symmetry_id, *endpoint_1),
+                        (symmetry_id, *auth_endpoint_1),
+                        (symmetry_id, *endpoint_2),
+                        (symmetry_id, *auth_endpoint_2),
+                    )
+                )
+                if touches_excluded_water:
+                    continue
                 raise ValueError(
                     "mmCIF struct_conn references an atom absent from the selected assembly/model: "
                     f"label={endpoint_1!r}, {endpoint_2!r}; auth={auth_endpoint_1!r}, {auth_endpoint_2!r}"

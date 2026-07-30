@@ -13,7 +13,6 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from ...modules.mpnn import label_smoothed_nll_loss as smoothed_loss
-from ...modules.mpnn import nll_loss as nll_loss
 
 
 def criterion(pred: Any, target: Any, *, label_smoothing: float = 0.1) -> Tensor:
