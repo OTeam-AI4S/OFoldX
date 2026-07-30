@@ -256,7 +256,7 @@ class NaMpnnProcessor(Processor):
         conditions: tuple[AllowedResidueIdentities | TiedResidueIdentities, ...],
     ) -> NaMpnnInput:
         coordinates = np.stack([row[5] for row in rows])
-        return NaMpnnInput(
+        return NaMpnnInput(  # type: ignore[call-arg]
             atom_coordinates=torch.as_tensor(coordinates, device=self.device, dtype=self.dtype).unsqueeze(0),
             atom_mask=self._tensor([list(row[6]) for row in rows], torch.bool),
             sequence_tokens=self._tensor(sequence_tokens, torch.int64),
@@ -519,16 +519,16 @@ class NaMpnnProcessor(Processor):
                     polymer_type = rows[index][2]
                     declared.append({self._component_token(component_id, polymer_type) for component_id in restriction})
             if declared:
-                allowed = declared[0].intersection(*declared[1:])
+                allowed_tokens = declared[0].intersection(*declared[1:])
                 for index in members:
                     row = rows[index]
                     supported = {
                         component_id
                         for component_id in _GENERATED_COMPONENTS[row[2]]
-                        if self._component_token(component_id, row[2]) in allowed
+                        if self._component_token(component_id, row[2]) in allowed_tokens
                     }
                     if not supported:
-                        if self._component_token(row[1], row[2]) in allowed:
+                        if self._component_token(row[1], row[2]) in allowed_tokens:
                             lowered_design_positions[index] = False
                             continue
                         raise ValueError("NA-MPNN allowed identities contain no residue it can generate")

@@ -7,11 +7,10 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from tensordict import tensorclass
-
 import numpy as np
 import torch
 import torch.nn.functional as F
+from tensordict import tensorclass
 from torch import Tensor, nn
 
 from ...data.molecular import AtomSite, MolecularSystem
@@ -155,7 +154,7 @@ class PxDesignModel(Model):
                 noise_level=noise_level,
             )
         )
-        return PxDesignOutput(coordinates, batch_size=[coordinates.shape[0]])
+        return PxDesignOutput(coordinates, batch_size=[coordinates.shape[0]])  # type: ignore[call-arg]
 
     @torch.inference_mode()
     def sample(
@@ -195,7 +194,7 @@ class PxDesignModel(Model):
             sample_chunk_size=sample_chunk_size,
             generator=generator,
         )
-        return PxDesignOutput(coordinates, batch_size=[coordinates.shape[0]])
+        return PxDesignOutput(coordinates, batch_size=[coordinates.shape[0]])  # type: ignore[call-arg]
 
     @torch.inference_mode()
     def design(
@@ -564,7 +563,7 @@ def _augment_reference_conformers(
             )[0]
             augmented = (values + translation) @ rotation.transpose(-1, -2)
             sample_positions[selected] = augmented.to(sample_positions.dtype)
-    return input.replace(reference_positions=positions)
+    return input.replace(reference_positions=positions)  # type: ignore[attr-defined]
 
 
 # ============================================================================

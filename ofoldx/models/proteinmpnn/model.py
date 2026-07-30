@@ -141,7 +141,7 @@ class ProteinMpnnModel(Model):
         def repeat(value: Tensor | None) -> Tensor | None:
             return None if value is None else value.repeat_interleave(count, dim=0)
 
-        return ProteinMpnnInput(
+        return ProteinMpnnInput(  # type: ignore[call-arg]
             backbone_coordinates=repeat(input.backbone_coordinates),
             sequence_tokens=repeat(input.sequence_tokens),
             residue_mask=repeat(input.residue_mask),
@@ -464,7 +464,11 @@ class ProteinMpnnModel(Model):
             input.residue_mask,
             decoding_ranks,
         )
-        return ProteinMpnnOutput(logits=logits, decoding_ranks=decoding_ranks, batch_size=[logits.shape[0]])
+        return ProteinMpnnOutput(  # type: ignore[call-arg]
+            logits=logits,
+            decoding_ranks=decoding_ranks,
+            batch_size=[logits.shape[0]],
+        )
 
     def autoregressive_probabilities(
         self,
@@ -1086,7 +1090,7 @@ class ProteinMpnnModel(Model):
             ] * member_selected.unsqueeze(-1)
             token_states[batch_indices, positions] = self.token_embedding(group_tokens[batch_indices])
 
-        return ProteinMpnnSamplingOutput(
+        return ProteinMpnnSamplingOutput(  # type: ignore[call-arg]
             sequence_tokens=sequence_tokens,
             log_probabilities=log_probabilities,
             sampling_probabilities=sampling_probabilities,

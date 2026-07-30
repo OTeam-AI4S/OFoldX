@@ -652,7 +652,7 @@ def _prepare_boltz2_affinity_features(
         name: value.to(device=device, dtype=dtype) if value.is_floating_point() else value.to(device=device)
         for name, value in tensor_values.items()
     }
-    return Boltz2Input(
+    return Boltz2Input(  # type: ignore[call-arg]
         **{name: value.unsqueeze(0) for name, value in placed.items()},
         layout=Boltz2Layout(
             system=system,
@@ -938,7 +938,7 @@ def _prepare_boltz2_structure_features(
         name: value.to(device=device, dtype=dtype) if value.is_floating_point() else value.to(device=device)
         for name, value in tensor_values.items()
     }
-    return Boltz2Input(
+    return Boltz2Input(  # type: ignore[call-arg]
         **{name: value.unsqueeze(0) for name, value in placed.items()},
         layout=Boltz2Layout(
             system=system,
@@ -1008,7 +1008,7 @@ def _prepare_boltz2_target(
         structure.system,
         atom_sites,
     )
-    return Boltz2StructureTarget(
+    return Boltz2StructureTarget(  # type: ignore[call-arg]
         coordinates=target_positions.to(device=device, dtype=dtype)[None, None],
         coordinate_mask=target_mask.to(device=device).unsqueeze(0),
         atom_index=target_atom_index.to(device=device).unsqueeze(0),

@@ -3923,7 +3923,7 @@ _GLY_INDEX = residue_constants.AMINO_ACID_ONE_LETTER_CODES.index("G")
 
 
 def _template_batch(input: AlphaFold2Input) -> AlphaFold2TemplateBatch:
-    return AlphaFold2TemplateBatch(
+    return AlphaFold2TemplateBatch(  # type: ignore[call-arg]
         template_residue_type_ids=input.template_residue_type_ids,
         template_mask=input.template_mask,
         template_all_atom_positions=input.template_all_atom_positions,

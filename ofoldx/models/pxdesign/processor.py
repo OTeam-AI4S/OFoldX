@@ -262,7 +262,7 @@ class PxDesignProcessor(Processor):
             token_sites,
             token_residues,
         )
-        return PxDesignInput(
+        return PxDesignInput(  # type: ignore[call-arg]
             residue_index=residue_index.unsqueeze(0).to(self.device),
             chain_index=chain_index.unsqueeze(0).to(self.device),
             entity_index=entity_index.unsqueeze(0).to(self.device),

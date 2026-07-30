@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, replace
-from typing import Literal, TypeAlias
+from typing import Literal, TypeAlias, cast
 
 #: Supported polymer chemistries.
 PolymerType: TypeAlias = Literal["protein", "rna", "dna", "dna_rna_hybrid"]
@@ -476,11 +476,12 @@ def _merge_physical_edge(existing: SystemBond, incoming: SystemBond) -> SystemBo
             f"conflicting aromaticity for physical edge {existing.site_a}-{existing.site_b}: "
             f"{existing.aromatic!r} vs {incoming.aromatic!r}"
         )
-    return replace(
-        incoming,
-        stereo=facet("stereo", existing.stereo, incoming.stereo),
-        stereo_sites=facet("stereo sites", existing.stereo_sites, incoming.stereo_sites),
+    stereo = cast(str | None, facet("stereo", existing.stereo, incoming.stereo))
+    stereo_sites = cast(
+        tuple[AtomSite, AtomSite] | None,
+        facet("stereo sites", existing.stereo_sites, incoming.stereo_sites),
     )
+    return replace(incoming, stereo=stereo, stereo_sites=stereo_sites)
 
 
 class MolecularSystem:
@@ -676,23 +677,23 @@ class MolecularSystem:
             for component_index, component in enumerate(entity.components):
                 if component.bonds is None:
                     continue
-                for bond in component.bonds:
-                    site_a = AtomSite(instance_id, component_index, bond.atom_a)
-                    site_b = AtomSite(instance_id, component_index, bond.atom_b)
+                for component_bond in component.bonds:
+                    site_a = AtomSite(instance_id, component_index, component_bond.atom_a)
+                    site_b = AtomSite(instance_id, component_index, component_bond.atom_b)
                     if site_a in realized and site_b in realized:
                         reconcile(
                             SystemBond(
                                 site_a,
                                 site_b,
-                                order=bond.order,
-                                aromatic=bond.aromatic,
-                                stereo=bond.stereo,
+                                order=component_bond.order,
+                                aromatic=component_bond.aromatic,
+                                stereo=component_bond.stereo,
                                 stereo_sites=(
                                     None
-                                    if bond.stereo_atoms is None
+                                    if component_bond.stereo_atoms is None
                                     else (
-                                        AtomSite(instance_id, component_index, bond.stereo_atoms[0]),
-                                        AtomSite(instance_id, component_index, bond.stereo_atoms[1]),
+                                        AtomSite(instance_id, component_index, component_bond.stereo_atoms[0]),
+                                        AtomSite(instance_id, component_index, component_bond.stereo_atoms[1]),
                                     )
                                 ),
                                 origin="component",
@@ -743,7 +744,7 @@ class MolecularSystem:
 
         # Fold each uniquely stored assembly bond into its physical edge. A stored bond
         # that contradicts intrinsic chemistry fails during construction.
-        for bond in sorted(
+        for stored_bond in sorted(
             self.bonds,
             key=lambda stored: (
                 tuple(sorted((site_key(stored.site_a), site_key(stored.site_b)))),
@@ -753,7 +754,7 @@ class MolecularSystem:
                 stored.stereo or "",
             ),
         ):
-            reconcile(bond)
+            reconcile(stored_bond)
 
         return reconciled
 

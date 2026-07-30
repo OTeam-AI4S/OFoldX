@@ -703,18 +703,19 @@ def _build_structure(
                 entity = _reuse_entity(entity_by_id, entity_id, declared_entity)
                 indexed = declared_indices
             else:
-                classified = {
+                classified_values = {
                     (
                         get_builtin_component_polymer_type(residue_rows[key][0].component_id)
                         if parsed.format == "mmcif"
                         else _pdb_component_polymer_type(component_table[residue_rows[key][0].component_id])
                     )
                     for key in segment_residues
-                } - {None}
+                }
+                classified = {polymer_type for polymer_type in classified_values if polymer_type is not None}
                 if classified == {"dna", "rna"}:
                     chain_polymer_type: PolymerType = "dna_rna_hybrid"
                 elif len(classified) == 1:
-                    chain_polymer_type = next(iter(classified))  # type: ignore[assignment]
+                    chain_polymer_type = next(iter(classified))
                 elif not classified and parsed.format == "mmcif" and source_entity_id is not None:
                     mapped = _ENTITY_POLY_TYPE_TO_POLYMER.get(
                         (entity_declarations.entity_poly_types.get(source_entity_id) or "")
@@ -744,7 +745,7 @@ def _build_structure(
             instance_id = unique_identifier(base_instance_id, used_instance_ids)
             if declared is not None and entity_declarations is not None:
                 observed_indices = {index for index, _ in indexed}
-                for component_index in range(len(entity)):
+                for component_index in range(len(declared_entity.components)):
                     if component_index in observed_indices:
                         continue
                     author = entity_declarations.author_numbering.get((chain_id, component_index + 1))
@@ -798,9 +799,9 @@ def _build_structure(
                         row.auth_chain_id,
                         row.auth_residue_id,
                     )
-                    component_index = branch_component_indices.get(scheme_key)
-                    if component_index is None and row.auth_component_id is not None:
-                        component_index = branch_component_indices.get(
+                    branch_component_index = branch_component_indices.get(scheme_key)
+                    if branch_component_index is None and row.auth_component_id is not None:
+                        branch_component_index = branch_component_indices.get(
                             (
                                 row.chain_id,
                                 row.entity_id,
@@ -809,9 +810,9 @@ def _build_structure(
                                 row.auth_residue_id,
                             )
                         )
-                    if component_index is None:
+                    if branch_component_index is None:
                         raise ValueError(f"cannot map branched-entity residue {residue_key!r} to its declaration")
-                    indexed_residues.append((component_index, residue_key))
+                    indexed_residues.append((branch_component_index, residue_key))
                 if len({index for index, _ in indexed_residues}) != len(indexed_residues):
                     raise ValueError(f"branched entity {source_entity_id!r} maps multiple residues to one component")
                 indexed_residues.sort()
@@ -851,15 +852,18 @@ def _build_structure(
             residue = residue_rows[residue_key]
             if is_polymer:
                 first = residue[0]
-                number = first.auth_residue_id if first.auth_residue_id is not None else first.residue_id
-                if number is not None:
-                    residue_numbers[(instance_id, component_index)] = ResidueNumber(number, first.insertion_code or "")
+                source_number = first.auth_residue_id if first.auth_residue_id is not None else first.residue_id
+                if source_number is not None:
+                    residue_numbers[(instance_id, component_index)] = ResidueNumber(
+                        source_number,
+                        first.insertion_code or "",
+                    )
             for row in residue:
                 site_by_row_index[row.row_index] = AtomSite(instance_id, component_index, row.atom_name)
     # Declared-but-unmodeled polymer residues carry author numbering from the scheme,
     # while observed residues above keep their authoritative atom-site numbering.
-    for reference, number in unmodeled_residue_numbers.items():
-        residue_numbers.setdefault(reference, number)
+    for reference, unmodeled_number in unmodeled_residue_numbers.items():
+        residue_numbers.setdefault(reference, unmodeled_number)
 
     for row in rows:
         site = site_by_row_index[row.row_index]

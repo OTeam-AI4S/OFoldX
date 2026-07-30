@@ -271,7 +271,7 @@ class ODesignProcessor(Processor):
                 if source_site is not None:
                     row = target_row.get(source_site)
             atom_index.append(-1 if row is None else row)
-        structure_target = ODesignStructureTarget(
+        structure_target = ODesignStructureTarget(  # type: ignore[call-arg]
             coordinates=torch.from_numpy(target.coordinates.copy())
             .unsqueeze(0)
             .to(device=self.device, dtype=self.dtype),
@@ -574,7 +574,7 @@ class ODesignProcessor(Processor):
             token_residues,
             token_entities,
         )
-        return ODesignInput(
+        return ODesignInput(  # type: ignore[call-arg]
             token_mask=torch.ones(1, len(token_sites), dtype=torch.bool, device=self.device),
             residue_index=residue_index.unsqueeze(0).to(self.device),
             chain_index=chain_index.unsqueeze(0).to(self.device),
@@ -896,7 +896,7 @@ class ODesignProcessor(Processor):
             source_residue_map=source_residue_map,
             source_atom_map=source_atom_map,
         )
-        return input.replace(
+        return input.replace(  # type: ignore[attr-defined]
             token_mask=input.token_mask.index_select(1, old_token_indices),
             residue_index=residue_index,
             chain_index=chain_index,
@@ -1227,7 +1227,7 @@ class ODesignLigandProcessor(Processor):
         residue_index = torch.cat([residue_index, torch.zeros(num_slots, dtype=torch.int64)])
 
         context_charges = [system.atom(site).formal_charge for site in context_sites] if system is not None else []
-        return ODesignLigandInput(
+        return ODesignLigandInput(  # type: ignore[call-arg]
             token_mask=torch.ones(1, num_tokens, dtype=torch.bool, device=self.device),
             residue_index=residue_index.unsqueeze(0).to(self.device),
             chain_index=chain_index.unsqueeze(0).to(self.device),
@@ -1304,7 +1304,7 @@ class ODesignLigandProcessor(Processor):
             generated_atoms=generated_atoms,
             slots=input.layout.slots[:num_atoms],
         )
-        return input.replace(
+        return input.replace(  # type: ignore[attr-defined]
             token_mask=input.token_mask[:, :token_count],
             residue_index=input.residue_index[:, :token_count],
             chain_index=input.chain_index[:, :token_count],

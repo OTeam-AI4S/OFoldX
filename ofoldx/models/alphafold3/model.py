@@ -598,7 +598,7 @@ class AlphaFold3Model(Model):
         )
         with torch.autocast(device_type=pair.device.type, enabled=False):
             distogram_logits = self.distogram_head(pair.to(dtype=self.distogram_head.projection.weight.dtype))
-        return AlphaFold3Output(
+        return AlphaFold3Output(  # type: ignore[call-arg]
             single=single,
             pair=pair,
             coordinates=coordinates,
@@ -754,7 +754,7 @@ class AlphaFold3Model(Model):
             generator=generator,
         )
 
-        return _AlphaFold3TrunkOutput(
+        return _AlphaFold3TrunkOutput(  # type: ignore[call-arg]
             token_embedding=token_embedding,
             single=single,
             pair=pair,
@@ -779,7 +779,7 @@ class AlphaFold3Model(Model):
 
         template_features = input.template_features
         if template_features is not None:
-            template_features = TemplateFeatures(
+            template_features = TemplateFeatures(  # type: ignore[call-arg]
                 distogram=template_features.distogram.to(dtype=pair_init.dtype),
                 pseudo_beta_mask=template_features.pseudo_beta_mask.to(dtype=pair_init.dtype),
                 residue_type_ids=template_features.residue_type_ids,

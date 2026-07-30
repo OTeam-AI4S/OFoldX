@@ -238,7 +238,7 @@ class GrnadeModel(Model):
 
         sequence_tokens = sequence_tokens.view(num_samples, num_nodes)
         logits = logits.view(num_samples, num_nodes, self.config.vocabulary_size)
-        return GrnadeSamplingOutput(
+        return GrnadeSamplingOutput(  # type: ignore[call-arg]
             sequence_tokens=sequence_tokens,
             logits=logits,
             batch_size=[num_samples],

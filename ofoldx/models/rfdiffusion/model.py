@@ -1218,7 +1218,7 @@ class RfDiffusionExtraTrunkBlock(nn.Module):
             cyclic_mask=cyclic_mask,
             top_k=0,
         )
-        return _RfDiffusionTrunkBlockOutput(
+        return _RfDiffusionTrunkBlockOutput(  # type: ignore[call-arg]
             msa=msa,
             pair=pair,
             rotations=structure_output.rotations,
@@ -1299,7 +1299,7 @@ class RfDiffusionTrunkBlock(nn.Module):
             cyclic_mask=cyclic_mask,
             top_k=0,
         )
-        return _RfDiffusionTrunkBlockOutput(
+        return _RfDiffusionTrunkBlockOutput(  # type: ignore[call-arg]
             msa=msa,
             pair=pair,
             rotations=structure_output.rotations,
@@ -1604,7 +1604,7 @@ class RfDiffusionStructureUpdate(nn.Module):
             rotations = einsum("bnij,bnjk->bnik", delta_rotations, input_rotations)
             translations = translations + input_translations
             torsion_angles = self.torsion_head(msa[:, 0], state)
-            return _RfDiffusionStructureUpdateOutput(
+            return _RfDiffusionStructureUpdateOutput(  # type: ignore[call-arg]
                 rotations=rotations,
                 translations=translations,
                 state=state,
@@ -2616,7 +2616,7 @@ class RfDiffusionPairwiseGeometryHead(nn.Module):
         symmetric_logits = symmetric_logits + symmetric_logits.transpose(1, 2)
         distance_logits, omega_logits = symmetric_logits.split((_DISTANCE_BINS, _OMEGA_BINS), dim=-1)
 
-        return _RfDiffusionGeometryLogits(
+        return _RfDiffusionGeometryLogits(  # type: ignore[call-arg]
             distance_logits=_channel_first(distance_logits),
             omega_logits=_channel_first(omega_logits),
             theta_logits=_channel_first(theta_logits),
@@ -5617,7 +5617,7 @@ def _sample_variable_lengths(
             [value == instance_id for value in instances],
             device=coords.device,
         )
-    return RfDiffusionInput(
+    return RfDiffusionInput(  # type: ignore[call-arg]
         noisy_coordinates=coords,
         residue_type_features=residue_type_features,
         residue_index=torch.tensor(residue_indices, dtype=torch.int64, device=coords.device)[None],

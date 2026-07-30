@@ -577,7 +577,7 @@ def _structure_target(
         [coordinate_index.get(site, -1) for site in input.atom_sites],
         dtype=torch.int64,
     )
-    return ProtenixStructureTarget(
+    return ProtenixStructureTarget(  # type: ignore[call-arg]
         coordinates=torch.from_numpy(structure.coordinates.copy()).to(device=device, dtype=dtype).unsqueeze(0),
         coordinate_mask=torch.from_numpy(structure.coordinate_mask.copy()).to(device=device).unsqueeze(0),
         atom_index=atom_index.to(device=device).unsqueeze(0),
@@ -918,7 +918,7 @@ def _features(
     def integer(value: Tensor) -> Tensor:
         return value.to(device=device).unsqueeze(0)
 
-    return ProtenixInput(
+    return ProtenixInput(  # type: ignore[call-arg]
         token_mask=integer(torch.ones(len(tokens), dtype=torch.bool)),
         residue_index=integer(torch.tensor([cast(int, token["residue_index"]) for token in tokens])),
         chain_index=integer(torch.tensor([cast(int, token["chain_index"]) for token in tokens])),
@@ -1708,7 +1708,7 @@ def _template_to(
     device: torch.device,
     dtype: torch.dtype,
 ) -> ProtenixTemplateFeatures:
-    return ProtenixTemplateFeatures(
+    return ProtenixTemplateFeatures(  # type: ignore[call-arg]
         distogram=features.distogram.to(device=device, dtype=dtype).unsqueeze(0),
         pseudo_beta_mask=features.pseudo_beta_mask.to(device=device, dtype=dtype).unsqueeze(0),
         residue_type_ids=features.residue_type_ids.to(device=device).unsqueeze(0),
@@ -1803,7 +1803,7 @@ def _template_features(
     )
     pseudo_beta_mask_2d = pseudo_beta_mask[..., :, None] * pseudo_beta_mask[..., None, :]
     backbone_mask_2d = backbone_mask[..., :, None] * backbone_mask[..., None, :]
-    return ProtenixTemplateFeatures(
+    return ProtenixTemplateFeatures(  # type: ignore[call-arg]
         distogram=_template_distogram(
             pseudo_beta,
             pseudo_beta_mask_2d,

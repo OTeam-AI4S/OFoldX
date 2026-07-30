@@ -477,7 +477,7 @@ def _features(
     def integer(value: Tensor) -> Tensor:
         return value.to(device=device).unsqueeze(0)
 
-    return AlphaFold3Input(
+    return AlphaFold3Input(  # type: ignore[call-arg]
         token_mask=integer(torch.ones(len(tokens), dtype=torch.bool)),
         residue_index=integer(torch.tensor([cast(int, token["residue_index"]) for token in tokens])),
         chain_index=integer(torch.tensor([cast(int, token["chain_index"]) for token in tokens])),
@@ -748,7 +748,7 @@ def _token_bonds(system: MolecularSystem, site_to_token: dict[AtomSite, int], to
 
 
 def _template_to(features: TemplateFeatures, *, device: torch.device, dtype: torch.dtype) -> TemplateFeatures:
-    return TemplateFeatures(
+    return TemplateFeatures(  # type: ignore[call-arg]
         distogram=features.distogram.to(device=device, dtype=dtype),
         pseudo_beta_mask=features.pseudo_beta_mask.to(device=device, dtype=dtype),
         residue_type_ids=features.residue_type_ids.to(device=device),
@@ -875,7 +875,7 @@ def _template_features(
         unit_vectors.append(unit_vector * backbone_mask_2d[..., None])
         backbone_masks.append(backbone_mask_2d)
 
-    return TemplateFeatures(
+    return TemplateFeatures(  # type: ignore[call-arg]
         distogram=torch.stack(distograms).unsqueeze(0),
         pseudo_beta_mask=torch.stack(pseudo_beta_masks).unsqueeze(0),
         residue_type_ids=torch.stack(per_template_residue_type).unsqueeze(0),

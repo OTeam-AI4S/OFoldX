@@ -489,7 +489,7 @@ def _prepare_boltz1_features(
         name: value.to(device=device, dtype=dtype) if value.is_floating_point() else value.to(device=device)
         for name, value in tensor_values.items()
     }
-    return Boltz1Input(
+    return Boltz1Input(  # type: ignore[call-arg]
         **{name: value.unsqueeze(0) for name, value in placed.items()},
         layout=Boltz1Layout(
             system=system,
@@ -558,7 +558,7 @@ def _prepare_boltz1_target(
         structure.system,
         atom_sites,
     )
-    return Boltz1StructureTarget(
+    return Boltz1StructureTarget(  # type: ignore[call-arg]
         coordinates=coordinates.to(device=device, dtype=dtype).unsqueeze(0),
         coordinate_mask=coordinate_mask.to(device=device).unsqueeze(0),
         atom_index=atom_index.to(device=device).unsqueeze(0),

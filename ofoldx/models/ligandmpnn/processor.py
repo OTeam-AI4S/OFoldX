@@ -420,7 +420,7 @@ class LigandMpnnProcessor(Processor):
         )
         residue_context_mask = torch.as_tensor(np.stack(row_residue_context_mask), device=self.device)
 
-        return LigandMpnnInput(
+        return LigandMpnnInput(  # type: ignore[call-arg]
             backbone_coordinates=backbone.unsqueeze(0),
             sequence_tokens=torch.tensor(row_tokens, device=self.device, dtype=torch.int64).unsqueeze(0),
             residue_mask=residue_mask.unsqueeze(0),

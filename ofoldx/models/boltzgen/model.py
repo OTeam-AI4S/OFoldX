@@ -413,7 +413,7 @@ class _BoltzGenStructureModel(Model):
                 num_samples,
                 *denoised_coordinate_trajectory.shape[1:],
             )
-        return BoltzGenSampleOutput(
+        return BoltzGenSampleOutput(  # type: ignore[call-arg]
             coordinates=coordinates.reshape(batch_size, num_samples, *coordinates.shape[1:]),
             distogram_logits=trunk.distogram_logits,
             bfactor_logits=self.bfactor_head(trunk.single),
@@ -513,7 +513,7 @@ class _BoltzGenStructureModel(Model):
                     )
                 single, pair = self.trunk_stack(single, pair, pair_mask=pair_mask)
 
-        return _BoltzGenTrunkOutput(
+        return _BoltzGenTrunkOutput(  # type: ignore[call-arg]
             single_inputs=single_inputs,
             single=single,
             pair=pair,
@@ -736,7 +736,7 @@ class BoltzGenModel(_BoltzGenStructureModel):
                 num_samples,
                 *residue_type_logits.shape[1:],
             )
-        return BoltzGenOutput(
+        return BoltzGenOutput(  # type: ignore[call-arg]
             coordinates=coordinates,
             distogram_logits=trunk.distogram_logits,
             bfactor_logits=self.bfactor_head(trunk.single),
@@ -988,7 +988,7 @@ class BoltzGenConfidenceModel(_BoltzGenStructureModel):
             )
         bfactor_logits = self.bfactor_head(trunk.single)
         confidence = self._score_confidence(input, trunk=trunk, coordinates=coordinates)
-        return BoltzGenSampleWithConfidenceOutput(
+        return BoltzGenSampleWithConfidenceOutput(  # type: ignore[call-arg]
             coordinates=coordinates,
             distogram_logits=trunk.distogram_logits,
             bfactor_logits=bfactor_logits,
@@ -1197,7 +1197,7 @@ class BoltzGenInverseFoldingModel(Model):
             target_residue_type,
             generator=generator,
         )
-        return BoltzGenInverseFoldingOutput(logits=logits, batch_size=[logits.shape[0]])
+        return BoltzGenInverseFoldingOutput(logits=logits, batch_size=[logits.shape[0]])  # type: ignore[call-arg]
 
     @torch.no_grad()
     def design(
@@ -1254,7 +1254,7 @@ class BoltzGenInverseFoldingModel(Model):
             tie_symmetric_sequences=tie_symmetric_sequences,
             generator=generator,
         )
-        return BoltzGenInverseFoldingDesignOutput(
+        return BoltzGenInverseFoldingDesignOutput(  # type: ignore[call-arg]
             logits=logits,
             tokens=residue_type.argmax(dim=-1),
             batch_size=[logits.shape[0]],
@@ -4244,7 +4244,7 @@ def _boltzgen_confidence_output(
     def unflatten(value: Tensor) -> Tensor:
         return value.reshape(batch_size, multiplicity, *value.shape[1:])
 
-    return BoltzGenConfidenceOutput(
+    return BoltzGenConfidenceOutput(  # type: ignore[call-arg]
         pae_logits=unflatten(pae_logits),
         pde_logits=unflatten(pde_logits),
         plddt_logits=unflatten(plddt_logits),

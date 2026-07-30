@@ -385,7 +385,7 @@ class Boltz2Model(Model):
         denoised_coordinates, augmented_target_coordinates, noise_level = diffusion_output
         batch_size = representations.single.shape[0]
         bfactor_logits = self.bfactor_head(representations.single) if self.bfactor_head is not None else None
-        return Boltz2Output(
+        return Boltz2Output(  # type: ignore[call-arg]
             coordinates=_unflatten_sample_axis(denoised_coordinates, batch_size, num_samples),
             distogram_logits=representations.distogram_logits,
             augmented_target_coordinates=_unflatten_sample_axis(augmented_target_coordinates, batch_size, num_samples),
@@ -457,7 +457,7 @@ class Boltz2Model(Model):
             msa_max_depth=msa_max_depth,
             generator=generator,
         )
-        return Boltz2Representations(
+        return Boltz2Representations(  # type: ignore[call-arg]
             single=representations.single,
             pair=representations.pair,
             batch_size=[representations.single.shape[0]],
@@ -575,7 +575,7 @@ class Boltz2Model(Model):
             input=input,
         )
         bfactor_logits = self.bfactor_head(representations.single) if self.bfactor_head is not None else None
-        return Boltz2ConfidenceOutput(
+        return Boltz2ConfidenceOutput(  # type: ignore[call-arg]
             coordinates=coordinates,
             distogram_logits=representations.distogram_logits,
             plddt_logits=plddt_logits,
@@ -823,7 +823,7 @@ class Boltz2Model(Model):
                     )
                 single, pair = self.pairformer_stack(single, pair, pair_mask=pair_mask)
 
-        return _Boltz2TrunkOutput(
+        return _Boltz2TrunkOutput(  # type: ignore[call-arg]
             single_inputs=single_inputs,
             single=single,
             pair=pair,
@@ -1152,7 +1152,7 @@ class Boltz2AffinityModel(Boltz2Model):
             coordinates,
             molecular_weight_correction=molecular_weight_correction,
         )
-        return Boltz2AffinityOutput(
+        return Boltz2AffinityOutput(  # type: ignore[call-arg]
             affinity_pred_value=values["affinity_pred_value"],
             affinity_probability_binary=values["affinity_probability_binary"],
             affinity_pred_value1=values["affinity_pred_value1"],

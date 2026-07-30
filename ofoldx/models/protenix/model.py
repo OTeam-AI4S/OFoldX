@@ -445,7 +445,7 @@ class ProtenixModel(Model):
             )
         )
         raw_output = self._assemble_output(input, representations, coordinates)
-        return ProtenixOutput(
+        return ProtenixOutput(  # type: ignore[call-arg]
             coordinates=raw_output.coordinates,
             distogram_logits=raw_output.distogram_logits,
             plddt_logits=raw_output.plddt_logits,
@@ -848,7 +848,7 @@ class ProtenixModel(Model):
             atom_to_token=input.atom_to_token,
             atom_token_index=input.atom_token_index,
         )
-        return ProtenixRawOutput(
+        return ProtenixRawOutput(  # type: ignore[call-arg]
             coordinates=coordinates,
             distogram_logits=self.distogram_head(representations.pair),
             plddt_logits=plddt_logits,
@@ -939,7 +939,7 @@ class ProtenixModel(Model):
             recycling_steps,
             msa_indices=msa_indices,
         )
-        return _ProtenixTrunkOutput(
+        return _ProtenixTrunkOutput(  # type: ignore[call-arg]
             token_embedding=token_embedding,
             single=single,
             pair=pair,
@@ -1649,7 +1649,7 @@ class ProtenixStructureConditionModel(Model):
             )
         )
         raw_output = self._assemble_output(input, representations, coordinates)
-        return ProtenixOutput(
+        return ProtenixOutput(  # type: ignore[call-arg]
             coordinates=raw_output.coordinates,
             distogram_logits=raw_output.distogram_logits,
             plddt_logits=raw_output.plddt_logits,
@@ -2052,7 +2052,7 @@ class ProtenixStructureConditionModel(Model):
             atom_to_token=input.atom_to_token,
             atom_token_index=input.atom_token_index,
         )
-        return ProtenixRawOutput(
+        return ProtenixRawOutput(  # type: ignore[call-arg]
             coordinates=coordinates,
             distogram_logits=self.distogram_head(representations.pair),
             plddt_logits=plddt_logits,
@@ -2143,7 +2143,7 @@ class ProtenixStructureConditionModel(Model):
             recycling_steps,
             msa_indices=msa_indices,
         )
-        return _ProtenixTrunkOutput(
+        return _ProtenixTrunkOutput(  # type: ignore[call-arg]
             token_embedding=token_embedding,
             single=single,
             pair=pair,

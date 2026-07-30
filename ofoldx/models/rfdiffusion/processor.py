@@ -466,7 +466,7 @@ class RfDiffusionProcessor(Processor):
                 previous_instance = instance_id
             residue_indices.append(200 * chain_index + row - chain_start)
         residue_index = torch.tensor(residue_indices, dtype=torch.int64)
-        return RfDiffusionInput(
+        return RfDiffusionInput(  # type: ignore[call-arg]
             noisy_coordinates=coords.unsqueeze(0).to(device=self.device, dtype=self.dtype),
             residue_type_features=F.one_hot(tokens, num_classes=22)
             .to(device=self.device, dtype=self.dtype)

@@ -211,7 +211,7 @@ class NaMpnnModel(Model):
         def repeat(value: Tensor | None) -> Tensor | None:
             return None if value is None else value.repeat_interleave(count, dim=0)
 
-        return NaMpnnInput(
+        return NaMpnnInput(  # type: ignore[call-arg]
             atom_coordinates=repeat(input.atom_coordinates),
             atom_mask=repeat(input.atom_mask),
             sequence_tokens=repeat(input.sequence_tokens),
@@ -507,7 +507,11 @@ class NaMpnnModel(Model):
             input.residue_mask,
             decoding_ranks,
         )
-        return NaMpnnOutput(logits=logits, decoding_ranks=decoding_ranks, batch_size=[logits.shape[0]])
+        return NaMpnnOutput(  # type: ignore[call-arg]
+            logits=logits,
+            decoding_ranks=decoding_ranks,
+            batch_size=[logits.shape[0]],
+        )
 
     @staticmethod
     def _training_ranks(
@@ -768,7 +772,7 @@ class NaMpnnModel(Model):
                 sampling_probabilities[:, member] = keep * probabilities
                 token_states[:, member] = self.token_embedding(token)
 
-        return NaMpnnSamplingOutput(
+        return NaMpnnSamplingOutput(  # type: ignore[call-arg]
             sequence_tokens=sequence_tokens,
             log_probabilities=log_probabilities,
             sampling_probabilities=sampling_probabilities,
@@ -995,7 +999,7 @@ class NaMpnnModel(Model):
 
         self._require_single_target(input)
         na_design = input.design_positions & ~input.protein_mask
-        fixed = NaMpnnInput(
+        fixed = NaMpnnInput(  # type: ignore[call-arg]
             atom_coordinates=input.atom_coordinates,
             atom_mask=input.atom_mask,
             sequence_tokens=input.sequence_tokens,

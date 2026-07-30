@@ -277,7 +277,7 @@ class AlphaFold2InitialGuessProcessor(Processor):
         alternative_torsion = torch.zeros_like(torsion)
         torsion_mask = torch.zeros(1, len(residue_sites), 7)
 
-        values = {field.name: getattr(base, field.name) for field in fields(base)}
+        values = {field.name: getattr(base, field.name) for field in fields(base)}  # type: ignore[arg-type]
         values.update(
             residue_index=torch.tensor(
                 residue_indices,
@@ -330,7 +330,7 @@ class AlphaFold2InitialGuessProcessor(Processor):
                 device=self.device,
             ).unsqueeze(0),
         )
-        return AlphaFold2InitialGuessInput(**values, batch_size=[1])
+        return AlphaFold2InitialGuessInput(**values, batch_size=[1])  # type: ignore[call-arg]
 
 
 def monomer_system_from_sequences(
@@ -484,7 +484,7 @@ def _prepare_alphafold2_features(
         floating[name] = value
     placed = {name: value.to(device=device, dtype=dtype).unsqueeze(0) for name, value in floating.items()}
     template_residue_type_ids = template_values[0]
-    return AlphaFold2Input(
+    return AlphaFold2Input(  # type: ignore[call-arg]
         residue_type_ids=residue_type_ids.to(device=device).unsqueeze(0),
         residue_index=torch.arange(len(target), device=device).unsqueeze(0),
         msa_tokens=msa_tokens.to(device=device).unsqueeze(0),

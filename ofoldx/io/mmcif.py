@@ -351,14 +351,14 @@ def _read_mmcif_entity_declarations(parsed: ParsedStructure) -> _MmcifEntityDecl
             seq = optional_integer(seq_id)
             if asym_id is None or seq is None:
                 raise ValueError("mmCIF _pdbx_poly_seq_scheme row is missing asym_id or seq_id")
-            number = optional_integer(auth_number)
-            if number is None:
-                number = optional_integer(pdb_number)
+            author_residue_number = optional_integer(auth_number)
+            if author_residue_number is None:
+                author_residue_number = optional_integer(pdb_number)
             key = (asym_id, seq)
-            value = (number, ins_code)
-            if key in author_numbering and author_numbering[key] != value:
+            numbering = (author_residue_number, ins_code)
+            if key in author_numbering and author_numbering[key] != numbering:
                 raise ValueError(f"mmCIF _pdbx_poly_seq_scheme has conflicting numbering for {key!r}")
-            author_numbering[key] = value
+            author_numbering[key] = numbering
 
     return _MmcifEntityDeclarations(
         entity_types=entity_types,

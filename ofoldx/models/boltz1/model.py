@@ -417,7 +417,7 @@ class Boltz1Model(Model):
             token_mask=input.token_mask,
         )
         batch_size = input.token_mask.shape[0]
-        return Boltz1Output(
+        return Boltz1Output(  # type: ignore[call-arg]
             coordinates=_unflatten_sample_axis(
                 denoised_coordinates,
                 batch_size,
@@ -499,7 +499,7 @@ class Boltz1Model(Model):
             msa_max_depth=msa_max_depth,
             generator=generator,
         )
-        return Boltz1Representations(
+        return Boltz1Representations(  # type: ignore[call-arg]
             single=representations.single,
             pair=representations.pair,
             batch_size=[representations.single.shape[0]],
@@ -776,7 +776,7 @@ class Boltz1Model(Model):
                 name: _unflatten_sample_axis(value, batch_size, num_samples)
                 for name, value in confidence_values.items()
             }
-            confidence_output = Boltz1ConfidenceOutput(
+            confidence_output = Boltz1ConfidenceOutput(  # type: ignore[call-arg]
                 coordinates=coordinates,
                 distogram_logits=distogram_logits,
                 plddt_logits=confidence_values["plddt_logits"],
@@ -798,7 +798,7 @@ class Boltz1Model(Model):
                 chain_pair_iptm=confidence_values.get("chain_pair_iptm"),
                 batch_size=[batch_size],
             )
-        return _Boltz1FoldOutput(
+        return _Boltz1FoldOutput(  # type: ignore[call-arg]
             coordinates=coordinates,
             distogram_logits=distogram_logits,
             confidence=confidence_output,
@@ -865,7 +865,7 @@ class Boltz1Model(Model):
                         pair_mask=pair_mask,
                     )
 
-        return _Boltz1TrunkOutput(
+        return _Boltz1TrunkOutput(  # type: ignore[call-arg]
             single_inputs=single_inputs,
             single=cast(Tensor, single),
             pair=pair,

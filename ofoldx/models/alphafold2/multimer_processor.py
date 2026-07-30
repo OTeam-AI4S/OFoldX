@@ -304,7 +304,7 @@ def prepare_multimer_features(
         "template_residue_type_ids": template_values["template_residue_type_ids"],
     }
     placed_integral = {name: value.to(device=device).unsqueeze(0) for name, value in integral.items()}
-    return AlphaFold2MultimerInput(
+    return AlphaFold2MultimerInput(  # type: ignore[call-arg]
         layout=AlphaFold2MultimerLayout(
             system=system,
             residue_sites=residue_sites,

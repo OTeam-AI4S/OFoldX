@@ -1034,7 +1034,7 @@ class EsmFold2Model(Model):
             token_bonds_encoding=auxiliary["token_bonds_encoding"],
             num_diffusion_samples=num_samples,
         )
-        return EsmFold2Output(
+        return EsmFold2Output(  # type: ignore[call-arg]
             coordinates=coordinates.unflatten(0, (batch_size, num_samples)),
             distogram_logits=auxiliary["distogram_logits"],
             plddt_logits=confidence["plddt_logits"].unflatten(0, (batch_size, num_samples)),
@@ -1370,7 +1370,7 @@ class EsmFold2ExperimentalModel(Model):
 
         distogram_logits = self.distogram_head(pair + pair.transpose(-2, -3))
 
-        return _EsmFold2ExperimentalTrunkOutput(
+        return _EsmFold2ExperimentalTrunkOutput(  # type: ignore[call-arg]
             single_inputs=single_inputs,
             pair=pair,
             distogram_logits=distogram_logits,
@@ -1416,7 +1416,7 @@ class EsmFold2ExperimentalModel(Model):
         )
         coordinates = cast(Tensor, structure_output["coordinates"])
         batch_size = input.token_mask.shape[0]
-        return EsmFold2ExperimentalSample(
+        return EsmFold2ExperimentalSample(  # type: ignore[call-arg]
             distogram_logits=trunk.distogram_logits,
             coordinates=coordinates.reshape(batch_size, num_samples, *coordinates.shape[1:]),
             batch_size=[batch_size],
@@ -4163,7 +4163,7 @@ class EsmFold2ExperimentalConfidenceHead(nn.Module):
         def unflatten(value: Tensor) -> Tensor:
             return value.reshape(batch_size, num_samples, *value.shape[1:])
 
-        return EsmFold2ExperimentalConfidence(
+        return EsmFold2ExperimentalConfidence(  # type: ignore[call-arg]
             plddt_logits=unflatten(plddt_logits),
             plddt=unflatten(plddt),
             plddt_per_atom=unflatten(plddt_per_atom),

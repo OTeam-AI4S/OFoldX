@@ -175,7 +175,7 @@ class LigandMpnnModel(Model):
         def repeat(value: Tensor | None) -> Tensor | None:
             return None if value is None else value.repeat_interleave(count, dim=0)
 
-        return LigandMpnnInput(
+        return LigandMpnnInput(  # type: ignore[call-arg]
             backbone_coordinates=repeat(input.backbone_coordinates),
             sequence_tokens=repeat(input.sequence_tokens),
             residue_mask=repeat(input.residue_mask),
@@ -465,7 +465,11 @@ class LigandMpnnModel(Model):
             input.residue_mask,
             decoding_ranks,
         )
-        return LigandMpnnOutput(logits=logits, decoding_ranks=decoding_ranks, batch_size=[logits.shape[0]])
+        return LigandMpnnOutput(  # type: ignore[call-arg]
+            logits=logits,
+            decoding_ranks=decoding_ranks,
+            batch_size=[logits.shape[0]],
+        )
 
     def autoregressive_probabilities(
         self,
@@ -835,7 +839,7 @@ class LigandMpnnModel(Model):
                 weights,
                 generator,
             )
-        return LigandMpnnSamplingOutput(
+        return LigandMpnnSamplingOutput(  # type: ignore[call-arg]
             sequence_tokens=result["S"],
             log_probabilities=result["log_probs"],
             sampling_probabilities=result["sampling_probs"],

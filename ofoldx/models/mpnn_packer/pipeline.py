@@ -141,7 +141,7 @@ class MpnnPackerPipeline(PairedPipeline[MpnnPackerModel, MpnnPackerProcessor]):
         # Model.sample consumes only the tensor fields; the structure metadata is carried per batch element
         # (a list -> NonTensorStack) so the B-sized input stays internally consistent -- ``batched[i]`` maps
         # to ``inputs[i]``. Realization below still reads each item directly.
-        batched = MpnnPackerInput(
+        batched = MpnnPackerInput(  # type: ignore[call-arg]
             backbone_coordinates=torch.cat([item.backbone_coordinates for item in inputs]),
             sequence_tokens=torch.cat([item.sequence_tokens for item in inputs]),
             residue_mask=torch.cat([item.residue_mask for item in inputs]),

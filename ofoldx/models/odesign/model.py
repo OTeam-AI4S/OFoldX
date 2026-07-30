@@ -303,7 +303,7 @@ class ODesignModel(Model):
             target_coordinates.unsqueeze(-3).expand(-1, num_samples, -1, -1),
             coordinates,
         )
-        return ODesignOutput(
+        return ODesignOutput(  # type: ignore[call-arg]
             coordinates=coordinates,
             distogram_logits=raw_output.distogram_logits,
             token_bond_type_logits=raw_output.token_bond_type_logits,
@@ -517,7 +517,7 @@ class ODesignModel(Model):
                     generator=generator,
                 )
             )
-        return ODesignSamplingOutput(
+        return ODesignSamplingOutput(  # type: ignore[call-arg]
             coordinates=torch.stack(coordinates, dim=1),
             distogram_logits=torch.stack(distograms, dim=1),
             token_bond_type_logits=torch.stack(bond_logits, dim=1),
@@ -544,7 +544,7 @@ class ODesignModel(Model):
                 noise_level=noise_level,
             )
         )
-        return ODesignRawOutput(
+        return ODesignRawOutput(  # type: ignore[call-arg]
             coordinates=coordinates,
             distogram_logits=self.distogram_head(trunk.pair),
             token_bond_type_logits=self.token_bond_type_head(trunk.pair),
@@ -605,7 +605,7 @@ class ODesignModel(Model):
                 )
                 single = single_init + self.single_recycle_projection(self.single_recycle_norm(single))
                 single, pair = self.pairformer_stack(single, pair, pair_mask=pair_mask)
-        return _ODesignTrunkOutput(
+        return _ODesignTrunkOutput(  # type: ignore[call-arg]
             token_embedding=token_embedding,
             single=single,
             pair=pair,

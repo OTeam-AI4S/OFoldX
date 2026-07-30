@@ -404,7 +404,7 @@ class BoltzGenProcessor(Processor):
             placement_map=plan.placement_map,
             instance_of=plan.instance_of,
         )
-        processed = BoltzGenInput(
+        processed = BoltzGenInput(  # type: ignore[call-arg]
             **{name: value.unsqueeze(0) for name, value in placed.items()},
             layout=layout,
             batch_size=[1],
@@ -451,7 +451,7 @@ class BoltzGenProcessor(Processor):
             )
             for name, value in target_values.items()
         }
-        target = BoltzGenStructureTarget(
+        target = BoltzGenStructureTarget(  # type: ignore[call-arg]
             coordinates=placed_target["coordinates"].unsqueeze(0).unsqueeze(0),
             coordinate_mask=placed_target["coordinate_mask"].unsqueeze(0),
             atom_index=placed_target["atom_index"].unsqueeze(0),
@@ -701,7 +701,7 @@ class BoltzGenInverseFoldingProcessor(Processor):
             output_instance_ids=tuple(cast(str, token["instance_id"]) for token in tokens),
         )
         return (
-            BoltzGenInverseFoldingInput(
+            BoltzGenInverseFoldingInput(  # type: ignore[call-arg]
                 **{name: value.unsqueeze(0) for name, value in placed.items()},
                 layout=layout,
                 batch_size=[1],

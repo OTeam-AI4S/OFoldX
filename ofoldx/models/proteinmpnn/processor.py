@@ -579,7 +579,7 @@ class ProteinMpnnProcessor(Processor):
                 if not torch.equal(group_values, group_values[:1].expand_as(group_values)):
                     raise ValueError("tied ProteinMPNN residues require identical PSSM probabilities")
 
-        return ProteinMpnnInput(
+        return ProteinMpnnInput(  # type: ignore[call-arg]
             backbone_coordinates=torch.as_tensor(
                 np.stack(row_coordinates),
                 device=self.device,

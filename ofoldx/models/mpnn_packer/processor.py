@@ -444,7 +444,7 @@ class MpnnPackerProcessor(Processor):
                 selected_types[:, :atom_count] = context_type[nearest]
                 selected_mask[:, :atom_count] = context_mask[nearest]
 
-        return MpnnPackerInput(
+        return MpnnPackerInput(  # type: ignore[call-arg]
             backbone_coordinates=backbone_tensor,
             sequence_tokens=torch.tensor(
                 [AMINO_ACID_TOKEN_BY_COMPONENT.get(row[1], AMINO_ACID_UNKNOWN_TOKEN) for row in rows],
