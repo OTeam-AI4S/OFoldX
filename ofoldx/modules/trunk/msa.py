@@ -463,11 +463,10 @@ class TrianglePairUpdateBlock(nn.Module):
 
     def forward(self, pair: Tensor, pair_mask: Tensor | None = None) -> Tensor:
         r"""
-        Apply the five residual updates: outgoing then incoming triangle multiplication, starting- then
-        ending-node triangle attention (each with row dropout), and a transition.
+        Apply the configured triangle residual updates, then the final pair transition.
 
-        The ending-node update transposes the residue axes ``(-3, -2)`` (and the pair mask's last two)
-        around the attention call.
+        [`triangle_update`][ofoldx.modules.trunk.msa.TrianglePairUpdateBlock.triangle_update]
+        owns the exact triangle branch order, transpositions, and structured dropout.
 
         Args:
             pair: Pair representation `[B, N, N, pair_size]`.
@@ -534,17 +533,34 @@ class BoltzTrianglePairUpdateBlock(TrianglePairUpdateBlock):
         dropout: float = 0.25,
         backend: str = "auto",
     ) -> None:
-        super().__init__(
+        nn.Module.__init__(self)
+        self.triangle_multiplication_outgoing = TriangleMultiplication(
             pair_size=pair_size,
-            triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
-            triangle_attention_hidden_size=triangle_attention_hidden_size,
-            num_triangle_attention_heads=num_triangle_attention_heads,
-            expansion=expansion,
-            dropout=dropout,
+            hidden_size=triangle_multiplication_hidden_size,
+            outgoing=True,
             backend=backend,
         )
         self.rowwise_dropout = StructuredDropout(dropout, broadcast_dims=(-2, -1))
+        self.triangle_multiplication_incoming = TriangleMultiplication(
+            pair_size=pair_size,
+            hidden_size=triangle_multiplication_hidden_size,
+            outgoing=False,
+            backend=backend,
+        )
+        self.triangle_attention_starting_node = TriangleAttention(
+            pair_size=pair_size,
+            head_dim=triangle_attention_hidden_size,
+            num_attention_heads=num_triangle_attention_heads,
+            backend=backend,
+        )
+        self.triangle_attention_ending_node = TriangleAttention(
+            pair_size=pair_size,
+            head_dim=triangle_attention_hidden_size,
+            num_attention_heads=num_triangle_attention_heads,
+            backend=backend,
+        )
         self.columnwise_dropout = StructuredDropout(dropout, broadcast_dims=(-3, -1))
+        self.transition = Transition(pair_size, expansion=expansion, backend=backend)
 
     def triangle_update(self, pair: Tensor, pair_mask: Tensor | None = None) -> Tensor:
         r"""

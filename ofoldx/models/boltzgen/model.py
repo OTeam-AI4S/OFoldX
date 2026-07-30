@@ -1941,7 +1941,7 @@ class BoltzGenMsaTrunk(nn.Module):
         token_mask: Tensor,
     ) -> Tensor:
         features = [
-            F.one_hot(msa_tokens.long(), num_classes=self.vocab_size).to(pair.dtype),
+            F.one_hot(msa_tokens, num_classes=self.vocab_size).to(pair.dtype),
             has_deletion.unsqueeze(-1).to(pair.dtype),
             deletion_value.unsqueeze(-1).to(pair.dtype),
         ]
@@ -2017,9 +2017,8 @@ class BoltzGenPairformerStack(PairformerStack):
     r"""
     Homogeneous stack of BoltzGen Pairformer blocks.
 
-    Runs the same sequential block loop as
-    [`PairformerStack`][ofoldx.modules.trunk.pairformer.PairformerStack]; only the block type
-    differs, so the base is initialised empty and the BoltzGen blocks are installed in its place.
+    Uses the sequential block loop from
+    [`PairformerStack`][ofoldx.modules.trunk.pairformer.PairformerStack] with BoltzGen blocks.
     """
 
     def __init__(
@@ -2036,7 +2035,7 @@ class BoltzGenPairformerStack(PairformerStack):
         post_layer_norm: bool = False,
         backend: str = "auto",
     ) -> None:
-        super().__init__(num_blocks=0)
+        nn.Module.__init__(self)
         self.num_blocks = num_blocks
         self.blocks = nn.ModuleList(
             BoltzGenPairformerBlock(
@@ -2109,10 +2108,8 @@ class BoltzGenMiniformerMsaTrunk(BoltzGenMsaTrunk):
     r"""
     MSA-module variant whose pair track uses compact pair-only Miniformer blocks.
 
-    The MSA feature construction and the block loop are those of
-    [`BoltzGenMsaTrunk`][ofoldx.models.boltzgen.model.BoltzGenMsaTrunk]; only the block type
-    differs, so the base is initialised without blocks and the Miniformer blocks are installed
-    in their place.
+    Uses the MSA feature construction and block loop from
+    [`BoltzGenMsaTrunk`][ofoldx.models.boltzgen.model.BoltzGenMsaTrunk] with Miniformer blocks.
     """
 
     def __init__(
@@ -2131,14 +2128,16 @@ class BoltzGenMiniformerMsaTrunk(BoltzGenMsaTrunk):
         expansion: int = 4,
         backend: str = "auto",
     ) -> None:
-        super().__init__(
-            single_size=single_size,
-            msa_size=msa_size,
-            num_blocks=0,
-            vocab_size=vocab_size,
-            use_paired_feature=use_paired_feature,
-        )
+        nn.Module.__init__(self)
         self.num_blocks = num_blocks
+        self.vocab_size = vocab_size
+        self.use_paired_feature = use_paired_feature
+        self.msa_projection = nn.Linear(
+            vocab_size + 2 + int(use_paired_feature),
+            msa_size,
+            bias=False,
+        )
+        self.token_projection = nn.Linear(single_size, msa_size, bias=False)
         self.blocks = nn.ModuleList(
             BoltzGenMiniformerMsaBlock(
                 msa_size=msa_size,

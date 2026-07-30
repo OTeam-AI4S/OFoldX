@@ -624,7 +624,6 @@ def read_mmcif_bonds(
     selected_rows: tuple[AtomRecord, ...],
     site_by_row_index: dict[int, AtomSite],
     unmodeled_source_sites: dict[tuple[object, ...], AtomSite],
-    excluded_water_rows: tuple[AtomRecord, ...],
 ) -> tuple[SystemBond, ...]:
     r"""
     Decode selected mmCIF covalent connections into system bonds.
@@ -635,14 +634,14 @@ def read_mmcif_bonds(
         site_by_row_index: Canonical atom sites indexed by source row.
         unmodeled_source_sites: Declared but unobserved polymer atoms indexed by
             their label identities.
-        excluded_water_rows: Source rows omitted by the reader's water projection.
 
     Returns:
-        Resolved covalent system bonds.
+        Resolved covalent system bonds. Connections whose endpoints are absent from the
+        selected model (an unmodeled cap or modified residue, or a partner in another
+        assembly) are skipped.
 
     Raises:
-        ValueError: If a selected covalent connection has invalid endpoints, bond order,
-            stereochemistry, or atom references.
+        ValueError: If a selected covalent connection declares an unsupported bond order.
     """
 
     cif_file = parsed.mmcif_file
@@ -676,28 +675,6 @@ def read_mmcif_bonds(
     value_orders = _cif_column(category, "pdbx_value_order")
     selected_sites = selected_source_sites(selected_rows, site_by_row_index)
     selected_sites.update(unmodeled_source_sites)
-    excluded_water_keys = {
-        key
-        for row in excluded_water_rows
-        for key in (
-            (
-                row.symmetry_id,
-                row.chain_id,
-                row.label_seq_id,
-                row.insertion_code,
-                row.component_id,
-                row.atom_name,
-            ),
-            (
-                row.symmetry_id,
-                row.auth_chain_id,
-                row.auth_residue_id,
-                row.insertion_code,
-                row.auth_component_id,
-                row.auth_atom_name,
-            ),
-        )
-    }
     symmetry_ids = {row.symmetry_id for row in selected_rows}
     bonds: list[SystemBond] = []
     for index, conn_type in enumerate(conn_types):
@@ -742,21 +719,11 @@ def read_mmcif_bonds(
                 (symmetry_id, *auth_endpoint_2)
             )
             if site_a is None or site_b is None:
-                touches_excluded_water = any(
-                    key in excluded_water_keys
-                    for key in (
-                        (symmetry_id, *endpoint_1),
-                        (symmetry_id, *auth_endpoint_1),
-                        (symmetry_id, *endpoint_2),
-                        (symmetry_id, *auth_endpoint_2),
-                    )
-                )
-                if touches_excluded_water:
-                    continue
-                raise ValueError(
-                    "mmCIF struct_conn references an atom absent from the selected assembly/model: "
-                    f"label={endpoint_1!r}, {endpoint_2!r}; auth={auth_endpoint_1!r}, {auth_endpoint_2!r}"
-                )
+                # A struct_conn endpoint may reference an atom absent from the selected model -- an
+                # unmodeled cap or modified residue (ACE, NH2, TPO, ...), or a partner in another
+                # assembly. The bond is then unrepresentable, so skip it rather than dropping the
+                # whole structure (excluded water lands here too, its sites having been removed).
+                continue
             bonds.append(
                 SystemBond(
                     site_a,

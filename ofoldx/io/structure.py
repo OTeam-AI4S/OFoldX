@@ -90,7 +90,7 @@ def read_structure(
             no atoms.
     """
 
-    parsed, rows, excluded_water_rows, component_table = _prepare_read(
+    parsed, rows, component_table = _prepare_read(
         path,
         model,
         assembly_id,
@@ -109,7 +109,7 @@ def read_structure(
             structure = _exclude_water(structure, entity_types)
         return _apply_atom_layout(structure, atom_layout)
     selected = _select_altloc(rows, altloc)
-    return _build_structure(parsed, selected, excluded_water_rows, atom_layout, component_table)
+    return _build_structure(parsed, selected, atom_layout, component_table)
 
 
 def read_structures(
@@ -137,7 +137,7 @@ def read_structures(
         One structure per valid combination of residue alternate locations.
     """
 
-    parsed, rows, excluded_water_rows, component_table = _prepare_read(
+    parsed, rows, component_table = _prepare_read(
         path,
         model,
         assembly_id,
@@ -154,9 +154,7 @@ def read_structures(
             structure = _exclude_water(structure, entity_types)
         return (_apply_atom_layout(structure, atom_layout),)
     selections = _expand_altlocs(rows)
-    return tuple(
-        _build_structure(parsed, selected, excluded_water_rows, atom_layout, component_table) for selected in selections
-    )
+    return tuple(_build_structure(parsed, selected, atom_layout, component_table) for selected in selections)
 
 
 def write_structure(
@@ -212,7 +210,6 @@ def _prepare_read(
 ) -> tuple[
     ParsedStructure,
     tuple[AtomRecord, ...],
-    tuple[AtomRecord, ...],
     dict[str, ChemicalComponent],
 ]:
     source, format_name = _structure_path(path, allow_compressed=True)
@@ -242,7 +239,7 @@ def _prepare_read(
                 raise ValueError("component mapping keys must equal ChemicalComponent.component_id")
         component_table.update(supplied)
     if parsed.canonical_payload is not None:
-        return parsed, parsed.rows, (), component_table
+        return parsed, parsed.rows, component_table
 
     rows = parsed.rows
     excluded_water_rows: tuple[AtomRecord, ...] = ()
@@ -265,7 +262,7 @@ def _prepare_read(
             )
             for component_id, component in component_table.items()
         }
-    return parsed, rows, excluded_water_rows, component_table
+    return parsed, rows, component_table
 
 
 def _exclude_water_rows(
@@ -765,7 +762,6 @@ def _pdb_polymer_segments(
 def _build_structure(
     parsed: ParsedStructure,
     rows: tuple[AtomRecord, ...],
-    excluded_water_rows: tuple[AtomRecord, ...],
     atom_layout: str,
     component_table: dict[str, ChemicalComponent],
 ) -> Structure:
@@ -1045,7 +1041,6 @@ def _build_structure(
             rows,
             site_by_row_index,
             unmodeled_source_sites,
-            excluded_water_rows,
         )
     system = MolecularSystem(entity_by_id, instances, frozenset(source_bonds))
     observed_sites = tuple(site_by_row_index[row.row_index] for row in rows)

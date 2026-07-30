@@ -3005,27 +3005,26 @@ class EsmFold2OuterProductMean(OuterProductMean):
     r"""
     Outer-product mean: maps a token-major MSA representation into a pair update.
 
-    Differs from [`OuterProductMean`][ofoldx.modules.trunk.msa.OuterProductMean] only in the
-    forward contract: the MSA arrives token-major (``[B, N_token, N_seq, msa_size]``) and the
-    mask-weighted mean is taken *after* the affine output projection, so the projection bias is
-    divided by the clamped valid-row count.
+    Adapts ESMFold2's token-major MSA layout (``[B, N_token, N_seq, msa_size]``) to the
+    shared outer-product-mean operation. The mask-weighted mean is taken *after* the affine
+    output projection, so the projection bias is divided by the clamped valid-row count.
     """
 
-    def forward(self, m: Tensor, msa_mask: Tensor) -> Tensor:
+    def forward(self, msa: Tensor, msa_mask: Tensor | None = None) -> Tensor:
         r"""
         Project the masked outer-product sum, then divide by the clamped valid-row count.
 
         Args:
-            m: MSA representation `[B, N_token, N_seq, msa_size]`.
-            msa_mask: MSA validity mask `[B, N_token, N_seq]`.
+            msa: MSA representation `[B, N_token, N_seq, msa_size]`.
+            msa_mask: Optional MSA validity mask `[B, N_token, N_seq]`.
 
         Returns:
             The pair contribution `[B, N_token, N_token, pair_size]`.
         """
 
         return dispatch_outer_product_mean(
-            m.transpose(1, 2),
-            msa_mask.transpose(1, 2),
+            msa.transpose(1, 2),
+            None if msa_mask is None else msa_mask.transpose(1, 2),
             msa_norm_weight=self.msa_norm.weight,
             msa_norm_bias=self.msa_norm.bias,
             proj_left_weight=self.left_projection.weight,
@@ -3048,21 +3047,21 @@ class EsmFold2ExperimentalOuterProductMean(OuterProductMean):
     valid-row count *before* the affine output projection, so the projection bias is added once.
     """
 
-    def forward(self, m: Tensor, msa_mask: Tensor) -> Tensor:
+    def forward(self, msa: Tensor, msa_mask: Tensor | None = None) -> Tensor:
         r"""
         Divide the masked outer-product sum by the clamped valid-row count, then project.
 
         Args:
-            m: MSA representation `[B, N_token, N_seq, msa_size]`.
-            msa_mask: MSA validity mask `[B, N_token, N_seq]`.
+            msa: MSA representation `[B, N_token, N_seq, msa_size]`.
+            msa_mask: Optional MSA validity mask `[B, N_token, N_seq]`.
 
         Returns:
             The pair contribution `[B, N_token, N_token, pair_size]`.
         """
 
         return dispatch_outer_product_mean(
-            m.transpose(1, 2),
-            msa_mask.transpose(1, 2),
+            msa.transpose(1, 2),
+            None if msa_mask is None else msa_mask.transpose(1, 2),
             msa_norm_weight=self.msa_norm.weight,
             msa_norm_bias=self.msa_norm.bias,
             proj_left_weight=self.left_projection.weight,
