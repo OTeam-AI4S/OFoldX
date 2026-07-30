@@ -8,7 +8,7 @@ import pytest
 from ofoldx.hub import MIRROR_REPOSITORY, upload_repository
 
 
-def test_selective_upload_does_not_delete_unselected_remote_files(
+def test_complete_upload_deletes_stale_managed_files(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -27,8 +27,8 @@ def test_selective_upload_does_not_delete_unselected_remote_files(
 
     monkeypatch.setattr(huggingface_hub, "HfApi", FakeHfApi)
 
-    upload_repository(tmp_path, "owner/model", allow_patterns=("model.json",))
     upload_repository(tmp_path, "owner/model")
 
-    assert calls[0]["delete_patterns"] is None
-    assert calls[1]["delete_patterns"] == list(MIRROR_REPOSITORY)
+    assert len(calls) == 1
+    assert "allow_patterns" not in calls[0]
+    assert calls[0]["delete_patterns"] == list(MIRROR_REPOSITORY)

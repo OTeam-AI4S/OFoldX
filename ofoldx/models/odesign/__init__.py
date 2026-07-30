@@ -22,7 +22,6 @@ from .model import (
     ODesignLigandInput,
     ODesignLigandLayout,
     ODesignModel,
-    ODesignNucleicAcidIdentity,
     ODesignOutput,
     ODesignPlacements,
     ODesignProvisionalAtomSlot,
@@ -30,7 +29,6 @@ from .model import (
     ODesignReferenceCoordinates,
     ODesignSamplingOutput,
     ODesignStructureTarget,
-    realize_nucleic_acid_identity,
 )
 from .pipeline import (
     ODesignGrnadeChainPrediction,

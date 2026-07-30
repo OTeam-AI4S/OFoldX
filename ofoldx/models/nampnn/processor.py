@@ -519,7 +519,7 @@ class NaMpnnProcessor(Processor):
                     polymer_type = rows[index][2]
                     declared.append({self._component_token(component_id, polymer_type) for component_id in restriction})
             if declared:
-                allowed = set.intersection(*declared)
+                allowed = declared[0].intersection(*declared[1:])
                 for index in members:
                     row = rows[index]
                     supported = {

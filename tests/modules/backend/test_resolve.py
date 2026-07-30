@@ -43,9 +43,7 @@ def test_a_broken_oops_dependency_propagates(monkeypatch) -> None:
         _execute_oops_import(monkeypatch, "oops_dependency")
 
 
-def test_resolve_config_backend_preserves_auto(monkeypatch) -> None:
-    monkeypatch.setattr(resolve_module, "oops_available", lambda: True)
-
+def test_resolve_config_backend_preserves_auto() -> None:
     backend = resolve_config_backend(
         "auto",
         supported=("oops", "eager"),
@@ -82,7 +80,7 @@ def test_provider_uses_public_implementation_when_operation_is_not_supported(bac
 
 
 def test_resolve_tensor_backend_auto_uses_public_default_for_cpu_tensors(monkeypatch) -> None:
-    monkeypatch.setattr(resolve_module, "oops_available", lambda: True)
+    monkeypatch.setattr(resolve_module, "OOPS_AVAILABLE", True)
 
     backend = resolve_tensor_backend(
         "auto",
@@ -105,9 +103,7 @@ def test_resolve_tensor_backend_keeps_explicit_eager() -> None:
     assert backend == "eager"
 
 
-def test_resolve_tensor_backend_keeps_explicit_oops_for_cpu_tensors(monkeypatch) -> None:
-    monkeypatch.setattr(resolve_module, "oops_available", lambda: True)
-
+def test_resolve_tensor_backend_keeps_explicit_oops_for_cpu_tensors() -> None:
     backend = resolve_tensor_backend(
         "oops",
         tensors=(torch.ones(1),),

@@ -51,7 +51,6 @@ from .model import (
     ODesignPlacements,
     ODesignProvisionalAtomSlot,
     ODesignReferenceCoordinates,
-    realize_nucleic_acid_identity,
 )
 from .processor import ODesignLigandProcessor, ODesignProcessor
 
@@ -1365,13 +1364,25 @@ def _protein_backbone_for_inverse_folding(
     )
 
 
+_NUCLEIC_ACID_IDENTITIES = {
+    ("dna", "A"): ("DA", "N9"),
+    ("dna", "C"): ("DC", "N1"),
+    ("dna", "G"): ("DG", "N9"),
+    ("dna", "T"): ("DT", "N1"),
+    ("rna", "A"): ("A", "N9"),
+    ("rna", "C"): ("C", "N1"),
+    ("rna", "G"): ("G", "N9"),
+    ("rna", "U"): ("U", "N1"),
+}
+
+
 def _nucleic_acid_backbone_for_inverse_folding(
     structure: Structure,
     positions: tuple[ComponentReference, ...],
     modality: Literal["dna", "rna"],
 ) -> Structure:
-    identity = realize_nucleic_acid_identity(modality, "A")
-    replacements = {reference: get_component(identity.component_id) for reference in positions}
+    component_id, base_anchor_atom_id = _NUCLEIC_ACID_IDENTITIES[modality, "A"]
+    replacements = {reference: get_component(component_id) for reference in positions}
     system = structure.system.replace_components(replacements)
     selected = set(positions)
     sites = tuple(
@@ -1379,7 +1390,7 @@ def _nucleic_acid_backbone_for_inverse_folding(
             AtomSite(
                 site.instance_id,
                 site.component_index,
-                identity.atom_id(site.atom_id),
+                base_anchor_atom_id if site.atom_id == "N" else site.atom_id,
             )
             if (site.instance_id, site.component_index) in selected
             else site
@@ -1477,8 +1488,8 @@ def _rna_structure_with_system(
             sites.append(site)
             continue
         symbol = system.component(reference).component_id
-        identity = realize_nucleic_acid_identity("rna", symbol)
-        atom_id = identity.base_anchor_atom_id if site.atom_id in ("N", "N1", "N9") else site.atom_id
+        _, base_anchor_atom_id = _NUCLEIC_ACID_IDENTITIES["rna", symbol]
+        atom_id = base_anchor_atom_id if site.atom_id in ("N", "N1", "N9") else site.atom_id
         sites.append(AtomSite(site.instance_id, site.component_index, atom_id))
     rows = [index for index, site in enumerate(sites) if _contains_site(system, site)]
     indices = np.asarray(rows, dtype=np.int64)

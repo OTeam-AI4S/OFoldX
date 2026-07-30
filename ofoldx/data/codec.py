@@ -37,8 +37,6 @@ def encode_system(system: MolecularSystem) -> dict[str, object]:
     Returns:
         Metadata preserving entity contents and instance declaration order.
     """
-    if not isinstance(system, MolecularSystem):
-        raise TypeError("system must be a MolecularSystem")
     return {
         "kind": "molecular_system",
         "entities": {
@@ -116,10 +114,6 @@ def encode_structure(
         A ``(metadata, arrays)`` pair containing the molecular system, atom sites,
         coordinate metadata, and aligned numeric arrays.
     """
-    if not isinstance(structure, Structure):
-        raise TypeError("structure must be a Structure")
-    if not isinstance(array_prefix, str):
-        raise TypeError("array_prefix must be a string")
     if not array_prefix:
         raise ValueError("array_prefix must be a non-empty string")
     coordinates_key = f"{array_prefix}.coordinates"
@@ -565,8 +559,6 @@ def encode_msa(msa: MSA) -> dict[str, object]:
     Returns:
         Sequence rows and deletion counts represented with JSON-safe values.
     """
-    if not isinstance(msa, MSA):
-        raise TypeError("msa must be an MSA")
     # Cells are UPPERCASE one-letter MSA symbols (or "-"), stored verbatim as strings; the codec does
     # not resolve symbols to tokens or ChemicalComponent IDs (that is the Processor's job). Deletion
     # arrays are CPU uint32; ``tolist`` widens each row to plain ints for the known-type JSON form.
@@ -622,8 +614,6 @@ def encode_msa_collection(collection: MSACollection) -> dict[str, object]:
     Returns:
         Encoded MSA columns, row-selection arrays, and optional instance targets.
     """
-    if not isinstance(collection, MSACollection):
-        raise TypeError("collection must be an MSACollection")
     # ``row_pairing`` (int64, >=0 source row / -1 gap) and ``row_is_paired`` (bool, paired vs unpaired
     # pool) are the dense (plan_rows, len(msas)) plan; ``tolist`` renders each as nested plain lists.
     return {
@@ -685,8 +675,6 @@ def encode_template(
     Returns:
         A ``(metadata, arrays)`` pair containing the template structure and alignments.
     """
-    if not isinstance(template, Template):
-        raise TypeError("template must be a Template")
     structure, arrays = encode_structure(template.structure, array_prefix=array_prefix)
     return (
         {
@@ -723,8 +711,6 @@ def decode_template(value: object, arrays: Mapping[str, NDArray]) -> Template:
 
 
 def _encode_template_alignment(alignment: TemplateAlignment) -> dict[str, object]:
-    if not isinstance(alignment, TemplateAlignment):
-        raise TypeError("alignment must be a TemplateAlignment")
     return {
         "target_entity_id": alignment.target_entity_id,
         "target_instance_id": alignment.target_instance_id,

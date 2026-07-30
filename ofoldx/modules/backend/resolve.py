@@ -17,19 +17,6 @@ Backend = Literal["auto", "eager", "sdpa", "oops", "cueq", "apex", "deepspeed"]
 PUBLIC_BACKENDS = frozenset(get_args(Backend))
 
 
-def oops_available() -> bool:
-    r"""
-    Return whether OOps imported successfully.
-
-    Runtime ``"auto"`` dispatch also considers the participating tensors.
-
-    Returns:
-        Whether the optional OOps package is available.
-    """
-
-    return OOPS_AVAILABLE
-
-
 def resolve_backend(requested: str, *, supported: tuple[str, ...], public_default: str) -> str:
     r"""
     Resolve a backend request without tensor-specific constraints.
@@ -53,7 +40,7 @@ def resolve_backend(requested: str, *, supported: tuple[str, ...], public_defaul
     """
 
     if requested == "auto":
-        return "oops" if "oops" in supported and oops_available() else public_default
+        return "oops" if "oops" in supported and OOPS_AVAILABLE else public_default
     if requested in PUBLIC_BACKENDS and requested not in supported:
         return public_default
     if requested not in supported:
@@ -108,7 +95,7 @@ def resolve_tensor_backend(
     """
 
     if requested == "auto":
-        if "oops" in supported and oops_available():
+        if "oops" in supported and OOPS_AVAILABLE:
             has_tensor = False
             for tensor in tensors:
                 if tensor is None:

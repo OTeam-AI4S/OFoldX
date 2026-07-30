@@ -1233,7 +1233,7 @@ class LigandMpnnFeatures(MpnnProteinFeatures):
         design_positions: Tensor,
         *,
         use_sidechain_context: bool,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         r"""
         Build residue-graph and context-atom features.
 
@@ -1255,7 +1255,8 @@ class LigandMpnnFeatures(MpnnProteinFeatures):
         Returns:
             Context features ``(B, L, A, H)``, residue edges ``(B, L, K, H)``,
             neighbor indices ``(B, L, K)``, context nodes ``(B, L, A, H)``,
-            context edges ``(B, L, A, A, H)``, and context mask ``(B, L, A)``.
+            context edges ``(B, L, A, A, H)``, context mask ``(B, L, A)``, and
+            valid-neighbor mask ``(B, L, K)``.
         """
 
         num_context_atoms = context_coordinates.shape[2]

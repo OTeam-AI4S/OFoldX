@@ -10,7 +10,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from ...modules.mpnn import nll_loss as _nll_loss
+from ...modules.mpnn import nll_loss as nll_loss
 
 _PROTEIN_RESIDUE_TYPE_SPAN = (0, 21)
 _DNA_RESIDUE_TYPE_SPAN = (21, 26)
@@ -18,12 +18,6 @@ _RNA_RESIDUE_TYPE_SPAN = (26, 31)
 _POLYMER_PROTEIN = 0
 _POLYMER_DNA = 1
 _POLYMER_RNA = 2
-
-
-def nll_loss(sequence_tokens: Tensor, log_probabilities: Tensor) -> Tensor:
-    r"""Return NA-MPNN's unreduced per-token negative log likelihood."""
-
-    return _nll_loss(sequence_tokens, log_probabilities)
 
 
 def smoothed_loss(

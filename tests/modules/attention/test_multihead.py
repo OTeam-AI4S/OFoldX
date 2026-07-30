@@ -52,7 +52,7 @@ def test_explicit_head_dim_defines_the_inner_width() -> None:
 
 @pytest.mark.parametrize("backend", ("auto", "eager"))
 def test_public_backends_do_not_change_state_dict(monkeypatch, backend: str) -> None:
-    monkeypatch.setattr(resolve_module, "oops_available", lambda: False)
+    monkeypatch.setattr(resolve_module, "OOPS_AVAILABLE", False)
     public = GatedMultiheadAttention(hidden_size=8, num_attention_heads=2, backend=backend)
     sdpa = GatedMultiheadAttention(hidden_size=8, num_attention_heads=2, backend="sdpa")
     sdpa.load_state_dict(public.state_dict())

@@ -9,7 +9,7 @@ import math
 from collections.abc import Callable, Sequence
 from os import PathLike
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import TYPE_CHECKING, Any, NamedTuple, NoReturn, cast
+from typing import TYPE_CHECKING, NamedTuple, NoReturn, cast
 
 import torch
 
@@ -176,7 +176,6 @@ MIRROR_REPOSITORY: tuple[str, ...] = (
     "pipeline.json",
     "*/pipeline.json",
 )
-_DEFAULT_DELETE_PATTERNS: Any = object()
 
 
 def upload_repository(
@@ -187,8 +186,6 @@ def upload_repository(
     private: bool = False,
     revision: str | None = None,
     commit_message: str | None = None,
-    allow_patterns: Sequence[str] | None = None,
-    delete_patterns: Sequence[str] | None = _DEFAULT_DELETE_PATTERNS,
 ) -> CommitInfo:
     r"""
     Upload a local model repository to the Hugging Face Hub.
@@ -200,11 +197,6 @@ def upload_repository(
         private: Whether a newly created repository is private.
         revision: Destination branch or revision.
         commit_message: Optional commit message.
-        allow_patterns: Optional local file patterns to upload.
-        delete_patterns: Remote file patterns to delete before upload. By default,
-            a complete upload removes repository-managed metadata and weights absent
-            locally, while a selective upload leaves unselected remote files untouched.
-            User-owned files such as model cards are retained in either case.
 
     Returns:
         Information about the created Hub commit.
@@ -213,11 +205,6 @@ def upload_repository(
     from huggingface_hub import HfApi
 
     folder = Path(directory).expanduser()
-    resolved_allow = None if allow_patterns is None else list(allow_patterns)
-    if delete_patterns is _DEFAULT_DELETE_PATTERNS:
-        resolved_delete = None if allow_patterns is not None else list(MIRROR_REPOSITORY)
-    else:
-        resolved_delete = None if delete_patterns is None else list(delete_patterns)
 
     api = HfApi(token=token)
     api.create_repo(repo_id=repo_id, repo_type="model", private=private, exist_ok=True)
@@ -227,8 +214,7 @@ def upload_repository(
         folder_path=str(folder),
         revision=revision,
         commit_message=commit_message,
-        allow_patterns=resolved_allow,
-        delete_patterns=resolved_delete,
+        delete_patterns=list(MIRROR_REPOSITORY),
     )
 
 
