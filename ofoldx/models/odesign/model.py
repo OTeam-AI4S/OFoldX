@@ -7,12 +7,12 @@ from __future__ import annotations
 import math
 import operator
 from dataclasses import dataclass, field
-from tensordict import tensorclass
 from typing import Generic, Literal, TypeVar
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+from tensordict import tensorclass
 from torch import Tensor, nn
 
 from ...data.bonds import SymbolicBond
@@ -22,7 +22,6 @@ from ...data.conditions import Hotspot
 from ...data.molecular import (
     AtomSite,
     MolecularSystem,
-    PolymerType,
 )
 from ...data.placement import (
     PlacementMap,
@@ -157,7 +156,7 @@ class ODesignModel(Model):
         self.msa_trunk = MsaTrunk(
             pair_size=config.pair_size,
             token_feature_size=config.token_feature_size,
-            num_blocks=config.trunk.num_msa_blocks,
+            num_stages=config.trunk.num_msa_blocks,
             msa_dropout=config.trunk.msa_dropout,
             pair_dropout=config.trunk.pair_dropout,
         )
@@ -391,7 +390,11 @@ class ODesignModel(Model):
             generator=generator,
         )
         structures = tuple(
-            _structure_from_coordinates(output.coordinates[0, 0, index], input.layout)
+            _structure_from_atom_coordinates(
+                output.coordinates[0, 0, index],
+                input.layout.system,
+                input.layout.atom_sites,
+            )
             for index in range(num_candidates)
         )
         for structure in structures:
@@ -843,10 +846,6 @@ def _reverse_odesign_augmentation(
     return coordinates + center.unsqueeze(-3)
 
 
-def _structure_from_coordinates(coordinates: Tensor, layout: ODesignLayout) -> Structure:
-    return _structure_from_atom_coordinates(coordinates, layout.system, layout.atom_sites)
-
-
 def _structure_from_atom_coordinates(
     coordinates: Tensor,
     system: MolecularSystem,
@@ -1017,6 +1016,10 @@ class ODesignGeneratedAtoms:
     min_atoms: int
     max_atoms: int
 
+    def __post_init__(self) -> None:
+        if self.min_atoms < 0 or self.max_atoms < self.min_atoms:
+            raise ValueError("generated atom range must satisfy 0 <= min_atoms <= max_atoms")
+
 
 @dataclass(frozen=True)
 class ODesignProvisionalAtomSlot:
@@ -1116,13 +1119,6 @@ class ODesignPlacements:
     def __post_init__(self) -> None:
         # A placement_id must be globally unique across the whole PlacementSpec.
         validate_placement(self.placements)
-        # One requested output length per declaration group, so the arity mismatch cannot reach the
-        # per-chain zip in _realize_ranges.
-        if self.chain_lengths is not None and len(self.chain_lengths) != len(self.placements):
-            raise ValueError(
-                f"chain_lengths arity {len(self.chain_lengths)} does not match the number of "
-                f"placement chains {len(self.placements)}"
-            )
 
 
 @dataclass(frozen=True)
@@ -1140,36 +1136,6 @@ class ODesignReferenceCoordinates:
     sites: tuple[AtomSite, ...]
     tolerance_angstrom: float
     intent: Literal["hard", "soft"] = "hard"
-
-
-@dataclass(frozen=True)
-class ODesignDesignedResidue:
-    r"""
-    Describe one generated polymer residue in an ODesign mask.
-
-    Args:
-        polymer_type: Chemistry of the generated polymer.
-    """
-
-    polymer_type: PolymerType
-
-
-@dataclass(frozen=True)
-class ODesignFixedResidue:
-    r"""
-    Describe one output residue copied from an input structure.
-
-    Args:
-        instance_id: Source molecular instance.
-        source_index: Zero-based component index within the source instance.
-    """
-
-    instance_id: str
-    source_index: int
-
-
-#: One designed or fixed residue in an ODesign residue mask.
-ODesignResidueSpec = ODesignDesignedResidue | ODesignFixedResidue
 
 
 @dataclass(eq=False)

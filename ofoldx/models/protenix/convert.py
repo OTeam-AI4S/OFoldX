@@ -17,7 +17,7 @@ from torch import Tensor, nn
 from .config import ProtenixVariant
 
 if TYPE_CHECKING:
-    from .model import ProtenixModel
+    from .model import ProtenixModel, ProtenixStructureConditionModel
 
 
 _DTYPES = {
@@ -148,7 +148,10 @@ def translate_reference_state(
     return translated
 
 
-def translate_protenix_state(model: ProtenixModel, reference_state: Mapping[str, Tensor]) -> dict[str, Tensor]:
+def translate_protenix_state(
+    model: ProtenixModel | ProtenixStructureConditionModel,
+    reference_state: Mapping[str, Tensor],
+) -> dict[str, Tensor]:
     r"""
     Translate every live tensor in one released Protenix graph.
 
@@ -166,7 +169,7 @@ def translate_protenix_state(model: ProtenixModel, reference_state: Mapping[str,
         if has_template
         else {key: value for key, value in reference_state.items() if key not in _INERT_V05_TEMPLATE_KEYS}
     )
-    msa_final_block = model.msa_trunk.num_blocks - 1
+    msa_final_block = len(model.msa_trunk.blocks)
 
     def reference_key(model_key: str) -> _ReferenceKey:
         return _protenix_reference_key(model_key, msa_final_block=msa_final_block)
@@ -216,7 +219,7 @@ def convert_protenix_model(
     variant: ProtenixVariant,
     esm_checkpoint_path: str | Path | None = None,
     dtype: torch.dtype | None = None,
-) -> ProtenixModel:
+) -> ProtenixModel | ProtenixStructureConditionModel:
     r"""
     Convert one explicitly selected released Protenix checkpoint.
 
@@ -229,7 +232,8 @@ def convert_protenix_model(
         dtype: Optional floating-point dtype for converted weights.
 
     Returns:
-        The converted, strict-loaded `ProtenixModel`. Use `convert_protenix_checkpoint` to persist the paired
+        The converted, strict-loaded model for the selected Protenix
+        architecture. Use `convert_protenix_checkpoint` to persist the paired
         model/processor repository locally or on the Hub.
     """
 
@@ -253,7 +257,7 @@ def convert_protenix_model(
         raise ValueError(f"{variant!r} has no ESM2 companion checkpoint")
 
     config = ProtenixConfig.from_variant(variant)
-    model: ProtenixModel
+    model: ProtenixModel | ProtenixStructureConditionModel
     with torch.device("meta"):
         if variant == "protenix_base_constraint_v0.5.0":
             model = ProtenixConstraintModel(cast(ProtenixConstraintConfig, config))
@@ -302,7 +306,12 @@ def convert_protenix_checkpoint(
     ``repo_id``.
     """
 
-    from .model import ProtenixConstraintModel, ProtenixStructureConditionModel
+    from .model import (
+        ProtenixConstraintModel,
+        ProtenixModel,
+        ProtenixStructureConditionModel,
+        ProtenixTemplateModel,
+    )
     from .pipeline import (
         ProtenixConstraintPipeline,
         ProtenixPipeline,
@@ -337,12 +346,12 @@ def convert_protenix_checkpoint(
         )
     elif variant in _TEMPLATE_VARIANTS:
         pipeline = ProtenixTemplatePipeline(
-            model=model,
+            model=cast(ProtenixTemplateModel, model),
             processor=ProtenixTemplateProcessor(dtype=dtype),
         )
     else:
         pipeline = ProtenixPipeline(
-            model=model,
+            model=cast(ProtenixModel, model),
             processor=ProtenixProcessor(dtype=dtype),
         )
     pipeline.save(

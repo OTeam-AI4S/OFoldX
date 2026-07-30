@@ -1,20 +1,20 @@
 r"""
-Training, evaluation, and inference runner for the trainable model families.
+Training and evaluation runner for the trainable model families.
 
 Trainability is bound to the **exact** registered architecture: an architecture is trainable iff its
 [`register`][ofoldx.models.registry.ModelRegistry.register] call declared a training ``criterion`` (and a
 ``strategy``), verified *before* any model build or weight download. The Runner resolves the architecture
 (fresh from ``model.name`` or loaded from ``model.pretrained``), builds the Model and a config-consistent
 Processor, then applies the registration's config-aware criterion and one of the generic batching/lowering/
-inference strategies below (the only generic Runner-side training knowledge).
+strategies below (the only generic Runner-side training knowledge).
 
 DanLing drives forward → criterion → loss-normalizer → backward → step, and toggles train/eval module mode
 itself (train_epoch/evaluate_epoch/infer set ``self.mode``). The Runner adds only what DanLing cannot know
 generically: a config-bound criterion, DDP ``find_unused_parameters=True`` (the objective trains only the
 loss-path parameters, so auxiliary heads, sampling-only modules, and unexercised conditioning embedders get
-no gradient; the models return ``tensorclass`` outputs, which DDP can walk to find them), a ``tensorclass``-
-native ``to_device``, and an ``infer_step`` that runs the family's inference entry point on its
-``tensorclass`` output instead of DanLing's tensor-shaped default.
+no gradient; the models return ``tensorclass`` outputs, which DDP can walk to find them), and an
+``infer_step`` that runs the family's inference entry point on its ``tensorclass`` output instead of
+DanLing's tensor-shaped default.
 """
 
 from __future__ import annotations
@@ -26,7 +26,6 @@ import danling as dl
 import torch
 from danling.runners.config import normalize_stack_name
 from tensordict import is_tensorclass
-from torch import Tensor
 
 from ..model import Model
 from ..models.registry import MODELS, ModelRegistration
@@ -37,96 +36,16 @@ from .config import RunnerConfig
 #: The only DanLing stack whose steps this Runner supports.
 _SUPPORTED_STACK = "ddp"
 
-Collate = Callable[[list[Any]], dict[str, Any]]
-CollateBuilder = Callable[[Mapping[str, Any]], Collate]
-Infer = Callable[..., Any]
 
-
-def _decoding_priority(model_input: Any, indices: Any, base_seed: Any, device: Any) -> Any:
-    r"""
-    Per-structure decoding priority ``(B, N)`` for a ragged sequence batch, one random draw per residue seeded
-    by ``base_seed + global_index`` for each structure. Supplying it (rather than letting the model draw from a
-    shared generator, whose sequential draws depend on batch order) is what makes a batched forward reproducible
-    and independent of batch composition. Returns a ragged ``NestedTensor`` matching the ragged input, or
-    ``None`` when there is no seed/index, the batch is not a tensorclass, or the batch is dense (a batch=1
-    single-structure family, which has no batch to be invariant to -- ``_forward_infer`` seeds its draw with a
-    generator instead).
-    """
-
-    from danling import NestedTensor
-
-    if base_seed is None or indices is None or not (is_tensorclass(model_input) and model_input.batch_size):
-        return None
-    if not isinstance(model_input.sequence_tokens, NestedTensor):
-        return None
-    priorities = []
-    for position, index in enumerate(indices):
-        length = int(model_input[position].sequence_tokens.shape[0])
-        generator = torch.Generator(device=device).manual_seed(int(base_seed) + int(index))
-        priorities.append(torch.rand(length, device=device, generator=generator))
-    return NestedTensor(priorities)
-
-
-def _forward_infer(
-    model: Any, model_input: Any, *, indices: Any = None, base_seed: Any = None, device: Any = None
-) -> Any:
-    r"""Sequence inference is the plain forward over the whole batch. For a ragged batch the Runner supplies a
-    per-structure decoding priority seeded by global index; for a dense batch=1 family it seeds the model's own
-    draw with a generator (also by global index). Either way each structure's design is reproducible."""
-
-    priority = _decoding_priority(model_input, indices, base_seed, device)
-    if priority is not None:
-        return model(model_input, decoding_priority=priority)
-    generator = None
-    if base_seed is not None and indices is not None:
-        generator = torch.Generator(device=device).manual_seed(int(base_seed) + int(indices[0]))
-    return model(model_input, generator=generator)
-
-
-def _sample_infer(
-    model: Any, model_input: Any, *, indices: Any = None, base_seed: Any = None, device: Any = None
-) -> Any:
-    r"""Diffusion inference is reverse-diffusion sampling (batch=1); the generator is seeded by the single
-    structure's global index so the sample is reproducible and topology-invariant."""
-
-    generator = None
-    if base_seed is not None and indices is not None:
-        generator = torch.Generator(device=device).manual_seed(int(base_seed) + int(indices[0]))
-    return model.sample(model_input, generator=generator)
-
-
-def _with_indices(collate: Collate) -> Collate:
-    r"""
-    Wrap a strategy collate so the batch carries each item's global dataset index. The Dataset yields
-    ``(index, item)`` pairs; unwrap them, collate the items as usual, and record the indices so
-    ``infer_step`` can seed a topology-invariant per-sample generator (``config.seed + index``).
-    """
-
-    def collate_with_indices(batch: list[Any]) -> dict[str, Any]:
-        result = collate([item for _, item in batch])
-        result["indices"] = [index for index, _ in batch]
-        return result
-
-    return collate_with_indices
-
-
-#: Strategy name -> (build the collate from the registration's options, train-split lowering, infer-split
-#: lowering, inference entry point). The sequence families collate to a ragged ``NestedTensor`` batch for
-#: BOTH training and inference: each structure runs at its own length, so the training loss and inference are
-#: topology-invariant (no padding to contaminate the k-NN/attention), and inference un-nests per structure.
-#: The diffusion families are batch=1 and lower the training splits to the ``(input, target)`` the denoising
-#: loss needs, but the ``infer`` split to the plain Processor call so inference-only kwargs (``tfg_guidance``,
-#: ``placement``, ...) flow and no target is built. The only generic Runner-side training knowledge; a
-#: trainable arch registers a strategy.
-_STRATEGIES: dict[str, tuple[CollateBuilder, str, str, Infer]] = {
-    "sequence": (
-        lambda options: (lambda batch: _collate.collate_sequence(batch, **options)),
-        "call",
-        "call",
-        _forward_infer,
-    ),
-    "sequence_single": (lambda options: _collate.collate_sequence_single, "call", "call", _forward_infer),
-    "denoising": (lambda options: _collate.collate_denoising, "process_training", "call", _sample_infer),
+#: Strategy name -> (collate, whether lowering uses the denoising training path).
+#: The sequence families collate to a ragged ``NestedTensor`` batch so each structure
+#: runs at its own length and padding cannot contaminate k-NN or attention.
+#: The diffusion families are batch=1 and lower structures to the ``(input, target)`` the denoising loss
+#: needs. The only generic Runner-side training knowledge; a trainable architecture registers a strategy.
+_STRATEGIES = {
+    "sequence": (_collate.collate_sequence, False),
+    "sequence_single": (_collate.collate_sequence_single, False),
+    "denoising": (_collate.collate_denoising, True),
 }
 
 
@@ -150,7 +69,7 @@ def _require_trainable(registration: ModelRegistration) -> None:
 
 class Runner(dl.Runner):
     r"""
-    Train, evaluate, and run inference for a trainable model family.
+    Train and evaluate a trainable model family.
 
     Args:
         config: Runner configuration, or any mapping it can be built from.
@@ -192,8 +111,7 @@ class Runner(dl.Runner):
         criterion, strategy = registration.criterion, registration.strategy
         assert criterion is not None and strategy is not None  # _resolve_registration enforced trainability
         self.criterion = criterion(self.model, self.processor)
-        build_collate, self._train_lower, self._infer_lower, self._infer = _STRATEGIES[strategy]
-        self.collate_fn = _with_indices(build_collate(registration.collate_options))
+        self.collate_fn, self._process_training = _STRATEGIES[strategy]
         # DanLing toggles module mode from its ``mode`` setter (train_epoch/evaluate_epoch/infer set it), but
         # it fixed ``mode=train`` before this model existed, so the first train_epoch's mode=train is a no-op
         # that will not force train mode -- and a repository model loads in eval(). Establish train mode here.
@@ -228,22 +146,18 @@ class Runner(dl.Runner):
     def _build(self, repository: Any, registration: ModelRegistration) -> tuple[Model, Processor]:
         r"""Instantiate the resolved architecture: load the repository snapshot, or build a fresh pair."""
 
-        from ..hub import build_registered_config
-
         model_config = self.config.model
         if model_config.pretrained:
             return self._build_from_repository(repository)
         overrides = {key: value for key, value in model_config.items() if key not in ("name", "pretrained", "revision")}
-        config = build_registered_config(registration.model_config, overrides, f"{registration.id} config overrides")
+        config = registration.model_config(overrides)
         model = registration.model(config)
-        processor = self._build_processor(registration, model)
+        processor = self._build_processor(registration)
         return model, processor
 
-    def _build_processor(self, registration: ModelRegistration, model: Model) -> Processor:
+    def _build_processor(self, registration: ModelRegistration) -> Processor:
         r"""
-        Build the paired Processor: thread the keys it genuinely shares with the Model config (e.g.
-        ``ca_only``) from the Model, so one setting drives both. A shared key may not also appear in the
-        ``processor`` overrides -- that would let the Processor and Model disagree (an incompatible pair).
+        Build the paired Processor from its own explicit configuration.
         """
 
         processor = cast("Callable[..., Processor]", registration.processor)
@@ -253,14 +167,8 @@ class Runner(dl.Runner):
             if overrides:
                 raise ValueError(f"{registration.id} has a configuration-free Processor; drop the processor overrides")
             return processor()
-        shared = {key: model.config[key] for key in config_class() if key in model.config}
-        conflicting = sorted(shared.keys() & overrides.keys())
-        if conflicting:
-            raise ValueError(
-                f"processor override(s) {conflicting} are shared with the model config; set them on the model "
-                "so the Model and Processor stay consistent"
-            )
-        return processor(config_class(**{**shared, **overrides}))
+        config = config_class(overrides)
+        return processor(config)
 
     def _prepare_repository(self, config: RunnerConfig) -> Any:
         r"""
@@ -303,50 +211,21 @@ class Runner(dl.Runner):
 
     def build_datasets(self) -> dict[str, Any]:
         r"""
-        Build structure datasets for the configured splits. Training and evaluation splits lower to whatever
-        the forward + criterion need (the diffusion families' separate ``(input, target)``); the ``infer``
-        split -- DanLing's inference split -- lowers with the plain Processor call, so inference-only kwargs
-        (``tfg_guidance``, ``placement``, ...) declared beside its ``source`` flow and no target is built.
+        Build structure datasets for the configured splits. Every split uses the architecture's training
+        lowering: sequence families call the Processor, while diffusion families call ``process_training``
+        to produce the separate ``(input, target)`` required by their objective.
         """
 
         from .dataset import StructureDataset
 
         datasets: dict[str, Any] = {}
+        processor: Any = self.processor
+        if self._process_training:
+            processor = processor.process_training
         for split, split_config in self.config.data.items():
             processor_kwargs = {key: value for key, value in split_config.items() if key != "source"}
-            lower = self._infer_lower if split == "infer" else self._train_lower
-            datasets[split] = StructureDataset(
-                split_config.source, self.processor, lower=lower, processor_kwargs=processor_kwargs
-            )
+            datasets[split] = StructureDataset(split_config.source, processor, processor_kwargs=processor_kwargs)
         return datasets
-
-    # -- batch movement ------------------------------------------------------
-
-    def to_device(self, data: Any, device: torch.device | None = None) -> Any:
-        r"""
-        Recursively move a nested batch to ``device`` -- the runner device by default; ``infer_step`` passes
-        the CPU. Family Input/Output/Target are ``tensorclass`` instances, moved with their native ``.to``,
-        which also moves nested ``tensorclass`` fields (e.g. Protenix ``template_features``). The one
-        tensor-bearing field it cannot reach is a plain (non-``tensorclass``) dataclass -- only Protenix's
-        ``tfg_features`` bundle, whose unbatched index tensors cannot be a tensorclass -- and its placement
-        is handled by the sampling consumer, so no dataclass recursion is needed here. Mappings/sequences
-        recurse; other leaves pass through.
-        """
-
-        if device is None:
-            device = self.device
-        if is_tensorclass(data):
-            return data.to(device)
-        if isinstance(data, Mapping):
-            moved = {key: self.to_device(value, device) for key, value in data.items()}
-            return type(data)(moved) if isinstance(data, dict) else moved
-        if isinstance(data, list):
-            return [self.to_device(value, device) for value in data]
-        if isinstance(data, tuple):
-            return tuple(self.to_device(value, device) for value in data)
-        if isinstance(data, Tensor):
-            return data.to(device)
-        return data
 
     # -- steps ---------------------------------------------------------------
 
@@ -359,11 +238,9 @@ class Runner(dl.Runner):
         family dataclass outputs. This override runs the strategy's inference entry point under DanLing's
         ``infer_context`` -- the plain forward for the sequence families (over a ragged ``NestedTensor`` batch),
         ``model.sample`` for the diffusion families (batch=1). Randomness is seeded from ``config.seed`` and
-        each structure's global dataset index (a per-residue decoding priority for the sequence forward, a
-        per-structure generator for diffusion sampling), so every prediction is reproducible and independent of
-        batch composition, DDP sharding, and prior RNG history; a ``None`` seed leaves it to ambient RNG. The
-        ragged output un-nests per structure with ``prediction[i]`` -- no padding to trim. Outputs are moved off
-        the accelerator so a long pass does not accumulate whole dataclasses on device.
+        the ordinary process-local RNG initialized by DanLing. The ragged output un-nests per structure with
+        ``prediction[i]`` -- no padding to trim. Outputs are moved off the accelerator so a long pass does not
+        accumulate whole dataclasses on device.
 
         Decorated with ``@torch.inference_mode()`` like DanLing's default (this override replaces it, so it
         must restore the guard). The model is ``unwrap``-ed first: under DDP ``self.model`` is a
@@ -375,13 +252,13 @@ class Runner(dl.Runner):
         if model is None:
             raise ValueError("cannot run infer_step: model is not initialized")
         model = self.unwrap(model)  # reach the family's own inference entry point (e.g. ``sample``) under DDP
-        model_input = data["input"]  # the infer split collates to ``{"input": model_input}`` (no target)
-        indices = data.get("indices") if isinstance(data, Mapping) else None
-        base_seed = self.config.get("seed")
+        model_input = data["input"]
+        if self._process_training:
+            model_input = model_input["input"]
         with self.infer_context():
-            prediction = self._infer(model, model_input, indices=indices, base_seed=base_seed, device=self.device)
+            prediction = model.sample(model_input) if self._process_training else model(model_input)
         # One output per structure so infer()'s grouping does not shift with batch size. A ragged tensorclass
         # output un-nests each structure at its own length; a non-tensorclass output passes through.
         if is_tensorclass(prediction) and prediction.batch_size:
-            return [self.to_device(prediction[index], torch.device("cpu")) for index in range(prediction.batch_size[0])]
-        return [self.to_device(prediction, torch.device("cpu"))]
+            return [dl.to_device(prediction[index], torch.device("cpu")) for index in range(prediction.batch_size[0])]
+        return [dl.to_device(prediction, torch.device("cpu"))]

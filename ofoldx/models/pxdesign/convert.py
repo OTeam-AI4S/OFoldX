@@ -168,7 +168,7 @@ def convert_pxdesign_checkpoint(
     from ..proteinmpnn.pipeline import ProteinMpnnPipeline
     from ..proteinmpnn.processor import ProteinMpnnProcessor
     from ..protenix.convert import convert_protenix_model
-    from ..protenix.model import ProtenixStructureConditionModel
+    from ..protenix.model import ProtenixModel, ProtenixStructureConditionModel
     from ..protenix.pipeline import (
         ProtenixPipeline,
         ProtenixStructureConditionPipeline,
@@ -201,10 +201,13 @@ def convert_pxdesign_checkpoint(
     )
     _own_parameter_storage(af2_complex_model)
     _own_parameter_storage(af2_binder_model)
-    protenix_model = convert_protenix_model(
-        Path(protenix_checkpoint_path),
-        variant="protenix_base_default_v0.5.0",
-        dtype=dtype,
+    protenix_model = cast(
+        ProtenixModel,
+        convert_protenix_model(
+            Path(protenix_checkpoint_path),
+            variant="protenix_base_default_v0.5.0",
+            dtype=dtype,
+        ),
     )
     protenix_structure_model = cast(
         ProtenixStructureConditionModel,

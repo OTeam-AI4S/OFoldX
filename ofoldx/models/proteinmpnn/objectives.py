@@ -53,6 +53,8 @@ def criterion(pred: Any, target: Any, *, label_smoothing: float = 0.1) -> Tensor
 
 
 def criterion_factory(model: Any, processor: Any) -> Any:
-    r"""Runner criterion factory: ProteinMPNN's loss needs no Model/Processor binding."""
+    r"""Bind a ProteinMPNN Runner only when Model and Processor use the same graph."""
 
+    if model.config.ca_only != processor.config.ca_only:
+        raise ValueError("ProteinMPNN Model and Processor must use the same ca_only value")
     return criterion

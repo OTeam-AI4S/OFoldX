@@ -118,10 +118,13 @@ class EsmFold2Processor(Processor):
         if isinstance(input, Structure):
             input = input.system
         system = input if isinstance(input, MolecularSystem) else molecular_system_from_sequences(input)
-        normalized_msa = _normalize_msa(msa, system)
+        if msa is not None:
+            for _value, _target_instance_id, entity in resolve_msa_bindings(msa, system):
+                if entity.polymer_type != "protein":
+                    raise ValueError("ESMFold2 accepts MSA evidence only for protein entities")
         return _prepare_esmfold2_features(
             system,
-            msa=normalized_msa,
+            msa=msa,
             tokenizer=self.tokenizer,
             device=self.device,
             dtype=self.dtype,
@@ -204,22 +207,6 @@ def _default_chain_id(index: int) -> str:
     """
 
     return chr(ord("A") + index) if index < 26 else f"chain_{index + 1}"
-
-
-def _normalize_msa(
-    msa: MSA | MSACollection | None,
-    system: MolecularSystem,
-) -> MSA | MSACollection | None:
-    r"""
-    Bind MSA evidence to the exact polymer definitions in ``system``.
-    """
-
-    if msa is None:
-        return None
-    for _value, _target_instance_id, entity in resolve_msa_bindings(msa, system):
-        if entity.polymer_type != "protein":
-            raise ValueError("ESMFold2 accepts MSA evidence only for protein entities")
-    return msa
 
 
 def _msa_residue_type(symbol: str) -> int:

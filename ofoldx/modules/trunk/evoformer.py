@@ -84,19 +84,6 @@ class EvoformerStack(nn.Module):
         msa_mask: Tensor | None = None,
         pair_mask: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
-        r"""
-        Refine MSA and pair representations through every block.
-
-        Args:
-            msa: MSA representation with shape ``(..., M, N, C_msa)``.
-            pair: Pair representation with shape ``(..., N, N, C_pair)``.
-            msa_mask: Optional MSA validity mask with shape ``(..., M, N)``.
-            pair_mask: Optional pair validity mask with shape ``(..., N, N)``.
-
-        Returns:
-            Refined MSA and pair representations with the same shapes as the inputs.
-        """
-
         if not self.blocks:
             return msa, pair
         if msa_mask is None:
@@ -108,7 +95,7 @@ class EvoformerStack(nn.Module):
         return msa, pair
 
 
-class ExtraMsaEvoformerStack(EvoformerStack):
+class ExtraMsaEvoformerStack(nn.Module):
     r"""
     Homogeneous stack of AlphaFold 2 extra-MSA blocks.
     """
@@ -130,7 +117,7 @@ class ExtraMsaEvoformerStack(EvoformerStack):
         pair_dropout: float,
         backend: str,
     ) -> None:
-        nn.Module.__init__(self)
+        super().__init__()
         self.num_blocks = num_blocks
         self.blocks = nn.ModuleList(
             ExtraMsaEvoformerBlock(
@@ -150,8 +137,26 @@ class ExtraMsaEvoformerStack(EvoformerStack):
             for _ in range(num_blocks)
         )
 
+    def forward(
+        self,
+        msa: Tensor,
+        pair: Tensor,
+        *,
+        msa_mask: Tensor | None = None,
+        pair_mask: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        if not self.blocks:
+            return msa, pair
+        if msa_mask is None:
+            msa_mask = msa.new_ones(msa.shape[:-1])
+        if pair_mask is None:
+            pair_mask = pair.new_ones(pair.shape[:-1])
+        for block in self.blocks:
+            msa, pair = block(msa, pair, msa_mask=msa_mask, pair_mask=pair_mask)
+        return msa, pair
 
-class OuterProductFirstEvoformerStack(EvoformerStack):
+
+class OuterProductFirstEvoformerStack(nn.Module):
     r"""
     Homogeneous Evoformer stack whose blocks apply outer-product mean before MSA attention.
     """
@@ -173,7 +178,7 @@ class OuterProductFirstEvoformerStack(EvoformerStack):
         pair_dropout: float,
         backend: str,
     ) -> None:
-        nn.Module.__init__(self)
+        super().__init__()
         self.num_blocks = num_blocks
         self.blocks = nn.ModuleList(
             OuterProductFirstEvoformerBlock(
@@ -193,8 +198,26 @@ class OuterProductFirstEvoformerStack(EvoformerStack):
             for _ in range(num_blocks)
         )
 
+    def forward(
+        self,
+        msa: Tensor,
+        pair: Tensor,
+        *,
+        msa_mask: Tensor | None = None,
+        pair_mask: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        if not self.blocks:
+            return msa, pair
+        if msa_mask is None:
+            msa_mask = msa.new_ones(msa.shape[:-1])
+        if pair_mask is None:
+            pair_mask = pair.new_ones(pair.shape[:-1])
+        for block in self.blocks:
+            msa, pair = block(msa, pair, msa_mask=msa_mask, pair_mask=pair_mask)
+        return msa, pair
 
-class OuterProductFirstExtraMsaEvoformerStack(EvoformerStack):
+
+class OuterProductFirstExtraMsaEvoformerStack(nn.Module):
     r"""
     Extra-MSA stack whose blocks apply outer-product mean before global-column MSA attention.
     """
@@ -216,7 +239,7 @@ class OuterProductFirstExtraMsaEvoformerStack(EvoformerStack):
         pair_dropout: float,
         backend: str,
     ) -> None:
-        nn.Module.__init__(self)
+        super().__init__()
         self.num_blocks = num_blocks
         self.blocks = nn.ModuleList(
             OuterProductFirstExtraMsaEvoformerBlock(
@@ -235,6 +258,24 @@ class OuterProductFirstExtraMsaEvoformerStack(EvoformerStack):
             )
             for _ in range(num_blocks)
         )
+
+    def forward(
+        self,
+        msa: Tensor,
+        pair: Tensor,
+        *,
+        msa_mask: Tensor | None = None,
+        pair_mask: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        if not self.blocks:
+            return msa, pair
+        if msa_mask is None:
+            msa_mask = msa.new_ones(msa.shape[:-1])
+        if pair_mask is None:
+            pair_mask = pair.new_ones(pair.shape[:-1])
+        for block in self.blocks:
+            msa, pair = block(msa, pair, msa_mask=msa_mask, pair_mask=pair_mask)
+        return msa, pair
 
 
 class EvoformerBlock(nn.Module):
@@ -275,14 +316,7 @@ class EvoformerBlock(nn.Module):
         backend: str,
     ) -> None:
         super().__init__()
-        # Preserve released initialization order while registering children in execution order.
-        outer_product_mean = EvoformerOuterProductMean(
-            msa_size=msa_size,
-            pair_size=pair_size,
-            hidden_size=outer_product_hidden_size,
-            backend=backend,
-        )
-        msa_block = EvoformerMsaBlock(
+        self.msa_block = EvoformerMsaBlock(
             msa_size=msa_size,
             pair_size=pair_size,
             num_attention_heads=num_msa_attention_heads,
@@ -290,8 +324,12 @@ class EvoformerBlock(nn.Module):
             dropout=msa_dropout,
             backend=backend,
         )
-        self.msa_block = msa_block
-        self.outer_product_mean = outer_product_mean
+        self.outer_product_mean = EvoformerOuterProductMean(
+            msa_size=msa_size,
+            pair_size=pair_size,
+            hidden_size=outer_product_hidden_size,
+            backend=backend,
+        )
         self.pair_block = EvoformerPairBlock(
             pair_size=pair_size,
             triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
@@ -344,14 +382,7 @@ class ExtraMsaEvoformerBlock(nn.Module):
         backend: str,
     ) -> None:
         super().__init__()
-        # Preserve released initialization order while registering children in execution order.
-        outer_product_mean = EvoformerOuterProductMean(
-            msa_size=msa_size,
-            pair_size=pair_size,
-            hidden_size=outer_product_hidden_size,
-            backend=backend,
-        )
-        msa_block = ExtraMsaTrackBlock(
+        self.msa_block = ExtraMsaTrackBlock(
             msa_size=msa_size,
             pair_size=pair_size,
             num_attention_heads=num_msa_attention_heads,
@@ -359,8 +390,12 @@ class ExtraMsaEvoformerBlock(nn.Module):
             dropout=msa_dropout,
             backend=backend,
         )
-        self.msa_block = msa_block
-        self.outer_product_mean = outer_product_mean
+        self.outer_product_mean = EvoformerOuterProductMean(
+            msa_size=msa_size,
+            pair_size=pair_size,
+            hidden_size=outer_product_hidden_size,
+            backend=backend,
+        )
         self.pair_block = EvoformerPairBlock(
             pair_size=pair_size,
             triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
@@ -514,13 +549,13 @@ class EvoformerMsaBlock(nn.Module):
             num_attention_heads=num_attention_heads,
             backend=backend,
         )
+        self.rowwise_dropout = StructuredDropout(dropout, broadcast_dims=-3)
         self.msa_column_attention = MsaColumnAttention(
             msa_size=msa_size,
             num_attention_heads=num_attention_heads,
             backend=backend,
         )
         self.transition = EvoformerTransition(msa_size, expansion=transition_expansion)
-        self.rowwise_dropout = StructuredDropout(dropout, broadcast_dims=-3)
 
     def forward(self, msa: Tensor, pair: Tensor, *, msa_mask: Tensor, pair_mask: Tensor) -> Tensor:
         r"""
@@ -565,12 +600,12 @@ class ExtraMsaTrackBlock(nn.Module):
             num_attention_heads=num_attention_heads,
             backend=backend,
         )
+        self.rowwise_dropout = StructuredDropout(dropout, broadcast_dims=-3)
         self.msa_column_global_attention = MsaColumnGlobalAttention(
             msa_size=msa_size,
             num_attention_heads=num_attention_heads,
         )
         self.transition = EvoformerTransition(msa_size, expansion=transition_expansion)
-        self.rowwise_dropout = StructuredDropout(dropout, broadcast_dims=-3)
 
     def forward(self, msa: Tensor, pair: Tensor, *, msa_mask: Tensor, pair_mask: Tensor) -> Tensor:
         msa = msa + self.rowwise_dropout(
@@ -612,6 +647,7 @@ class EvoformerPairBlock(nn.Module):
             outgoing=True,
             backend=backend,
         )
+        self.rowwise_dropout = StructuredDropout(dropout, broadcast_dims=-3)
         self.triangle_multiplication_incoming = EvoformerTriangleMultiplication(
             pair_size=pair_size,
             hidden_size=triangle_multiplication_hidden_size,
@@ -631,7 +667,6 @@ class EvoformerPairBlock(nn.Module):
             backend=backend,
         )
         self.transition = EvoformerTransition(pair_size, expansion=transition_expansion)
-        self.rowwise_dropout = StructuredDropout(dropout, broadcast_dims=-3)
 
     def forward(self, pair: Tensor, *, pair_mask: Tensor) -> Tensor:
         r"""
@@ -799,48 +834,15 @@ class GlobalAttention(nn.Module):
 
     def __init__(self, *, hidden_size: int, num_attention_heads: int, head_dim: int) -> None:
         super().__init__()
-        self.projection = GlobalAttentionProjection(
-            hidden_size=hidden_size,
-            num_attention_heads=num_attention_heads,
-            head_dim=head_dim,
-        )
-
-    def forward(self, query: Tensor, mask: Tensor) -> Tensor:
-        r"""
-        Project a mask-weighted global query and return gated attended values.
-
-        Args:
-            query: Input states with shape ``(..., N, C)``.
-            mask: Valid-input mask broadcastable to ``(..., N, 1)``.
-
-        Returns:
-            Gated attention updates with the same shape as ``query``.
-        """
-
-        return self.projection(query, mask)
-
-
-class GlobalAttentionProjection(nn.Module):
-    r"""
-    Own the query, key, value, gate, and output projections for global attention.
-
-    Args:
-        hidden_size: Width of input and output states.
-        num_attention_heads: Number of global-query heads.
-        head_dim: Width of each attention head.
-    """
-
-    def __init__(self, *, hidden_size: int, num_attention_heads: int, head_dim: int) -> None:
-        super().__init__()
         self.num_attention_heads = num_attention_heads
         self.head_dim = head_dim
         inner_size = num_attention_heads * head_dim
         self.query_projection = nn.Linear(hidden_size, inner_size, bias=False)
         self.key_projection = nn.Linear(hidden_size, head_dim, bias=False)
         self.value_projection = nn.Linear(hidden_size, head_dim, bias=False)
-        self.output_projection = nn.Linear(inner_size, hidden_size)
         self.gate_projection = nn.Linear(hidden_size, inner_size)
         self.sigmoid = nn.Sigmoid()
+        self.output_projection = nn.Linear(inner_size, hidden_size)
 
     def forward(self, query: Tensor, mask: Tensor) -> Tensor:
         r"""

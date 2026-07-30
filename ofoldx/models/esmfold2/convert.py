@@ -404,8 +404,12 @@ def _translate_biohub_state_key(name: str) -> str:
     elif name.startswith("msa_encoder.project_inputs."):
         name = f"msa_encoder.input_projection.{name.removeprefix('msa_encoder.project_inputs.')}"
 
+    if name.startswith("folding_trunk."):
+        name = f"folding_stack.{name.removeprefix('folding_trunk.')}"
+    elif name.startswith("confidence_head.folding_trunk."):
+        name = f"confidence_head.folding_stack.{name.removeprefix('confidence_head.folding_trunk.')}"
     name = re.sub(
-        r"^(folding_trunk|language_model_encoder|parcae_coda|confidence_head\.folding_trunk)"
+        r"^(folding_stack|language_model_encoder|parcae_coda|confidence_head\.folding_stack)"
         r"\.blocks\.(\d+)\.pair_transition\.",
         r"\1.blocks.\2.transition.",
         name,
@@ -544,7 +548,7 @@ def _translate_biohub_config(raw_config: Mapping[str, Any]) -> dict[str, Any]:
         },
         # n_heads/dropout are inert upstream dataclass leftovers: the released
         # upstream PairUpdateBlock has neither an attention nor a dropout operation.
-        "folding_trunk": {"num_blocks": folding_trunk["n_layers"]},
+        "folding_stack": {"num_blocks": folding_trunk["n_layers"]},
         "diffusion_structure_head": {
             "denoiser": {
                 "sigma_data": diffusion["sigma_data"],
@@ -576,13 +580,13 @@ def _translate_biohub_config(raw_config: Mapping[str, Any]) -> dict[str, Any]:
             "min_distance": confidence["min_dist"],
             "max_distance": confidence["max_dist"],
             "num_distogram_bins": confidence["distogram_bins"],
-            "folding_trunk": {"num_blocks": confidence_trunk["n_layers"]},
+            "folding_stack": {"num_blocks": confidence_trunk["n_layers"]},
         },
         "msa_encoder": {
             "enabled": msa["enabled"],
             "msa_size": msa["d_msa"],
             "hidden_size": msa["d_hidden"],
-            "num_blocks": msa["n_layers"],
+            "num_stages": msa["n_layers"],
             "num_msa_attention_heads": msa["n_heads_msa"],
             "msa_head_dim": msa["msa_head_width"],
         },
@@ -640,7 +644,7 @@ def experimental_config_from_biohub(raw_config: Mapping[str, Any]) -> EsmFold2Ex
     atom_encoder_config.num_reference_space_rope_pairs = atom_encoder["n_uid_rope_pairs"]
     atom_encoder_config.reference_space_rope_base_frequency = atom_encoder["uid_rope_base_frequency"]
 
-    config.folding_trunk.num_blocks = raw_config["folding_trunk"]["n_layers"]
+    config.folding_stack.num_blocks = raw_config["folding_trunk"]["n_layers"]
 
     structure = raw_config["structure_head"]
     diffusion = structure["diffusion_module"]
@@ -675,14 +679,14 @@ def experimental_config_from_biohub(raw_config: Mapping[str, Any]) -> EsmFold2Ex
     confidence_config.max_distance = confidence["max_dist"]
     confidence_config.num_plddt_bins = confidence["num_plddt_bins"]
     confidence_config.num_pae_bins = confidence["num_pae_bins"]
-    confidence_config.folding_trunk.num_blocks = confidence["folding_trunk"]["n_layers"]
+    confidence_config.folding_stack.num_blocks = confidence["folding_trunk"]["n_layers"]
 
     msa = raw_config["msa_encoder"]
     msa_config = config.msa_encoder
     msa_config.enabled = msa["enabled"]
     msa_config.msa_size = msa["d_msa"]
     msa_config.hidden_size = msa["d_hidden"]
-    msa_config.num_blocks = msa["n_layers"]
+    msa_config.num_stages = msa["n_layers"]
     msa_config.num_msa_attention_heads = msa["n_heads_msa"]
     msa_config.msa_head_dim = msa["msa_head_width"]
 

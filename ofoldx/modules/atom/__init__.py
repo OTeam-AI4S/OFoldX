@@ -10,7 +10,6 @@ from .encoders import (
     AtomPairEncoder,
     AtomSelfAttention,
     AtomToTokenEncoder,
-    AtomToTokenEncoderBase,
     AttentionLayout,
     CoordinateAtomToTokenEncoder,
     NormalizedKeyAtomToTokenEncoder,

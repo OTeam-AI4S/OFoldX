@@ -252,16 +252,17 @@ def _cif_column(category: _CifCategory, name: str) -> tuple[str | None, ...]:
 
 
 @dataclass(frozen=True)
-class MmcifEntityDeclarations:
+class _MmcifEntityDeclarations:
     r"""
     Authoritative entity declarations parsed from an mmCIF document.
 
     Args:
         entity_types: ``_entity.type`` (``"polymer"``, ``"non-polymer"``, ``"water"``,
             ``"branched"``, ``"macrolide"``) keyed by ``_entity.id``, lower-cased.
-        polymer_monomers: For each polymer ``_entity.id`` its ordered
-            ``_entity_poly_seq`` ``(num, mon_id)`` monomers, including residues that are
-            declared but unmodeled in the coordinates.
+        polymer_monomers: For each polymer ``_entity.id``, its ordered
+            ``_entity_poly_seq`` positions and candidate monomer IDs. Multiple
+            candidates at one position represent standard microheterogeneity. ``None``
+            means the category is absent.
         entity_poly_types: ``_entity_poly.type`` keyed by ``_entity.id``, lower-cased.
         author_numbering: ``pdbx_poly_seq_scheme`` author numbering
             ``(auth_seq_num, pdb_ins_code)`` keyed by ``(asym_id, seq_id)`` for every
@@ -269,12 +270,12 @@ class MmcifEntityDeclarations:
     """
 
     entity_types: dict[str, str]
-    polymer_monomers: dict[str, tuple[tuple[int, str], ...]]
+    polymer_monomers: dict[str, tuple[tuple[int, tuple[str, ...]], ...]] | None
     entity_poly_types: dict[str, str]
     author_numbering: dict[tuple[str, int], tuple[int | None, str | None]]
 
 
-def read_mmcif_entity_declarations(parsed: ParsedStructure) -> MmcifEntityDeclarations:
+def _read_mmcif_entity_declarations(parsed: ParsedStructure) -> _MmcifEntityDeclarations:
     r"""
     Decode mmCIF entity-type, polymer-sequence, and author-numbering declarations.
 
@@ -286,24 +287,28 @@ def read_mmcif_entity_declarations(parsed: ParsedStructure) -> MmcifEntityDeclar
         parsed: Parsed mmCIF records and source document.
 
     Returns:
-        Entity declarations gathered defensively from the source; missing categories or
-        columns yield empty mappings rather than errors.
+        Entity declarations gathered from the source. Absent categories yield empty
+        mappings; malformed rows in a present category raise.
     """
 
     cif_file = parsed.mmcif_file
     if cif_file is None:
-        return MmcifEntityDeclarations({}, {}, {}, {})
+        return _MmcifEntityDeclarations({}, None, {}, {})
     block = cast(_CifFile, cif_file).block
 
     entity_types: dict[str, str] = {}
     if "entity" in block:
         category = block["entity"]
         for entity_id, entity_type in zip(_cif_column(category, "id"), _cif_column(category, "type")):
-            if entity_id is not None and entity_type is not None:
-                entity_types[entity_id] = entity_type.lower()
+            if entity_id is None or entity_type is None:
+                raise ValueError("mmCIF _entity row is missing id or type")
+            if entity_id in entity_types:
+                raise ValueError(f"mmCIF _entity contains duplicate id {entity_id!r}")
+            entity_types[entity_id] = entity_type.lower()
 
-    polymer_monomers: dict[str, list[tuple[int, str]]] = {}
-    if "entity_poly_seq" in block:
+    polymer_monomers: dict[str, dict[int, list[str]]] = {}
+    has_polymer_sequences = "entity_poly_seq" in block
+    if has_polymer_sequences:
         category = block["entity_poly_seq"]
         for entity_id, number, monomer in zip(
             _cif_column(category, "entity_id"),
@@ -312,15 +317,26 @@ def read_mmcif_entity_declarations(parsed: ParsedStructure) -> MmcifEntityDeclar
         ):
             index = optional_integer(number)
             if entity_id is None or index is None or monomer is None:
-                continue
-            polymer_monomers.setdefault(entity_id, []).append((index, monomer))
+                raise ValueError("mmCIF _entity_poly_seq row is missing entity_id, num, or mon_id")
+            if index < 1:
+                raise ValueError(f"mmCIF _entity_poly_seq.num must be positive, got {index}")
+            candidates = polymer_monomers.setdefault(entity_id, {}).setdefault(index, [])
+            if monomer not in candidates:
+                candidates.append(monomer)
+        for entity_id, positions in polymer_monomers.items():
+            numbers = sorted(positions)
+            if numbers != list(range(1, len(numbers) + 1)):
+                raise ValueError(f"mmCIF polymer entity {entity_id!r} has a non-contiguous declared sequence")
 
     entity_poly_types: dict[str, str] = {}
     if "entity_poly" in block:
         category = block["entity_poly"]
         for entity_id, poly_type in zip(_cif_column(category, "entity_id"), _cif_column(category, "type")):
-            if entity_id is not None and poly_type is not None:
-                entity_poly_types[entity_id] = poly_type.lower()
+            if entity_id is None or poly_type is None:
+                raise ValueError("mmCIF _entity_poly row is missing entity_id or type")
+            if entity_id in entity_poly_types:
+                raise ValueError(f"mmCIF _entity_poly contains duplicate entity_id {entity_id!r}")
+            entity_poly_types[entity_id] = poly_type.lower()
 
     author_numbering: dict[tuple[str, int], tuple[int | None, str | None]] = {}
     if "pdbx_poly_seq_scheme" in block:
@@ -334,15 +350,26 @@ def read_mmcif_entity_declarations(parsed: ParsedStructure) -> MmcifEntityDeclar
         ):
             seq = optional_integer(seq_id)
             if asym_id is None or seq is None:
-                continue
+                raise ValueError("mmCIF _pdbx_poly_seq_scheme row is missing asym_id or seq_id")
             number = optional_integer(auth_number)
             if number is None:
                 number = optional_integer(pdb_number)
-            author_numbering[(asym_id, seq)] = (number, ins_code)
+            key = (asym_id, seq)
+            value = (number, ins_code)
+            if key in author_numbering and author_numbering[key] != value:
+                raise ValueError(f"mmCIF _pdbx_poly_seq_scheme has conflicting numbering for {key!r}")
+            author_numbering[key] = value
 
-    return MmcifEntityDeclarations(
+    return _MmcifEntityDeclarations(
         entity_types=entity_types,
-        polymer_monomers={entity_id: tuple(sorted(monomers)) for entity_id, monomers in polymer_monomers.items()},
+        polymer_monomers=(
+            {
+                entity_id: tuple((number, tuple(positions[number])) for number in sorted(positions))
+                for entity_id, positions in polymer_monomers.items()
+            }
+            if has_polymer_sequences
+            else None
+        ),
         entity_poly_types=entity_poly_types,
         author_numbering=author_numbering,
     )

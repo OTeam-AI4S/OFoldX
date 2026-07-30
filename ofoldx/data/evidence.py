@@ -289,7 +289,7 @@ def select_msa_binding(
     return None
 
 
-@dataclass(eq=False)
+@dataclass(frozen=True)
 class TemplateAlignment:
     r"""
     A target-to-template polymer alignment.

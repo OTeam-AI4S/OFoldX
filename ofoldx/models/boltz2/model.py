@@ -7,14 +7,13 @@ from __future__ import annotations
 import math
 import operator
 from dataclasses import dataclass
-
-from tensordict import tensorclass
 from functools import partial
 from typing import cast
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+from tensordict import tensorclass
 from torch import Tensor, nn
 
 from ...data.evidence import Template
@@ -185,8 +184,8 @@ class Boltz2Model(Model):
 
         # Recycling (zero-init gates).
         self.single_recycle_norm = LayerNorm(single_size)
-        self.pair_recycle_norm = LayerNorm(pair_size)
         self.single_recycle_projection = nn.Linear(single_size, single_size, bias=False)
+        self.pair_recycle_norm = LayerNorm(pair_size)
         self.pair_recycle_projection = nn.Linear(pair_size, pair_size, bias=False)
         nn.init.zeros_(self.single_recycle_projection.weight)
         nn.init.zeros_(self.pair_recycle_projection.weight)
@@ -1632,9 +1631,9 @@ class Boltz2TemplateEmbedder(nn.Module):
         self.min_distance = min_distance
         self.max_distance = max_distance
         template_feature_size = 2 * vocab_size + num_bins + 5
+        self.template_projection = nn.Linear(template_feature_size, hidden_size, bias=False)
         self.pair_norm = LayerNorm(pair_size, backend=backend)
         self.pair_projection = nn.Linear(pair_size, hidden_size, bias=False)
-        self.template_projection = nn.Linear(template_feature_size, hidden_size, bias=False)
         self.pair_update_stack = Boltz2TrianglePairUpdateStack(
             num_blocks=num_blocks,
             pair_size=hidden_size,
@@ -1766,12 +1765,12 @@ class Boltz2MsaTrunk(nn.Module):
         super().__init__()
         self.vocab_size = vocab_size
         self.use_paired_feature = use_paired_feature
-        self.token_projection = nn.Linear(single_size, msa_size, bias=False)
         self.msa_projection = nn.Linear(
             vocab_size + 2 + int(use_paired_feature),
             msa_size,
             bias=False,
         )
+        self.token_projection = nn.Linear(single_size, msa_size, bias=False)
         self.num_blocks = num_blocks
         self.blocks = nn.ModuleList(
             Boltz2MsaBlock(
@@ -1860,6 +1859,7 @@ class Boltz2MsaBlock(nn.Module):
             head_dim=msa_head_dim,
             backend=backend,
         )
+        self.msa_dropout = StructuredDropout(msa_dropout, broadcast_dims=(-2, -1))
         self.msa_transition = Transition(msa_size, expansion=expansion, backend=backend)
         self.outer_product_mean = OuterProductMean(
             msa_size=msa_size,
@@ -1875,7 +1875,6 @@ class Boltz2MsaBlock(nn.Module):
             dropout=pair_dropout,
             backend=backend,
         )
-        self.msa_dropout = StructuredDropout(msa_dropout, broadcast_dims=(-2, -1))
 
     def forward(
         self,
@@ -2037,6 +2036,7 @@ class Boltz2TrianglePairUpdateBlock(nn.Module):
             outgoing=True,
             backend=backend,
         )
+        self.rowwise_dropout = StructuredDropout(dropout, broadcast_dims=(-2, -1))
         self.triangle_multiplication_incoming = TriangleMultiplication(
             pair_size=pair_size,
             hidden_size=triangle_multiplication_hidden_size,
@@ -2055,7 +2055,6 @@ class Boltz2TrianglePairUpdateBlock(nn.Module):
             num_attention_heads=num_triangle_attention_heads,
             backend=backend,
         )
-        self.rowwise_dropout = StructuredDropout(dropout, broadcast_dims=(-2, -1))
         self.columnwise_dropout = StructuredDropout(dropout, broadcast_dims=(-3, -1))
         self.transition = Transition(pair_size, expansion=expansion, backend=backend)
 
@@ -2296,9 +2295,9 @@ class Boltz2CoordinateDiffusion(nn.Module):
         noise_log_std: float = 1.5,
     ) -> None:
         super().__init__()
-        self.denoiser = denoiser
         self.sigma_data = sigma_data
         self.preconditioner = EdmPreconditioner(sigma_data=sigma_data)
+        self.denoiser = denoiser
         self.min_noise_level = min_noise_level
         self.max_noise_level = max_noise_level
         self.rho = rho
@@ -2748,9 +2747,6 @@ class Boltz2DenoiserAtomEncoder(nn.Module):
         self.num_query_atoms = num_query_atoms
         self.num_key_atoms = num_key_atoms
         self.atom_feature_projection = nn.Linear(atom_feature_size, atom_hidden_size)
-        self.distance_vector_projection = nn.Linear(3, atom_pair_hidden_size, bias=False)
-        self.inverse_distance_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
-        self.distance_mask_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
         self.single_trunk_norm = LayerNorm(single_size)
         self.single_trunk_projection = nn.Linear(single_size, atom_hidden_size, bias=False)
         self.pair_trunk_norm = LayerNorm(pair_size)
@@ -2759,6 +2755,9 @@ class Boltz2DenoiserAtomEncoder(nn.Module):
             atom_pair_hidden_size,
             bias=False,
         )
+        self.distance_vector_projection = nn.Linear(3, atom_pair_hidden_size, bias=False)
+        self.inverse_distance_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
+        self.distance_mask_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
         self.left_atom_projection = nn.Linear(
             atom_hidden_size,
             atom_pair_hidden_size,
@@ -2971,13 +2970,13 @@ class Boltz2AffinityHead(nn.Module):
         backend: str = "auto",
     ) -> None:
         super().__init__()
+        self.pair_norm = LayerNorm(pair_size, backend=backend)
+        self.pair_projection = nn.Linear(pair_size, pair_size, bias=False)
+        self.single_to_pair_product_left = nn.Linear(single_size, pair_size, bias=False)
+        self.single_to_pair_product_right = nn.Linear(single_size, pair_size, bias=False)
         self.register_buffer("boundaries", torch.linspace(2.0, max_distance, num_distogram_bins - 1))
         self.dist_bin_pairwise_embed = nn.Embedding(num_distogram_bins, pair_size)
         nn.init.zeros_(self.dist_bin_pairwise_embed.weight)
-        self.single_to_pair_product_left = nn.Linear(single_size, pair_size, bias=False)
-        self.single_to_pair_product_right = nn.Linear(single_size, pair_size, bias=False)
-        self.pair_norm = LayerNorm(pair_size, backend=backend)
-        self.pair_projection = nn.Linear(pair_size, pair_size, bias=False)
         self.pairwise_conditioner = PairwiseConditioning(
             pair_size=pair_size,
             relative_position_size=pair_size,
@@ -3098,20 +3097,12 @@ class Boltz2ConfidenceHead(nn.Module):
         backend: str = "auto",
     ) -> None:
         super().__init__()
-        self.register_buffer("boundaries", torch.linspace(2.0, max_distance, num_distogram_bins - 1))
-        self.distance_embedding = nn.Embedding(num_distogram_bins, pair_size)
-
         self.input_single_norm = LayerNorm(single_size, backend=backend)
         self.single_norm: LayerNorm | None = None
         if normalize_single_input:
             self.single_norm = LayerNorm(single_size, backend=backend)
-        self.pair_norm = LayerNorm(pair_size, backend=backend)
         self.input_single_projection = nn.Linear(single_size, single_size, bias=False)
-        self.single_to_pair_row = nn.Linear(single_size, pair_size, bias=False)
-        self.single_to_pair_col = nn.Linear(single_size, pair_size, bias=False)
-        self.single_to_pair_product_left = nn.Linear(single_size, pair_size, bias=False)
-        self.single_to_pair_product_right = nn.Linear(single_size, pair_size, bias=False)
-        self.single_to_pair_product_out = nn.Linear(pair_size, pair_size, bias=False)
+        self.pair_norm = LayerNorm(pair_size, backend=backend)
 
         self.relative_position_embedder = RelativePositionEmbedder(relative_position_size, pair_size)
         self.token_bond_projection = nn.Linear(1, pair_size, bias=False)
@@ -3119,6 +3110,14 @@ class Boltz2ConfidenceHead(nn.Module):
         self.contact_conditioning = BoltzContactConditioning(
             pair_size, cutoff_min=conditioning_cutoff_min, cutoff_max=conditioning_cutoff_max
         )
+
+        self.single_to_pair_row = nn.Linear(single_size, pair_size, bias=False)
+        self.single_to_pair_col = nn.Linear(single_size, pair_size, bias=False)
+        self.single_to_pair_product_left = nn.Linear(single_size, pair_size, bias=False)
+        self.single_to_pair_product_right = nn.Linear(single_size, pair_size, bias=False)
+        self.single_to_pair_product_out = nn.Linear(pair_size, pair_size, bias=False)
+        self.register_buffer("boundaries", torch.linspace(2.0, max_distance, num_distogram_bins - 1))
+        self.distance_embedding = nn.Embedding(num_distogram_bins, pair_size)
 
         self.pairformer_stack = Boltz2PairformerStack(
             num_blocks=num_blocks,
@@ -3265,8 +3264,8 @@ def _decode_boltz2_fold_result(output: Boltz2ConfidenceOutput, input: Boltz2Inpu
     # The metric axis follows layout.token_sites.
     token_axis = layout.token_sites
 
-    # Per-token pLDDT fraction (0-1) and resolved probability aligned to the token axis.
-    plddt_fraction = output.plddt[0, :, :token_count].to(device="cpu", dtype=torch.float32)
+    # Per-token pLDDT (0--100) and resolved probability aligned to the token axis.
+    plddt = output.plddt[0, :, :token_count].to(device="cpu", dtype=torch.float32)
     resolved_probability = output.resolved_probability[0, :, :token_count].float().cpu()
 
     # Expected PAE/PDE in angstrom (half-bin centers over 0-32, matching _boltz2_ptm_scores).
@@ -3346,7 +3345,7 @@ def _decode_boltz2_fold_result(output: Boltz2ConfidenceOutput, input: Boltz2Inpu
                 structure=structure,
                 scores=scores,
                 metrics={
-                    "plddt": Metric(values=plddt_fraction[sample_index].numpy(), axis=token_axis),
+                    "plddt": Metric(values=plddt[sample_index].numpy(), axis=token_axis),
                     "resolved_probability": Metric(values=resolved_probability[sample_index].numpy(), axis=token_axis),
                 },
                 pair_metrics={
@@ -5079,7 +5078,7 @@ class Boltz2Template:
         template: Canonical structural template evidence.
         force: Whether template distances also guide coordinate sampling.
         threshold: Flat-bottom template deviation threshold in angstroms.
-            Required when ``force`` is true.
+            ``None`` applies force without a finite cutoff.
     """
 
     template: Template
@@ -5364,7 +5363,8 @@ class Boltz2ConfidenceOutput:
             ``(B, S, N, D_resolved)``.
         bfactor_logits: Optional per-token B-factor logits with shape
             ``(B, N, D_bfactor)``.
-        plddt: Expected pLDDT fractions with shape ``(B, S, N)``.
+        plddt: Expected pLDDT values on the ``0--100`` scale with shape
+            ``(B, S, N)``.
         pae: Expected PAE in angstroms with shape ``(B, S, N, N)``.
         pde: Expected PDE in angstroms with shape ``(B, S, N, N)``.
         resolved_probability: Probability of resolved class zero with shape

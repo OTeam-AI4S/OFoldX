@@ -132,7 +132,6 @@ class AlphaFold2Model(Model):
         if self.num_ensembles < 1:
             raise ValueError("num_ensembles must be positive")
         self._resample_msa_in_recycling = config.msa.resample_msa_in_recycling
-        self._ensemble_msa_from_last = False
         self.input_embeddings = AlphaFold2InputEmbeddings(
             token_feature_size=input_config.token_feature_size,
             msa_feature_size=input_config.msa_feature_size,
@@ -150,7 +149,6 @@ class AlphaFold2Model(Model):
             previous_positions_num_distogram_bins=recycling_config.previous_positions.num_distogram_bins,
         )
         self.template_embedder: AlphaFold2TemplateEmbedder | None = None
-        self.template_msa_embedder: AlphaFold2TemplateMsaEmbedder | None = None
         if template_config.enabled:
             self.template_embedder = AlphaFold2TemplateEmbedder(
                 query_size=evoformer_config.pair_size,
@@ -175,14 +173,9 @@ class AlphaFold2Model(Model):
                 num_attention_heads=template_config.attention.num_attention_heads,
                 backend="auto",
             )
-            if template_config.embed_torsion_angles:
-                self.template_msa_embedder = AlphaFold2TemplateMsaEmbedder(
-                    vocab_size=template_config.vocab_size,
-                    msa_size=evoformer_config.msa_size,
-                )
-        self.extra_msa_embeddings = AlphaFold2ExtraMsaEmbeddings(
-            extra_msa_feature_size=input_config.extra_msa_feature_size,
-            extra_msa_size=evoformer_config.extra_msa_size,
+        self.extra_msa_projection = nn.Linear(
+            input_config.extra_msa_feature_size,
+            evoformer_config.extra_msa_size,
         )
         extra_msa_stack_type = (
             OuterProductFirstExtraMsaEvoformerStack if block_config.outer_product_mean.first else ExtraMsaEvoformerStack
@@ -205,6 +198,12 @@ class AlphaFold2Model(Model):
             pair_dropout=block_config.triangle_attention_starting_node.dropout,
             backend="auto",
         )
+        self.template_msa_embedder: AlphaFold2TemplateMsaEmbedder | None = None
+        if template_config.enabled and template_config.embed_torsion_angles:
+            self.template_msa_embedder = AlphaFold2TemplateMsaEmbedder(
+                vocab_size=template_config.vocab_size,
+                msa_size=evoformer_config.msa_size,
+            )
         self.evoformer_stack = evoformer_stack_type(
             num_blocks=evoformer_config.num_blocks,
             msa_size=evoformer_config.msa_size,
@@ -248,20 +247,26 @@ class AlphaFold2Model(Model):
             hidden_size=heads.predicted_lddt.hidden_size,
             num_bins=heads.predicted_lddt.num_plddt_bins,
         )
-        self.predicted_aligned_error_head: AlphaFold2PredictedAlignedErrorHead | None = None
+        self.predicted_aligned_error_head: nn.Linear | None = None
         if heads.predicted_aligned_error.enabled:
-            self.predicted_aligned_error_head = AlphaFold2PredictedAlignedErrorHead(
-                pair_size=evoformer_config.pair_size,
-                num_bins=heads.predicted_aligned_error.num_pae_bins,
+            self.predicted_aligned_error_head = nn.Linear(
+                evoformer_config.pair_size,
+                heads.predicted_aligned_error.num_pae_bins,
             )
-        self.experimentally_resolved_head = AlphaFold2ExperimentallyResolvedHead(
-            input_size=evoformer_config.single_size,
-            num_atom_types=heads.experimentally_resolved.num_atom_types,
+            nn.init.zeros_(self.predicted_aligned_error_head.weight)
+            nn.init.zeros_(self.predicted_aligned_error_head.bias)
+        self.experimentally_resolved_head = nn.Linear(
+            evoformer_config.single_size,
+            heads.experimentally_resolved.num_atom_types,
         )
-        self.masked_msa_head = AlphaFold2MaskedMsaHead(
-            msa_size=evoformer_config.msa_size,
-            num_output=heads.masked_msa.num_output,
+        nn.init.zeros_(self.experimentally_resolved_head.weight)
+        nn.init.zeros_(self.experimentally_resolved_head.bias)
+        self.masked_msa_head = nn.Linear(
+            evoformer_config.msa_size,
+            heads.masked_msa.num_output,
         )
+        nn.init.zeros_(self.masked_msa_head.weight)
+        nn.init.zeros_(self.masked_msa_head.bias)
         self.post_init()
 
     def forward(
@@ -449,10 +454,6 @@ class AlphaFold2Model(Model):
         if needs_realize and not resample:
             fixed_ensemble = tuple(self._realize_msa(input, generator=generator) for _ in range(self.num_ensembles))
         previous_positions, previous_msa_first_row, previous_pair = self._initial_recycling(input)
-        early_stop_tolerance = (
-            self.config.recycle_early_stop_tolerance if isinstance(self.config, AlphaFold2MultimerConfig) else None
-        )
-        stop_after_cycle = False
         for cycle in range(recycling_steps):
             if needs_realize:
                 if resample:
@@ -464,7 +465,7 @@ class AlphaFold2Model(Model):
                     cycle_inputs = fixed_ensemble
             else:
                 cycle_inputs = (input,) * self.num_ensembles
-            final_cycle = stop_after_cycle or cycle == recycling_steps - 1
+            final_cycle = cycle == recycling_steps - 1
             grad_enabled = torch.is_grad_enabled() and final_cycle
             with torch.set_grad_enabled(grad_enabled):
                 msa, single, pair, msa_first_row, cycle_input = self._run_ensemble(
@@ -476,23 +477,7 @@ class AlphaFold2Model(Model):
                 structure = self.structure_module(single, pair, cycle_input)
             if final_cycle:
                 break
-            next_positions = structure.final_atom_positions.detach()
-            if early_stop_tolerance is not None:
-                ca_index = residue_constants.atom_order["CA"]
-                previous_ca = previous_positions[..., ca_index, :]
-                next_ca = next_positions[..., ca_index, :]
-                previous_distances = torch.sqrt(
-                    torch.square(previous_ca.unsqueeze(-2) - previous_ca.unsqueeze(-3)).sum(dim=-1)
-                )
-                next_distances = torch.sqrt(torch.square(next_ca.unsqueeze(-2) - next_ca.unsqueeze(-3)).sum(dim=-1))
-                squared_difference = torch.square(previous_distances - next_distances)
-                pair_mask = input.sequence_mask.unsqueeze(-1) * input.sequence_mask.unsqueeze(-2)
-                mean_squared_difference = (squared_difference * pair_mask).sum(dim=(-2, -1)) / (
-                    pair_mask.sum(dim=(-2, -1)) + 1e-10
-                )
-                difference = torch.sqrt(mean_squared_difference + 1e-8)
-                stop_after_cycle = bool((difference <= early_stop_tolerance).all())
-            previous_positions = next_positions
+            previous_positions = structure.final_atom_positions.detach()
             previous_msa_first_row = msa_first_row.detach()
             previous_pair = pair.detach()
         return msa, single, pair, structure, cycle_input, cycle
@@ -505,8 +490,6 @@ class AlphaFold2Model(Model):
         previous_msa_first_row: Tensor,
         previous_pair: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, _AlphaFold2InputT]:
-        # Monomer aggregation retains the first MSA representation, whereas
-        # multimer aggregation retains the final ensemble representation.
         selected_msa = None
         selected_input = inputs[0]
         single_sum = None
@@ -519,7 +502,7 @@ class AlphaFold2Model(Model):
                 previous_msa_first_row=previous_msa_first_row,
                 previous_pair=previous_pair,
             )
-            if index == 0 or self._ensemble_msa_from_last:
+            if index == 0:
                 selected_msa = msa
                 selected_input = ensemble_input
             single_sum = single if single_sum is None else single_sum + single
@@ -630,7 +613,8 @@ class AlphaFold2Model(Model):
         )
         pair = pair * pair_mask.unsqueeze(-1).to(dtype=pair.dtype)
         pair = self._add_template_embedding(pair, input, pair_mask)
-        extra_msa, extra_msa_mask = self.extra_msa_embeddings(input)
+        extra_msa = self.extra_msa_projection(input.extra_msa_features)
+        extra_msa_mask = input.extra_msa_mask
         extra_msa, pair = self.extra_msa_stack(
             extra_msa,
             pair,
@@ -835,7 +819,7 @@ class AlphaFold2InitialGuessModel(AlphaFold2Model):
         )
 
 
-class AlphaFold2MultimerModel(AlphaFold2Model):
+class AlphaFold2MultimerModel(Model):
     r"""
     Predict multimeric protein structures with AlphaFold-Multimer.
 
@@ -914,7 +898,7 @@ class AlphaFold2MultimerModel(AlphaFold2Model):
 
     def __init__(self, config: AlphaFold2MultimerConfig | None = None) -> None:
         config = AlphaFold2MultimerConfig() if config is None else config
-        Model.__init__(self, config)
+        super().__init__(config)
         input_config = config.input_embeddings
         recycling_config = config.recycling
         template_config = config.template
@@ -930,7 +914,6 @@ class AlphaFold2MultimerModel(AlphaFold2Model):
         if self.num_ensembles < 1:
             raise ValueError("num_ensembles must be positive")
         self._resample_msa_in_recycling = config.msa.resample_msa_in_recycling
-        self._ensemble_msa_from_last = True
         self.input_embeddings = AlphaFold2MultimerInputEmbeddings(
             token_feature_size=input_config.token_feature_size,
             msa_feature_size=input_config.msa_feature_size,
@@ -950,7 +933,6 @@ class AlphaFold2MultimerModel(AlphaFold2Model):
             previous_positions_num_distogram_bins=recycling_config.previous_positions.num_distogram_bins,
         )
         self.template_embedder: AlphaFold2MultimerTemplateEmbedder | None = None
-        self.template_msa_embedder = None
         if template_config.enabled:
             self.template_embedder = AlphaFold2MultimerTemplateEmbedder(
                 query_size=evoformer_config.pair_size,
@@ -973,13 +955,9 @@ class AlphaFold2MultimerModel(AlphaFold2Model):
                 dropout=template_config.template_pair_stack.triangle_attention_starting_node.dropout,
                 backend="auto",
             )
-            self.template_msa_embedder = AlphaFold2MultimerTemplateMsaEmbedder(
-                msa_size=evoformer_config.msa_size,
-                vocab_size=template_config.vocab_size,
-            )
-        self.extra_msa_embeddings = AlphaFold2ExtraMsaEmbeddings(
-            extra_msa_feature_size=input_config.extra_msa_feature_size,
-            extra_msa_size=evoformer_config.extra_msa_size,
+        self.extra_msa_projection = nn.Linear(
+            input_config.extra_msa_feature_size,
+            evoformer_config.extra_msa_size,
         )
         extra_msa_stack_type = (
             OuterProductFirstExtraMsaEvoformerStack if block_config.outer_product_mean.first else ExtraMsaEvoformerStack
@@ -1002,6 +980,12 @@ class AlphaFold2MultimerModel(AlphaFold2Model):
             pair_dropout=block_config.triangle_attention_starting_node.dropout,
             backend="auto",
         )
+        self.template_msa_embedder: AlphaFold2MultimerTemplateMsaEmbedder | None = None
+        if template_config.enabled:
+            self.template_msa_embedder = AlphaFold2MultimerTemplateMsaEmbedder(
+                msa_size=evoformer_config.msa_size,
+                vocab_size=template_config.vocab_size,
+            )
         self.evoformer_stack = evoformer_stack_type(
             num_blocks=evoformer_config.num_blocks,
             msa_size=evoformer_config.msa_size,
@@ -1046,56 +1030,91 @@ class AlphaFold2MultimerModel(AlphaFold2Model):
             num_bins=heads.predicted_lddt.num_plddt_bins,
         )
         # The multimer TM head is always present.
-        self.predicted_aligned_error_head = AlphaFold2PredictedAlignedErrorHead(
-            pair_size=evoformer_config.pair_size,
-            num_bins=heads.predicted_aligned_error.num_pae_bins,
+        self.predicted_aligned_error_head = nn.Linear(
+            evoformer_config.pair_size,
+            heads.predicted_aligned_error.num_pae_bins,
         )
-        self.experimentally_resolved_head = AlphaFold2ExperimentallyResolvedHead(
-            input_size=evoformer_config.single_size,
-            num_atom_types=heads.experimentally_resolved.num_atom_types,
+        nn.init.zeros_(self.predicted_aligned_error_head.weight)
+        nn.init.zeros_(self.predicted_aligned_error_head.bias)
+        self.experimentally_resolved_head = nn.Linear(
+            evoformer_config.single_size,
+            heads.experimentally_resolved.num_atom_types,
         )
-        self.masked_msa_head = AlphaFold2MaskedMsaHead(
-            msa_size=evoformer_config.msa_size,
-            num_output=heads.masked_msa.num_output,
+        nn.init.zeros_(self.experimentally_resolved_head.weight)
+        nn.init.zeros_(self.experimentally_resolved_head.bias)
+        self.masked_msa_head = nn.Linear(
+            evoformer_config.msa_size,
+            heads.masked_msa.num_output,
         )
+        nn.init.zeros_(self.masked_msa_head.weight)
+        nn.init.zeros_(self.masked_msa_head.bias)
         self.post_init()
 
-    def _realize_msa_features(
+    def forward(
         self,
-        msa_tokens: Tensor,
-        msa_deletions: Tensor,
-        msa_profile: Tensor,
+        input: AlphaFold2Input | AlphaFold2MultimerInput,
         *,
-        generator: torch.Generator | None,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> _MsaRealization:
+        recycling_steps: int | None = None,
+        generator: torch.Generator | None = None,
+    ) -> AlphaFold2Output:
         r"""
-        Realize one multimer MSA-feature ensemble slice from the raw pool.
+        Run one AlphaFold 2 structure-prediction pass.
 
-        Runs multimer MSA sampling, masking, nearest-neighbor clustering, and feature
-        assembly over the raw paired alignment tensors supplied by the shared
-        realization boundary. Every draw consumes the per-sample ``generator`` so
-        the slice is reproducible from the fold seed.
+        The input tensors use batch and residue axes ``(B, N)``. When
+        ``input.msa_features`` is absent, ``generator`` controls MSA row sampling,
+        masking, clustering, and extra-MSA cropping. Precomputed MSA features do
+        not consume this generator. Dropout follows the module's training mode and
+        uses PyTorch's ambient random state.
+
+        Args:
+            input: Monomer or multimer features aligned to ``B`` systems and ``N``
+                residues.
+            recycling_steps: Total network passes, including the final pass.
+                ``None`` uses the configured value.
+            generator: Optional generator for stochastic MSA feature construction.
+
+        Returns:
+            Predictions with atom37 coordinates in angstroms and tensor axes
+            described by [`AlphaFold2Output`][].
+
+        Raises:
+            ValueError: If ``recycling_steps`` is not positive.
         """
 
-        cfg = self.config.msa
-        return _realize_multimer_msa_features(
-            msa_tokens,
-            msa_deletions,
-            msa_profile,
-            max_msa_clusters=cfg.max_msa_clusters,
-            max_extra_msa=cfg.max_extra_msa,
-            msa_cluster_features=cfg.msa_cluster_features,
-            gap_agreement_weight=cfg.gap_agreement_weight,
-            masked_msa_enabled=cfg.masked_msa_enabled,
-            uniform_prob=cfg.masked_msa_uniform_prob,
-            profile_prob=cfg.masked_msa_profile_prob,
-            same_prob=cfg.masked_msa_same_prob,
-            replace_fraction=cfg.masked_msa_replace_fraction,
-            generator=generator,
-            device=device,
-            dtype=dtype,
+        recycling_steps = operator.index(self._recycling_steps if recycling_steps is None else recycling_steps)
+        if recycling_steps < 1:
+            raise ValueError("recycling_steps must be positive")
+
+        msa, single, pair, structure, realized, num_recycles = self._run_recycling(
+            input, recycling_steps=recycling_steps, generator=generator
+        )
+        assert realized.msa_features is not None
+        num_msa_rows = realized.msa_features.shape[-3]
+        distogram_logits = self.distogram_head(pair)
+        plddt_logits = self.predicted_lddt_head(structure.structure_module)
+        pae_logits = None if self.predicted_aligned_error_head is None else self.predicted_aligned_error_head(pair)
+        resolved_logits = self.experimentally_resolved_head(single)
+        masked_msa_logits = self.masked_msa_head(msa.narrow(-3, 0, num_msa_rows))
+        return AlphaFold2Output(
+            single=single,
+            pair=pair,
+            frames=structure.traj,
+            atom14_positions=structure.atom14_positions,
+            sidechain_frames=structure.sidechain_frames,
+            final_atom_positions=structure.final_atom_positions,
+            final_atom_mask=structure.final_atom_mask,
+            final_atom14_positions=structure.final_atom14_positions,
+            final_atom14_mask=structure.final_atom14_mask,
+            sidechain_angles=structure.sidechain_angles,
+            sidechain_unnormalized_angles=structure.sidechain_unnormalized_angles,
+            true_msa=realized.true_msa,
+            bert_mask=realized.bert_mask,
+            distogram_logits=distogram_logits,
+            masked_msa_logits=masked_msa_logits,
+            plddt_logits=plddt_logits,
+            pae_logits=pae_logits,
+            resolved_logits=resolved_logits,
+            num_recycles=num_recycles,
         )
 
     @torch.inference_mode()
@@ -1210,6 +1229,254 @@ class AlphaFold2MultimerModel(AlphaFold2Model):
             metrics=metrics,
             pair_metrics=pair_metrics,
         )
+
+    def _run_recycling(
+        self,
+        input: _AlphaFold2InputT,
+        *,
+        recycling_steps: int,
+        generator: torch.Generator | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor, AlphaFold2StructureModuleOutput, _AlphaFold2InputT, int]:
+        needs_realize = input.msa_features is None
+        resample = needs_realize and self._resample_msa_in_recycling
+        fixed_ensemble: tuple[_AlphaFold2InputT, ...] | None = None
+        if needs_realize and not resample:
+            fixed_ensemble = tuple(self._realize_msa(input, generator=generator) for _ in range(self.num_ensembles))
+        previous_positions, previous_msa_first_row, previous_pair = self._initial_recycling(input)
+        early_stop_tolerance = self.config.recycle_early_stop_tolerance
+        stop_after_cycle = False
+        for cycle in range(recycling_steps):
+            if needs_realize:
+                if resample:
+                    cycle_inputs = tuple(
+                        self._realize_msa(input, generator=generator) for _ in range(self.num_ensembles)
+                    )
+                else:
+                    assert fixed_ensemble is not None
+                    cycle_inputs = fixed_ensemble
+            else:
+                cycle_inputs = (input,) * self.num_ensembles
+            final_cycle = stop_after_cycle or cycle == recycling_steps - 1
+            grad_enabled = torch.is_grad_enabled() and final_cycle
+            with torch.set_grad_enabled(grad_enabled):
+                msa, single, pair, msa_first_row, cycle_input = self._run_ensemble(
+                    cycle_inputs,
+                    previous_positions=previous_positions,
+                    previous_msa_first_row=previous_msa_first_row,
+                    previous_pair=previous_pair,
+                )
+                structure = self.structure_module(single, pair, cycle_input)
+            if final_cycle:
+                break
+            next_positions = structure.final_atom_positions.detach()
+            if early_stop_tolerance is not None:
+                ca_index = residue_constants.atom_order["CA"]
+                previous_ca = previous_positions[..., ca_index, :]
+                next_ca = next_positions[..., ca_index, :]
+                previous_distances = torch.sqrt(
+                    torch.square(previous_ca.unsqueeze(-2) - previous_ca.unsqueeze(-3)).sum(dim=-1)
+                )
+                next_distances = torch.sqrt(torch.square(next_ca.unsqueeze(-2) - next_ca.unsqueeze(-3)).sum(dim=-1))
+                squared_difference = torch.square(previous_distances - next_distances)
+                pair_mask = input.sequence_mask.unsqueeze(-1) * input.sequence_mask.unsqueeze(-2)
+                mean_squared_difference = (squared_difference * pair_mask).sum(dim=(-2, -1)) / (
+                    pair_mask.sum(dim=(-2, -1)) + 1e-10
+                )
+                difference = torch.sqrt(mean_squared_difference + 1e-8)
+                stop_after_cycle = bool((difference <= early_stop_tolerance).all())
+            previous_positions = next_positions
+            previous_msa_first_row = msa_first_row.detach()
+            previous_pair = pair.detach()
+        return msa, single, pair, structure, cycle_input, cycle
+
+    def _run_ensemble(
+        self,
+        inputs: tuple[_AlphaFold2InputT, ...],
+        *,
+        previous_positions: Tensor,
+        previous_msa_first_row: Tensor,
+        previous_pair: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, _AlphaFold2InputT]:
+        selected_msa = None
+        selected_input = inputs[0]
+        single_sum = None
+        pair_sum = None
+        msa_first_row_sum = None
+        for ensemble_input in inputs:
+            msa, single, pair, msa_first_row = self._embed_and_refine(
+                ensemble_input,
+                previous_positions=previous_positions,
+                previous_msa_first_row=previous_msa_first_row,
+                previous_pair=previous_pair,
+            )
+            selected_msa = msa
+            selected_input = ensemble_input
+            single_sum = single if single_sum is None else single_sum + single
+            pair_sum = pair if pair_sum is None else pair_sum + pair
+            msa_first_row_sum = msa_first_row if msa_first_row_sum is None else msa_first_row_sum + msa_first_row
+
+        assert selected_msa is not None
+        assert single_sum is not None
+        assert pair_sum is not None
+        assert msa_first_row_sum is not None
+        if len(inputs) == 1:
+            return selected_msa, single_sum, pair_sum, msa_first_row_sum, selected_input
+        scale = 1.0 / len(inputs)
+        return (
+            selected_msa,
+            single_sum * scale,
+            pair_sum * scale,
+            msa_first_row_sum * scale,
+            selected_input,
+        )
+
+    def _realize_msa(self, input: _AlphaFold2InputT, *, generator: torch.Generator | None) -> _AlphaFold2InputT:
+        r"""
+        Realize one MSA-feature ensemble slice from the raw pool.
+
+        Runs MSA sampling, masking, nearest-neighbor clustering, cluster
+        summarization, extra-MSA cropping, and feature assembly over the raw
+        alignment tensors supplied by the shared realization boundary. Every draw
+        consumes the per-sample ``generator`` so the slice is reproducible from the
+        fold seed.
+        """
+
+        device = input.token_features.device
+        dtype = input.token_features.dtype
+        realized_batch = [
+            self._realize_msa_features(
+                msa_tokens,
+                msa_deletions,
+                msa_profile,
+                generator=generator,
+                device=device,
+                dtype=dtype,
+            )
+            for msa_tokens, msa_deletions, msa_profile in zip(
+                input.msa_tokens,
+                input.msa_deletions,
+                input.msa_profile,
+                strict=True,
+            )
+        ]
+        msa_features, msa_mask, extra_msa_features, extra_msa_mask, bert_mask, true_msa = (
+            torch.stack(values) for values in zip(*realized_batch, strict=True)
+        )
+        realized = copy(input)
+        realized.msa_features = msa_features
+        realized.msa_mask = msa_mask
+        realized.extra_msa_features = extra_msa_features
+        realized.extra_msa_mask = extra_msa_mask
+        realized.bert_mask = bert_mask
+        realized.true_msa = true_msa
+        return realized
+
+    def _realize_msa_features(
+        self,
+        msa_tokens: Tensor,
+        msa_deletions: Tensor,
+        msa_profile: Tensor,
+        *,
+        generator: torch.Generator | None,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> _MsaRealization:
+        r"""
+        Realize one multimer MSA-feature ensemble slice from the raw pool.
+
+        Runs multimer MSA sampling, masking, nearest-neighbor clustering, and feature
+        assembly over the raw paired alignment tensors supplied by the shared
+        realization boundary. Every draw consumes the per-sample ``generator`` so
+        the slice is reproducible from the fold seed.
+        """
+
+        cfg = self.config.msa
+        return _realize_multimer_msa_features(
+            msa_tokens,
+            msa_deletions,
+            msa_profile,
+            max_msa_clusters=cfg.max_msa_clusters,
+            max_extra_msa=cfg.max_extra_msa,
+            msa_cluster_features=cfg.msa_cluster_features,
+            gap_agreement_weight=cfg.gap_agreement_weight,
+            masked_msa_enabled=cfg.masked_msa_enabled,
+            uniform_prob=cfg.masked_msa_uniform_prob,
+            profile_prob=cfg.masked_msa_profile_prob,
+            same_prob=cfg.masked_msa_same_prob,
+            replace_fraction=cfg.masked_msa_replace_fraction,
+            generator=generator,
+            device=device,
+            dtype=dtype,
+        )
+
+    def _embed_and_refine(
+        self,
+        input: _AlphaFold2RecyclingInput,
+        *,
+        previous_positions: Tensor,
+        previous_msa_first_row: Tensor,
+        previous_pair: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        msa, pair, msa_mask, pair_mask = self.input_embeddings(input)
+        msa, pair = self.recycling_embeddings(
+            msa,
+            pair,
+            input=input,
+            previous_positions=previous_positions,
+            previous_msa_first_row=previous_msa_first_row,
+            previous_pair=previous_pair,
+        )
+        pair = pair * pair_mask.unsqueeze(-1).to(dtype=pair.dtype)
+        pair = self._add_template_embedding(pair, input, pair_mask)
+        extra_msa = self.extra_msa_projection(input.extra_msa_features)
+        extra_msa_mask = input.extra_msa_mask
+        extra_msa, pair = self.extra_msa_stack(
+            extra_msa,
+            pair,
+            msa_mask=extra_msa_mask,
+            pair_mask=pair_mask,
+        )
+        if self.template_msa_embedder is not None:
+            template_activations, template_mask = self.template_msa_embedder(input)
+            msa = torch.cat([msa, template_activations], dim=-3)
+            msa_mask = torch.cat([msa_mask, template_mask], dim=-2)
+        msa, pair = self.evoformer_stack(
+            msa,
+            pair,
+            msa_mask=msa_mask,
+            pair_mask=pair_mask,
+        )
+        msa_first_row = msa.select(dim=-3, index=0)
+        single = self.single_projection(msa_first_row)
+        return msa, single, pair, msa_first_row
+
+    def _initial_recycling(self, input: _AlphaFold2RecyclingInput) -> tuple[Tensor, Tensor, Tensor]:
+        token_shape = input.sequence_mask.shape
+        num_tokens = token_shape[-1]
+        dtype = input.token_features.dtype
+        device = input.token_features.device
+        return (
+            torch.zeros(*token_shape, residue_constants.atom_type_num, 3, device=device, dtype=dtype),
+            torch.zeros(
+                *token_shape,
+                self.input_embeddings.msa_projection.out_features,
+                device=device,
+                dtype=dtype,
+            ),
+            torch.zeros(
+                *token_shape[:-1],
+                num_tokens,
+                num_tokens,
+                self.input_embeddings.pair_left_projection.out_features,
+                device=device,
+                dtype=dtype,
+            ),
+        )
+
+    def _add_template_embedding(self, pair: Tensor, input: _AlphaFold2RecyclingInput, pair_mask: Tensor) -> Tensor:
+        if self.template_embedder is None:
+            return pair
+        return pair + self.template_embedder(pair, input, pair_mask=pair_mask)
 
 
 class AlphaFold2StructureModule(nn.Module):
@@ -1732,9 +1999,9 @@ class AlphaFold2RecyclingEmbeddings(nn.Module):
         self.previous_positions_min_distance = previous_positions_min_distance
         self.previous_positions_max_distance = previous_positions_max_distance
         self.previous_positions_num_distogram_bins = previous_positions_num_distogram_bins
-        self.previous_positions_projection = nn.Linear(previous_positions_num_distogram_bins, pair_size)
         self.previous_msa_first_row_norm = LayerNorm(msa_size)
         self.previous_pair_norm = LayerNorm(pair_size)
+        self.previous_positions_projection = nn.Linear(previous_positions_num_distogram_bins, pair_size)
 
     def forward(
         self,
@@ -1786,24 +2053,6 @@ class AlphaFold2RecyclingEmbeddings(nn.Module):
         return ((squared_distances.unsqueeze(-1) > lower_breaks) & (squared_distances.unsqueeze(-1) < upper_breaks)).to(
             dtype=dtype
         )
-
-
-class AlphaFold2ExtraMsaEmbeddings(nn.Module):
-    r"""
-    Embed extra-MSA features before the extra-MSA Evoformer stack.
-    """
-
-    def __init__(
-        self,
-        *,
-        extra_msa_feature_size: int,
-        extra_msa_size: int,
-    ) -> None:
-        super().__init__()
-        self.extra_msa_projection = nn.Linear(extra_msa_feature_size, extra_msa_size)
-
-    def forward(self, input: AlphaFold2Input) -> tuple[Tensor, Tensor]:
-        return self.extra_msa_projection(input.extra_msa_features), input.extra_msa_mask
 
 
 class AlphaFold2SingleTemplateEmbedder(nn.Module):
@@ -1941,8 +2190,8 @@ class AlphaFold2MultimerSingleTemplateEmbedder(nn.Module):
         self.unit_vector_y_projection = nn.Linear(1, template_size)
         self.unit_vector_z_projection = nn.Linear(1, template_size)
         self.backbone_pair_mask_projection = nn.Linear(1, template_size)
-        self.query_pair_projection = nn.Linear(query_size, template_size)
         self.query_embedding_norm = LayerNorm(query_size, backend=backend)
+        self.query_pair_projection = nn.Linear(query_size, template_size)
         self.template_pair_stack = AlphaFold2MultimerTemplatePairStack(
             num_blocks=num_blocks,
             pair_size=template_size,
@@ -2136,6 +2385,7 @@ class AlphaFold2TemplatePairBlock(nn.Module):
             num_attention_heads=num_triangle_attention_heads,
             backend=backend,
         )
+        self.rowwise_dropout = StructuredDropout(dropout, broadcast_dims=-3)
         self.triangle_attention_ending_node = EvoformerTriangleAttention(
             pair_size=pair_size,
             head_dim=triangle_attention_hidden_size,
@@ -2155,7 +2405,6 @@ class AlphaFold2TemplatePairBlock(nn.Module):
             backend=backend,
         )
         self.transition = EvoformerTransition(pair_size, expansion=transition_expansion)
-        self.rowwise_dropout = StructuredDropout(dropout, broadcast_dims=-3)
 
     def forward(self, pair: Tensor, *, pair_mask: Tensor) -> Tensor:
         pair = pair + self.rowwise_dropout(self.triangle_attention_starting_node(pair, pair_mask))
@@ -2235,6 +2484,7 @@ class AlphaFold2MultimerTemplatePairBlock(nn.Module):
             outgoing=True,
             backend=backend,
         )
+        self.rowwise_dropout = StructuredDropout(dropout, broadcast_dims=-3)
         self.triangle_multiplication_incoming = EvoformerTriangleMultiplication(
             pair_size=pair_size,
             hidden_size=triangle_multiplication_hidden_size,
@@ -2254,7 +2504,6 @@ class AlphaFold2MultimerTemplatePairBlock(nn.Module):
             backend=backend,
         )
         self.transition = EvoformerTransition(pair_size, expansion=transition_expansion)
-        self.rowwise_dropout = StructuredDropout(dropout, broadcast_dims=-3)
 
     def forward(self, pair: Tensor, *, pair_mask: Tensor) -> Tensor:
         pair = pair + self.rowwise_dropout(self.triangle_multiplication_outgoing(pair, pair_mask))
@@ -2441,12 +2690,12 @@ class AlphaFold2InvariantPointAttention(nn.Module):
         self.key_value_scalar_projection = nn.Linear(hidden_size, num_attention_heads * (num_scalar_v + num_scalar_qk))
         self.query_point_projection = nn.Linear(hidden_size, num_attention_heads * 3 * num_point_qk)
         self.key_value_point_projection = nn.Linear(hidden_size, num_attention_heads * 3 * (num_point_qk + num_point_v))
+        self.trainable_point_weights = nn.Parameter(torch.empty(num_attention_heads))
         self.pair_bias_projection = nn.Linear(pair_size, num_attention_heads)
         output_size = (
             num_attention_heads * num_scalar_v + 4 * num_attention_heads * num_point_v + num_attention_heads * pair_size
         )
         self.output_projection = nn.Linear(output_size, hidden_size)
-        self.trainable_point_weights = nn.Parameter(torch.empty(num_attention_heads))
         nn.init.constant_(self.trainable_point_weights, math.log(math.exp(1.0) - 1.0))
         nn.init.zeros_(self.output_projection.weight)
         nn.init.zeros_(self.output_projection.bias)
@@ -2537,14 +2786,14 @@ class AlphaFold2MultimerInvariantPointAttention(nn.Module):
         self.num_point_qk = num_point_qk
         self.num_point_v = num_point_v
         self.inf = inf
-        self.query_scalar_projection = nn.Linear(hidden_size, num_attention_heads * num_scalar_qk, bias=False)
-        self.key_scalar_projection = nn.Linear(hidden_size, num_attention_heads * num_scalar_qk, bias=False)
-        self.value_scalar_projection = nn.Linear(hidden_size, num_attention_heads * num_scalar_v, bias=False)
+        self.trainable_point_weights = nn.Parameter(torch.zeros(num_attention_heads))
         self.query_point_projection = AlphaFold2MultimerPointProjection(hidden_size, num_point_qk, num_attention_heads)
         self.key_point_projection = AlphaFold2MultimerPointProjection(hidden_size, num_point_qk, num_attention_heads)
-        self.value_point_projection = AlphaFold2MultimerPointProjection(hidden_size, num_point_v, num_attention_heads)
+        self.query_scalar_projection = nn.Linear(hidden_size, num_attention_heads * num_scalar_qk, bias=False)
+        self.key_scalar_projection = nn.Linear(hidden_size, num_attention_heads * num_scalar_qk, bias=False)
         self.pair_bias_projection = nn.Linear(pair_size, num_attention_heads)
-        self.trainable_point_weights = nn.Parameter(torch.zeros(num_attention_heads))
+        self.value_scalar_projection = nn.Linear(hidden_size, num_attention_heads * num_scalar_v, bias=False)
+        self.value_point_projection = AlphaFold2MultimerPointProjection(hidden_size, num_point_v, num_attention_heads)
         output_size = num_attention_heads * (pair_size + num_scalar_v + num_point_v * 4)
         self.output_projection = nn.Linear(output_size, hidden_size)
 
@@ -2873,51 +3122,6 @@ class AlphaFold2PredictedLddtHead(nn.Module):
         act = F.relu(self.input_projection(act))
         act = F.relu(self.hidden_projection(act))
         return self.logits(act)
-
-
-class AlphaFold2PredictedAlignedErrorHead(nn.Module):
-    r"""
-    Predict aligned-error bin logits for each residue pair.
-    """
-
-    def __init__(self, *, pair_size: int, num_bins: int) -> None:
-        super().__init__()
-        self.logits = nn.Linear(pair_size, num_bins)
-        nn.init.zeros_(self.logits.weight)
-        nn.init.zeros_(self.logits.bias)
-
-    def forward(self, pair: Tensor) -> Tensor:
-        return self.logits(pair)
-
-
-class AlphaFold2ExperimentallyResolvedHead(nn.Module):
-    r"""
-    Predict experimentally resolved logits for each atom.
-    """
-
-    def __init__(self, *, input_size: int, num_atom_types: int) -> None:
-        super().__init__()
-        self.logits = nn.Linear(input_size, num_atom_types)
-        nn.init.zeros_(self.logits.weight)
-        nn.init.zeros_(self.logits.bias)
-
-    def forward(self, single: Tensor) -> Tensor:
-        return self.logits(single)
-
-
-class AlphaFold2MaskedMsaHead(nn.Module):
-    r"""
-    Predict token logits for masked-MSA reconstruction.
-    """
-
-    def __init__(self, *, msa_size: int, num_output: int) -> None:
-        super().__init__()
-        self.logits = nn.Linear(msa_size, num_output)
-        nn.init.zeros_(self.logits.weight)
-        nn.init.zeros_(self.logits.bias)
-
-    def forward(self, msa: Tensor) -> Tensor:
-        return self.logits(msa)
 
 
 # ``fold()`` returns an unrelaxed ``FoldPrediction``; callers may apply

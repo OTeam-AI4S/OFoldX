@@ -5,7 +5,7 @@ RFdiffusion denoiser, sampler, and public scientific modules.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from operator import index as integer_index
 from typing import Literal, cast
@@ -41,13 +41,11 @@ from ...data.molecular import (
 from ...data.placement import (
     ExistingSpan,
     GeneratedSegment,
-    InstanceIdAllocator,
     PlacementMap,
 )
 from ...data.placement import PlacementSpec as PlacementMapping
 from ...data.placement import SymbolicAtomSite, SymbolicResidueSite
 from ...data.placement import instance_of as derive_instance_of
-from ...data.placement import symbolic_residue_aliases
 from ...data.structure import Structure
 from ...model import Model
 from ...modules.attention import GatedMultiheadAttention, ProjectedAttention
@@ -59,7 +57,12 @@ from ...modules.backend import (
     WeightedTensorProduct,
 )
 from ...modules.diffusion.ddpm import ddpm_forward_step, ddpm_posterior
-from ...modules.diffusion.igso3 import calculate_igso3, so3_exp_map, so3_log_map, so3_project_to_rotation
+from ...modules.diffusion.igso3 import (
+    calculate_igso3,
+    so3_exp_map,
+    so3_log_map,
+    so3_project_to_rotation,
+)
 from ...modules.dropout import StructuredDropout
 from ...modules.geometry import rigid_from_three_points
 from ...modules.potential import (
@@ -88,6 +91,30 @@ _IGSO3_FIELDS: tuple[tuple[str, tuple[int, ...]], ...] = (
     ("discrete_omega", (_IGSO3_NUM_OMEGA,)),
     ("discrete_sigma", (_IGSO3_NUM_SIGMA,)),
 )
+
+
+def _index_output_residues(
+    references: Sequence[ComponentReference | SymbolicResidueSite],
+) -> tuple[
+    dict[ComponentReference | SymbolicResidueSite, int],
+    dict[str, tuple[int, ...]],
+]:
+    rows = {reference: row for row, reference in enumerate(references)}
+    symbolic: dict[str, list[int]] = {}
+    for row, reference in enumerate(references):
+        if isinstance(reference, SymbolicResidueSite):
+            symbolic.setdefault(reference.placement_id, []).append(row)
+    return rows, {placement_id: tuple(indices) for placement_id, indices in symbolic.items()}
+
+
+def _output_residue_row(
+    reference: ComponentReference | SymbolicResidueSite,
+    rows: Mapping[ComponentReference | SymbolicResidueSite, int],
+    symbolic_rows: Mapping[str, tuple[int, ...]],
+) -> int:
+    if isinstance(reference, SymbolicResidueSite) and reference.offset < 0:
+        return symbolic_rows[reference.placement_id][reference.offset]
+    return rows[reference]
 
 
 class RfDiffusionModel(Model):
@@ -163,6 +190,7 @@ class RfDiffusionModel(Model):
 
     config_class = RfDiffusionConfig
     config: RfDiffusionConfig
+    _igso3_cache_cdf: Tensor | None
 
     def __init__(self, config: RfDiffusionConfig | None = None) -> None:
         config = RfDiffusionConfig() if config is None else config
@@ -199,6 +227,7 @@ class RfDiffusionModel(Model):
         # lookup table before the model repository is saved.
         for name, shape in _IGSO3_FIELDS:
             self.register_buffer(f"igso3_{name}", torch.zeros(shape, dtype=torch.float64), persistent=True)
+            self.register_buffer(f"_igso3_cache_{name}", None, persistent=False)
         self.register_buffer(
             "igso3_schedule_present",
             torch.tensor(False, dtype=torch.bool),
@@ -206,18 +235,45 @@ class RfDiffusionModel(Model):
         )
         self.post_init()
 
-    def _igso3_schedule(self) -> dict[str, Tensor] | None:
+    def _igso3_schedule(self) -> dict[str, Tensor]:
         r"""
-        Return the populated IGSO(3) lookup table, if one was converted.
+        Return a populated IGSO(3) lookup table.
 
-        The float64 tables are handed to the diffuser as the persistent buffers
-        themselves (no per-design NumPy round-trip); the diffuser holds them as its
-        own buffers on the same device.
+        Converted Models carry the released persistent table. A fresh Model computes
+        its config's table once into non-persistent buffers on the Model's current
+        device and dtype.
         """
 
-        if not bool(self.igso3_schedule_present):
-            return None
-        return {name: getattr(self, f"igso3_{name}") for name, _ in _IGSO3_FIELDS}
+        if bool(self.igso3_schedule_present):
+            return {name: getattr(self, f"igso3_{name}") for name, _ in _IGSO3_FIELDS}
+        if self._igso3_cache_cdf is None:
+            config = self.config.diffuser
+            max_sigma = (
+                config.min_rotation_sigma
+                + config.min_rotation_beta
+                + 0.5 * (config.max_rotation_beta - config.min_rotation_beta)
+                if config.rotation_schedule_type == "linear"
+                else config.max_rotation_sigma
+            )
+            schedule = calculate_igso3(
+                num_sigma=_IGSO3_NUM_SIGMA,
+                min_sigma=config.min_rotation_sigma,
+                max_sigma=max_sigma,
+                num_omega=_IGSO3_NUM_OMEGA,
+                num_terms=2000,
+            )
+            for name, _shape in _IGSO3_FIELDS:
+                release_buffer = getattr(self, f"igso3_{name}")
+                setattr(
+                    self,
+                    f"_igso3_cache_{name}",
+                    torch.as_tensor(
+                        schedule[name],
+                        device=release_buffer.device,
+                        dtype=release_buffer.dtype,
+                    ),
+                )
+        return {name: cast(Tensor, getattr(self, f"_igso3_cache_{name}")) for name, _ in _IGSO3_FIELDS}
 
     def forward(
         self,
@@ -1507,73 +1563,54 @@ class RfDiffusionStructureUpdate(nn.Module):
         # SE(3)/frame geometry must run in fp32; disable autocast device-generically. A "cuda"-hardcoded
         # guard is a no-op on CPU/MPS/XPU, where an ambient autocast would silently downcast this math.
         with torch.autocast(device_type=msa.device.type, enabled=False):
-            return self._structure_update(
-                msa,
-                pair,
-                input_rotations,
-                input_translations,
-                coords,
-                state,
-                residue_index,
-                fixed_structure_mask,
-                cyclic_mask,
-                top_k,
+            batch_size, _, length = msa.shape[:3]
+            fixed_structure_mask = (
+                torch.zeros_like(residue_index, dtype=torch.bool)
+                if fixed_structure_mask is None
+                else fixed_structure_mask
+            )
+            if fixed_structure_mask.ndim == 1:
+                fixed_structure_mask = fixed_structure_mask.unsqueeze(0).expand(batch_size, -1)
+
+            node = torch.cat((self.msa_norm(msa[:, 0]), self.state_norm(state)), dim=-1)
+            node = self.node_norm(self.node_projection(node))
+            pair = self.pair_edge_norm(self.pair_projection(self.pair_norm(pair)))
+
+            neighbor = _sequence_separation(residue_index, cyclic_mask)
+            pair = torch.cat((pair, _backbone_ca_distogram(coords), neighbor), dim=-1)
+            pair = self.geometry_norm(self.geometry_projection(pair))
+
+            ca_coords = coords[:, :, 1, :]
+            graph, edge_features = (
+                _top_k_graph(ca_coords, pair, residue_index, top_k=top_k)
+                if top_k != 0
+                else _full_graph(ca_coords, pair, residue_index)
+            )
+            vector_features = (coords - ca_coords.unsqueeze(2)).reshape(batch_size * length, -1, 3)
+            shift = self.structure_module(
+                graph,
+                node.reshape(batch_size * length, -1, 1),
+                vector_features,
+                edge_features,
             )
 
-    def _structure_update(
-        self,
-        msa: Tensor,
-        pair: Tensor,
-        input_rotations: Tensor,
-        input_translations: Tensor,
-        coords: Tensor,
-        state: Tensor,
-        residue_index: Tensor,
-        fixed_structure_mask: Tensor | None,
-        cyclic_mask: Tensor | None = None,
-        top_k: int = 64,
-    ) -> _RfDiffusionStructureUpdateOutput:
-        batch_size, _, length = msa.shape[:3]
-        fixed_structure_mask = (
-            torch.zeros_like(residue_index, dtype=torch.bool) if fixed_structure_mask is None else fixed_structure_mask
-        )
-        if fixed_structure_mask.ndim == 1:
-            fixed_structure_mask = fixed_structure_mask.unsqueeze(0).expand(batch_size, -1)
+            state = shift["0"].reshape(batch_size, length, -1)
+            offset = shift["1"].reshape(batch_size, length, 2, 3)
+            offset = offset.masked_fill(fixed_structure_mask[:, :, None, None], 0)
 
-        node = torch.cat((self.msa_norm(msa[:, 0]), self.state_norm(state)), dim=-1)
-        node = self.node_norm(self.node_projection(node))
-        pair = self.pair_edge_norm(self.pair_projection(self.pair_norm(pair)))
-
-        neighbor = _sequence_separation(residue_index, cyclic_mask)
-        pair = torch.cat((pair, _backbone_ca_distogram(coords), neighbor), dim=-1)
-        pair = self.geometry_norm(self.geometry_projection(pair))
-
-        ca_coords = coords[:, :, 1, :]
-        graph, edge_features = (
-            _top_k_graph(ca_coords, pair, residue_index, top_k=top_k)
-            if top_k != 0
-            else _full_graph(ca_coords, pair, residue_index)
-        )
-        vector_features = (coords - ca_coords.unsqueeze(2)).reshape(batch_size * length, -1, 3)
-        shift = self.structure_module(graph, node.reshape(batch_size * length, -1, 1), vector_features, edge_features)
-
-        state = shift["0"].reshape(batch_size, length, -1)
-        offset = shift["1"].reshape(batch_size, length, 2, 3)
-        offset = offset.masked_fill(fixed_structure_mask[:, :, None, None], 0)
-
-        translations = offset[:, :, 0, :] / 10.0
-        rotation_vector = offset[:, :, 1, :] / 100.0
-        delta_rotations = _quaternion_update_matrix(rotation_vector, device=coords.device)
-        rotations = einsum("bnij,bnjk->bnik", delta_rotations, input_rotations)
-        translations = translations + input_translations
-        torsion_angles = self.torsion_head(msa[:, 0], state)
-        return _RfDiffusionStructureUpdateOutput(
-            rotations=rotations,
-            translations=translations,
-            state=state,
-            torsion_angles=torsion_angles,
-            batch_size=[batch_size],
-        )
+            translations = offset[:, :, 0, :] / 10.0
+            rotation_vector = offset[:, :, 1, :] / 100.0
+            delta_rotations = _quaternion_update_matrix(rotation_vector, device=coords.device)
+            rotations = einsum("bnij,bnjk->bnik", delta_rotations, input_rotations)
+            translations = translations + input_translations
+            torsion_angles = self.torsion_head(msa[:, 0], state)
+            return _RfDiffusionStructureUpdateOutput(
+                rotations=rotations,
+                translations=translations,
+                state=state,
+                torsion_angles=torsion_angles,
+                batch_size=[batch_size],
+            )
 
 
 class RfDiffusionTransition(nn.Module):
@@ -2132,7 +2169,6 @@ class RfDiffusionSe3Convolution(nn.Module):
         self.fused_output = unique_channels_in and fiber_in.degrees == degrees_up_to_max
         self.output_convolutions = nn.ModuleDict()
         self.input_convolutions = nn.ModuleDict()
-        self.segment_sum = SegmentSumCsr()
 
         if self.fused_output:
             for degree_out, channels_out in fiber_out.items():
@@ -2162,6 +2198,7 @@ class RfDiffusionSe3Convolution(nn.Module):
                     self.self_interaction_weights[str(degree_out)] = nn.Parameter(
                         torch.randn(channels_out, fiber_in[degree_out]) / math.sqrt(fiber_in[degree_out])
                     )
+        self.segment_sum = SegmentSumCsr()
 
     def forward(
         self,
@@ -2436,9 +2473,9 @@ class RfDiffusionAllAtomReconstruction(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         frame_indices, base_frame_transforms, base_frame_coordinates = _RF_ATOM14_KINEMATICS
-        self.register_buffer("frame_indices", frame_indices, persistent=False)
         self.register_buffer("base_frame_transforms", base_frame_transforms, persistent=False)
         self.register_buffer("base_frame_coordinates", base_frame_coordinates, persistent=False)
+        self.register_buffer("frame_indices", frame_indices, persistent=False)
 
     def forward(
         self,
@@ -2720,17 +2757,9 @@ class RfDiffusionTranslationDiffuser:
 
 def _interp1d(x: Tensor, xp: Tensor, fp: Tensor) -> Tensor:
     r"""
-    One-dimensional linear interpolation matching ``numpy.interp`` for increasing ``xp``.
+    Linearly interpolate increasing one-dimensional samples.
 
-    Query points outside ``[xp[0], xp[-1]]`` clamp to the corresponding endpoint value.
-
-    Args:
-        x: Query points `[...]`.
-        xp: Strictly increasing sample locations `[M]`.
-        fp: Sample values `[M]`.
-
-    Returns:
-        Interpolated values with the shape of ``x``.
+    Query points outside the sample range use the nearest endpoint value.
     """
 
     index = torch.searchsorted(xp, x, right=True).clamp(1, xp.shape[-1] - 1)
@@ -2739,17 +2768,15 @@ def _interp1d(x: Tensor, xp: Tensor, fp: Tensor) -> Tensor:
     slope = (fp[index] - fp[index - 1]) / (right - left)
     interpolated = fp[index - 1] + slope * (x - left)
     interpolated = torch.where(x <= xp[0], fp[0], interpolated)
-    interpolated = torch.where(x >= xp[-1], fp[-1], interpolated)
-    return interpolated
+    return torch.where(x >= xp[-1], fp[-1], interpolated)
 
 
 class RfDiffusionIgso3Diffuser(nn.Module):
     r"""
     Isotropic-Gaussian-on-SO(3) (IGSO3) rotation diffuser and reverse sampler.
 
-    The float64 IGSO(3) lookup table is owned as persistent-free buffers so both the
-    forward frame diffusion and the reverse sampler run in pure PyTorch on the tables'
-    device without round-tripping through NumPy per design.
+    The IGSO(3) lookup table is held in non-persistent buffers. Direct construction
+    without a table calculates it once.
     """
 
     # The score-norm table buffer avoids the ``score_norm`` method name; every other
@@ -2785,22 +2812,36 @@ class RfDiffusionIgso3Diffuser(nn.Module):
         self.num_sigma = integer_index(num_sigma)
         self.truncation_level = integer_index(truncation_level)
         self.step_size = 1 / self.num_timesteps
-        # Own the released (or offline-computed) lookup table as float64 buffers on its native
-        # device; nothing round-trips through NumPy on the per-design path.
-        for key, value in self._calc_igso3_vals(igso3_schedule).items():
+        if igso3_schedule is None:
+            igso3_schedule = {
+                key: torch.as_tensor(value)
+                for key, value in calculate_igso3(
+                    num_sigma=self.num_sigma,
+                    min_sigma=self.min_sigma,
+                    max_sigma=self.max_sigma,
+                    num_omega=self.num_omega,
+                    num_terms=self.truncation_level,
+                ).items()
+            }
+        for key, value in igso3_schedule.items():
             self.register_buffer(
                 self._BUFFER_NAMES.get(key, key),
-                torch.as_tensor(value, dtype=torch.float64),
+                torch.as_tensor(value),
                 persistent=False,
             )
 
     def sigma_idx(self, sigma: Tensor | float) -> Tensor:
-        sigma_tensor = torch.as_tensor(sigma, dtype=torch.float64, device=self.discrete_sigma.device)
+        sigma_tensor = torch.as_tensor(
+            sigma,
+            dtype=self.discrete_sigma.dtype,
+            device=self.discrete_sigma.device,
+        )
         return torch.searchsorted(self.discrete_sigma, sigma_tensor, right=True) - 1
 
     def t_to_idx(self, t: int | Tensor) -> Tensor:
         sigma = self.sigma(torch.as_tensor(t, dtype=torch.float32) / self.num_timesteps).to(
-            dtype=torch.float64, device=self.discrete_sigma.device
+            dtype=self.discrete_sigma.dtype,
+            device=self.discrete_sigma.device,
         )
         return self.sigma_idx(sigma)
 
@@ -2836,7 +2877,13 @@ class RfDiffusionIgso3Diffuser(nn.Module):
             cdf = self.cdf[sigma_idx]
             rng_device = torch.device("cpu") if generator is None else generator.device
             uniform = torch.rand(n_samples, device=rng_device, generator=generator)
-            all_samples.append(_interp1d(uniform.to(device=device).double(), cdf, self.discrete_omega))
+            all_samples.append(
+                _interp1d(
+                    uniform.to(device=device, dtype=self.discrete_omega.dtype),
+                    cdf,
+                    self.discrete_omega,
+                )
+            )
         return torch.stack(all_samples, dim=0)
 
     def sample_vec(
@@ -2848,34 +2895,18 @@ class RfDiffusionIgso3Diffuser(nn.Module):
     ) -> Tensor:
         rng_device = torch.device("cpu") if generator is None else generator.device
         axes = torch.randn((len(ts), n_samples, 3), device=rng_device, generator=generator)
-        axes = axes.to(device=self.discrete_omega.device)
+        axes = axes.to(device=self.discrete_omega.device, dtype=self.discrete_omega.dtype)
         axes = axes / torch.linalg.vector_norm(axes, dim=-1, keepdim=True)
         return axes * self.sample(ts, n_samples=n_samples, generator=generator)[..., None]
 
     def score_norm(self, t: int, omega: Tensor) -> Tensor:
-        omega_tensor = torch.as_tensor(omega, dtype=torch.float64, device=self.discrete_omega.device)
+        omega_tensor = torch.as_tensor(
+            omega,
+            dtype=self.discrete_omega.dtype,
+            device=self.discrete_omega.device,
+        )
         sigma_idx = int(self.t_to_idx(t))
         return _interp1d(omega_tensor, self.discrete_omega, self.score_norm_table[sigma_idx])
-
-    def _sigma_idx_tensor(self, t: int) -> int:
-        r"""
-        The lookup-table row for timestep ``t``; a scalar host int with no per-step sync.
-        """
-
-        return int(self.t_to_idx(t))
-
-    def _score_norm_tensor(self, t: int, omega: Tensor) -> Tensor:
-        r"""
-        Torch equivalent of ``score_norm``: linear interpolation of the float64 score table.
-
-        Interpolates on ``omega``'s device so the reverse sampler keeps following the query
-        tensors, even if the tables live elsewhere.
-        """
-
-        sigma_idx = self._sigma_idx_tensor(t)
-        discrete_omega = self.discrete_omega.to(device=omega.device)
-        score_row = self.score_norm_table[sigma_idx].to(device=omega.device)
-        return _interp1d(omega, discrete_omega, score_row)
 
     def diffuse_frames(
         self,
@@ -2886,7 +2917,7 @@ class RfDiffusionIgso3Diffuser(nn.Module):
         generator: torch.Generator | None = None,
     ) -> tuple[Tensor, Tensor]:
         device = self.discrete_omega.device
-        coords_tensor = torch.as_tensor(coords, dtype=torch.float64, device=device)
+        coords_tensor = torch.as_tensor(coords, dtype=self.discrete_omega.dtype, device=device)
         t_values = np.arange(self.num_timesteps) + 1 if t_list is None else np.asarray(t_list, dtype=np.int64)
         num_res = coords_tensor.shape[0]
         N = coords_tensor[None, :, 0]
@@ -2897,7 +2928,7 @@ class RfDiffusionIgso3Diffuser(nn.Module):
         Ca_true = Ca_true[0]
         sampled_rots = self.sample_vec(t_values, n_samples=num_res, generator=generator)
         if diffusion_mask is not None:
-            mask = torch.as_tensor(diffusion_mask, dtype=torch.float64, device=device)
+            mask = torch.as_tensor(diffusion_mask, dtype=coords_tensor.dtype, device=device)
             sampled_rots = sampled_rots * (1 - mask[None, :, None])
         R_sampled = so3_exp_map(sampled_rots.reshape(-1, 3)).reshape(len(t_values), num_res, 3, 3)
         R_perturbed = torch.einsum("tnij,njk->tnik", R_sampled, R_true)
@@ -2924,11 +2955,10 @@ class RfDiffusionIgso3Diffuser(nn.Module):
         # relative rotation in float64, then take the rotation logarithm.
         rotvec = so3_log_map(so3_project_to_rotation(R_0t.double())).to(dtype=R_t_t.dtype)
         omega_value = torch.linalg.norm(rotvec, dim=-1)
-        denom = omega_value.double().clamp_min(1e-8)
-        # ``score_norm`` interpolates the float64 lookup table; keep the division in float64 to
-        # mirror ``np.interp`` promoting the float32 angles before dividing.
-        scale = self._score_norm_tensor(t, omega_value.double()) / denom
-        score = rotvec * scale.to(dtype=rotvec.dtype)[:, None]
+        score_norm = self.score_norm(t, omega_value)
+        denom = omega_value.to(device=score_norm.device, dtype=score_norm.dtype).clamp_min(1e-8)
+        scale = score_norm / denom
+        score = rotvec * scale.to(device=rotvec.device, dtype=rotvec.dtype)[:, None]
         rot_g = self.diffusion_coefficient(t / self.num_timesteps).to(device=score.device, dtype=score.dtype)
         rng_device = score.device if generator is None else generator.device
         z = torch.randn(score.shape, dtype=score.dtype, device=rng_device, generator=generator).to(score.device)
@@ -2941,27 +2971,6 @@ class RfDiffusionIgso3Diffuser(nn.Module):
         if return_perturb:
             return perturb
         return torch.einsum("...ij,...jk->...ik", perturb, R_t_t)
-
-    def _calc_igso3_vals(self, igso3_schedule: dict[str, Tensor] | None) -> dict[str, Tensor] | dict[str, np.ndarray]:
-        if (
-            igso3_schedule is not None
-            and self.num_timesteps == 50
-            and self.num_omega == 1000
-            and self.num_sigma == 500
-            and self.truncation_level == 2000
-            and self.schedule == "linear"
-            and self.min_sigma == 0.02
-            and self.min_b == 1.5
-            and self.max_b == 2.5
-        ):
-            return igso3_schedule
-        return calculate_igso3(
-            num_sigma=self.num_sigma,
-            min_sigma=self.min_sigma,
-            max_sigma=self.max_sigma,
-            num_omega=self.num_omega,
-            num_terms=self.truncation_level,
-        )
 
 
 class RfDiffusionDiffuser:
@@ -3130,6 +3139,10 @@ class RfDiffusionSampler:
             self.noise_scale_frame if final_noise_scale_frame is None else float(final_noise_scale_frame)
         )
         self.frame_noise_schedule = frame_noise_schedule
+        if ca_noise_schedule not in ("constant", "linear"):
+            raise ValueError(f"unknown CA noise schedule {ca_noise_schedule!r}")
+        if frame_noise_schedule not in ("constant", "linear"):
+            raise ValueError(f"unknown frame noise schedule {frame_noise_schedule!r}")
         if (
             ca_noise_schedule == "constant"
             and final_noise_scale_ca is not None
@@ -3596,18 +3609,6 @@ class RfDiffusionSamplerStep:
             self.beta_final,
             self.schedule_type,
         )
-        self.noise_schedule_ca = _noise_schedule(
-            self.num_timesteps,
-            self.noise_scale_ca,
-            self.final_noise_scale_ca,
-            self.ca_noise_schedule,
-        )
-        self.noise_schedule_frame = _noise_schedule(
-            self.num_timesteps,
-            self.noise_scale_frame,
-            self.final_noise_scale_frame,
-            self.frame_noise_schedule,
-        )
 
     @staticmethod
     def align_prediction_to_noisy_motif(pred_coords: Tensor, final_coords: Tensor, diffusion_mask: Tensor) -> Tensor:
@@ -3649,7 +3650,13 @@ class RfDiffusionSamplerStep:
         if align_motif and diffusion_mask.any():
             pred_coords = self.align_prediction_to_noisy_motif(pred_coords, noisy_coords, diffusion_mask)
         pred_coords = pred_coords.to(device=noisy_coords.device, dtype=noisy_coords.dtype)
-        noise_scale_ca = self.noise_schedule_ca(t)
+        noise_scale_ca = _noise_scale(
+            t,
+            self.num_timesteps,
+            self.noise_scale_ca,
+            self.final_noise_scale_ca,
+            self.ca_noise_schedule,
+        )
         _out, ca_deltas = _next_alpha_carbon(
             noisy_coords,
             pred_coords,
@@ -3661,7 +3668,13 @@ class RfDiffusionSamplerStep:
             noise_scale=noise_scale_ca,
             generator=generator,
         )
-        noise_scale_frame = self.noise_schedule_frame(t)
+        noise_scale_frame = _noise_scale(
+            t,
+            self.num_timesteps,
+            self.noise_scale_frame,
+            self.final_noise_scale_frame,
+            self.frame_noise_schedule,
+        )
         frames_next = _next_frames(
             noisy_coords,
             pred_coords,
@@ -3700,13 +3713,7 @@ class RfDiffusionSymmetry:
     """
 
     def __init__(self, condition: RfDiffusionPointGroupSymmetry, layout: RfDiffusionLayout) -> None:
-        row_by_reference = {reference: row for row, reference in enumerate(layout.output_residues)}
-        row_by_reference.update(
-            {
-                alias: row_by_reference[reference]
-                for alias, reference in symbolic_residue_aliases(layout.output_residues).items()
-            }
-        )
+        row_by_reference, symbolic_rows = _index_output_residues(layout.output_residues)
         units = []
         for unit in condition.units:
             rows: list[int] = []
@@ -3718,7 +3725,13 @@ class RfDiffusionSymmetry:
                         if isinstance(reference, SymbolicResidueSite) and reference.placement_id == target
                     )
                 else:
-                    rows.append(row_by_reference[cast(tuple[str, int] | SymbolicResidueSite, target)])
+                    rows.append(
+                        _output_residue_row(
+                            cast(tuple[str, int] | SymbolicResidueSite, target),
+                            row_by_reference,
+                            symbolic_rows,
+                        )
+                    )
             units.append(tuple(rows))
         lengths = {len(unit) for unit in units}
         if len(lengths) != 1:
@@ -3773,13 +3786,7 @@ class RfDiffusionGuidance:
         layout: RfDiffusionLayout,
     ) -> None:
         self.layout = layout
-        self.row_by_reference = {reference: row for row, reference in enumerate(layout.output_residues)}
-        self.row_by_reference.update(
-            {
-                alias: self.row_by_reference[reference]
-                for alias, reference in symbolic_residue_aliases(layout.output_residues).items()
-            }
-        )
+        self.row_by_reference, self.symbolic_rows = _index_output_residues(layout.output_residues)
         self.structure_index = (
             {} if layout.structure is None else {site: index for index, site in enumerate(layout.structure.sites)}
         )
@@ -3924,10 +3931,22 @@ class RfDiffusionGuidance:
                     if isinstance(output, SymbolicResidueSite) and output.placement_id == reference
                 )
             elif isinstance(reference, (tuple, SymbolicResidueSite)):
-                rows.append(self.row_by_reference[cast(tuple[str, int] | SymbolicResidueSite, reference)])
+                rows.append(
+                    _output_residue_row(
+                        cast(tuple[str, int] | SymbolicResidueSite, reference),
+                        self.row_by_reference,
+                        self.symbolic_rows,
+                    )
+                )
             elif isinstance(reference, SymbolicAtomSite):
                 symbolic_site = cast(SymbolicAtomSite, reference)
-                rows.append(self.row_by_reference[symbolic_site.residue])
+                rows.append(
+                    _output_residue_row(
+                        symbolic_site.residue,
+                        self.row_by_reference,
+                        self.symbolic_rows,
+                    )
+                )
             elif isinstance(reference, AtomSite):
                 atom_site = cast(AtomSite, reference)
                 system = cast(MolecularSystem, self.layout.system)
@@ -3957,7 +3976,11 @@ class RfDiffusionGuidance:
     def _atom(self, reference: AtomSite | SymbolicAtomSite, coords: Tensor) -> Tensor:
         if isinstance(reference, SymbolicAtomSite):
             symbolic_site = cast(SymbolicAtomSite, reference)
-            symbolic_row = self.row_by_reference[symbolic_site.residue]
+            symbolic_row = _output_residue_row(
+                symbolic_site.residue,
+                self.row_by_reference,
+                self.symbolic_rows,
+            )
             symbolic_atom_names = ("N", "CA", "C")
             return coords[symbolic_row, symbolic_atom_names.index(symbolic_site.atom_id)]
         atom_site = cast(AtomSite, reference)
@@ -4004,7 +4027,7 @@ class RfDiffusionGuidance:
 
 def rfdiffusion_terminal_cyclization_instance(
     condition: SymbolicBond,
-    row_by_reference: Mapping[ComponentReference | SymbolicResidueSite, int],
+    output_residues: Sequence[ComponentReference | SymbolicResidueSite],
     output_instances: tuple[str, ...],
 ) -> str:
     r"""
@@ -4012,7 +4035,7 @@ def rfdiffusion_terminal_cyclization_instance(
 
     Args:
         condition: Requested symbolic bond between the terminal nitrogen and carbon.
-        row_by_reference: Output-row lookup for concrete and symbolic residues.
+        output_residues: Concrete and symbolic output residues in row order.
         output_instances: Output instance identifier for each residue row.
 
     Returns:
@@ -4022,6 +4045,7 @@ def rfdiffusion_terminal_cyclization_instance(
         ValueError: If the bond is not an intrachain terminal peptide cyclization.
     """
 
+    row_by_reference, symbolic_rows = _index_output_residues(output_residues)
     endpoints: list[tuple[int, str]] = []
     for site in (condition.site_a, condition.site_b):
         if isinstance(site, SymbolicAtomSite):
@@ -4034,8 +4058,9 @@ def rfdiffusion_terminal_cyclization_instance(
             atom_name = site.atom_id
         else:
             raise ValueError("RFdiffusion supports only terminal peptide cyclization")
-        row = row_by_reference.get(reference)
-        if row is None:
+        try:
+            row = _output_residue_row(reference, row_by_reference, symbolic_rows)
+        except (IndexError, KeyError):
             raise ValueError("SymbolicBond endpoints must belong to RFdiffusion output residues")
         endpoints.append((row, atom_name))
     left, right = endpoints
@@ -4756,9 +4781,9 @@ def _next_frames(
     transitions = transitions[:, None]
     ca_t = Ca_t.squeeze(0).to(dtype=torch.float64)
     noisy_bb = noisy_coords[:, :3].to(dtype=torch.float64)
-    next_coords = (
-        torch.einsum("lrij,laj->lrai", transitions, noisy_bb - ca_t[:, None]) + ca_t[:, None, None]
-    ).squeeze(1)
+    next_coords = (torch.einsum("lrij,laj->lrai", transitions, noisy_bb - ca_t[:, None]) + ca_t[:, None, None]).squeeze(
+        1
+    )
     return next_coords.to(dtype=noisy_coords.dtype, device=noisy_coords.device)
 
 
@@ -4810,37 +4835,30 @@ def _next_alpha_carbon(
     return out / crd_scale, delta / crd_scale
 
 
-def _noise_schedule(
+def _noise_scale(
+    timestep: int,
     num_timesteps: int,
     initial_noise: float,
     final_noise: float,
-    schedule_type: str,
-) -> Callable[[int], float]:
+    schedule_type: Literal["constant", "linear"],
+) -> float:
     r"""
-    Return a callable mapping a timestep to its noise scale.
+    Return the noise scale at one reverse-diffusion timestep.
 
     Args:
+        timestep: Current one-indexed reverse-diffusion timestep.
         num_timesteps: Total number of timesteps (for the linear interpolation).
         initial_noise: Noise scale at the initial timestep ``t = num_timesteps``.
         final_noise: Linear-interpolation endpoint at timestep ``t = 1``.
         schedule_type: Schedule shape (`"constant"` or `"linear"`).
 
     Returns:
-        A function ``schedule(t) -> float`` giving the noise scale at timestep ``t``.
-
-    Raises:
-        ValueError: If ``schedule_type`` is not `"constant"` or `"linear"`.
+        The noise scale for ``timestep``.
     """
 
-    schedules = {
-        "constant": lambda t: initial_noise,
-        "linear": lambda t: ((t - 1) / (num_timesteps - 1)) * (initial_noise - final_noise) + final_noise,
-    }
-    if schedule_type not in schedules:
-        raise ValueError(f"noise schedule must be one of {tuple(schedules)}")
-    if schedule_type == "constant" and final_noise != initial_noise:
-        raise ValueError("a constant noise schedule cannot have different initial and final values")
-    return schedules[schedule_type]
+    if schedule_type == "constant":
+        return initial_noise
+    return ((timestep - 1) / (num_timesteps - 1)) * (initial_noise - final_noise) + final_noise
 
 
 _PAIR_MIN_DISTANCE = 2.0
@@ -4886,21 +4904,6 @@ def _beta_carbon(nitrogen: Tensor, alpha_carbon: Tensor, carbon: Tensor) -> Tens
     c = carbon - alpha_carbon
     a = torch.cross(b, c, dim=-1)
     return -0.58273431 * a + 0.56802827 * b - 0.54067466 * c + alpha_carbon
-
-
-def _pair_distance(a: Tensor, b: Tensor) -> Tensor:
-    r"""
-    Return the pairwise Euclidean distance matrix between point sets ``a`` and ``b``.
-
-    Args:
-        a: First point set `[..., M, 3]`.
-        b: Second point set `[..., N, 3]`.
-
-    Returns:
-        The pairwise distance matrix `[..., M, N]`.
-    """
-
-    return torch.cdist(a, b, p=2)
 
 
 def _planar_angle(a: Tensor, b: Tensor, c: Tensor) -> Tensor:
@@ -4970,7 +4973,7 @@ def _backbone_pair_geometry(
     pair_geometry = torch.zeros(
         (batch_size, num_residues, num_residues, 4), dtype=coordinates.dtype, device=coordinates.device
     )
-    distance = _pair_distance(beta_carbon, beta_carbon)
+    distance = torch.cdist(beta_carbon, beta_carbon)
     distance = torch.where(torch.isnan(distance), 999.9, distance)
     pair_geometry[..., 0] = distance + 999.9 * torch.eye(num_residues, device=coordinates.device)[None]
     valid = pair_geometry[..., 0] < max_distance
@@ -5380,7 +5383,7 @@ def _sample_variable_lengths(
         for placement_id, value in group.items()
         if isinstance(value, GeneratedSegment)
     }
-    chain_lengths = placement.chain_lengths or (None,) * len(placement.placements)
+    chain_lengths = (None,) * len(placement.placements) if placement.chain_lengths is None else placement.chain_lengths
 
     def sample_segment_lengths() -> dict[str, int]:
         sampled_lengths: dict[str, int] = {}
@@ -5492,12 +5495,8 @@ def _sample_variable_lengths(
 
     output_residues: list[tuple[str, int] | SymbolicResidueSite] = []
     output_instances: list[str] = []
-    # Mint realized output instance IDs with the shared `InstanceIdAllocator`, walking declaration groups in
-    # order and calling `allocate()` once per realized output chain with >=1 occurrence — the
-    # canonical `chain_{n}` IDs (uniform and 0-based). A declaration group that
-    # realizes to zero residues mints no chain and consumes no index. Identical to the processor
-    # lowering in `_resolve_placement`.
-    allocator = InstanceIdAllocator()
+    # Mint canonical `chain_{n}` IDs in declaration order for nonempty groups.
+    next_instance = 0
     for group in placement.placements.values():
         group_residues: list[tuple[str, int] | SymbolicResidueSite] = []
         for placement_id, part in group.items():
@@ -5512,7 +5511,8 @@ def _sample_variable_lengths(
             group_residues.extend(group_references)
         if not group_residues:
             continue  # zero-length declaration group mints no realized chain, consumes no index
-        instance_id = allocator.allocate()
+        instance_id = f"chain_{next_instance}"
+        next_instance += 1
         output_residues.extend(group_residues)
         output_instances.extend([instance_id] * len(group_residues))
 
@@ -5556,13 +5556,7 @@ def _sample_variable_lengths(
             chain_start = row
             previous_instance = instance_id
         residue_indices.append(200 * chain_index + row - chain_start)
-    row_by_reference = {reference: row for row, reference in enumerate(realized_references)}
-    row_by_reference.update(
-        {
-            alias: row_by_reference[reference]
-            for alias, reference in symbolic_residue_aliases(realized_references).items()
-        }
-    )
+    row_by_reference, symbolic_rows = _index_output_residues(realized_references)
     for condition in input.layout.conditions:
         if not isinstance(condition, AllowedResidueIdentities):
             continue
@@ -5578,7 +5572,7 @@ def _sample_variable_lengths(
                     and cast(SymbolicResidueSite, reference).placement_id == target
                 )
             else:
-                identity_rows.append(row_by_reference[target])
+                identity_rows.append(_output_residue_row(target, row_by_reference, symbolic_rows))
         for row in identity_rows:
             residue_type_features[0, row].zero_()
             residue_type_features[0, row, token] = 1
@@ -5599,19 +5593,24 @@ def _sample_variable_lengths(
                     and cast(SymbolicResidueSite, reference).placement_id == secondary_target
                 )
             else:
-                secondary_rows.append(row_by_reference[cast(tuple[str, int] | SymbolicResidueSite, secondary_target)])
+                secondary_rows.append(
+                    _output_residue_row(
+                        cast(tuple[str, int] | SymbolicResidueSite, secondary_target),
+                        row_by_reference,
+                        symbolic_rows,
+                    )
+                )
         secondary_labels[0, torch.tensor(secondary_rows, device=coords.device)] = label_by_kind[
             secondary_condition.kind
         ]
     cyclic_mask = torch.zeros((1, length), dtype=torch.bool, device=coords.device)
-    row_by_reference_for_cyclization = dict(row_by_reference)
     for condition in input.layout.conditions:
         if not isinstance(condition, SymbolicBond):
             continue
         bond = cast(SymbolicBond, condition)
         instance_id = rfdiffusion_terminal_cyclization_instance(
             bond,
-            row_by_reference_for_cyclization,
+            realized_references,
             instances,
         )
         cyclic_mask[0] |= torch.tensor(
@@ -5647,14 +5646,6 @@ def _sample_variable_lengths(
         ),
         batch_size=[coords.shape[0]],
     )
-
-
-def _resolved_placement_condition(layout: RfDiffusionLayout) -> RfDiffusionPlacements | None:
-    r"""
-    Return the topology retained by the Processor for placement-map materialization.
-    """
-
-    return layout.placement
 
 
 def _decode_design(
@@ -5696,7 +5687,7 @@ def _decode_design(
         # reconstructed losslessly from output_residues and residue_map, with
         # exhaustive coverage enforced inside _materialize_placement_map). The realized ids in
         # its ComponentReference[0] values are this candidate's Structure.system instance ids.
-        placement_condition = _resolved_placement_condition(layout)
+        placement_condition = layout.placement
         placement_map = (
             {}
             if placement_condition is None
@@ -5744,7 +5735,7 @@ def _decode_structure(
     for row, (reference, instance_id) in enumerate(zip(layout.output_residues, layout.output_instance_ids)):
         rows_by_instance.setdefault(instance_id, []).append((row, reference))
 
-    aliases = symbolic_residue_aliases(layout.output_residues)
+    row_by_reference, symbolic_rows = _index_output_residues(layout.output_residues)
     allowed_references: set[tuple[str, int] | SymbolicResidueSite] = set()
     for condition in layout.conditions:
         if not isinstance(condition, AllowedResidueIdentities):
@@ -5764,8 +5755,8 @@ def _decode_structure(
                     identity_target,
                 )
                 if isinstance(residue_target, SymbolicResidueSite):
-                    symbolic_target = cast(SymbolicResidueSite, residue_target)
-                    allowed_references.add(aliases.get(symbolic_target, symbolic_target))
+                    row = _output_residue_row(residue_target, row_by_reference, symbolic_rows)
+                    allowed_references.add(layout.output_residues[row])
                 else:
                     allowed_references.add(cast(tuple[str, int], residue_target))
 
@@ -5790,8 +5781,6 @@ def _decode_structure(
                 )
             residue_map[reference] = (instance_id, component_index)
         output_sequences[instance_id] = tuple(residue_components)
-
-    residue_map.update({alias: residue_map[reference] for alias, reference in aliases.items()})
 
     touched_instances = {reference[0] for reference in layout.output_residues if isinstance(reference, tuple)}
     retained_instance_ids = (
@@ -5843,7 +5832,14 @@ def _decode_structure(
         for endpoint in (symbolic_bond.site_a, symbolic_bond.site_b):
             if isinstance(endpoint, SymbolicAtomSite):
                 symbolic_endpoint = cast(SymbolicAtomSite, endpoint)
-                instance_id, component_index = residue_map[symbolic_endpoint.residue]
+                reference = layout.output_residues[
+                    _output_residue_row(
+                        symbolic_endpoint.residue,
+                        row_by_reference,
+                        symbolic_rows,
+                    )
+                ]
+                instance_id, component_index = residue_map[reference]
                 endpoints.append(AtomSite(instance_id, component_index, symbolic_endpoint.atom_id))
             else:
                 atom_endpoint = cast(AtomSite, endpoint)
@@ -5963,6 +5959,7 @@ def _hard_condition_outcomes(
     residue_map: Mapping[tuple[str, int] | SymbolicResidueSite, tuple[str, int]],
 ) -> tuple[bool | None, ...]:
     coordinate_index = {site: index for index, site in enumerate(candidate.sites)}
+    row_by_reference, symbolic_rows = _index_output_residues(layout.output_residues)
     source_index = (
         {} if layout.structure is None else {site: index for index, site in enumerate(layout.structure.sites)}
     )
@@ -5980,7 +5977,16 @@ def _hard_condition_outcomes(
                         and cast(SymbolicResidueSite, reference).placement_id == identity_target
                     )
                 else:
-                    references.append(cast(tuple[str, int] | SymbolicResidueSite, identity_target))
+                    reference = cast(tuple[str, int] | SymbolicResidueSite, identity_target)
+                    if isinstance(reference, SymbolicResidueSite):
+                        reference = layout.output_residues[
+                            _output_residue_row(
+                                reference,
+                                row_by_reference,
+                                symbolic_rows,
+                            )
+                        ]
+                    references.append(reference)
             component_ids = []
             for reference in references:
                 instance_id, component_index = residue_map[reference]
@@ -6063,7 +6069,14 @@ def _hard_condition_outcomes(
             for endpoint in (symbolic_bond.site_a, symbolic_bond.site_b):
                 if isinstance(endpoint, SymbolicAtomSite):
                     symbolic_endpoint = cast(SymbolicAtomSite, endpoint)
-                    mapped_residue = residue_map[symbolic_endpoint.residue]
+                    reference = layout.output_residues[
+                        _output_residue_row(
+                            symbolic_endpoint.residue,
+                            row_by_reference,
+                            symbolic_rows,
+                        )
+                    ]
+                    mapped_residue = residue_map[reference]
                     endpoint_sites.append(AtomSite(mapped_residue[0], mapped_residue[1], symbolic_endpoint.atom_id))
                 else:
                     atom_endpoint = cast(AtomSite, endpoint)
@@ -6825,6 +6838,9 @@ class RfDiffusionPlacements:
 
     placements: PlacementMapping
     chain_lengths: tuple[int | None, ...] | None = None
+
+    def __post_init__(self) -> None:
+        derive_instance_of(self.placements)
 
 
 # --------------------------------------------------------------------------------------

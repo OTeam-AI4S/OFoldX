@@ -187,6 +187,7 @@ class Boltz2AffinityPipeline(CompositePipeline):
         pockets: Sequence[Boltz2Pocket] = (),
         method: str = "x-ray diffraction",
         num_samples: int = 1,
+        recycling_steps: int | None = None,
         num_sampling_steps: int | None = None,
         step_scale: float | None = None,
         max_parallel_samples: int | None = None,
@@ -199,6 +200,7 @@ class Boltz2AffinityPipeline(CompositePipeline):
         feynman_kac_resampling_interval: int = 3,
         num_guidance_steps: int = 20,
         affinity_num_samples: int = 5,
+        affinity_recycling_steps: int | None = None,
         affinity_num_sampling_steps: int | None = None,
         affinity_step_scale: float | None = None,
         msa_max_depth: int | None = None,
@@ -220,6 +222,7 @@ class Boltz2AffinityPipeline(CompositePipeline):
             pockets: Learned binder-to-pocket conditions used by both passes.
             method: Experimental method used by the first structure pass.
             num_samples: Number of first-pass structure samples.
+            recycling_steps: Number of first-pass trunk recycling iterations.
             num_sampling_steps: Number of first-pass diffusion transitions.
             step_scale: Optional first-pass reverse-diffusion Euler-step scale.
             max_parallel_samples: Maximum first-pass samples evaluated by one
@@ -238,6 +241,8 @@ class Boltz2AffinityPipeline(CompositePipeline):
             num_guidance_steps: Gradient updates applied at each guided
                 first-pass reverse-diffusion step.
             affinity_num_samples: Number of second-pass candidate samples.
+            affinity_recycling_steps: Number of second-pass trunk recycling
+                iterations.
             affinity_num_sampling_steps: Number of second-pass diffusion transitions.
             affinity_step_scale: Optional second-pass reverse-diffusion Euler-step scale.
             msa_max_depth: Optional rows independently sampled for every MSA-module
@@ -280,6 +285,7 @@ class Boltz2AffinityPipeline(CompositePipeline):
         fold_result = self.structure_model.fold(
             fold_batch,
             num_samples=num_samples,
+            recycling_steps=recycling_steps,
             num_sampling_steps=num_sampling_steps,
             step_scale=step_scale,
             msa_max_depth=msa_max_depth,
@@ -319,6 +325,7 @@ class Boltz2AffinityPipeline(CompositePipeline):
         score_result = self.model.score(
             affinity_batch,
             num_samples=affinity_num_samples,
+            recycling_steps=affinity_recycling_steps,
             num_sampling_steps=affinity_num_sampling_steps,
             step_scale=affinity_step_scale,
             msa_max_depth=msa_max_depth,

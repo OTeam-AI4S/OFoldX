@@ -9,12 +9,9 @@ from typing import Literal
 from chanfig import Config
 
 from ..config import (
-    ConfidenceConfig,
     DenoiserConfig,
     DistogramConfig,
     SamplerConfig,
-    TemplateConfig,
-    TrunkConfig,
 )
 
 ProtenixVariant = Literal[
@@ -31,13 +28,17 @@ ProtenixVariant = Literal[
 ]
 
 
-class ProtenixTrunkConfig(TrunkConfig):
+class ProtenixTrunkConfig(Config):
     r"""
     Configure the exact MSA and Pairformer axes of a Protenix trunk.
 
     Args:
+        num_pairformer_blocks: Number of Pairformer blocks in the trunk.
+        pairformer_dropout: Dropout probability applied inside each Pairformer block.
+        msa_dropout: Dropout probability applied along the MSA path.
+        pair_dropout: Dropout probability applied along the pair path.
         msa_size: Width of the projected MSA representation.
-        num_msa_blocks: Number of joint MSA/pair update blocks.
+        num_msa_blocks: Number of MSA stages, including the final pair-only update.
         msa_outer_product_hidden_size: Hidden width of the MSA outer-product mean.
         num_msa_attention_heads: Number of heads in MSA pair-weighted averaging.
         msa_triangle_multiplication_hidden_size: Hidden width of MSA-path triangle multiplication.
@@ -51,6 +52,10 @@ class ProtenixTrunkConfig(TrunkConfig):
         pairformer_expansion: Feed-forward expansion factor inside Pairformer blocks.
     """
 
+    num_pairformer_blocks: int = 48
+    pairformer_dropout: float = 0.25
+    msa_dropout: float = 0.15
+    pair_dropout: float = 0.25
     msa_size: int = 64
     num_msa_blocks: int = 4
     msa_outer_product_hidden_size: int = 32
@@ -66,16 +71,31 @@ class ProtenixTrunkConfig(TrunkConfig):
     pairformer_expansion: int = 4
 
 
-class ProtenixTemplateConfig(TemplateConfig):
+class ProtenixTemplateConfig(Config):
     r"""
     Configure the released Protenix template graph used by base v1 and v2.
 
     Args:
+        hidden_size: Width of the template pair embedding.
+        num_blocks: Number of template Pairformer blocks.
+        vocab_size: Number of template token types.
+        num_distogram_bins: Number of template distogram distance bins.
         triangle_multiplication_hidden_size: Hidden width of template triangle multiplication.
+        triangle_attention_hidden_size: Per-head width of template triangle attention.
+        num_triangle_attention_heads: Number of template triangle-attention heads.
+        expansion: Feed-forward expansion factor inside the template transition.
+        dropout: Dropout probability applied inside the template stack.
     """
 
+    hidden_size: int = 64
     num_blocks: int = 2
+    vocab_size: int = 32
+    num_distogram_bins: int = 39
     triangle_multiplication_hidden_size: int = 128
+    triangle_attention_hidden_size: int = 32
+    num_triangle_attention_heads: int = 4
+    expansion: int = 2
+    dropout: float = 0.25
 
 
 class ProtenixEsmConfig(Config):
@@ -102,6 +122,48 @@ class ProtenixEsmConfig(Config):
     position_embedding_type: Literal["rotary"] = "rotary"
     emb_layer_norm_before: bool = False
     token_dropout: bool = True
+
+
+class ProtenixConfidenceConfig(Config):
+    r"""
+    Configure Protenix confidence metrics and their Pairformer trunk.
+
+    Args:
+        num_plddt_bins: Number of pLDDT confidence bins.
+        num_resolved_bins: Number of resolved-atom bins.
+        num_pae_bins: Number of predicted-aligned-error bins.
+        num_pde_bins: Number of predicted-distance-error bins.
+        distance_bin_start: Lower edge of the confidence distance grid, in angstroms.
+        distance_bin_end: Upper edge of the confidence distance grid, in angstroms.
+        distance_bin_step: Spacing between confidence distance bins, in angstroms.
+        max_atoms_per_token: Maximum number of atoms represented for a single token.
+        single_max_abs: Optional clamp on the absolute value of single-representation
+            features; ``None`` disables it.
+        num_blocks: Number of Pairformer blocks in the confidence trunk.
+        num_pair_attention_heads: Number of attention heads used for pair-biased attention.
+        triangle_multiplication_hidden_size: Hidden width of the triangle-multiplication update.
+        triangle_attention_hidden_size: Per-head hidden width of triangle attention.
+        num_triangle_attention_heads: Number of triangle-attention heads.
+        expansion: Feed-forward expansion factor inside the Pairformer transition.
+        pairformer_dropout: Dropout probability applied inside the confidence Pairformer.
+    """
+
+    num_plddt_bins: int = 50
+    num_resolved_bins: int = 2
+    num_pae_bins: int = 64
+    num_pde_bins: int = 64
+    distance_bin_start: float = 3.25
+    distance_bin_end: float = 52.0
+    distance_bin_step: float = 1.25
+    max_atoms_per_token: int = 24
+    single_max_abs: float | None = 512.0
+    num_blocks: int = 4
+    num_pair_attention_heads: int = 16
+    triangle_multiplication_hidden_size: int = 128
+    triangle_attention_hidden_size: int = 32
+    num_triangle_attention_heads: int = 4
+    expansion: int = 4
+    pairformer_dropout: float = 0.0
 
 
 class ProtenixConfig(Config):
@@ -144,7 +206,7 @@ class ProtenixConfig(Config):
     denoiser: DenoiserConfig = DenoiserConfig()
     sampler: SamplerConfig = SamplerConfig()
     distogram: DistogramConfig = DistogramConfig()
-    confidence: ConfidenceConfig = ConfidenceConfig()
+    confidence: ProtenixConfidenceConfig = ProtenixConfidenceConfig()
 
     @staticmethod
     def from_variant(variant: ProtenixVariant) -> ProtenixConfig:
@@ -233,7 +295,7 @@ class ProtenixConfig(Config):
                     triangle_multiplication_hidden_size=64,
                     num_triangle_attention_heads=2,
                 ),
-                confidence=ConfidenceConfig(
+                confidence=ProtenixConfidenceConfig(
                     triangle_multiplication_hidden_size=256,
                     num_triangle_attention_heads=8,
                 ),

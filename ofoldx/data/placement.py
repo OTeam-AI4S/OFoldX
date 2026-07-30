@@ -35,8 +35,7 @@ class GeneratedSegment:
             raise ValueError(f"min_length must be >= 0, got {self.min_length}")
         if self.max_length < self.min_length:
             raise ValueError(
-                f"max_length must be >= min_length, got min_length={self.min_length}, "
-                f"max_length={self.max_length}"
+                f"max_length must be >= min_length, got min_length={self.min_length}, " f"max_length={self.max_length}"
             )
 
 
@@ -104,72 +103,6 @@ class SymbolicAtomSite:
 
     residue: SymbolicResidueSite
     atom_id: str
-
-
-def symbolic_residue_aliases(
-    references: tuple[ComponentReference | SymbolicResidueSite, ...],
-) -> dict[SymbolicResidueSite, SymbolicResidueSite]:
-    r"""
-    Map negative placement offsets to equivalent non-negative references.
-
-    Args:
-        references: Existing and symbolic residue references in realization order.
-
-    Returns:
-        A mapping from each valid negative symbolic offset to its non-negative form.
-    """
-
-    placements: dict[str, list[SymbolicResidueSite]] = {}
-    for reference in references:
-        if isinstance(reference, SymbolicResidueSite):
-            placements.setdefault(reference.placement_id, []).append(reference)
-    return {
-        SymbolicResidueSite(placement_id, index - len(rows)): reference
-        for placement_id, rows in placements.items()
-        for index, reference in enumerate(rows)
-    }
-
-
-def realized_instance_id(index: int) -> str:
-    r"""
-    Return a realized instance ID for a zero-based index.
-
-    Args:
-        index: Non-negative instance index.
-
-    Returns:
-        The identifier `chain_{index}`.
-
-    Raises:
-        ValueError: If `index` is negative.
-    """
-
-    if index < 0:
-        raise ValueError(f"realized instance index must be >= 0, got {index}")
-    return f"chain_{index}"
-
-
-class InstanceIdAllocator:
-    r"""
-    Allocate ``chain_{n}`` instance IDs in declaration order.
-    """
-
-    __slots__ = ("_next",)
-
-    def __init__(self) -> None:
-        self._next = 0
-
-    def allocate(self) -> str:
-        r"""
-        Return the next realized instance ID and advance the allocator.
-
-        Returns:
-            The next `chain_{n}` identifier.
-        """
-
-        instance_id = realized_instance_id(self._next)
-        self._next += 1
-        return instance_id
 
 
 def instance_of(placement: PlacementSpec) -> dict[str, str]:

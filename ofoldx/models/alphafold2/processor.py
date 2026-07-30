@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from ...data.evidence import MSA, MSACollection, Template, TemplateAlignment
+from ...data.evidence import MSA, MSACollection, Template, TemplateAlignment, resolve_msa_bindings
 from ...data.molecular import AtomSite, MolecularSystem, PolymerSequence
 from ...data.structure import Structure
 from ...modules import residue_constants
@@ -119,7 +119,12 @@ class AlphaFold2Processor(Processor):
         system = topology if isinstance(topology, MolecularSystem) else monomer_system_from_sequences(topology)
         target, instance_id = protein_monomer(system)
         target_entity_id = system.instances[instance_id]
-        normalized_msa = _normalize_msa(msa, system, target)
+        if isinstance(msa, MSACollection):
+            raise ValueError("AlphaFold 2 monomer accepts an entity-bound MSA, not a multimer MSACollection")
+        if msa is not None:
+            ((_value, _target_instance_id, entity),) = resolve_msa_bindings(msa, system)
+            if entity != target:
+                raise ValueError("MSA entity disagrees with the AlphaFold 2 target")
         normalized_templates = _normalize_templates(
             templates,
             target=target,
@@ -132,7 +137,7 @@ class AlphaFold2Processor(Processor):
             target=target,
             instance_id=instance_id,
             target_entity_id=target_entity_id,
-            msa=normalized_msa,
+            msa=msa,
             templates=normalized_templates,
             device=self.device,
             dtype=self.dtype,
@@ -364,30 +369,6 @@ def protein_monomer(system: MolecularSystem) -> tuple[PolymerSequence, str]:
         if component_id not in RESIDUE_TYPE_INDEX_BY_COMPONENT:
             raise ValueError(f"AlphaFold 2 monomer does not support protein component {component_id!r}")
     return entity, instance_id
-
-
-def _normalize_msa(
-    msa: MSA | MSACollection | None,
-    system: MolecularSystem,
-    target: PolymerSequence,
-) -> MSA | None:
-    r"""
-    Bind one monomer alignment to the exact target sequence.
-
-    An [`MSA`][] names its entity by ``entity_id``; the Processor resolves that
-    entity against ``system`` and verifies the query width.
-    """
-
-    if msa is None:
-        return None
-    if isinstance(msa, MSACollection):
-        raise ValueError("AlphaFold 2 monomer accepts an entity-bound MSA, not a multimer MSACollection")
-    entity = system.entities.get(msa.entity_id)
-    if not isinstance(entity, PolymerSequence) or entity != target:
-        raise ValueError("MSA entity disagrees with the AlphaFold 2 target")
-    if len(msa.unpaired_sequences[0]) != len(target):
-        raise ValueError("MSA query length disagrees with the AlphaFold 2 target")
-    return msa
 
 
 def _normalize_templates(

@@ -67,7 +67,7 @@ class DataConfig(chanfig.Config):
 
 class RunnerConfig(dl.RunnerConfig):
     r"""
-    Configure OFoldX training, evaluation, and forward inference.
+    Configure OFoldX training and evaluation.
 
     Danling optimizer, scheduler, dataloader, checkpoint, and scoring options are
     inherited from [`danling.RunnerConfig`][danling.RunnerConfig].

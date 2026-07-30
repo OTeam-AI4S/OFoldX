@@ -113,10 +113,6 @@ _RECYCLING_SCOPE_MAP = {
     "prev_msa_first_row_norm": "previous_msa_first_row_norm",
     "prev_pair_norm": "previous_pair_norm",
 }
-_EXTRA_MSA_EMBEDDINGS_SCOPE_MAP = {
-    "extra_msa_activations": "extra_msa_projection",
-    "extra_msa_projection": "extra_msa_projection",
-}
 _STACK_SCOPE_MAP = {
     "outer_product_mean": ("outer_product_mean",),
     "layer_norm_input": ("layer_norm_input",),
@@ -389,9 +385,8 @@ def _normalize_evoformer_scope(parts: list[str]) -> list[str]:
     recycling_scope = _RECYCLING_SCOPE_MAP.get(parts[0])
     if recycling_scope is not None:
         return ["recycling_embeddings", recycling_scope, *_normalize_stack_scope(parts[1:])]
-    extra_msa_embedding_scope = _EXTRA_MSA_EMBEDDINGS_SCOPE_MAP.get(parts[0])
-    if extra_msa_embedding_scope is not None:
-        return ["extra_msa_embeddings", extra_msa_embedding_scope, *_normalize_stack_scope(parts[1:])]
+    if parts[0] in {"extra_msa_activations", "extra_msa_projection"}:
+        return ["extra_msa_projection", *_normalize_stack_scope(parts[1:])]
     if parts[0] == "single_activations":
         return ["single_projection", *_normalize_stack_scope(parts[1:])]
     if parts[0] in {"template_single_embedding", "template_projection"}:
@@ -421,6 +416,10 @@ def _normalize_evoformer_block_scope(parts: list[str]) -> list[str]:
             normalized.append(part)
         else:
             normalized.extend(mapped)
+    for index in range(len(normalized) - 2):
+        if normalized[index : index + 3] == ["msa_column_global_attention", "attention", "projection"]:
+            del normalized[index + 2]
+            break
     return _rename_outer_product_mean_norm(normalized)
 
 
@@ -577,6 +576,10 @@ def _repeated_haiku_index(name: str, base: str) -> int | None:
 def _normalize_head_scope(parts: list[str]) -> list[str]:
     if parts[:2] == ["distogram_head", "half_logits"]:
         return ["distogram_head", "projection"]
+    if parts[0] in {"experimentally_resolved_head", "masked_msa_head", "predicted_aligned_error_head"} and parts[
+        1:2
+    ] == ["logits"]:
+        return [parts[0], *parts[2:]]
     if parts[:2] == ["predicted_lddt_head", "act_0"]:
         return ["predicted_lddt_head", "input_projection", *parts[2:]]
     if parts[:2] == ["predicted_lddt_head", "act_1"]:

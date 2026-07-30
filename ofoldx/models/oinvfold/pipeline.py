@@ -26,7 +26,6 @@ from .model import (
     OINVFOLD_POLYMER_TOKENS,
     OInvFoldLigandInput,
     OInvFoldLigandModel,
-    OInvFoldOutput,
     OInvFoldPolymerInput,
     OInvFoldPolymerModel,
 )
@@ -149,21 +148,22 @@ class OInvFoldPolymerPipeline(PairedPipeline[OInvFoldPolymerModel, OInvFoldPolym
         )
         with torch.no_grad():
             output = self.model(model_input)
+        log_probabilities = output.log_probabilities
         allowed = _polymer_allowed_indices(self.processor.config.modality)
         token_sequences = _decode_token_sequences(
-            output,
+            log_probabilities,
             allowed,
             topk=topk,
             use_beam=use_beam,
         )
         probability_view = torch.softmax(output.logits / temperature, dim=-1)
-        candidates = tuple(self._candidate(model_input, output, tokens) for tokens in token_sequences)
+        candidates = tuple(self._candidate(model_input, log_probabilities, tokens) for tokens in token_sequences)
         return OInvFoldPolymerResult(
             target=input,
             component_references=model_input.component_references,
             design_mask=model_input.design_mask.detach().cpu().numpy(),
             logits=_numpy(output.logits),
-            log_probabilities=_numpy(output.log_probabilities),
+            log_probabilities=_numpy(log_probabilities),
             probabilities=_numpy(probability_view),
             candidates=candidates,
         )
@@ -171,11 +171,11 @@ class OInvFoldPolymerPipeline(PairedPipeline[OInvFoldPolymerModel, OInvFoldPolym
     def _candidate(
         self,
         input: OInvFoldPolymerInput,
-        output: OInvFoldOutput,
+        log_probabilities: torch.Tensor,
         tokens: tuple[int, ...],
     ) -> OInvFoldPolymerCandidate:
-        indices = torch.tensor(tokens, dtype=torch.long, device=output.logits.device)
-        selected = output.log_probabilities[
+        indices = torch.tensor(tokens, dtype=torch.long, device=log_probabilities.device)
+        selected = log_probabilities[
             torch.arange(indices.shape[0], device=indices.device),
             indices,
         ]
@@ -264,9 +264,10 @@ class OInvFoldLigandPipeline(PairedPipeline[OInvFoldLigandModel, OInvFoldLigandP
     ) -> OInvFoldLigandResult:
         with torch.no_grad():
             output = self.model(model_input)
+        log_probabilities = output.log_probabilities
         allowed = tuple(range(35))
         token_sequences = _decode_token_sequences(
-            output,
+            log_probabilities,
             allowed,
             topk=topk,
             use_beam=use_beam,
@@ -275,7 +276,7 @@ class OInvFoldLigandPipeline(PairedPipeline[OInvFoldLigandModel, OInvFoldLigandP
         candidates = tuple(
             _ligand_candidate(
                 model_input,
-                output,
+                log_probabilities,
                 probability_view,
                 tokens,
             )
@@ -286,14 +287,14 @@ class OInvFoldLigandPipeline(PairedPipeline[OInvFoldLigandModel, OInvFoldLigandP
             slot_ids=model_input.slot_ids,
             coordinates=_numpy(model_input.coordinates),
             logits=_numpy(output.logits),
-            log_probabilities=_numpy(output.log_probabilities),
+            log_probabilities=_numpy(log_probabilities),
             probabilities=_numpy(probability_view),
             candidates=candidates,
         )
 
 
 def _decode_token_sequences(
-    output: OInvFoldOutput,
+    log_probabilities: torch.Tensor,
     allowed: tuple[int, ...],
     *,
     topk: int,
@@ -302,18 +303,18 @@ def _decode_token_sequences(
     allowed_tensor = torch.tensor(
         allowed,
         dtype=torch.long,
-        device=output.logits.device,
+        device=log_probabilities.device,
     )
     if not use_beam:
-        relative = output.logits[:, allowed_tensor].argmax(dim=-1)
+        relative = log_probabilities[:, allowed_tensor].argmax(dim=-1)
         return (tuple(allowed_tensor[relative].tolist()),)
 
     if topk <= 0:
         raise ValueError("OInvFold beam topk must be positive")
     beam_width = topk
     beams: list[tuple[tuple[int, ...], float]] = [((), 0.0)]
-    log_probabilities = output.log_probabilities.detach().float().cpu()
-    for row in log_probabilities:
+    host_log_probabilities = log_probabilities.detach().float().cpu()
+    for row in host_log_probabilities:
         candidates = [(tokens + (token,), score + float(row[token])) for tokens, score in beams for token in allowed]
         candidates.sort(key=lambda candidate: candidate[1], reverse=True)
         beams = candidates[:beam_width]
@@ -412,13 +413,13 @@ def _component_for_token(
 
 def _ligand_candidate(
     input: OInvFoldLigandInput,
-    output: OInvFoldOutput,
+    log_probabilities: torch.Tensor,
     probability_view: torch.Tensor,
     tokens: tuple[int, ...],
 ) -> OInvFoldLigandCandidate:
-    indices = torch.tensor(tokens, dtype=torch.long, device=output.logits.device)
+    indices = torch.tensor(tokens, dtype=torch.long, device=log_probabilities.device)
     rows = torch.arange(indices.shape[0], device=indices.device)
-    selected_log_probabilities = output.log_probabilities[rows, indices]
+    selected_log_probabilities = log_probabilities[rows, indices]
     selected_probabilities = probability_view[rows, indices]
     return OInvFoldLigandCandidate(
         context=input.context,

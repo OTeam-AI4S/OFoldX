@@ -260,12 +260,11 @@ class MultiheadAttentionProjection(nn.Module):
         if use_qk_norm:
             self.query_norm = LayerNorm(self.head_dim, backend=backend)
             self.key_norm = LayerNorm(self.head_dim, backend=backend)
-        self.output_projection = nn.Linear(self.inner_size, hidden_size, bias=output_bias)
         if self.gating:
             self.gate_projection = nn.Linear(self.query_size, self.inner_size, bias=gate_bias)
             if self.gate_projection.bias is not None:
                 nn.init.constant_(self.gate_projection.bias, gate_bias_init)
-        self.sigmoid = nn.Sigmoid()
+        self.output_projection = nn.Linear(self.inner_size, hidden_size, bias=output_bias)
 
     def project(self, query: Tensor, key: Tensor, value: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         r"""
@@ -336,8 +335,8 @@ class MultiheadAttentionProjection(nn.Module):
         """
 
         if self.gating:
-            gate = self.sigmoid(self.gate_projection(query)).view(
-                *query.shape[:-1], self.num_attention_heads, self.head_dim
+            gate = (
+                self.gate_projection(query).sigmoid().view(*query.shape[:-1], self.num_attention_heads, self.head_dim)
             )
             output = output * gate
         output = output.reshape(*output.shape[:-2], self.inner_size)

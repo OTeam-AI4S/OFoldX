@@ -38,16 +38,16 @@ _TOP_LEVEL_PREFIX_MAP = {
     "recycling_embedder.linear.": "recycling_embeddings.previous_positions_projection.",
     "recycling_embedder.layer_norm_m.": "recycling_embeddings.previous_msa_first_row_norm.",
     "recycling_embedder.layer_norm_z.": "recycling_embeddings.previous_pair_norm.",
-    "extra_msa_embedder.linear.": "extra_msa_embeddings.extra_msa_projection.",
+    "extra_msa_embedder.linear.": "extra_msa_projection.",
     "evoformer.linear.": "single_projection.",
     "template_angle_embedder.linear_1.": "template_msa_embedder.input_projection.",
     "template_angle_embedder.linear_2.": "template_msa_embedder.output_projection.",
     "template_pair_embedder.linear.": "template_embedder.single_template_embedder.template_pair_projection.",
     "template_pair_stack.layer_norm.": "template_embedder.single_template_embedder.output_norm.",
     "aux_heads.distogram.linear.": "distogram_head.projection.",
-    "aux_heads.masked_msa.linear.": "masked_msa_head.logits.",
-    "aux_heads.experimentally_resolved.linear.": "experimentally_resolved_head.logits.",
-    "aux_heads.tm.linear.": "predicted_aligned_error_head.logits.",
+    "aux_heads.masked_msa.linear.": "masked_msa_head.",
+    "aux_heads.experimentally_resolved.linear.": "experimentally_resolved_head.",
+    "aux_heads.tm.linear.": "predicted_aligned_error_head.",
     "aux_heads.plddt.layer_norm.": "predicted_lddt_head.input_norm.",
     "aux_heads.plddt.linear_1.": "predicted_lddt_head.input_projection.",
     "aux_heads.plddt.linear_2.": "predicted_lddt_head.hidden_projection.",
@@ -184,9 +184,8 @@ def _normalize_evoformer_block_key(stack_name: str, block_index: str, rest: str)
         return f"{block_prefix}.msa_block.msa_column_global_attention.query_norm.{suffix}"
     if rest.startswith("msa_att_col.global_attention."):
         suffix = rest.removeprefix("msa_att_col.global_attention.")
-        return (
-            f"{block_prefix}.msa_block.msa_column_global_attention.attention.projection."
-            + _normalize_attention_projection_key(suffix)
+        return f"{block_prefix}.msa_block.msa_column_global_attention.attention." + _normalize_attention_projection_key(
+            suffix
         )
     if rest.startswith("core.outer_product_mean."):
         return f"{block_prefix}.outer_product_mean." + _normalize_outer_product_mean_key(

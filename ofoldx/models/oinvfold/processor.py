@@ -245,7 +245,7 @@ class OInvFoldLigandProcessor(Processor):
             device=self.device,
         )
         local_slots = _ligand_local_slots(coordinates)
-        graph = _lower_ligand_graph(
+        graph = _lower_graph(
             local_slots,
             num_neighbors=48,
             node_feature_size=114,
@@ -411,23 +411,6 @@ def _lower_polymer_graph(
             50.0,
             16,
         ),
-    )
-
-
-def _lower_ligand_graph(
-    coordinates: Tensor,
-    *,
-    num_neighbors: int,
-    node_feature_size: int,
-    edge_feature_size: int,
-    dtype: torch.dtype,
-) -> OInvFoldGraph:
-    return _lower_graph(
-        coordinates,
-        num_neighbors=num_neighbors,
-        node_feature_size=node_feature_size,
-        edge_feature_size=edge_feature_size,
-        dtype=dtype,
     )
 
 

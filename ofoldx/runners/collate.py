@@ -5,95 +5,16 @@ This is Runner plumbing, not model math: it turns a list of per-structure proces
 and reports the ``loss_normalizer`` -- the exact count each family's criterion averages over, so DanLing's
 accumulation/DDP reduction (which scales the backward by ``normalizer / Σnormalizer``) forms a true global
 per-unit mean. The sequence families average over designable residues; the diffusion families average over
-resolved atoms. ``pad_and_collate`` is the multi-residue-axis padding for batch_size>1 sequence families;
-``collate_single`` and ``collate_denoising`` are batch_size=1 (large single-structure models -- multi
-structure training comes from gradient accumulation weighted by the normalizer).
+resolved atoms. ``collate_single`` and ``collate_denoising`` are batch_size=1 (large single-structure models
+-- multi-structure training comes from gradient accumulation weighted by the normalizer).
 """
 
 from __future__ import annotations
 
-from collections.abc import Collection
-from dataclasses import fields, is_dataclass
+from dataclasses import fields
 from typing import Any
 
-import torch
 from torch import Tensor
-
-
-def _pad_axis(tensor: Tensor, axis: int, length: int, value: float | bool) -> Tensor:
-    current = tensor.shape[axis]
-    if current == length:
-        return tensor
-    shape = list(tensor.shape)
-    shape[axis] = length - current
-    return torch.cat([tensor, tensor.new_full(shape, value)], dim=axis)
-
-
-def _pad_tied_group_ids(tensor: Tensor, length: int) -> Tensor:
-    current = tensor.shape[1]
-    if current == length:
-        return tensor
-    extra = torch.arange(current, length, device=tensor.device, dtype=tensor.dtype).expand(tensor.shape[0], -1)
-    return torch.cat([tensor, extra], dim=1)
-
-
-def pad_and_collate(batch: list[Any], *, token_pad_id: int, pair_bias_fields: Collection[str] = ()) -> Any:
-    r"""
-    Collate a batch of one MPNN-family Input dataclass to the longest sequence.
-
-    Args:
-        batch: Non-empty list of the same Input dataclass type.
-        token_pad_id: Pad value for ``sequence_tokens``.
-        pair_bias_fields: Field names that are residue-aligned on axes 1 and 3.
-    """
-
-    if not batch:
-        raise ValueError("collate requires a non-empty batch")
-    first = batch[0]
-    if not is_dataclass(first) or isinstance(first, type):
-        raise TypeError("MPNN collate expects family Input dataclass instances")
-    input_type = type(first)
-    for item in batch:
-        if type(item) is not input_type:
-            raise TypeError(
-                f"collate requires one Input type per batch; got {input_type.__name__} and {type(item).__name__}"
-            )
-
-    pair_fields = frozenset(pair_bias_fields)
-    length = max(item.sequence_tokens.shape[1] for item in batch)
-    merged: dict[str, Any] = {}
-    for field in fields(first):
-        values = [getattr(item, field.name) for item in batch]
-        present = [value is not None for value in values]
-        if not any(present):
-            merged[field.name] = None
-            continue
-        if not all(present):
-            raise ValueError(f"optional field {field.name!r} must be present on every item or on none")
-        if isinstance(values[0], Tensor):
-            if field.name == "tied_group_ids":
-                merged[field.name] = torch.cat([_pad_tied_group_ids(value, length) for value in values], dim=0)
-                continue
-            if field.name == "sequence_tokens":
-                pad: float | bool = token_pad_id
-            elif field.name == "allowed_token_mask":
-                pad = True
-            else:
-                pad = 0
-            axes = (1, 3) if field.name in pair_fields else (1,)
-            padded = []
-            for value in values:
-                for axis in axes:
-                    value = _pad_axis(value, axis, length, pad)
-                padded.append(value)
-            merged[field.name] = torch.cat(padded, dim=0)
-        else:
-            # A list (not a tuple) becomes a batched NonTensorStack, so batch indexing ``input[i]`` selects
-            # the i-th item's metadata; a tuple would be one shared blob that does not track the batch axis.
-            merged[field.name] = [element for value in values for element in value]
-    # Rebuild with an explicit batch_size: the tensors are now ``(len(batch), ...)``. ``dataclasses.replace``
-    # would reset a tensorclass batch_size to ``[]``, leaving the batch axis untracked.
-    return type(first)(**merged, batch_size=[len(batch)])
 
 
 def nested_collate(batch: list[Any]) -> Any:
@@ -109,17 +30,8 @@ def nested_collate(batch: list[Any]) -> Any:
 
     from danling import NestedTensor
 
-    if not batch:
-        raise ValueError("collate requires a non-empty batch")
     first = batch[0]
-    if not is_dataclass(first) or isinstance(first, type):
-        raise TypeError("MPNN collate expects family Input dataclass instances")
     input_type = type(first)
-    for item in batch:
-        if type(item) is not input_type:
-            raise TypeError(
-                f"collate requires one Input type per batch; got {input_type.__name__} and {type(item).__name__}"
-            )
 
     merged: dict[str, Any] = {}
     for field in fields(first):
@@ -157,19 +69,14 @@ def _design_count(batched: Any) -> int:
     return int((batched.residue_mask & batched.design_positions).sum())
 
 
-def collate_sequence(
-    batch: list[Any], *, token_pad_id: int = 0, pair_bias_fields: Collection[str] = ()
-) -> dict[str, Any]:
+def collate_sequence(batch: list[Any]) -> dict[str, Any]:
     r"""
     Collate a sequence family to a ragged ``NestedTensor`` batch, normalized by designable residues. Each
     structure runs at its own length, so BOTH the training loss and inference are topology-invariant
     (independent of what shared the batch, no padded rows to contaminate the k-NN/attention); inference
-    un-nests per structure (``prediction[i]``) with no tail-padding to trim. ``token_pad_id`` /
-    ``pair_bias_fields`` are accepted for registration compatibility but unused (a ragged batch has no
-    padding to place).
+    un-nests per structure (``prediction[i]``) with no tail-padding to trim.
     """
 
-    del token_pad_id, pair_bias_fields
     batched = nested_collate(batch)
     return {"input": batched, "target": batched, "loss_normalizer": _design_count(batched)}
 
@@ -177,8 +84,7 @@ def collate_sequence(
 def collate_sequence_single(batch: list[Any]) -> dict[str, Any]:
     r"""
     Collate a batch_size=1 sequence family (e.g. LigandMPNN's single-structure Input) to DanLing's batch. A
-    single structure has no batch to be topology-invariant to and no padding, so it stays dense; the Runner
-    seeds its decoding-order draw by the structure's global index for reproducibility.
+    single structure has no batch to be topology-invariant to and no padding, so it stays dense.
     """
 
     batched = collate_single(batch)
@@ -194,20 +100,11 @@ def collate_denoising(batch: list[Any]) -> dict[str, Any]:
     ``model(input=..., target=...)``; the same mapping is the criterion's ``target`` (carrying both the
     ``atom_mask`` and the resolved-atom Target). The normalizer is the resolved-atom count the denoising
     loss averages over.
-
-    An inference item is a bare model input from the plain Processor call (the ``infer`` split lowers that
-    way, so inference-only kwargs like ``tfg_guidance`` / ``placement`` flow through). There is no target;
-    ``infer_step`` samples from the input alone, so the batch is just ``{"input": model_input}``.
     """
 
     from ..modules.diffusion.loss import resolved_atom_mask
 
-    if len(batch) != 1:
-        raise ValueError(f"the diffusion families train at batch_size=1; got a batch of {len(batch)}")
-    item = batch[0]
-    if not isinstance(item, tuple):
-        return {"input": item}
-    model_input, model_target = item
+    model_input, model_target = collate_single(batch)
     pair = {"input": model_input, "target": model_target}
     resolved = resolved_atom_mask(model_target, model_input)
     return {"input": pair, "target": pair, "loss_normalizer": int(resolved.sum())}

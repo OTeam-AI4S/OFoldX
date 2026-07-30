@@ -9,11 +9,11 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from tensordict import tensorclass
 from typing import cast
 
 import torch
 import torch.nn.functional as F
+from tensordict import tensorclass
 from torch import Tensor, nn
 
 from ...data.molecular import ComponentReference
@@ -28,74 +28,6 @@ GRNADE_UNKNOWN_TOKEN = len(GRNADE_COMPONENT_IDS)
 
 GvpValue = tuple[Tensor, Tensor]
 Activation = Callable[[Tensor], Tensor] | None
-
-
-@dataclass(eq=False)
-class GrnadeInput:
-    r"""
-    Typed tensor graph consumed by gRNAde.
-
-    Args:
-        node_scalar_features: Scalar node features with shape
-            ``(num_residues, num_conformations, 15)``.
-        node_vector_features: Vector node features with shape
-            ``(num_residues, num_conformations, 4, 3)``.
-        edge_scalar_features: Scalar edge features with shape
-            ``(num_edges, num_conformations, 132)``.
-        edge_vector_features: Vector edge features with shape
-            ``(num_edges, num_conformations, 3, 3)``.
-        edge_index: Directed source and destination indices with shape ``(2, num_edges)``.
-        sequence_tokens: Native RNA tokens with shape ``(num_residues,)``.
-        conformation_mask: Valid-conformation mask with shape
-            ``(num_residues, num_conformations)``.
-        design_mask: Residues whose identities may be replaced.
-        structure: Canonical source structure.
-        component_references: Residue axis aligned with all node tensors.
-    """
-
-    node_scalar_features: Tensor
-    node_vector_features: Tensor
-    edge_scalar_features: Tensor
-    edge_vector_features: Tensor
-    edge_index: Tensor
-    sequence_tokens: Tensor
-    conformation_mask: Tensor
-    design_mask: Tensor
-    structure: Structure
-    component_references: tuple[ComponentReference, ...]
-
-
-@dataclass(eq=False)
-class GrnadeOutput:
-    r"""
-    Teacher-forced RNA identity predictions.
-
-    Args:
-        logits: Unnormalized canonical-RNA logits with shape
-            ``(num_residues, 4)``.
-        log_probabilities: Log-softmax values aligned with ``logits``.
-    """
-
-    logits: Tensor
-    log_probabilities: Tensor
-
-
-@tensorclass
-class GrnadeSamplingOutput:
-    r"""
-    Autoregressively sampled RNA identities.
-
-    Args:
-        sequence_tokens: Sampled token IDs with shape
-            ``(num_samples, num_residues)``.
-        logits: Realized autoregressive logits with shape
-            ``(num_samples, num_residues, 4)``.
-        log_probabilities: Log-softmax values aligned with ``logits``.
-    """
-
-    sequence_tokens: Tensor
-    logits: Tensor
-    log_probabilities: Tensor
 
 
 class GrnadeModel(Model):
@@ -207,10 +139,7 @@ class GrnadeModel(Model):
                 encoder_node=encoder_node,
             )
         logits = cast(Tensor, self.output_projection(node))
-        return GrnadeOutput(
-            logits=logits,
-            log_probabilities=F.log_softmax(logits, dim=-1),
-        )
+        return GrnadeOutput(logits=logits)
 
     @torch.inference_mode()
     def sample(
@@ -312,7 +241,6 @@ class GrnadeModel(Model):
         return GrnadeSamplingOutput(
             sequence_tokens=sequence_tokens,
             logits=logits,
-            log_probabilities=F.log_softmax(logits, dim=-1),
             batch_size=[num_samples],
         )
 
@@ -358,12 +286,12 @@ class GrnadeEncoderBlock(nn.Module):
         dropout: float,
     ) -> None:
         super().__init__()
+        self.norms = nn.ModuleList(GvpLayerNorm(node_size) for _ in range(2))
         self.message_passing = GvpMessagePassing(
             node_size,
             edge_size,
             aggregation="mean",
         )
-        self.norms = nn.ModuleList(GvpLayerNorm(node_size) for _ in range(2))
         self.dropouts = nn.ModuleList(GvpDropout(dropout) for _ in range(2))
         hidden_size = (4 * node_size[0], 2 * node_size[1])
         self.transition = nn.Sequential(
@@ -407,8 +335,8 @@ class GrnadeDecoderBlock(nn.Module):
             edge_size,
             aggregation="add",
         )
-        self.norms = nn.ModuleList(GvpLayerNorm(node_size) for _ in range(2))
         self.dropouts = nn.ModuleList(GvpDropout(dropout) for _ in range(2))
+        self.norms = nn.ModuleList(GvpLayerNorm(node_size) for _ in range(2))
         hidden_size = (4 * node_size[0], 2 * node_size[1])
         self.transition = nn.Sequential(
             Gvp(node_size, hidden_size, vector_activation=None),
@@ -728,3 +656,83 @@ def _norm_no_nan(
 ) -> Tensor:
     norm_square = value.square().sum(dim=dim, keepdim=keepdim).clamp_min(1e-8)
     return norm_square if square else torch.sqrt(norm_square)
+
+
+@dataclass(eq=False)
+class GrnadeInput:
+    r"""
+    Typed tensor graph consumed by gRNAde.
+
+    Args:
+        node_scalar_features: Scalar node features with shape
+            ``(num_residues, num_conformations, 15)``.
+        node_vector_features: Vector node features with shape
+            ``(num_residues, num_conformations, 4, 3)``.
+        edge_scalar_features: Scalar edge features with shape
+            ``(num_edges, num_conformations, 132)``.
+        edge_vector_features: Vector node features with shape
+            ``(num_edges, num_conformations, 3, 3)``.
+        edge_index: Directed source and destination indices with shape ``(2, num_edges)``.
+        sequence_tokens: Native RNA tokens with shape ``(num_residues,)``.
+        conformation_mask: Valid-conformation mask with shape
+            ``(num_residues, num_conformations)``.
+        design_mask: Residues whose identities may be replaced.
+        structure: Canonical source structure.
+        component_references: Residue axis aligned with all node tensors.
+    """
+
+    node_scalar_features: Tensor
+    node_vector_features: Tensor
+    edge_scalar_features: Tensor
+    edge_vector_features: Tensor
+    edge_index: Tensor
+    sequence_tokens: Tensor
+    conformation_mask: Tensor
+    design_mask: Tensor
+    structure: Structure
+    component_references: tuple[ComponentReference, ...]
+
+
+@dataclass(eq=False)
+class GrnadeOutput:
+    r"""
+    Teacher-forced RNA identity predictions.
+
+    Args:
+        logits: Unnormalized canonical-RNA logits with shape
+            ``(num_residues, 4)``.
+    """
+
+    logits: Tensor
+
+    @property
+    def log_probabilities(self) -> Tensor:
+        r"""
+        Log-softmax values aligned with ``logits``.
+        """
+
+        return self.logits.log_softmax(dim=-1)
+
+
+@tensorclass
+class GrnadeSamplingOutput:
+    r"""
+    Autoregressively sampled RNA identities.
+
+    Args:
+        sequence_tokens: Sampled token IDs with shape
+            ``(num_samples, num_residues)``.
+        logits: Realized autoregressive logits with shape
+            ``(num_samples, num_residues, 4)``.
+    """
+
+    sequence_tokens: Tensor
+    logits: Tensor
+
+    @property
+    def log_probabilities(self) -> Tensor:
+        r"""
+        Log-softmax values aligned with ``logits``.
+        """
+
+        return self.logits.log_softmax(dim=-1)

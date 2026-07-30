@@ -128,9 +128,3 @@ class PxDesignConfig(Config):
     condition_embeddings: PxDesignConditionEmbeddingsConfig = PxDesignConditionEmbeddingsConfig()
     denoiser: PxDesignDenoiserConfig = PxDesignDenoiserConfig()
     sampler: PxDesignSamplerConfig = PxDesignSamplerConfig()
-
-
-class PxDesignProcessorConfig(Config):
-    r"""
-    Configuration for the PxDesign processor.
-    """

@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from os import PathLike
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, Any, NamedTuple, NoReturn, cast
@@ -176,6 +176,7 @@ MIRROR_REPOSITORY: tuple[str, ...] = (
     "pipeline.json",
     "*/pipeline.json",
 )
+_DEFAULT_DELETE_PATTERNS: Any = object()
 
 
 def upload_repository(
@@ -187,7 +188,7 @@ def upload_repository(
     revision: str | None = None,
     commit_message: str | None = None,
     allow_patterns: Sequence[str] | None = None,
-    delete_patterns: Sequence[str] | None = MIRROR_REPOSITORY,
+    delete_patterns: Sequence[str] | None = _DEFAULT_DELETE_PATTERNS,
 ) -> CommitInfo:
     r"""
     Upload a local model repository to the Hugging Face Hub.
@@ -213,11 +214,10 @@ def upload_repository(
 
     folder = Path(directory).expanduser()
     resolved_allow = None if allow_patterns is None else list(allow_patterns)
-    resolved_delete = (
-        None
-        if delete_patterns is None or (allow_patterns is not None and delete_patterns is MIRROR_REPOSITORY)
-        else list(delete_patterns)
-    )
+    if delete_patterns is _DEFAULT_DELETE_PATTERNS:
+        resolved_delete = None if allow_patterns is not None else list(MIRROR_REPOSITORY)
+    else:
+        resolved_delete = None if delete_patterns is None else list(delete_patterns)
 
     api = HfApi(token=token)
     api.create_repo(repo_id=repo_id, repo_type="model", private=private, exist_ok=True)
@@ -310,37 +310,6 @@ def model_values(path: Path) -> tuple[ModelRegistration, dict[str, object]]:
     return registered, values
 
 
-def build_registered_config(config_class: Any, values: Mapping[str, object], source: str) -> Any:
-    r"""
-    Construct a registered config from repository or override values, rejecting unknown keys.
-
-    Every path that reconstructs a config from untrusted values (a loaded model.json,
-    processor.json, or fresh-training overrides) must reject a key that is not a field of the
-    config, so a stale or misspelled key fails loudly here instead of being kept verbatim while
-    the real field silently uses its default.
-
-    Args:
-        config_class: The registered ``Config`` subclass to construct.
-        values: The candidate key/value pairs.
-        source: A human-readable origin used in the error (e.g. ``"boltz1 model.json"``).
-
-    Returns:
-        The constructed config.
-
-    Raises:
-        ValueError: If ``values`` contains a key that is not a field of ``config_class``.
-    """
-
-    unknown = sorted(set(values) - set(config_class().keys()))
-    if unknown:
-        raise ValueError(
-            f"{source} has unknown config key(s) {unknown}: not fields of {config_class.__name__}. "
-            "A stale or misspelled key would otherwise be kept verbatim while the real field silently "
-            "used its default."
-        )
-    return config_class(dict(values))
-
-
 def load_model(
     repository: ResolvedRepository,
     *,
@@ -362,7 +331,7 @@ def load_model(
     """
 
     registration, values = model_values(repository.path)
-    config = build_registered_config(registration.model_config, values, f"{registration.id} model.json")
+    config = registration.model_config(values)
     with torch.device("meta"):
         model = registration.model(config)
     return load_registered_model(
@@ -491,7 +460,7 @@ def load_registered_processor(
         return registration.processor(device=device, dtype=resolved_dtype)
 
     processor = cast(Callable[..., Processor], registration.processor)
-    config = build_registered_config(processor_config, values, f"{registration.id} processor.json")
+    config = processor_config(values)
     return processor(config, device=device, dtype=resolved_dtype)
 
 

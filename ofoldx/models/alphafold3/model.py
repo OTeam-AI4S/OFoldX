@@ -57,12 +57,9 @@ from ...modules.head import (
 from ...modules.head.frames import gather_atoms_by_index, insert_sample_axis
 from ...modules.transition import Transition
 from ...modules.trunk.msa import (
-    MsaPairBlock,
     MsaPairWeightedAveraging,
     PostProjectionOuterProductMean,
-    TrianglePairUpdateBlock,
 )
-from ...modules.trunk.pairformer import PairformerBlock, PairformerStack
 from ...results import FoldPrediction, FoldResult, Metric, PairMetric, Score
 from .config import AlphaFold3Config
 
@@ -153,9 +150,6 @@ class AlphaFold3Model(Model):
         self.token_bond_projection = nn.Linear(1, config.pair_size, bias=False)
         self.pair_recycle_norm = LayerNorm(config.pair_size)
         self.pair_recycle_projection = nn.Linear(config.pair_size, config.pair_size, bias=False)
-        # Preserve released initialization order while registering children in execution order.
-        single_recycle_norm = LayerNorm(config.single_size)
-        single_recycle_projection = nn.Linear(config.single_size, config.single_size, bias=False)
         self.template_embedder = AlphaFold3TemplateEmbedder(
             pair_size=config.pair_size,
             hidden_size=config.template.hidden_size,
@@ -170,8 +164,8 @@ class AlphaFold3Model(Model):
             pair_size=config.pair_size,
             token_feature_size=config.token_feature_size,
         )
-        self.single_recycle_norm = single_recycle_norm
-        self.single_recycle_projection = single_recycle_projection
+        self.single_recycle_norm = LayerNorm(config.single_size)
+        self.single_recycle_projection = nn.Linear(config.single_size, config.single_size, bias=False)
         self.pairformer_stack = AlphaFold3PairformerStack(
             num_blocks=config.trunk.num_pairformer_blocks,
             single_size=config.single_size,
@@ -210,7 +204,6 @@ class AlphaFold3Model(Model):
             center_random_augmentation=config.sampler.center_random_augmentation,
         )
         self._num_sampling_steps = config.sampler.num_sampling_steps
-        self.distogram_head = DistogramHead(config.pair_size, config.distogram.num_bins, bias=False)
         self.confidence_head = AlphaFold3ConfidenceHead(
             single_size=config.single_size,
             pair_size=config.pair_size,
@@ -231,6 +224,7 @@ class AlphaFold3Model(Model):
             expansion=config.confidence.expansion,
             single_max_abs=config.confidence.single_max_abs,
         )
+        self.distogram_head = DistogramHead(config.pair_size, config.distogram.num_bins, bias=False)
         # Atom cross-attention adaptively normalizes queries and keys from the raw hidden state.
         self.post_init()
 
@@ -323,19 +317,24 @@ class AlphaFold3Model(Model):
             and confidence logits.
 
         Raises:
-            ValueError: If ``recycling_steps`` is not positive.
+            ValueError: If a count is not positive.
         """
 
         num_samples = 5 if num_samples is None else num_samples
+        if num_samples < 1:
+            raise ValueError("num_samples must be positive")
         recycling_steps = self._recycling_steps if recycling_steps is None else recycling_steps
         if recycling_steps < 1:
             raise ValueError("recycling_steps must be positive")
+        num_sampling_steps = self._num_sampling_steps if num_sampling_steps is None else num_sampling_steps
+        if num_sampling_steps < 1:
+            raise ValueError("num_sampling_steps must be positive")
         representations = self._run_trunk(input, recycling_steps=recycling_steps, generator=generator)
         pred_coords = self.coordinate_sampler(
             self._denoise,
             context=self._denoise_context(input, representations),
             num_samples=num_samples,
-            num_sampling_steps=self._num_sampling_steps if num_sampling_steps is None else num_sampling_steps,
+            num_sampling_steps=num_sampling_steps,
             generator=generator,
         )
         return self._assemble_output(input, representations, pred_coords)
@@ -378,14 +377,8 @@ class AlphaFold3Model(Model):
         """
 
         num_samples = 5 if num_samples is None else num_samples
-        if num_samples < 1:
-            raise ValueError("num_samples must be positive")
         recycling_steps = self._recycling_steps if recycling_steps is None else recycling_steps
-        if recycling_steps < 1:
-            raise ValueError("recycling_steps must be positive")
         num_sampling_steps = self._num_sampling_steps if num_sampling_steps is None else num_sampling_steps
-        if num_sampling_steps < 1:
-            raise ValueError("num_sampling_steps must be positive")
         if input.system is None or not input.atom_sites or not input.token_sites:
             raise ValueError(
                 "fold requires a Processor-built input carrying system, atom_sites, and token_sites; "
@@ -1131,7 +1124,7 @@ class AlphaFold3TemplateEmbedder(nn.Module):
         expansion: int = 2,
         backend: str = "auto",
     ) -> None:
-        nn.Module.__init__(self)
+        super().__init__()
         self.num_blocks = num_blocks
         self.vocab_size = vocab_size
         self.pair_norm = LayerNorm(pair_size, backend=backend)
@@ -1292,6 +1285,8 @@ class AlphaFold3BinnedDistancePairEmbedder(nn.Module):
 class AlphaFold3MsaTrunk(nn.Module):
     r"""
     AlphaFold 3 MSA trunk with homogeneous family-owned joint blocks and a final pair-only update.
+
+    ``num_stages`` counts both the joint MSA/pair blocks and the distinct final pair-only stage.
     """
 
     def __init__(
@@ -1300,7 +1295,7 @@ class AlphaFold3MsaTrunk(nn.Module):
         pair_size: int = 128,
         msa_feature_size: int = 34,
         token_feature_size: int = 449,
-        num_blocks: int = 4,
+        num_stages: int = 4,
         outer_product_hidden_size: int = 32,
         num_msa_attention_heads: int = 8,
         triangle_multiplication_hidden_size: int = 128,
@@ -1312,7 +1307,7 @@ class AlphaFold3MsaTrunk(nn.Module):
         super().__init__()
         self.msa_projection = nn.Linear(msa_feature_size, msa_size, bias=False)
         self.token_projection = nn.Linear(token_feature_size, msa_size, bias=False)
-        self.num_blocks = num_blocks
+        self.num_stages = num_stages
         self.blocks = nn.ModuleList(
             AlphaFold3MsaPairBlock(
                 msa_size=msa_size,
@@ -1325,7 +1320,7 @@ class AlphaFold3MsaTrunk(nn.Module):
                 expansion=expansion,
                 backend=backend,
             )
-            for _ in range(num_blocks - 1)
+            for _ in range(num_stages - 1)
         )
         self.final_pair_update = (
             AlphaFold3FinalMsaPairUpdate(
@@ -1338,7 +1333,7 @@ class AlphaFold3MsaTrunk(nn.Module):
                 expansion=expansion,
                 backend=backend,
             )
-            if num_blocks
+            if num_stages
             else None
         )
 
@@ -1363,7 +1358,7 @@ class AlphaFold3MsaTrunk(nn.Module):
         return msa, pair
 
 
-class AlphaFold3MsaPairBlock(MsaPairBlock):
+class AlphaFold3MsaPairBlock(nn.Module):
     r"""
     Joint AlphaFold 3 MSA/pair block with the family-owned triangle-bias equation.
     """
@@ -1380,7 +1375,7 @@ class AlphaFold3MsaPairBlock(MsaPairBlock):
         expansion: int = 4,
         backend: str = "auto",
     ) -> None:
-        nn.Module.__init__(self)
+        super().__init__()
         self.outer_product_mean = PostProjectionOuterProductMean(
             msa_size=msa_size,
             hidden_size=outer_product_hidden_size,
@@ -1402,6 +1397,19 @@ class AlphaFold3MsaPairBlock(MsaPairBlock):
             expansion=expansion,
             backend=backend,
         )
+
+    def forward(
+        self,
+        msa: Tensor,
+        pair: Tensor,
+        *,
+        msa_mask: Tensor | None = None,
+        pair_mask: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        pair = pair + self.outer_product_mean(msa, msa_mask=msa_mask)
+        msa = self.msa_update(msa, pair, pair_mask=pair_mask)
+        pair = self.triangle_pair_update(pair, pair_mask=pair_mask)
+        return msa, pair
 
 
 class AlphaFold3FinalMsaPairUpdate(nn.Module):
@@ -1475,7 +1483,7 @@ class AlphaFold3MsaUpdateBlock(nn.Module):
         return msa + self.transition(msa)
 
 
-class AlphaFold3PairformerStack(PairformerStack):
+class AlphaFold3PairformerStack(nn.Module):
     r"""
     Homogeneous stack of AlphaFold 3 Pairformer blocks.
     """
@@ -1492,7 +1500,7 @@ class AlphaFold3PairformerStack(PairformerStack):
         expansion: int = 4,
         backend: str = "auto",
     ) -> None:
-        nn.Module.__init__(self)
+        super().__init__()
         self.num_blocks = num_blocks
         self.blocks = nn.ModuleList(
             AlphaFold3PairformerBlock(
@@ -1508,8 +1516,13 @@ class AlphaFold3PairformerStack(PairformerStack):
             for _ in range(num_blocks)
         )
 
+    def forward(self, single: Tensor, pair: Tensor, pair_mask: Tensor | None = None) -> tuple[Tensor, Tensor]:
+        for block in self.blocks:
+            single, pair = block(single, pair, pair_mask=pair_mask)
+        return single, pair
 
-class AlphaFold3PairformerBlock(PairformerBlock):
+
+class AlphaFold3PairformerBlock(nn.Module):
     r"""
     One AlphaFold 3 Pairformer block with the family-owned triangle-bias equation.
     """
@@ -1525,7 +1538,7 @@ class AlphaFold3PairformerBlock(PairformerBlock):
         expansion: int = 4,
         backend: str = "auto",
     ) -> None:
-        nn.Module.__init__(self)
+        super().__init__()
         self.pair_update = AlphaFold3TrianglePairUpdateBlock(
             pair_size=pair_size,
             triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
@@ -1542,8 +1555,14 @@ class AlphaFold3PairformerBlock(PairformerBlock):
         )
         self.single_transition = Transition(single_size, expansion=expansion, backend=backend)
 
+    def forward(self, single: Tensor, pair: Tensor, pair_mask: Tensor | None = None) -> tuple[Tensor, Tensor]:
+        pair = self.pair_update(pair, pair_mask=pair_mask)
+        single = single + self.pair_attention(single, pair, pair_mask=pair_mask)
+        single = single + self.single_transition(single)
+        return single, pair
 
-class AlphaFold3TrianglePairUpdateBlock(TrianglePairUpdateBlock):
+
+class AlphaFold3TrianglePairUpdateBlock(nn.Module):
     r"""
     AlphaFold 3 pair update with its exact ending-node triangle-bias equation.
     """
@@ -1557,7 +1576,7 @@ class AlphaFold3TrianglePairUpdateBlock(TrianglePairUpdateBlock):
         expansion: int = 4,
         backend: str = "auto",
     ) -> None:
-        nn.Module.__init__(self)
+        super().__init__()
         self.triangle_multiplication_outgoing = TriangleMultiplication(
             pair_size=pair_size,
             hidden_size=triangle_multiplication_hidden_size,
@@ -1583,6 +1602,10 @@ class AlphaFold3TrianglePairUpdateBlock(TrianglePairUpdateBlock):
             backend=backend,
         )
         self.transition = Transition(pair_size, expansion=expansion, backend=backend)
+
+    def forward(self, pair: Tensor, pair_mask: Tensor | None = None) -> Tensor:
+        pair = self.triangle_update(pair, pair_mask=pair_mask)
+        return pair + self.transition(pair)
 
     def triangle_update(self, pair: Tensor, pair_mask: Tensor | None = None) -> Tensor:
         pair = pair + self.triangle_multiplication_outgoing(pair, pair_mask=pair_mask)
@@ -1723,8 +1746,8 @@ class AlphaFold3PostProjectionSymmetricPairConfidenceProjector(nn.Module):
     ) -> None:
         super().__init__()
         self.pae_norm = LayerNorm(pair_size)
-        self.pde_norm = LayerNorm(pair_size)
         self.pae_projection = nn.Linear(pair_size, num_pae_bins, bias=False)
+        self.pde_norm = LayerNorm(pair_size)
         self.pde_projection = nn.Linear(pair_size, num_pde_bins, bias=False)
 
     def forward(self, pair: Tensor) -> tuple[Tensor, Tensor]:

@@ -1,5 +1,5 @@
 r"""
-Training, evaluation, and inference runners.
+Training and evaluation runners.
 """
 
 from .config import RunnerConfig

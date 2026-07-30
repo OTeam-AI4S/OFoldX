@@ -23,11 +23,8 @@ class StructureDataset(Dataset):
     Args:
         source: Directory, glob, manifest, structure file, or ``None`` for an empty
             dataset.
-        processor: Callable that converts one structure reference into a model input.
-        lower: How to lower each structure -- ``"process_training"`` to produce the separate
-            ``(input, target)`` the diffusion families train on, or ``"call"`` for the plain Processor
-            call (the sequence families, and every family's inference splits). The Runner supplies this
-            explicitly from the architecture's training spec rather than sniffing the Processor's methods.
+        processor: Callable that converts one structure into the value consumed by
+            the model strategy.
         processor_kwargs: Arguments forwarded to every processor call.
     """
 
@@ -36,15 +33,11 @@ class StructureDataset(Dataset):
         source: Any,
         processor: Any,
         *,
-        lower: str = "call",
         processor_kwargs: Mapping[str, Any] | None = None,
     ) -> None:
-        if lower not in ("call", "process_training"):
-            raise ValueError(f"lower must be 'call' or 'process_training'; got {lower!r}")
         self.processor = processor
-        self.lower = lower
         self.processor_kwargs = dict(processor_kwargs or {})
-        # Records stay as raw paths (lazy): the Processor owns reading, one file per access.
+        # Records stay as raw paths; generic I/O reads one structure per access.
         self.records: list[str] = _resolve_records(source)
 
     def __len__(self) -> int:
@@ -54,13 +47,7 @@ class StructureDataset(Dataset):
         from ..io import read_structure
 
         structure = read_structure(self.records[index])
-        if self.lower == "process_training":
-            item = self.processor.process_training(structure, **self.processor_kwargs)
-        else:
-            item = self.processor(structure, **self.processor_kwargs)
-        # Pair each item with its global dataset index (the sampler-assigned ``index``, independent of batch
-        # size and DDP sharding) so inference can seed a per-sample generator reproducibly.
-        return index, item
+        return self.processor(structure, **self.processor_kwargs)
 
 
 def _resolve_records(source: Any) -> list[str]:
@@ -105,7 +92,5 @@ def _read_manifest(path: Path) -> list[str]:
         entry = Path(line).expanduser()
         if not entry.is_absolute():
             entry = path.parent / entry
-        if not entry.exists():
-            raise FileNotFoundError(f"manifest {path} lists a missing structure: {entry}")
         records.append(str(entry))
     return records

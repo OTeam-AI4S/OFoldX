@@ -5,7 +5,7 @@ Input processing for ODesign structure generation.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import cast, get_args
 
@@ -20,6 +20,7 @@ from ...data.evidence import MSA, MSACollection, msa_bindings, resolve_msa_bindi
 from ...data.molecular import (
     AtomSite,
     ChemicalComponent,
+    ComponentReference,
     MolecularSystem,
     Molecule,
     PolymerSequence,
@@ -36,7 +37,6 @@ from ...data.molecular import (
 from ...data.placement import (
     ExistingSpan,
     GeneratedSegment,
-    InstanceIdAllocator,
     PlacementMap,
     PlacementSpec,
     SymbolicAtomSite,
@@ -44,13 +44,10 @@ from ...data.placement import (
 )
 from ...data.placement import instance_of as _placement_instance_of
 from ...data.placement import resolve as _resolve_site
-from ...data.placement import validate_placement
 from ...data.structure import Structure
 from ...processor import Processor
 from .config import ODesignLigandProcessorConfig, ODesignProcessorConfig
 from .model import (
-    ODesignDesignedResidue,
-    ODesignFixedResidue,
     ODesignGeneratedAtoms,
     ODesignInput,
     ODesignLayout,
@@ -59,11 +56,13 @@ from .model import (
     ODesignPlacements,
     ODesignProvisionalAtomSlot,
     ODesignReferenceCoordinates,
-    ODesignResidueSpec,
     ODesignStructureTarget,
 )
 
 _CORE_POLYMER_TYPES: frozenset[str] = frozenset(get_args(PolymerType))
+
+#: One designed polymer type or fixed source residue in an ODesign mask.
+ODesignResidueSpec = PolymerType | ComponentReference
 
 
 _RESIDUE_TYPE_INDEX: dict[str, int] = {
@@ -718,9 +717,6 @@ class ODesignLigandProcessor(Processor):
         generated_atoms: ODesignGeneratedAtoms,
         conditions: Sequence[Hotspot | ODesignReferenceCoordinates],
     ) -> _ODesignLigandPlan:
-        if generated_atoms.min_atoms < 0 or generated_atoms.max_atoms < generated_atoms.min_atoms:
-            raise ValueError("generated atom range must satisfy 0 <= min_atoms <= max_atoms")
-
         condition_values = tuple(conditions)
         for condition in condition_values:
             if not isinstance(condition, (Hotspot, ODesignReferenceCoordinates)):
@@ -1012,17 +1008,17 @@ class ODesignLigandProcessor(Processor):
 def from_design_mask(
     residues: Sequence[ODesignResidueSpec],
     *,
-    group_of: Callable[[int], str],
-    placement_id_of: Callable[[int], str],
+    groups: Sequence[str],
+    placement_ids: Sequence[str],
 ) -> PlacementSpec:
     r"""
     Convert ODesign residue specifications to placements.
 
     Args:
         residues: Designed or fixed residue specifications in output order.
-        group_of: Function returning the placement group for each residue index.
-        placement_id_of: Function returning the placement identifier for each residue
-            index. Each identifier must occupy one contiguous run.
+        groups: Declaration group for each residue.
+        placement_ids: Placement identifier for each residue. Each identifier must
+            occupy one contiguous run.
 
     Returns:
         Placements containing exact-length generated polymer segments for designed
@@ -1055,20 +1051,16 @@ def from_design_mask(
             value = ExistingSpan(current_instance_id, run_start_source, run_next_source)
         placement.setdefault(current_group, {})[current_placement_id] = value
 
-    for index, residue in enumerate(residues):
-        group = group_of(index)
-        placement_id = placement_id_of(index)
-        if isinstance(residue, ODesignDesignedResidue):
-            if residue.polymer_type not in _CORE_POLYMER_TYPES:
+    for index, (residue, group, placement_id) in enumerate(zip(residues, groups, placement_ids, strict=True)):
+        if isinstance(residue, str):
+            if residue not in _CORE_POLYMER_TYPES:
                 raise ValueError(
                     f"designed residue {index} has non-core polymer_type "
-                    f"{residue.polymer_type!r}; a de-novo non-polymer (ligand num_atoms) has no "
+                    f"{residue!r}; a de-novo non-polymer (ligand num_atoms) has no "
                     f"PlacementValue (GAP-1) and cannot be projected onto the placement core"
                 )
             extends = (
-                group == current_group
-                and placement_id == current_placement_id
-                and current_polymer_type == residue.polymer_type
+                group == current_group and placement_id == current_placement_id and current_polymer_type == residue
             )
             if extends:
                 run_length += 1
@@ -1082,20 +1074,20 @@ def from_design_mask(
             seen.add(placement_id)
             current_group = group
             current_placement_id = placement_id
-            current_polymer_type = residue.polymer_type
+            current_polymer_type = residue
             current_instance_id = None
             run_length = 1
         else:
-            assert isinstance(residue, ODesignFixedResidue)
+            instance_id, source_index = residue
             extends = (
                 group == current_group
                 and placement_id == current_placement_id
                 and current_polymer_type is None
-                and current_instance_id == residue.instance_id
-                and run_next_source == residue.source_index
+                and current_instance_id == instance_id
+                and run_next_source == source_index
             )
             if extends:
-                run_next_source = residue.source_index + 1
+                run_next_source = source_index + 1
                 continue
             flush()
             if placement_id in seen:
@@ -1107,13 +1099,11 @@ def from_design_mask(
             current_group = group
             current_placement_id = placement_id
             current_polymer_type = None
-            current_instance_id = residue.instance_id
-            run_start_source = residue.source_index
-            run_next_source = residue.source_index + 1
+            current_instance_id = instance_id
+            run_start_source = source_index
+            run_next_source = source_index + 1
 
     flush()
-    # Enforce globally unique placement IDs across the PlacementSpec.
-    validate_placement(placement)
     return placement
 
 
@@ -1225,7 +1215,7 @@ def _materialize_placement(
     # canonical ``chain_{n}`` (uniform and 0-based) once per realized output
     # chain that has >=1 occurrence. A declaration group whose parts all realize to zero length
     # mints NO chain and consumes NO index — it is recorded as () and skipped.
-    instance_ids = InstanceIdAllocator()
+    next_instance = 0
     for chain_index, (group, chain) in enumerate(placement.placements.items()):
         if all(
             part.max_length == 0 if isinstance(part, GeneratedSegment) else part.stop == part.start
@@ -1235,7 +1225,8 @@ def _materialize_placement(
                 if isinstance(part, GeneratedSegment):
                     placement_map.setdefault(group, {})[placement_id] = ()
             continue
-        instance_id = instance_ids.allocate()
+        instance_id = f"chain_{next_instance}"
+        next_instance += 1
         while instance_id in used_instance_ids:
             instance_id += "_"
         used_instance_ids.add(instance_id)
@@ -1522,7 +1513,7 @@ def _realize_ranges(input: ODesignInput, generator: torch.Generator | None) -> O
         if isinstance(part, GeneratedSegment) and part.min_length != part.max_length
     }
     lengths = {}
-    chain_lengths = placement.chain_lengths or (None,) * len(placement.placements)
+    chain_lengths = (None,) * len(placement.placements) if placement.chain_lengths is None else placement.chain_lengths
     for chain, chain_length in zip(placement.placements.values(), chain_lengths, strict=True):
         chain_ranges = [
             (placement_id, part)
@@ -1548,12 +1539,10 @@ def _realize_ranges(input: ODesignInput, generator: torch.Generator | None) -> O
         # so an exact-match check falls out of the same bounds. Outside the window there is no length
         # assignment to realize the request, mirroring the rfdiffusion "cannot be realized" contract.
         minimum = sum(
-            part.min_length if isinstance(part, GeneratedSegment) else part.stop - part.start
-            for part in chain.values()
+            part.min_length if isinstance(part, GeneratedSegment) else part.stop - part.start for part in chain.values()
         )
         maximum = sum(
-            part.max_length if isinstance(part, GeneratedSegment) else part.stop - part.start
-            for part in chain.values()
+            part.max_length if isinstance(part, GeneratedSegment) else part.stop - part.start for part in chain.values()
         )
         if not minimum <= chain_length <= maximum:
             raise ValueError(

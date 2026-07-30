@@ -261,12 +261,16 @@ class ProtenixProcessor(Processor):
             dtype=self.dtype,
         )
 
-    def _normalize_msa(
+    def _validate_msa(
         self,
         msa: MSA | MSACollection | None,
         system: MolecularSystem,
-    ) -> MSA | MSACollection | None:
-        return _normalize_msa(msa, system)
+    ) -> None:
+        if msa is None:
+            return
+        for _value, _target_instance_id, entity in resolve_msa_bindings(msa, system):
+            if entity.polymer_type != "protein":
+                raise ValueError("Protenix accepts supplied MSA evidence only for proteins")
 
     def _lower(
         self,
@@ -286,7 +290,7 @@ class ProtenixProcessor(Processor):
         atom_contact_values = tuple(atom_contacts)
         token_contact_values = tuple(token_contacts)
         system = molecular_system_from_input(input)
-        normalized_msa = self._normalize_msa(msa, system)
+        self._validate_msa(msa, system)
         # Atom contacts require atom-level tokens. Token contacts and pockets use
         # the tokenization already selected for each residue.
         expanded_residues = _atom_constraint_residues(atom_contact_values, system)
@@ -294,7 +298,7 @@ class ProtenixProcessor(Processor):
         return _features(
             system,
             tokens=tokens,
-            msa=normalized_msa,
+            msa=msa,
             templates=templates,
             atom_contacts=atom_contact_values,
             token_contacts=token_contact_values,
@@ -379,12 +383,16 @@ class ProtenixTemplateProcessor(ProtenixProcessor):
             dtype=self.dtype,
         )
 
-    def _normalize_msa(
+    def _validate_msa(
         self,
         msa: MSA | MSACollection | None,
         system: MolecularSystem,
-    ) -> MSA | MSACollection | None:
-        return _normalize_template_msa(msa, system)
+    ) -> None:
+        if msa is None:
+            return
+        for _value, _target_instance_id, entity in resolve_msa_bindings(msa, system):
+            if entity.polymer_type not in {"protein", "rna"}:
+                raise ValueError("template-capable Protenix accepts supplied MSA evidence only for proteins and RNA")
 
 
 class ProtenixStructureConditionProcessor(ProtenixProcessor):
@@ -644,30 +652,6 @@ def molecular_system_from_named_sequences(
     return MolecularSystem(entities, instances)
 
 
-def _normalize_msa(
-    msa: MSA | MSACollection | None,
-    system: MolecularSystem,
-) -> MSA | MSACollection | None:
-    if msa is None:
-        return None
-    for _value, _target_instance_id, entity in resolve_msa_bindings(msa, system):
-        if entity.polymer_type != "protein":
-            raise ValueError("Protenix accepts supplied MSA evidence only for proteins")
-    return msa
-
-
-def _normalize_template_msa(
-    msa: MSA | MSACollection | None,
-    system: MolecularSystem,
-) -> MSA | MSACollection | None:
-    if msa is None:
-        return None
-    for _value, _target_instance_id, entity in resolve_msa_bindings(msa, system):
-        if entity.polymer_type not in {"protein", "rna"}:
-            raise ValueError("template-capable Protenix accepts supplied MSA evidence only for proteins and RNA")
-    return msa
-
-
 def _atom_constraint_residues(
     atom_contacts: tuple[ProtenixAtomContact, ...],
     system: MolecularSystem,
@@ -822,7 +806,8 @@ def _features(
         augment=augment_reference_positions,
         generator=generator,
     )
-    atom_names = _model_atom_names(atom_sites)
+    # Preserve canonical atom IDs; SMILES imports assign element-number IDs during construction.
+    atom_names = tuple(site.atom_id for site in atom_sites)
     element_indices = torch.tensor([ATOMIC_NUMBER_BY_ELEMENT[system.atom(site).element] - 1 for site in atom_sites])
     name_indices = torch.tensor(
         [[min(63, max(0, ord(character) - 32)) for character in name.ljust(4)[:4]] for name in atom_names],
@@ -1487,11 +1472,6 @@ def _esm_features(
         token_to_esm_residue[token_index] = esm_sequence_index * sequence_length + monomer_index + 1
         token_has_esm[token_index] = True
     return esm_tokens, esm_mask, token_to_esm_residue, token_has_esm
-
-
-def _model_atom_names(atom_sites: tuple[AtomSite, ...]) -> tuple[str, ...]:
-    # Preserve canonical atom IDs; SMILES imports assign element-number IDs during construction.
-    return tuple(site.atom_id for site in atom_sites)
 
 
 def _structure_condition_features(

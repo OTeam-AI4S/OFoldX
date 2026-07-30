@@ -247,10 +247,7 @@ class OInvFoldPolymerModel(Model):
             valid_mask,
         )
         logits = padded_logits[valid_mask]
-        return OInvFoldOutput(
-            logits=logits,
-            log_probabilities=F.log_softmax(logits, dim=-1),
-        )
+        return OInvFoldOutput(logits=logits)
 
 
 class OInvFoldLigandModel(Model):
@@ -373,10 +370,7 @@ class OInvFoldLigandModel(Model):
         if input.vocabulary_logit_mask is None:
             return output
         logits = output.logits + input.vocabulary_logit_mask.to(output.logits.dtype)
-        return OInvFoldOutput(
-            logits=logits,
-            log_probabilities=F.log_softmax(logits, dim=-1),
-        )
+        return OInvFoldOutput(logits=logits)
 
 
 class OInvFoldEncoder(nn.Module):
@@ -601,7 +595,6 @@ class OInvFoldGraphAttention(nn.Module):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
-        self.value_projection = nn.Linear(hidden_size, hidden_size)
         self.logit_input_projection = nn.Linear(
             3 * hidden_size,
             hidden_size,
@@ -611,6 +604,7 @@ class OInvFoldGraphAttention(nn.Module):
             hidden_size,
             num_attention_heads,
         )
+        self.value_projection = nn.Linear(hidden_size, hidden_size)
         self.output_projection = nn.Linear(hidden_size, hidden_size, bias=False)
         self.output_gate = nn.Linear(hidden_size, hidden_size)
 
@@ -823,10 +817,7 @@ class OInvFoldPolymerDecoder(nn.Module):
         update = self.transition_output_projection(update)
         update = self.transition_output_dropout(update)
         logits = self.output_projection(node + update)
-        return OInvFoldOutput(
-            logits=logits,
-            log_probabilities=F.log_softmax(logits, dim=-1),
-        )
+        return OInvFoldOutput(logits=logits)
 
 
 class OInvFoldAutoregressiveDecoder(nn.Module):
@@ -846,8 +837,8 @@ class OInvFoldAutoregressiveDecoder(nn.Module):
     ) -> None:
         super().__init__()
         self.token_embedding = nn.Embedding(vocabulary_size, hidden_size)
-        self.position_embedding = nn.Embedding(max_positions, hidden_size)
         self.bos_embedding = nn.Parameter(torch.randn(hidden_size))
+        self.position_embedding = nn.Embedding(max_positions, hidden_size)
         self.structure_projection = nn.Linear(hidden_size, hidden_size)
         self.blocks = nn.ModuleList(
             OInvFoldAutoregressiveDecoderBlock(
@@ -969,10 +960,7 @@ class OInvFoldLigandDecoder(nn.Module):
 
     def forward(self, node: Tensor) -> OInvFoldOutput:
         logits = self.output_projection(node)
-        return OInvFoldOutput(
-            logits=logits,
-            log_probabilities=F.log_softmax(logits, dim=-1),
-        )
+        return OInvFoldOutput(logits=logits)
 
 
 def _encode_graph(
@@ -1086,8 +1074,14 @@ class OInvFoldOutput:
 
     Args:
         logits: Unnormalized values with shape ``(num_nodes, vocabulary_size)``.
-        log_probabilities: Log-softmax values aligned with ``logits``.
     """
 
     logits: Tensor
-    log_probabilities: Tensor
+
+    @property
+    def log_probabilities(self) -> Tensor:
+        r"""
+        Log-softmax values aligned with ``logits``.
+        """
+
+        return F.log_softmax(self.logits, dim=-1)

@@ -197,9 +197,6 @@ class Boltz1Processor(Processor):
             are in angstroms; tensor axes align to ``layout``.
         """
 
-        if not isinstance(input, MolecularSystem | Structure):
-            raise TypeError("Boltz1Processor input must be a MolecularSystem or Structure")
-
         if isinstance(input, Structure):
             structure = input
             system = input.system

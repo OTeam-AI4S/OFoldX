@@ -117,24 +117,6 @@ def test_unsupported_stack_is_rejected(tmp_path: Path) -> None:
         Runner(config)
 
 
-def test_processor_shares_model_config(tmp_path: Path) -> None:
-    # `ca_only` is one setting on the Model config; the Runner threads it into the paired Processor.
-    runner = Runner(_config(tmp_path, _write(tmp_path / "chain.pdb"), name="proteinmpnn", ca_only=True))
-    try:
-        assert runner.model.config.ca_only is True
-        assert runner.processor.config.ca_only is True
-    finally:
-        runner.close()
-
-
-def test_processor_override_of_a_shared_key_is_rejected(tmp_path: Path) -> None:
-    # A shared key set on the Processor could disagree with the Model, building an incompatible pair.
-    config = _config(tmp_path, _write(tmp_path / "chain.pdb"), name="proteinmpnn")
-    config["processor"] = {"ca_only": True}
-    with pytest.raises(ValueError, match="shared with the model"):
-        Runner(config)
-
-
 def test_nampnn_criterion_binds_processor_token_scheme(tmp_path: Path) -> None:
     # The RNA token scheme is a Processor setting; the criterion must score with the same scheme, not a
     # baked default, or RNA smoothing mass lands on the wrong token span.
@@ -171,26 +153,6 @@ def test_infer_step_returns_dataclass_output(tmp_path: Path) -> None:
         output = runner.infer_step(batch)
         assert isinstance(output, list) and len(output) == 1
         assert type(output[0]).__name__ == "ProteinMpnnOutput"
-    finally:
-        runner.close()
-
-
-def test_diffusion_infer_split_lowers_via_plain_call(tmp_path: Path) -> None:
-    # The infer split must lower with the plain Processor call, not process_training: that is the only path
-    # inference-only kwargs (tfg_guidance, placement, ...) travel, and it builds no target. collate_denoising
-    # then yields just {"input": ...}, and infer_step samples from it.
-    source = str(_write(tmp_path / "chain.pdb"))
-    config = _config(tmp_path, name="boltz1", **_MINIMAL_BOLTZ1)
-    config["data"] = {"train": {"source": source}, "infer": {"source": source}}
-    runner = Runner(config)
-    try:
-        assert runner.datasets["train"].lower == "process_training"
-        assert runner.datasets["infer"].lower == "call"
-        index, item = runner.datasets["infer"][0]  # the Dataset pairs each item with its global index
-        assert not isinstance(item, tuple)  # a bare model input, not (input, target)
-        batch = runner.collate_fn([(index, item)])
-        assert set(batch) == {"input", "indices"}  # bare input + per-sample index; no target / loss_normalizer
-        assert len(runner.infer_step(batch)) == 1
     finally:
         runner.close()
 

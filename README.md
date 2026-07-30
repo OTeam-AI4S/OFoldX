@@ -10,12 +10,11 @@ registration is reserved for a family only after all of its released scientific
 functions, checkpoint variants, canonical mappings, and conversion paths are
 complete.
 
-Training, evaluation, and inference run through one config-only `ofoldx.runners.Runner`
+Training and evaluation run through one config-only `ofoldx.runners.Runner`
 (Danling-backed). It resolves the exact registered architecture, builds the Model and a
-config-consistent Processor, and applies the training criterion and batching/inference
-strategy that architecture registers; an architecture is trainable exactly when its
-registration declares a criterion. Training support is not a model-registration
-requirement.
+config-consistent Processor, and applies the training criterion and batching strategy
+that architecture registers; an architecture is trainable exactly when its registration
+declares a criterion. Training support is not a model-registration requirement.
 
 ## Get Started
 
@@ -84,16 +83,16 @@ ID; the class owns how its model/processor pair or fixed composition is loaded.
 
 ## Explore
 
-| Package                                | Purpose                                                                                 |
-| -------------------------------------- | --------------------------------------------------------------------------------------- |
-| [`ofoldx.models`](ofoldx/models)       | Model registration; concrete family packages are imported explicitly.                   |
-| `ofoldx.artifacts`                     | The one public writer for a validated standard Model/Processor repository.              |
-| `ofoldx.hub`                           | Hugging Face Hub repository resolution, publication, and loading.                       |
-| [`ofoldx.pipelines`](ofoldx/pipelines) | Concrete family Pipeline registration and shared paired/composite persistence.          |
-| [`ofoldx.modules`](ofoldx/modules)     | Shared neural-network building blocks: attention, trunk, heads, denoising, diffusion.   |
-| [`ofoldx.io`](ofoldx/io)               | Canonical PDB/mmCIF structure I/O; sequence-format I/O belongs to MultiMolecule.        |
-| [`ofoldx.data`](ofoldx/data)           | Canonical molecular, evidence, placement, and scientific domain values.                 |
-| `ofoldx.runners`                       | Pre-release Danling Runner scaffold; its config-only construction contract is deferred. |
+| Package                                | Purpose                                                                               |
+| -------------------------------------- | ------------------------------------------------------------------------------------- |
+| [`ofoldx.models`](ofoldx/models)       | Model registration; concrete family packages are imported explicitly.                 |
+| `ofoldx.artifacts`                     | The one public writer for a validated standard Model/Processor repository.            |
+| `ofoldx.hub`                           | Hugging Face Hub repository resolution, publication, and loading.                     |
+| [`ofoldx.pipelines`](ofoldx/pipelines) | Concrete family Pipeline registration and shared paired/composite persistence.        |
+| [`ofoldx.modules`](ofoldx/modules)     | Shared neural-network building blocks: attention, trunk, heads, denoising, diffusion. |
+| [`ofoldx.io`](ofoldx/io)               | Canonical PDB/mmCIF structure I/O; sequence-format I/O belongs to MultiMolecule.      |
+| [`ofoldx.data`](ofoldx/data)           | Canonical molecular, evidence, placement, and scientific domain values.               |
+| `ofoldx.runners`                       | Config-only Danling Runner for unified training and evaluation.                       |
 
 The low-level values exported by `ofoldx.data` are part of the domain API: atom, bond,
 component, attachment, entity, instance, and site values are what make an in-memory

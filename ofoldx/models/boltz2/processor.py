@@ -1609,8 +1609,6 @@ def _template_features(
         if isinstance(value, Boltz2Template):
             template = value.template
             force_rows.append(value.force)
-            if value.force and value.threshold is None:
-                raise ValueError("a forced Boltz-2 template requires threshold")
             force_threshold_rows.append(float("inf") if value.threshold is None else value.threshold)
         else:
             template = value

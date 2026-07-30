@@ -715,12 +715,9 @@ def _within_residue_violations(positions: Tensor, exists: Tensor, residue_types:
     return (violations.any(dim=1) | violations.any(dim=2)).any(dim=-1)
 
 
-@dataclass(frozen=True)
-class _PdbLocations:
-    component_locations: dict[tuple[str, int], tuple[str, str, str]]
-
-
-def _structure_pdb(structure: Structure) -> tuple[str, _PdbLocations]:
+def _structure_pdb(
+    structure: Structure,
+) -> tuple[str, dict[tuple[str, int], tuple[str, str, str]]]:
     atoms, _dropped, _rewritten = prepare_pdb_atoms(structure)
     atoms = tuple(atom for atom in atoms if atom.element != "H")
     lines = [_pdb_atom_line(atom) for atom in atoms]
@@ -733,7 +730,7 @@ def _structure_pdb(structure: Structure) -> tuple[str, _PdbLocations]:
         )
         for atom in atoms
     }
-    return "\n".join(lines) + "\n", _PdbLocations(component_locations)
+    return "\n".join(lines) + "\n", component_locations
 
 
 def _pdb_atom_line(atom: PdbAtomRecord) -> str:
@@ -874,11 +871,11 @@ def _structure_from_openmm(
     source: Structure,
     topology: _OpenMMTopology,
     positions: NDArray,
-    locations: _PdbLocations,
+    locations: dict[tuple[str, int], tuple[str, str, str]],
 ) -> Structure:
     site_by_location: dict[tuple[str, str, str, str], AtomSite] = {}
     for site, _atom in source.system.iter_atoms():
-        component_location = locations.component_locations.get((site.instance_id, site.component_index))
+        component_location = locations.get((site.instance_id, site.component_index))
         if component_location is None:
             continue
         chain_id, residue_id, insertion_code = component_location

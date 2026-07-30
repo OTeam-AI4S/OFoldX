@@ -130,8 +130,6 @@ class PxDesignCandidate:
         bucket: One-based released selection bucket.
         rank: One-based stable rank over every generated candidate.
         chosen_source: Source of ``chosen_structure``.
-        chosen_structure: Final Protenix, AF2 complex, or original sequence
-            structure according to released priority.
         generation_index: Zero-based backbone generation order.
     """
 
@@ -148,8 +146,19 @@ class PxDesignCandidate:
     bucket: int
     rank: int
     chosen_source: Literal["original", "af2", "protenix"]
-    chosen_structure: Structure
     generation_index: int
+
+    @property
+    def chosen_structure(self) -> Structure:
+        r"""
+        Final Protenix, AF2 complex, or original sequence structure.
+        """
+
+        if self.chosen_source == "original":
+            return self.sequence_structure
+        if self.chosen_source == "af2":
+            return self.af2_complex.structure
+        return cast(FoldPrediction, self.protenix_final).structure
 
 
 @dataclass(eq=False)
@@ -409,13 +418,10 @@ class PxDesignPipeline(CompositePipeline):
                 pass_af2 = candidate.bucket in (1, 2, 3, 4, 7, 8)
                 if candidate.protenix_final is not None:
                     candidate.chosen_source = "protenix"
-                    candidate.chosen_structure = candidate.protenix_final.structure
                 elif pass_af2:
                     candidate.chosen_source = "af2"
-                    candidate.chosen_structure = candidate.af2_complex.structure
                 else:
                     candidate.chosen_source = "original"
-                    candidate.chosen_structure = candidate.sequence_structure
 
         ranked_indices = _rank_preview(candidates) if mode == "preview" else _rank_extended(candidates)
         for rank, candidate_index in enumerate(ranked_indices, start=1):
@@ -567,7 +573,6 @@ class PxDesignPipeline(CompositePipeline):
         bucket = _preview_bucket(filters) if mode == "preview" else _extended_bucket(filters)
         pass_af2 = bucket < 5 if mode == "preview" else bucket in (1, 2, 3, 4, 7, 8)
         chosen_source: Literal["original", "af2", "protenix"] = "af2" if pass_af2 else "original"
-        chosen_structure = af2_complex.structure if chosen_source == "af2" else sequence_structure
         return PxDesignCandidate(
             original_backbone=original_backbone,
             sequence_structure=sequence_structure,
@@ -592,7 +597,6 @@ class PxDesignPipeline(CompositePipeline):
             bucket=bucket,
             rank=0,
             chosen_source=chosen_source,
-            chosen_structure=chosen_structure,
             generation_index=generation_index,
         )
 

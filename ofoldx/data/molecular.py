@@ -527,10 +527,11 @@ class MolecularSystem:
                 self.atom(stereo_a)
                 self.atom(stereo_b)
 
-        # Materialize the physical graph once so genuinely conflicting chemistries for
-        # the same undirected edge fail loud here, at the construction boundary, rather
-        # than reconciling by hidden precedence when the graph is later consumed.
-        self._reconcile_edges()
+        # Only assembly bonds can overlap intrinsic chemistry. Validate those
+        # overlaps now; the derived graph remains uncached because the public
+        # dictionaries are live.
+        if self.bonds:
+            self._reconcile_edges()
 
     def component(self, reference: ComponentReference) -> ChemicalComponent:
         r"""
@@ -740,10 +741,8 @@ class MolecularSystem:
                                 )
                             )
 
-        # Fold stored assembly bonds into their physical edge. Sort so that reversed or
-        # multiple stored edges materialize to the same deterministic representative;
-        # a stored bond that contradicts an intrinsic edge has already failed at
-        # construction, so the fold only agrees with or refines each edge here.
+        # Fold each uniquely stored assembly bond into its physical edge. A stored bond
+        # that contradicts intrinsic chemistry fails during construction.
         for bond in sorted(
             self.bonds,
             key=lambda stored: (
@@ -783,9 +782,7 @@ class MolecularSystem:
             return self
 
         changed_references = frozenset(
-            reference
-            for reference, replacement in replacements.items()
-            if self.component(reference) != replacement
+            reference for reference, replacement in replacements.items() if self.component(reference) != replacement
         )
         instances_by_entity: dict[str, list[str]] = {entity_id: [] for entity_id in self.entities}
         for instance_id, entity_id in self.instances.items():

@@ -195,7 +195,6 @@ class ConditionedTransformerEncoderBlock(nn.Module):
             backend=backend,
         )
         self.post_norm = LayerNorm(hidden_size, backend=backend) if post_layer_norm else nn.Identity()
-        self.sigmoid = nn.Sigmoid()
 
     def forward(
         self,
@@ -215,7 +214,6 @@ class ConditionedTransformerEncoderBlock(nn.Module):
             to_keys,
             attention=self.attention,
             output_gate_projection=self.output_gate_projection,
-            sigmoid=self.sigmoid,
         )
         hidden = hidden + self.transition(hidden, conditioning)
         return self.post_norm(hidden)
@@ -249,7 +247,6 @@ class DenoisingTransformerEncoderBlock(nn.Module):
             expansion=2,
             backend=backend,
         )
-        self.sigmoid = nn.Sigmoid()
 
     def forward(
         self,
@@ -269,12 +266,11 @@ class DenoisingTransformerEncoderBlock(nn.Module):
             to_keys,
             attention=self.attention,
             output_gate_projection=self.output_gate_projection,
-            sigmoid=self.sigmoid,
         )
         return hidden + self.transition(hidden, conditioning)
 
 
-class AtomCrossAttentionTransformerEncoderBlock(DenoisingTransformerEncoderBlock):
+class AtomCrossAttentionTransformerEncoderBlock(nn.Module):
     r"""
     Double-product atom cross-attention with independently normalized raw keys.
     """
@@ -286,8 +282,23 @@ class AtomCrossAttentionTransformerEncoderBlock(DenoisingTransformerEncoderBlock
         num_attention_heads: int,
         backend: str = "auto",
     ) -> None:
-        super().__init__(hidden_size, conditioning_size, num_attention_heads, backend)
+        super().__init__()
+        self.conditioned_norm = AdaptiveLayerNorm(hidden_size, conditioning_size, backend=backend)
         self.key_value_norm = AdaptiveLayerNorm(hidden_size, conditioning_size, backend=backend)
+        self.attention = GatedMultiheadAttention(
+            hidden_size,
+            num_attention_heads=num_attention_heads,
+            query_bias=True,
+            gating=True,
+            backend=backend,
+        )
+        self.output_gate_projection = nn.Linear(conditioning_size, hidden_size)
+        self.transition = ConditionedTransition(
+            hidden_size,
+            conditioning_size,
+            expansion=2,
+            backend=backend,
+        )
 
     def forward(
         self,
@@ -308,7 +319,6 @@ class AtomCrossAttentionTransformerEncoderBlock(DenoisingTransformerEncoderBlock
             to_keys,
             attention=self.attention,
             output_gate_projection=self.output_gate_projection,
-            sigmoid=self.sigmoid,
         )
         return hidden + self.transition(hidden, conditioning)
 
@@ -337,7 +347,6 @@ class NormalizedKeyAtomCrossAttentionTransformerEncoderBlock(AtomCrossAttentionT
             to_keys,
             attention=self.attention,
             output_gate_projection=self.output_gate_projection,
-            sigmoid=self.sigmoid,
         )
         return hidden + self.transition(hidden, conditioning)
 
@@ -358,12 +367,12 @@ class TripleProductConditionedTransition(nn.Module):
         inner_size = hidden_size * expansion
         self.conditioned_norm = AdaptiveLayerNorm(hidden_size, conditioning_size, backend=backend)
         self.gate_projection = nn.Linear(hidden_size, inner_size, bias=False)
+        self.silu = nn.SiLU()
         self.value_projection = nn.Linear(hidden_size, inner_size, bias=False)
         self.expand_projection = nn.Linear(hidden_size, inner_size, bias=False)
-        self.output_projection = nn.Linear(inner_size, hidden_size, bias=False)
         self.conditioning_gate_projection = nn.Linear(conditioning_size, hidden_size)
-        self.silu = nn.SiLU()
         self.sigmoid = nn.Sigmoid()
+        self.output_projection = nn.Linear(inner_size, hidden_size, bias=False)
 
     def forward(self, hidden: Tensor, conditioning: Tensor) -> Tensor:
         normalized = self.conditioned_norm(hidden, conditioning)
@@ -409,7 +418,6 @@ def _attention_update(
     *,
     attention: GatedMultiheadAttention,
     output_gate_projection: nn.Linear,
-    sigmoid: nn.Sigmoid,
 ) -> Tensor:
     key = to_keys(key_base) if to_keys is not None else key_base
     attention_mask = None
@@ -430,7 +438,7 @@ def _attention_update(
         biases=(bias.movedim(-1, -3),),
         attention_mask=attention_mask,
     )
-    return sigmoid(output_gate_projection(conditioning)) * update
+    return output_gate_projection(conditioning).sigmoid() * update
 
 
 def _attention_mask_for_query_keys(mask: Tensor, *, query_length: int, key_length: int) -> Tensor:

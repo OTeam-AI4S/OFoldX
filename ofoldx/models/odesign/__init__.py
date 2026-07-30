@@ -16,8 +16,6 @@ from .config import (
     ODesignTrunkConfig,
 )
 from .model import (
-    ODesignDesignedResidue,
-    ODesignFixedResidue,
     ODesignGeneratedAtoms,
     ODesignInput,
     ODesignLigandBackbone,
@@ -30,7 +28,6 @@ from .model import (
     ODesignProvisionalAtomSlot,
     ODesignRawOutput,
     ODesignReferenceCoordinates,
-    ODesignResidueSpec,
     ODesignSamplingOutput,
     ODesignStructureTarget,
     realize_nucleic_acid_identity,
@@ -49,7 +46,13 @@ from .pipeline import (
     ODesignPolymerDesignResult,
     ODesignProteinPipeline,
 )
-from .processor import ODesignLigandProcessor, ODesignProcessor, from_design_mask, to_design_mask
+from .processor import (
+    ODesignLigandProcessor,
+    ODesignProcessor,
+    ODesignResidueSpec,
+    from_design_mask,
+    to_design_mask,
+)
 
 _MODELS.register(
     "odesign",

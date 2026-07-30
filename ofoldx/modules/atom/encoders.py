@@ -32,118 +32,7 @@ from .window import LocalAtomGeometry, LocalAtomGeometryBuilder, gather_key_wind
 AttentionLayout = Literal["dense", "local"]
 
 
-class AtomToTokenEncoderBase(nn.Module):
-    r"""
-    Shared machinery for the atom-to-token encoders (reference and coordinate paths).
-
-    Holds the atom conditioner, the atom-pair encoder, the atom self-attention module, and the token
-    projection, and exposes the pieces of the encode-then-aggregate pipeline that both concrete encoders
-    reuse: [`build_local_geometry`][ofoldx.modules.atom.encoders.AtomToTokenEncoderBase.build_local_geometry]
-    to precompute the windowed geometry and
-    [`aggregate_to_tokens`][ofoldx.modules.atom.encoders.AtomToTokenEncoderBase.aggregate_to_tokens] to
-    reduce per-atom states down to token states. Subclasses supply the ``forward`` that wires them together.
-
-    Args:
-        token_hidden_size: Width of the produced token hidden states.
-        atom_hidden_size: Width of the per-atom conditioning / query channel.
-        atom_pair_hidden_size: Width of the atom-pair representation feeding the attention bias.
-        num_query_atoms: Number of query atoms per local window.
-        num_key_atoms: Number of key atoms gathered around each query window.
-        atom_feature_size: Width of the raw reference atom-feature vector.
-        backend: Backend selector passed down to atom self-attention (``"auto"`` picks the
-            OOps-owned implementation when available, else the public implementation).
-        atom_self_attention: Exact atom-attention equation used by the encoder.
-    """
-
-    def __init__(
-        self,
-        token_hidden_size: int,
-        atom_hidden_size: int = 128,
-        atom_pair_hidden_size: int = 16,
-        num_query_atoms: int = 32,
-        num_key_atoms: int = 128,
-        atom_feature_size: int = 385,
-        backend: str = "auto",
-        *,
-        atom_self_attention: AtomSelfAttention,
-    ) -> None:
-        super().__init__()
-        self.atom_conditioner = AtomConditioner(atom_feature_size=atom_feature_size, atom_hidden_size=atom_hidden_size)
-        self.atom_pair_encoder = AtomPairEncoder(
-            atom_hidden_size=atom_hidden_size,
-            atom_pair_hidden_size=atom_pair_hidden_size,
-            num_query_atoms=num_query_atoms,
-            num_key_atoms=num_key_atoms,
-        )
-        self.atom_self_attention = atom_self_attention
-        self.token_projection = nn.Linear(atom_hidden_size, token_hidden_size, bias=False)
-        self.relu = nn.ReLU()
-        self.atom_to_token_mean = AtomToTokenMean(backend=backend)
-
-    def build_local_geometry(
-        self, reference_positions: Tensor, reference_space_id: Tensor, num_valid_atoms: int | None = None
-    ) -> LocalAtomGeometry:
-        r"""
-        Precompute the windowed atom-pair geometry for local-layout attention.
-
-        Delegates to the atom-pair encoder's window builder so the geometry uses this encoder's
-        ``num_query_atoms``/``num_key_atoms`` layout. Pass the result as ``local_geometry`` to a subclass
-        ``forward`` to select local-window attention instead of dense all-pairs attention.
-
-        Args:
-            reference_positions: `[..., N_atom, 3]` reference coordinates.
-            reference_space_id: `[..., N_atom]` reference-space ids grouping atoms that may interact.
-            num_valid_atoms: Number of real atoms; enables the clamped/shifted key window
-                (see [`gather_key_windows`][ofoldx.modules.atom.window.gather_key_windows]). Left unset by the
-                non-diffusion input-embedder path, which keeps the fixed zero-padded window.
-
-        Returns:
-            A [`LocalAtomGeometry`][ofoldx.modules.atom.window.LocalAtomGeometry] carrying per-window
-            `query - key` displacement vectors, the same-space validity mask, and the window padding metadata.
-        """
-
-        return self.atom_pair_encoder.build_local_geometry(reference_positions, reference_space_id, num_valid_atoms)
-
-    def aggregate_to_tokens(
-        self,
-        atom_query: Tensor,
-        *,
-        atom_to_token: Tensor,
-        num_tokens: int,
-        atom_mask: Tensor | None,
-        atom_context: AtomContext,
-    ) -> AtomToTokenOutput:
-        r"""
-        Project the atom query to token width and mask-mean atoms into their tokens.
-
-        Applies the ReLU'd token projection to ``atom_query`` and averages the resulting per-atom vectors
-        into ``num_tokens`` tokens according to ``atom_to_token`` (respecting ``atom_mask`` if given), then
-        packages the token states together with the untouched ``atom_query`` and ``atom_context`` for the
-        downstream coordinate decoder.
-
-        Args:
-            atom_query: `[..., N_atom, atom_hidden_size]` per-atom query states from atom self-attention.
-            atom_to_token: `[..., N_atom]` integer index mapping each atom to its token.
-            num_tokens: Number of tokens to scatter into (size of the output token axis).
-            atom_mask: Optional `[..., N_atom]` validity mask; absent atoms are excluded from the mean.
-            atom_context: Precomputed pair/conditioning tensors to carry into the output.
-
-        Returns:
-            An [`AtomToTokenOutput`][ofoldx.modules.atom.context.AtomToTokenOutput] whose
-            ``token_hidden`` has shape `[..., num_tokens, token_hidden_size]`.
-        """
-
-        token_hidden = self.relu(self.token_projection(atom_query))
-        token_hidden = self.atom_to_token_mean(
-            token_hidden,
-            atom_to_token,
-            num_tokens,
-            atom_mask,
-        )
-        return AtomToTokenOutput(token_hidden=token_hidden, atom_query=atom_query, atom_context=atom_context)
-
-
-class AtomToTokenEncoder(AtomToTokenEncoderBase):
+class AtomToTokenEncoder(nn.Module):
     r"""
     Encode reference atom features and geometry into token hidden states.
 
@@ -153,8 +42,6 @@ class AtomToTokenEncoder(AtomToTokenEncoderBase):
     [`CoordinateAtomToTokenEncoder`][ofoldx.modules.atom.encoders.CoordinateAtomToTokenEncoder] for the
     diffusion variant that additionally folds in noisy coordinates and trunk context.
 
-    Constructor arguments are inherited from
-    [`AtomToTokenEncoderBase`][ofoldx.modules.atom.encoders.AtomToTokenEncoderBase].
     """
 
     def __init__(
@@ -169,25 +56,35 @@ class AtomToTokenEncoder(AtomToTokenEncoderBase):
         atom_feature_size: int = 385,
         backend: str = "auto",
     ) -> None:
-        super().__init__(
-            token_hidden_size=token_hidden_size,
+        super().__init__()
+        self.atom_conditioner = AtomConditioner(
+            atom_feature_size=atom_feature_size,
+            atom_hidden_size=atom_hidden_size,
+        )
+        self.atom_pair_encoder = AtomPairEncoder(
             atom_hidden_size=atom_hidden_size,
             atom_pair_hidden_size=atom_pair_hidden_size,
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
-            atom_feature_size=atom_feature_size,
-            backend=backend,
-            atom_self_attention=AtomSelfAttention(
-                atom_hidden_size=atom_hidden_size,
-                conditioning_size=atom_hidden_size,
-                pair_size=atom_pair_hidden_size,
-                num_blocks=num_blocks,
-                num_attention_heads=num_attention_heads,
-                num_query_atoms=num_query_atoms,
-                num_key_atoms=num_key_atoms,
-                backend=backend,
-            ),
         )
+        self.atom_self_attention = AtomSelfAttention(
+            atom_hidden_size=atom_hidden_size,
+            conditioning_size=atom_hidden_size,
+            pair_size=atom_pair_hidden_size,
+            num_blocks=num_blocks,
+            num_attention_heads=num_attention_heads,
+            num_query_atoms=num_query_atoms,
+            num_key_atoms=num_key_atoms,
+            backend=backend,
+        )
+        self.token_projection = nn.Linear(atom_hidden_size, token_hidden_size, bias=False)
+        self.relu = nn.ReLU()
+        self.atom_to_token_mean = AtomToTokenMean(backend=backend)
+
+    def build_local_geometry(
+        self, reference_positions: Tensor, reference_space_id: Tensor, num_valid_atoms: int | None = None
+    ) -> LocalAtomGeometry:
+        return self.atom_pair_encoder.build_local_geometry(reference_positions, reference_space_id, num_valid_atoms)
 
     def forward(
         self,
@@ -201,29 +98,6 @@ class AtomToTokenEncoder(AtomToTokenEncoderBase):
         num_tokens: int,
         local_geometry: LocalAtomGeometry | None = None,
     ) -> AtomToTokenOutput:
-        r"""
-        Encode reference atom features plus geometry into token hidden states.
-
-        Builds per-atom conditioning, encodes the atom-pair representation (dense when ``local_geometry`` is
-        ``None``, else local-window), runs atom self-attention, then projects and mask-means atoms into
-        ``num_tokens`` tokens.
-
-        Args:
-            atom_features: `[..., N_atom, atom_feature_size]` raw reference atom features.
-            reference_positions: `[..., N_atom, 3]` reference coordinates.
-            reference_charges: `[..., N_atom, 1]` reference charges.
-            reference_mask: `[..., N_atom]` validity mask zeroing conditioning for absent atoms.
-            atom_mask: Optional `[..., N_atom]` attention/aggregation mask.
-            atom_to_token: `[..., N_atom]` integer index mapping each atom to its token.
-            num_tokens: Number of tokens to aggregate into.
-            local_geometry: Optional precomputed local geometry; when given, selects local-window attention.
-
-        Returns:
-            An [`AtomToTokenOutput`][ofoldx.modules.atom.context.AtomToTokenOutput] with ``token_hidden``
-            `[..., num_tokens, token_hidden_size]`, ``atom_query`` `[..., N_atom, atom_hidden_size]`, and the
-            [`AtomContext`][ofoldx.modules.atom.context.AtomContext] (pair + conditioning) for the decoder.
-        """
-
         atom_conditioning = self.atom_conditioner(
             atom_features,
             reference_positions=reference_positions,
@@ -244,36 +118,26 @@ class AtomToTokenEncoder(AtomToTokenEncoderBase):
             attention_layout=attention_layout,
             num_valid_atoms=None if local_geometry is None else local_geometry.window_info.num_valid_atoms,
         )
-        return self.aggregate_to_tokens(
-            atom_query,
-            atom_to_token=atom_to_token,
-            num_tokens=num_tokens,
-            atom_mask=atom_mask,
+        token_hidden = self.relu(self.token_projection(atom_query))
+        token_hidden = self.atom_to_token_mean(
+            token_hidden,
+            atom_to_token,
+            num_tokens,
+            atom_mask,
+        )
+        return AtomToTokenOutput(
+            token_hidden=token_hidden,
+            atom_query=atom_query,
             atom_context=AtomContext(pair=atom_pair, conditioning=atom_conditioning),
         )
 
 
-class CoordinateAtomToTokenEncoder(AtomToTokenEncoderBase):
+class CoordinateAtomToTokenEncoder(nn.Module):
     r"""
     Encode noisy atom coordinates and trunk context into token hidden states (diffusion path).
 
-    Extends [`AtomToTokenEncoderBase`][ofoldx.modules.atom.encoders.AtomToTokenEncoderBase] with the
-    trunk-conditioning it needs inside the diffusion module: broadcast trunk ``single`` augments the atom
-    conditioning, broadcast trunk ``pair`` fuses into the atom-pair representation, and a projection of the
-    noisy coordinates seeds the attention query.
-
-    Args:
-        token_hidden_size: Width of the produced token hidden states.
-        atom_hidden_size: Width of the per-atom conditioning / query channel.
-        atom_pair_hidden_size: Width of the atom-pair representation feeding the attention bias.
-        single_size: Width of the trunk single (per-token) representation.
-        pair_size: Width of the trunk pair (per-token-pair) representation.
-        num_blocks: Number of atom self-attention blocks.
-        num_attention_heads: Number of attention heads per block.
-        num_query_atoms: Number of query atoms per local window.
-        num_key_atoms: Number of key atoms gathered around each query window.
-        atom_feature_size: Width of the raw reference atom-feature vector.
-        backend: Backend selector passed down to atom self-attention.
+    Broadcast trunk ``single`` augments the atom conditioning, broadcast trunk ``pair`` fuses into the
+    atom-pair representation, and a projection of the noisy coordinates seeds the attention query.
     """
 
     def __init__(
@@ -290,7 +154,30 @@ class CoordinateAtomToTokenEncoder(AtomToTokenEncoderBase):
         atom_feature_size: int = 385,
         backend: str = "auto",
     ) -> None:
-        atom_self_attention = AtomSelfAttention(
+        super().__init__()
+        self.atom_conditioner = AtomConditioner(
+            atom_feature_size=atom_feature_size,
+            atom_hidden_size=atom_hidden_size,
+        )
+        self.single_norm = LayerNorm(single_size, bias=False, backend=backend)
+        self.single_to_atom_projection = nn.Linear(single_size, atom_hidden_size, bias=False)
+        self.token_to_atom_broadcast = TokenToAtomBroadcast(backend=backend)
+        self.pair_norm = LayerNorm(pair_size, bias=False, backend=backend)
+        self.pair_projection = nn.Linear(pair_size, atom_pair_hidden_size, bias=False)
+        self.token_pair_to_atom_pair_broadcast = TokenPairToAtomPairBroadcast()
+        self.token_pair_to_local_atom_pair_broadcast = TokenPairToLocalAtomPairBroadcast(
+            num_query_atoms=num_query_atoms,
+            num_key_atoms=num_key_atoms,
+            backend=backend,
+        )
+        self.atom_pair_encoder = AtomPairEncoder(
+            atom_hidden_size=atom_hidden_size,
+            atom_pair_hidden_size=atom_pair_hidden_size,
+            num_query_atoms=num_query_atoms,
+            num_key_atoms=num_key_atoms,
+        )
+        self.noisy_position_projection = nn.Linear(3, atom_hidden_size, bias=False)
+        self.atom_self_attention = AtomSelfAttention(
             atom_hidden_size=atom_hidden_size,
             conditioning_size=atom_hidden_size,
             pair_size=atom_pair_hidden_size,
@@ -300,28 +187,14 @@ class CoordinateAtomToTokenEncoder(AtomToTokenEncoderBase):
             num_key_atoms=num_key_atoms,
             backend=backend,
         )
-        super().__init__(
-            token_hidden_size=token_hidden_size,
-            atom_hidden_size=atom_hidden_size,
-            atom_pair_hidden_size=atom_pair_hidden_size,
-            num_query_atoms=num_query_atoms,
-            num_key_atoms=num_key_atoms,
-            atom_feature_size=atom_feature_size,
-            backend=backend,
-            atom_self_attention=atom_self_attention,
-        )
-        self.token_to_atom_broadcast = TokenToAtomBroadcast(backend=backend)
-        self.token_pair_to_atom_pair_broadcast = TokenPairToAtomPairBroadcast()
-        self.token_pair_to_local_atom_pair_broadcast = TokenPairToLocalAtomPairBroadcast(
-            num_query_atoms=num_query_atoms,
-            num_key_atoms=num_key_atoms,
-            backend=backend,
-        )
-        self.single_norm = LayerNorm(single_size, bias=False, backend=backend)
-        self.single_to_atom_projection = nn.Linear(single_size, atom_hidden_size, bias=False)
-        self.pair_norm = LayerNorm(pair_size, bias=False, backend=backend)
-        self.pair_projection = nn.Linear(pair_size, atom_pair_hidden_size, bias=False)
-        self.noisy_position_projection = nn.Linear(3, atom_hidden_size, bias=False)
+        self.token_projection = nn.Linear(atom_hidden_size, token_hidden_size, bias=False)
+        self.relu = nn.ReLU()
+        self.atom_to_token_mean = AtomToTokenMean(backend=backend)
+
+    def build_local_geometry(
+        self, reference_positions: Tensor, reference_space_id: Tensor, num_valid_atoms: int | None = None
+    ) -> LocalAtomGeometry:
+        return self.atom_pair_encoder.build_local_geometry(reference_positions, reference_space_id, num_valid_atoms)
 
     def forward(
         self,
@@ -391,11 +264,16 @@ class CoordinateAtomToTokenEncoder(AtomToTokenEncoderBase):
             attention_layout=attention_layout,
             num_valid_atoms=num_valid_atoms,
         )
-        return self.aggregate_to_tokens(
+        token_hidden = self.relu(self.token_projection(atom_query))
+        token_hidden = self.atom_to_token_mean(
+            token_hidden,
+            atom_to_token,
+            num_tokens,
+            atom_mask,
+        )
+        return AtomToTokenOutput(
+            token_hidden=token_hidden,
             atom_query=atom_query,
-            atom_to_token=atom_to_token,
-            num_tokens=num_tokens,
-            atom_mask=atom_mask,
             atom_context=AtomContext(pair=atom_pair, conditioning=atom_conditioning),
         )
 
@@ -534,6 +412,7 @@ class AtomPairEncoder(nn.Module):
         self.local_geometry_builder = LocalAtomGeometryBuilder(
             num_query_atoms=num_query_atoms, num_key_atoms=num_key_atoms
         )
+        self.activation = nn.ReLU()
         self.distance_vector_projection = nn.Linear(3, atom_pair_hidden_size, bias=False)
         self.inverse_distance_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
         self.distance_mask_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
@@ -554,7 +433,6 @@ class AtomPairEncoder(nn.Module):
             atom_pair_hidden_size,
             bias=False,
         )
-        self.activation = nn.ReLU()
 
     def feed_forward(self, pair: Tensor) -> Tensor:
         r"""
@@ -1218,22 +1096,6 @@ class AtomSelfAttention(nn.Module):
         attention_layout: AttentionLayout = "dense",
         num_valid_atoms: int | None = None,
     ) -> Tensor:
-        r"""
-        Project ``pair`` to a packed per-block bias and run atom self-attention.
-
-        Args:
-            atom_hidden: `[..., N_atom, atom_hidden_size]` atom query states driving the blocks.
-            conditioning: `[..., N_atom, conditioning_size]` per-atom conditioning.
-            pair: Dense `[..., N_atom, N_atom, pair_size]` or local-window pair representation, projected
-                per block into per-head bias logits.
-            atom_mask: Optional `[..., N_atom]` attention mask.
-            attention_layout: Either ``"dense"`` or ``"local"`` execution.
-            num_valid_atoms: Number of real atoms; enables the clamped/shifted key gather.
-
-        Returns:
-            Updated atom hidden states of shape `[..., N_atom, atom_hidden_size]`.
-        """
-
         packed_bias = torch.cat(
             [projection(norm(pair)) for norm, projection in zip(self.pair_norms, self.bias_projections)],
             dim=-1,
@@ -1248,7 +1110,7 @@ class AtomSelfAttention(nn.Module):
         )
 
 
-class NormalizedKeyAtomSelfAttention(AtomSelfAttention):
+class NormalizedKeyAtomSelfAttention(nn.Module):
     r"""
     Atom self-attention whose gathered keys are normalized from query-normalized states.
     """
@@ -1264,7 +1126,7 @@ class NormalizedKeyAtomSelfAttention(AtomSelfAttention):
         num_key_atoms: int = 128,
         backend: str = "auto",
     ) -> None:
-        nn.Module.__init__(self)
+        super().__init__()
         self.pair_norms = nn.ModuleList(LayerNorm(pair_size, bias=False, backend=backend) for _ in range(num_blocks))
         self.bias_projections = nn.ModuleList(
             nn.Linear(pair_size, num_attention_heads, bias=False) for _ in range(num_blocks)
@@ -1281,8 +1143,30 @@ class NormalizedKeyAtomSelfAttention(AtomSelfAttention):
             num_key_atoms=num_key_atoms,
         )
 
+    def forward(
+        self,
+        atom_hidden: Tensor,
+        conditioning: Tensor,
+        pair: Tensor,
+        atom_mask: Tensor | None = None,
+        attention_layout: AttentionLayout = "dense",
+        num_valid_atoms: int | None = None,
+    ) -> Tensor:
+        packed_bias = torch.cat(
+            [projection(norm(pair)) for norm, projection in zip(self.pair_norms, self.bias_projections)],
+            dim=-1,
+        )
+        return self.atom_attention(
+            atom_hidden,
+            conditioning,
+            packed_bias,
+            atom_mask=atom_mask,
+            attention_layout=attention_layout,
+            num_valid_atoms=num_valid_atoms,
+        )
 
-class NormalizedKeyAtomToTokenEncoder(AtomToTokenEncoder):
+
+class NormalizedKeyAtomToTokenEncoder(nn.Module):
     r"""
     Reference-atom encoder with query-normalized gathered keys.
     """
@@ -1299,29 +1183,83 @@ class NormalizedKeyAtomToTokenEncoder(AtomToTokenEncoder):
         atom_feature_size: int = 385,
         backend: str = "auto",
     ) -> None:
-        AtomToTokenEncoderBase.__init__(
-            self,
-            token_hidden_size=token_hidden_size,
+        super().__init__()
+        self.atom_conditioner = AtomConditioner(
+            atom_feature_size=atom_feature_size,
+            atom_hidden_size=atom_hidden_size,
+        )
+        self.atom_pair_encoder = AtomPairEncoder(
             atom_hidden_size=atom_hidden_size,
             atom_pair_hidden_size=atom_pair_hidden_size,
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
-            atom_feature_size=atom_feature_size,
+        )
+        self.atom_self_attention = NormalizedKeyAtomSelfAttention(
+            atom_hidden_size=atom_hidden_size,
+            conditioning_size=atom_hidden_size,
+            pair_size=atom_pair_hidden_size,
+            num_blocks=num_blocks,
+            num_attention_heads=num_attention_heads,
+            num_query_atoms=num_query_atoms,
+            num_key_atoms=num_key_atoms,
             backend=backend,
-            atom_self_attention=NormalizedKeyAtomSelfAttention(
-                atom_hidden_size=atom_hidden_size,
-                conditioning_size=atom_hidden_size,
-                pair_size=atom_pair_hidden_size,
-                num_blocks=num_blocks,
-                num_attention_heads=num_attention_heads,
-                num_query_atoms=num_query_atoms,
-                num_key_atoms=num_key_atoms,
-                backend=backend,
-            ),
+        )
+        self.token_projection = nn.Linear(atom_hidden_size, token_hidden_size, bias=False)
+        self.relu = nn.ReLU()
+        self.atom_to_token_mean = AtomToTokenMean(backend=backend)
+
+    def build_local_geometry(
+        self, reference_positions: Tensor, reference_space_id: Tensor, num_valid_atoms: int | None = None
+    ) -> LocalAtomGeometry:
+        return self.atom_pair_encoder.build_local_geometry(reference_positions, reference_space_id, num_valid_atoms)
+
+    def forward(
+        self,
+        atom_features: Tensor,
+        *,
+        reference_positions: Tensor,
+        reference_charges: Tensor,
+        reference_mask: Tensor,
+        atom_mask: Tensor | None = None,
+        atom_to_token: Tensor,
+        num_tokens: int,
+        local_geometry: LocalAtomGeometry | None = None,
+    ) -> AtomToTokenOutput:
+        atom_conditioning = self.atom_conditioner(
+            atom_features,
+            reference_positions=reference_positions,
+            reference_charges=reference_charges,
+            reference_mask=reference_mask,
+        )
+        atom_pair = self.atom_pair_encoder(
+            atom_conditioning,
+            reference_positions=reference_positions,
+            local_geometry=local_geometry,
+        )
+        attention_layout = "dense" if local_geometry is None else "local"
+        atom_query = self.atom_self_attention(
+            atom_conditioning,
+            atom_conditioning,
+            atom_pair,
+            atom_mask=atom_mask,
+            attention_layout=attention_layout,
+            num_valid_atoms=None if local_geometry is None else local_geometry.window_info.num_valid_atoms,
+        )
+        token_hidden = self.relu(self.token_projection(atom_query))
+        token_hidden = self.atom_to_token_mean(
+            token_hidden,
+            atom_to_token,
+            num_tokens,
+            atom_mask,
+        )
+        return AtomToTokenOutput(
+            token_hidden=token_hidden,
+            atom_query=atom_query,
+            atom_context=AtomContext(pair=atom_pair, conditioning=atom_conditioning),
         )
 
 
-class NormalizedKeyCoordinateAtomToTokenEncoder(CoordinateAtomToTokenEncoder):
+class NormalizedKeyCoordinateAtomToTokenEncoder(nn.Module):
     r"""
     Coordinate atom encoder with query-normalized gathered keys.
     """
@@ -1340,38 +1278,129 @@ class NormalizedKeyCoordinateAtomToTokenEncoder(CoordinateAtomToTokenEncoder):
         atom_feature_size: int = 385,
         backend: str = "auto",
     ) -> None:
-        AtomToTokenEncoderBase.__init__(
-            self,
-            token_hidden_size=token_hidden_size,
-            atom_hidden_size=atom_hidden_size,
-            atom_pair_hidden_size=atom_pair_hidden_size,
-            num_query_atoms=num_query_atoms,
-            num_key_atoms=num_key_atoms,
+        super().__init__()
+        self.atom_conditioner = AtomConditioner(
             atom_feature_size=atom_feature_size,
-            backend=backend,
-            atom_self_attention=NormalizedKeyAtomSelfAttention(
-                atom_hidden_size=atom_hidden_size,
-                conditioning_size=atom_hidden_size,
-                pair_size=atom_pair_hidden_size,
-                num_blocks=num_blocks,
-                num_attention_heads=num_attention_heads,
-                num_query_atoms=num_query_atoms,
-                num_key_atoms=num_key_atoms,
-                backend=backend,
-            ),
+            atom_hidden_size=atom_hidden_size,
         )
+        self.single_norm = LayerNorm(single_size, bias=False, backend=backend)
+        self.single_to_atom_projection = nn.Linear(single_size, atom_hidden_size, bias=False)
         self.token_to_atom_broadcast = TokenToAtomBroadcast(backend=backend)
+        self.pair_norm = LayerNorm(pair_size, bias=False, backend=backend)
+        self.pair_projection = nn.Linear(pair_size, atom_pair_hidden_size, bias=False)
         self.token_pair_to_atom_pair_broadcast = TokenPairToAtomPairBroadcast()
         self.token_pair_to_local_atom_pair_broadcast = TokenPairToLocalAtomPairBroadcast(
             num_query_atoms=num_query_atoms,
             num_key_atoms=num_key_atoms,
             backend=backend,
         )
-        self.single_norm = LayerNorm(single_size, bias=False, backend=backend)
-        self.single_to_atom_projection = nn.Linear(single_size, atom_hidden_size, bias=False)
-        self.pair_norm = LayerNorm(pair_size, bias=False, backend=backend)
-        self.pair_projection = nn.Linear(pair_size, atom_pair_hidden_size, bias=False)
+        self.atom_pair_encoder = AtomPairEncoder(
+            atom_hidden_size=atom_hidden_size,
+            atom_pair_hidden_size=atom_pair_hidden_size,
+            num_query_atoms=num_query_atoms,
+            num_key_atoms=num_key_atoms,
+        )
         self.noisy_position_projection = nn.Linear(3, atom_hidden_size, bias=False)
+        self.atom_self_attention = NormalizedKeyAtomSelfAttention(
+            atom_hidden_size=atom_hidden_size,
+            conditioning_size=atom_hidden_size,
+            pair_size=atom_pair_hidden_size,
+            num_blocks=num_blocks,
+            num_attention_heads=num_attention_heads,
+            num_query_atoms=num_query_atoms,
+            num_key_atoms=num_key_atoms,
+            backend=backend,
+        )
+        self.token_projection = nn.Linear(atom_hidden_size, token_hidden_size, bias=False)
+        self.relu = nn.ReLU()
+        self.atom_to_token_mean = AtomToTokenMean(backend=backend)
+
+    def build_local_geometry(
+        self, reference_positions: Tensor, reference_space_id: Tensor, num_valid_atoms: int | None = None
+    ) -> LocalAtomGeometry:
+        return self.atom_pair_encoder.build_local_geometry(reference_positions, reference_space_id, num_valid_atoms)
+
+    def forward(
+        self,
+        atom_features: Tensor,
+        *,
+        reference_positions: Tensor,
+        reference_charges: Tensor,
+        reference_mask: Tensor,
+        single: Tensor,
+        pair: Tensor,
+        noisy_coords: Tensor,
+        atom_mask: Tensor | None = None,
+        atom_to_token: Tensor,
+        num_tokens: int,
+        local_geometry: LocalAtomGeometry | None = None,
+    ) -> AtomToTokenOutput:
+        atom_conditioning = self.atom_conditioner(
+            atom_features,
+            reference_positions=reference_positions,
+            reference_charges=reference_charges,
+            reference_mask=reference_mask,
+        )
+        num_valid_atoms = None if local_geometry is None else local_geometry.window_info.num_valid_atoms
+        atom_conditioning = self._add_single_conditioning(atom_conditioning, single, atom_to_token)
+        atom_pair = self._build_atom_pair(
+            atom_conditioning,
+            pair=pair,
+            atom_to_token=atom_to_token,
+            reference_positions=reference_positions,
+            local_geometry=local_geometry,
+        )
+        atom_query = atom_conditioning + self.noisy_position_projection(noisy_coords)
+        attention_layout = "dense" if local_geometry is None else "local"
+        atom_query = self.atom_self_attention(
+            atom_query,
+            atom_conditioning,
+            atom_pair,
+            atom_mask=atom_mask,
+            attention_layout=attention_layout,
+            num_valid_atoms=num_valid_atoms,
+        )
+        token_hidden = self.relu(self.token_projection(atom_query))
+        token_hidden = self.atom_to_token_mean(
+            token_hidden,
+            atom_to_token,
+            num_tokens,
+            atom_mask,
+        )
+        return AtomToTokenOutput(
+            token_hidden=token_hidden,
+            atom_query=atom_query,
+            atom_context=AtomContext(pair=atom_pair, conditioning=atom_conditioning),
+        )
+
+    def _add_single_conditioning(self, atom_conditioning: Tensor, single: Tensor, atom_to_token: Tensor) -> Tensor:
+        single_conditioning = self.single_to_atom_projection(self.single_norm(single))
+        single_conditioning = self.token_to_atom_broadcast(single_conditioning, atom_to_token)
+        if single_conditioning.dim() == atom_conditioning.dim() + 1:
+            return atom_conditioning.unsqueeze(-3) + single_conditioning
+        return atom_conditioning + single_conditioning
+
+    def _build_atom_pair(
+        self,
+        atom_conditioning: Tensor,
+        *,
+        pair: Tensor,
+        atom_to_token: Tensor,
+        reference_positions: Tensor,
+        local_geometry: LocalAtomGeometry | None,
+    ) -> Tensor:
+        pair = self.pair_projection(self.pair_norm(pair))
+        if local_geometry is None:
+            pair = self.token_pair_to_atom_pair_broadcast(pair, atom_to_token)
+            return self.atom_pair_encoder(
+                atom_conditioning,
+                reference_positions=reference_positions,
+                pair=pair,
+            )
+        local_pair = self.token_pair_to_local_atom_pair_broadcast(
+            pair, atom_to_token, num_valid_atoms=local_geometry.window_info.num_valid_atoms
+        )
+        return self.atom_pair_encoder(atom_conditioning, local_geometry=local_geometry, pair=local_pair)
 
 
 class TokenToAtomDecoder(nn.Module):
@@ -1431,28 +1460,6 @@ class TokenToAtomDecoder(nn.Module):
         attention_layout: AttentionLayout = "dense",
         num_valid_atoms: int | None = None,
     ) -> Tensor:
-        r"""
-        Decode token hidden states into per-atom coordinate updates.
-
-        Projects ``token_hidden`` to atom width, broadcasts it onto the encoder ``atom_query`` via
-        ``atom_to_token``, runs atom self-attention (reusing ``atom_context``'s pair/conditioning,
-        dense or local per ``attention_layout``), and projects to a coordinate delta per atom.
-
-        Args:
-            token_hidden: `[..., N_token, token_hidden_size]` token hidden states to decode.
-            atom_to_token: `[..., N_atom]` integer index mapping each atom to its token.
-            atom_query: `[..., N_atom, atom_hidden_size]` encoder atom query states to update.
-            atom_context: Precomputed [`AtomContext`][ofoldx.modules.atom.context.AtomContext] with the
-                pair representation and conditioning to reuse.
-            atom_mask: Optional `[..., N_atom]` attention mask.
-            attention_layout: Either ``"dense"`` or ``"local"`` execution.
-            num_valid_atoms: Number of real atoms; enables the clamped/shifted key gather so the
-                decoder attends over the same key panes the encoder built the reused pair bias for.
-
-        Returns:
-            Per-atom coordinate updates of shape `[..., N_atom, 3]`.
-        """
-
         atom_query = atom_query + self.token_to_atom_broadcast(self.token_projection(token_hidden), atom_to_token)
         atom_query = self.atom_self_attention(
             atom_query,
@@ -1465,7 +1472,7 @@ class TokenToAtomDecoder(nn.Module):
         return self.output_projection(self.query_norm(atom_query))
 
 
-class NormalizedKeyTokenToAtomDecoder(TokenToAtomDecoder):
+class NormalizedKeyTokenToAtomDecoder(nn.Module):
     r"""
     Token-to-atom decoder with query-normalized gathered keys.
     """
@@ -1481,7 +1488,7 @@ class NormalizedKeyTokenToAtomDecoder(TokenToAtomDecoder):
         num_key_atoms: int = 128,
         backend: str = "auto",
     ) -> None:
-        nn.Module.__init__(self)
+        super().__init__()
         self.token_projection = nn.Linear(token_hidden_size, atom_hidden_size, bias=False)
         self.token_to_atom_broadcast = TokenToAtomBroadcast(backend=backend)
         self.atom_self_attention = NormalizedKeyAtomSelfAttention(
@@ -1496,6 +1503,28 @@ class NormalizedKeyTokenToAtomDecoder(TokenToAtomDecoder):
         )
         self.query_norm = LayerNorm(atom_hidden_size, bias=False, backend=backend)
         self.output_projection = nn.Linear(atom_hidden_size, 3, bias=False)
+
+    def forward(
+        self,
+        token_hidden: Tensor,
+        *,
+        atom_to_token: Tensor,
+        atom_query: Tensor,
+        atom_context: AtomContext,
+        atom_mask: Tensor | None = None,
+        attention_layout: AttentionLayout = "dense",
+        num_valid_atoms: int | None = None,
+    ) -> Tensor:
+        atom_query = atom_query + self.token_to_atom_broadcast(self.token_projection(token_hidden), atom_to_token)
+        atom_query = self.atom_self_attention(
+            atom_query,
+            conditioning=atom_context.conditioning,
+            pair=atom_context.pair,
+            atom_mask=atom_mask,
+            attention_layout=attention_layout,
+            num_valid_atoms=num_valid_atoms,
+        )
+        return self.output_projection(self.query_norm(atom_query))
 
 
 def _flatten_batch(tensor: Tensor, prefix: tuple[int, ...], payload_ndim: int) -> Tensor:

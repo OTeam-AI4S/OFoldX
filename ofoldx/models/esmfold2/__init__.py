@@ -16,7 +16,7 @@ from .config import (
     EsmFold2ExperimentalConfidenceHeadConfig,
     EsmFold2ExperimentalConfig,
     EsmFold2ExperimentalProcessorConfig,
-    EsmFold2FoldingTrunkConfig,
+    EsmFold2FoldingStackConfig,
     EsmFold2InputEmbeddingsConfig,
     EsmFold2LanguageModelEncoderConfig,
     EsmFold2MsaEncoderConfig,

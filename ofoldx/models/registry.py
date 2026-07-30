@@ -4,7 +4,7 @@ Model and Processor registration.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from importlib import import_module
 from typing import Any, NamedTuple, cast
 
@@ -32,7 +32,6 @@ class ModelRegistration(NamedTuple):
             is what makes an architecture trainable.
         strategy: Which generic Runner batching/lowering/inference strategy trains it (``"sequence"``,
             ``"sequence_single"``, ``"denoising"``); ``None`` when not trainable.
-        collate_options: Family-specific batching parameters (e.g. the sequence pad token id).
     """
 
     id: str
@@ -41,7 +40,6 @@ class ModelRegistration(NamedTuple):
     model_config: type[chanfig.Config]
     criterion: CriterionFactory | None = None
     strategy: str | None = None
-    collate_options: Mapping[str, Any] = {}
 
 
 BUILTIN_MODULES = {
@@ -104,7 +102,6 @@ class ModelRegistry(chanfig.Registry):
         processor: type[Processor],
         criterion: CriterionFactory | None = None,
         strategy: str | None = None,
-        collate_options: Mapping[str, Any] | None = None,
     ) -> None:
         r"""
         Register one architecture.
@@ -115,7 +112,6 @@ class ModelRegistry(chanfig.Registry):
             processor: Processor class producing the model's input type.
             criterion: Training criterion factory; pass it to make the architecture trainable.
             strategy: Generic Runner training strategy (required with ``criterion``).
-            collate_options: Family-specific batching parameters.
 
         Raises:
             ValueError: If the model, processor, or config is already registered
@@ -142,7 +138,6 @@ class ModelRegistry(chanfig.Registry):
             model_config=model_config,
             criterion=criterion,
             strategy=strategy,
-            collate_options={} if collate_options is None else collate_options,
         )
         super().register(registration, id)
         self.by_pair[pair] = registration

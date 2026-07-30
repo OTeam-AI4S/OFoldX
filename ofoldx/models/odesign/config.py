@@ -36,7 +36,7 @@ class ODesignTrunkConfig(Config):
 
     Args:
         num_pairformer_blocks: Number of Pairformer blocks.
-        num_msa_blocks: Number of MSA blocks.
+        num_msa_blocks: Number of MSA stages, including the final pair-only update.
         pairformer_dropout: Dropout probability inside Pairformer blocks.
         msa_dropout: Dropout probability along the MSA path.
         pair_dropout: Dropout probability along the pair path.

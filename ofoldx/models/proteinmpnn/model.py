@@ -124,14 +124,6 @@ class ProteinMpnnModel(Model):
                 nn.init.xavier_uniform_(parameter)
 
     @staticmethod
-    def _validate_num_decoding_orders(num_decoding_orders: int) -> int:
-        r"""
-        Validate the independent decoding-order evaluation count.
-        """
-
-        return validate_positive_integer(num_decoding_orders, "num_decoding_orders")
-
-    @staticmethod
     def _require_single_target(input: ProteinMpnnInput) -> None:
         r"""
         Reject an execution-batch axis on one-target biological operations.
@@ -242,11 +234,10 @@ class ProteinMpnnModel(Model):
         distinct unit receives a distinct rank. A unit is a generated unit only when
         all of its members are designed; those units sort after every fixed unit.
 
-        ``decoding_priority`` is the per-residue random priority. The Runner supplies it, seeded per structure
-        by global index, so a batched (and ragged) forward stays reproducible and independent of batch
-        composition; only a standalone call falls back to drawing it from ``generator``. Every tensor is
-        derived from ``tied_group_ids`` (``ones_like``/``cumsum``, out-of-place scatter) so a ragged
-        ``NestedTensor`` batch keeps each structure's order over its own residues, with no padded rows.
+        ``decoding_priority`` may provide the per-residue random priorities
+        explicitly; otherwise they are drawn from ``generator``. Every tensor is
+        derived from ``tied_group_ids`` so ragged batches keep each structure's
+        order over its own residues, with no padded rows.
         """
 
         designed = (residue_mask & design_positions).to(torch.long)
@@ -437,10 +428,8 @@ class ProteinMpnnModel(Model):
             input: ProteinMPNN tensors with batch size ``B`` and ``L`` residue rows.
             decoding_ranks: Optional ranks with shape ``(B, L)``; smaller values
                 decode earlier. A fixed-first random order is drawn when omitted.
-            decoding_priority: Optional per-residue random priority ``(B, L)`` the order is drawn from. The
-                Runner seeds it per structure by global index; supplying it (rather than a ``generator``) keeps
-                a batched forward reproducible and independent of batch composition. Ignored when
-                ``decoding_ranks`` is given.
+            decoding_priority: Optional per-residue random priority ``(B, L)``
+                used to draw the order. Ignored when ``decoding_ranks`` is given.
             coordinate_noise: Standard deviation of Gaussian coordinate noise.
             generator: Random generator used for the order (when no priority is supplied) and coordinate noise.
 
@@ -502,7 +491,7 @@ class ProteinMpnnModel(Model):
         """
 
         self._require_single_target(input)
-        num_decoding_orders = self._validate_num_decoding_orders(num_decoding_orders)
+        num_decoding_orders = validate_positive_integer(num_decoding_orders, "num_decoding_orders")
         repeated = self._repeat_input(input, num_decoding_orders)
         output = self.forward(
             repeated,
@@ -538,7 +527,7 @@ class ProteinMpnnModel(Model):
         """
 
         self._require_single_target(input)
-        num_decoding_orders = self._validate_num_decoding_orders(num_decoding_orders)
+        num_decoding_orders = validate_positive_integer(num_decoding_orders, "num_decoding_orders")
         repeated = self._repeat_input(input, num_decoding_orders)
         if decoding_ranks is not None:
             self._assert_decoding_ranks(decoding_ranks, repeated.tied_group_ids)
@@ -582,7 +571,7 @@ class ProteinMpnnModel(Model):
         """
 
         self._require_single_target(input)
-        num_decoding_orders = self._validate_num_decoding_orders(num_decoding_orders)
+        num_decoding_orders = validate_positive_integer(num_decoding_orders, "num_decoding_orders")
         repeated = self._repeat_input(input, num_decoding_orders)
         device = repeated.backbone_coordinates.device
         node_states, edge_states, neighbor_indices, neighbor_valid = self._encode(
@@ -748,7 +737,7 @@ class ProteinMpnnModel(Model):
         """
 
         self._require_single_target(input)
-        num_decoding_orders = self._validate_num_decoding_orders(num_decoding_orders)
+        num_decoding_orders = validate_positive_integer(num_decoding_orders, "num_decoding_orders")
         repeated = self._repeat_input(input, num_decoding_orders)
         log_probabilities = self.forward(
             repeated,
@@ -1163,7 +1152,7 @@ class ProteinMpnnModel(Model):
 
         self._require_single_target(input)
         num_candidates = validate_positive_integer(num_candidates, "num_candidates")
-        num_decoding_orders = self._validate_num_decoding_orders(num_decoding_orders)
+        num_decoding_orders = validate_positive_integer(num_decoding_orders, "num_decoding_orders")
         temperature = float(temperature)
         if not math.isfinite(temperature) or temperature <= 0:
             raise ValueError("temperature must be a finite positive number")

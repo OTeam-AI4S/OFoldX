@@ -25,7 +25,6 @@ _MODELS.register(
     processor=ProteinMpnnProcessor,
     criterion=criterion_factory,
     strategy="sequence",
-    collate_options={"token_pad_id": 0},
 )
 _PIPELINES.register(
     "proteinmpnn",

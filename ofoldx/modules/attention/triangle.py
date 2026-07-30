@@ -118,14 +118,13 @@ class TriangleMultiplication(nn.Module):
         self.outgoing = outgoing
         self.backend = resolve_config_backend(backend, supported=("oops", "eager"), public_default="eager")
         self.input_norm = LayerNorm(pair_size, backend=backend)
-        self.output_norm = LayerNorm(hidden_size, backend=backend)
         self.left_projection = nn.Linear(pair_size, hidden_size, bias=False)
         self.left_gate_projection = nn.Linear(pair_size, hidden_size, bias=False)
         self.right_projection = nn.Linear(pair_size, hidden_size, bias=False)
         self.right_gate_projection = nn.Linear(pair_size, hidden_size, bias=False)
+        self.output_norm = LayerNorm(hidden_size, backend=backend)
         self.output_projection = nn.Linear(hidden_size, pair_size, bias=False)
         self.gate_projection = nn.Linear(pair_size, pair_size, bias=False)
-        self.sigmoid = nn.Sigmoid()
 
     def forward(
         self,

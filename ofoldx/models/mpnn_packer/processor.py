@@ -80,8 +80,6 @@ class MpnnPackerProcessor(Processor):
             A single-example ``MpnnPackerInput`` with aligned atom14, context, and layout values.
         """
 
-        if not isinstance(structure, Structure):
-            raise TypeError("MpnnPackerProcessor requires a Structure")
         system = structure.system
         protein_instances: list[tuple[str, PolymerSequence]] = []
         for instance_id, entity_id in system.instances.items():

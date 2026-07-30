@@ -190,12 +190,15 @@ class AlphaFold3Processor(Processor):
 
         system = molecular_system_from_input(input)
         system = _resolve_components(system, revision=self.config.ccd_revision)
-        normalized_msa = _normalize_msa(msa, system)
+        if msa is not None:
+            for _value, _target_instance_id, entity in resolve_msa_bindings(msa, system):
+                if entity.polymer_type != "protein":
+                    raise ValueError("AlphaFold 3 consumes supplied MSA evidence only for proteins")
         tokens = _tokenize(system)
         return _features(
             system,
             tokens=tokens,
-            msa=normalized_msa,
+            msa=msa,
             templates=tuple(templates),
             max_msa_rows=self.config.max_msa_rows,
             device=self.device,
@@ -312,18 +315,6 @@ def _needs_ccd_resolution(component: ChemicalComponent) -> bool:
     if not component.atoms:
         return True
     return not any(coordinate is not None for coordinate in component.reference_coordinates)
-
-
-def _normalize_msa(
-    msa: MSA | MSACollection | None,
-    system: MolecularSystem,
-) -> MSA | MSACollection | None:
-    if msa is None:
-        return None
-    for _value, _target_instance_id, entity in resolve_msa_bindings(msa, system):
-        if entity.polymer_type != "protein":
-            raise ValueError("AlphaFold 3 consumes supplied MSA evidence only for proteins")
-    return msa
 
 
 def _is_standard(component: ChemicalComponent, polymer_type: str) -> bool:

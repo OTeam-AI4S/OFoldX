@@ -39,16 +39,6 @@ def _require_pair_identity(
     )
 
 
-def _require_repository_architecture(
-    owner: str,
-    architecture: str,
-    directory: Path,
-) -> None:
-    registration, _ = model_values(directory)
-    if registration.id != architecture:
-        raise ValueError(f"{owner} requires architecture {architecture!r}; " f"repository declares {registration.id!r}")
-
-
 class PairedPipeline(Generic[_ModelT, _ProcessorT]):
     r"""
     Base class for a pipeline backed by one model and processor.
@@ -61,13 +51,9 @@ class PairedPipeline(Generic[_ModelT, _ProcessorT]):
     model_architecture: ClassVar[str]
 
     def __init__(self, *, model: _ModelT, processor: _ProcessorT) -> None:
-        self._validate_pair(model, processor)
+        _require_pair_identity(type(self).__name__, self.model_architecture, model, processor)
         self.model = model
         self.processor = processor
-
-    @classmethod
-    def _validate_pair(cls, model: Model, processor: Processor) -> None:
-        _require_pair_identity(cls.__name__, cls.model_architecture, model, processor)
 
     @classmethod
     def from_repository(
@@ -99,11 +85,12 @@ class PairedPipeline(Generic[_ModelT, _ProcessorT]):
             allow_patterns=PROCESSOR_METADATA,
             token=token,
         )
-        _require_repository_architecture(
-            cls.__name__,
-            cls.model_architecture,
-            resolved.path,
-        )
+        registration, _ = model_values(resolved.path)
+        if registration.id != cls.model_architecture:
+            raise ValueError(
+                f"{cls.__name__} requires architecture {cls.model_architecture!r}; "
+                f"repository declares {registration.id!r}"
+            )
         processor = load_processor(resolved, device=device, dtype=dtype)
         model = load_model(resolved, device=device, dtype=dtype, token=token)
         return cls(
@@ -156,7 +143,6 @@ class PairedPipeline(Generic[_ModelT, _ProcessorT]):
         pipeline_id = PIPELINES.id_for(type(self))
         if pipeline_id is None:
             raise ValueError(f"{type(self).__name__} is not a registered concrete Pipeline; it cannot be saved")
-        self._validate_pair(self.model, self.processor)
         clear_model_subrepositories(directory)
         save_model(
             directory,

@@ -700,30 +700,30 @@ class MpnnPackerFeatureEncoder(nn.Module):
         self.node_projection = nn.Linear(len(AMINO_ACID_COMPONENT_IDS) + 1, node_size, bias=False)
         self.node_norm = LayerNorm(node_size)
 
+        buffer_device = self.edge_projection.weight.device
+        if buffer_device.type == "meta":
+            buffer_device = torch.device("cpu")
+        group, period = periodic_group_period(device=buffer_device)
+        self.register_buffer("periodic_group", group, persistent=False)
+        self.register_buffer("periodic_period", period, persistent=False)
+
+        self.element_projection = nn.Linear(147, 64)
+        self.context_node_projection = nn.Linear(5 * num_rbf + 64 + 4, node_size)
+        self.context_node_norm = LayerNorm(node_size)
+        self.atom_edge_projection = nn.Linear(num_rbf, node_size, bias=False)
+        self.atom_edge_norm = LayerNorm(node_size)
+        self.atom_node_projection = nn.Linear(147, node_size, bias=False)
+        self.atom_node_norm = LayerNorm(node_size)
+
         self.context_down_projection = nn.Linear(num_rbf + 120, num_rbf)
+        self.decode_node_projection = nn.Linear(_ATOM14 * num_context_atoms * num_rbf, node_size, bias=False)
+        self.decode_node_norm = LayerNorm(node_size)
         self.decode_edge_projection = nn.Linear(
             num_rbf * _ATOM14 * _ATOM14 + 2 * (len(AMINO_ACID_COMPONENT_IDS) + 1),
             edge_size,
             bias=False,
         )
         self.decode_edge_norm = LayerNorm(edge_size)
-        self.decode_node_projection = nn.Linear(_ATOM14 * num_context_atoms * num_rbf, node_size, bias=False)
-        self.decode_node_norm = LayerNorm(node_size)
-
-        self.context_node_projection = nn.Linear(5 * num_rbf + 64 + 4, node_size)
-        self.context_node_norm = LayerNorm(node_size)
-        self.element_projection = nn.Linear(147, 64)
-        self.atom_node_projection = nn.Linear(147, node_size, bias=False)
-        self.atom_edge_projection = nn.Linear(num_rbf, node_size, bias=False)
-        self.atom_edge_norm = LayerNorm(node_size)
-        self.atom_node_norm = LayerNorm(node_size)
-
-        buffer_device = self.element_projection.weight.device
-        if buffer_device.type == "meta":
-            buffer_device = torch.device("cpu")
-        group, period = periodic_group_period(device=buffer_device)
-        self.register_buffer("periodic_group", group, persistent=False)
-        self.register_buffer("periodic_period", period, persistent=False)
 
     def _context_rbf(self, distances: Tensor) -> Tensor:
         r"""

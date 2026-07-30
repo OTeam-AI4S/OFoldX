@@ -194,14 +194,6 @@ class NaMpnnModel(Model):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _validate_num_decoding_orders(num_decoding_orders: int) -> int:
-        r"""
-        Validate the independent decoding-order evaluation count.
-        """
-
-        return validate_positive_integer(num_decoding_orders, "num_decoding_orders")
-
-    @staticmethod
     def _require_single_target(input: NaMpnnInput) -> None:
         r"""
         Reject an execution-batch axis on one-target biological operations.
@@ -279,11 +271,10 @@ class NaMpnnModel(Model):
         every distinct unit receives a distinct rank. A unit is generated only when
         all of its members are designed; those units sort after every fixed unit.
 
-        ``decoding_priority`` is the per-residue random priority. The Runner supplies it, seeded per structure
-        by global index, so a batched (and ragged) forward stays reproducible and independent of batch
-        composition; only a standalone call falls back to drawing it from ``generator``. Every tensor is
-        derived from ``tied_group_ids`` (``ones_like``/``cumsum``, out-of-place scatter) so a ragged
-        ``NestedTensor`` batch keeps each structure's order over its own residues, with no padded rows.
+        ``decoding_priority`` may provide the per-residue random priorities
+        explicitly; otherwise they are drawn from ``generator``. Every tensor is
+        derived from ``tied_group_ids`` so ragged batches keep each structure's
+        order over its own residues, with no padded rows.
         """
 
         designed = (residue_mask & design_positions).to(torch.long)
@@ -483,10 +474,8 @@ class NaMpnnModel(Model):
             input: NA-MPNN tensors with batch size ``B`` and ``L`` residue rows.
             decoding_ranks: Optional ranks with shape ``(B, L)``; smaller values
                 decode earlier.
-            decoding_priority: Optional per-residue random priority ``(B, L)`` the order is drawn from. The
-                Runner seeds it per structure by global index; supplying it (rather than a ``generator``) keeps
-                a batched forward reproducible and independent of batch composition. Ignored when
-                ``decoding_ranks`` is given.
+            decoding_priority: Optional per-residue random priority ``(B, L)``
+                used to draw the order. Ignored when ``decoding_ranks`` is given.
             decode_protein_first: Whether generated protein rows precede generated
                 nucleic-acid rows when ranks are drawn.
             protein_coordinate_noise: Gaussian coordinate-noise standard deviation for proteins.
@@ -530,11 +519,10 @@ class NaMpnnModel(Model):
         r"""
         Draw the noised training decode order, protein-first when asked.
 
-        ``decoding_priority`` is the per-residue random priority. The Runner supplies it, seeded per structure
-        by global index, so a batched (and ragged) forward stays reproducible and independent of batch
-        composition; only a standalone call falls back to drawing it from ``generator``. The order is inverted
-        with a ``cumsum``-of-ones step index and an out-of-place scatter, so a ragged ``NestedTensor`` batch
-        keeps each structure's order over its own residues with no dense ``arange`` and no padded rows.
+        ``decoding_priority`` may provide the per-residue random priorities
+        explicitly; otherwise they are drawn from ``generator``. The order is
+        inverted without constructing a dense step tensor, so ragged batches keep
+        each structure's own residue axis.
         """
 
         decode_mask = (input.residue_mask & input.design_positions).to(torch.float32)
@@ -576,7 +564,7 @@ class NaMpnnModel(Model):
         """
 
         self._require_single_target(input)
-        num_decoding_orders = self._validate_num_decoding_orders(num_decoding_orders)
+        num_decoding_orders = validate_positive_integer(num_decoding_orders, "num_decoding_orders")
         repeated = self._repeat_input(input, num_decoding_orders)
         node_states, edge_states, neighbor_indices, neighbor_valid = self._encode(repeated)
         if decoding_ranks is None:
@@ -616,7 +604,7 @@ class NaMpnnModel(Model):
         """
 
         self._require_single_target(input)
-        num_decoding_orders = self._validate_num_decoding_orders(num_decoding_orders)
+        num_decoding_orders = validate_positive_integer(num_decoding_orders, "num_decoding_orders")
         repeated = self._repeat_input(input, num_decoding_orders)
         node_states, edge_states, neighbor_indices, neighbor_valid = self._encode(repeated)
         logits = self._decode_unconditional_logits(
@@ -1099,14 +1087,14 @@ class NaMpnnFeatures(nn.Module):
         self.carbon_2_prime_index = NA_MPNN_ATOM_INDEX["C2'"]
         total_atoms = config.num_atom_types + 1 + int(self.include_predicted_na_n)
         self.relative_position = MpnnRelativePositionEncoding(config.num_positional_embeddings)
-        self.node_projection = nn.Linear(config.num_polymer_types, config.feature_size, bias=False)
-        self.node_norm = LayerNorm(config.feature_size)
         self.edge_projection = nn.Linear(
             config.num_positional_embeddings + config.num_rbf * total_atoms * total_atoms,
             config.feature_size,
             bias=False,
         )
         self.edge_norm = LayerNorm(config.feature_size)
+        self.node_projection = nn.Linear(config.num_polymer_types, config.feature_size, bias=False)
+        self.node_norm = LayerNorm(config.feature_size)
 
     def forward(
         self,

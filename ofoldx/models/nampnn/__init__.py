@@ -34,7 +34,6 @@ _MODELS.register(
     processor=NaMpnnProcessor,
     criterion=criterion_factory,
     strategy="sequence",
-    collate_options={"token_pad_id": NA_MPNN_PADDING_TOKEN_ID, "pair_bias_fields": ("pair_logit_bias",)},
 )
 _PIPELINES.register(
     "nampnn",

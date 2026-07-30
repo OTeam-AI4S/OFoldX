@@ -48,11 +48,11 @@ class AtomConfidenceProjector(nn.Module):
         backend: str = "auto",
     ):
         super().__init__()
+        self.token_to_atom_broadcast = TokenToAtomBroadcast(backend=backend)
         self.plddt_weight = nn.Parameter(torch.empty(max_atoms_per_token, single_size, num_plddt_bins))
         self.resolved_weight = nn.Parameter(torch.empty(max_atoms_per_token, single_size, num_resolved_bins))
         self.plddt_norm = LayerNorm(single_size, backend=backend)
         self.resolved_norm = LayerNorm(single_size, backend=backend)
-        self.token_to_atom_broadcast = TokenToAtomBroadcast(backend=backend)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:

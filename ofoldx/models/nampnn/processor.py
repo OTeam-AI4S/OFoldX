@@ -107,8 +107,6 @@ class NaMpnnProcessor(Processor):
             A single-example ``NaMpnnInput`` with aligned structure, residue, and condition axes.
         """
 
-        if not isinstance(structure, Structure):
-            raise TypeError("NaMpnnProcessor requires a Structure")
         if sequence is not None:
             structure = self._resolve_score_target(structure, sequence)
             return self._process_score(
@@ -499,9 +497,7 @@ class NaMpnnProcessor(Processor):
             # Two fixed members disagreeing over that identity is unsatisfiable; fail loud rather than let
             # the sampler silently keep each member's own token.
             fixed_identities = {
-                sequence_tokens[index]
-                for index in members
-                if rows[index][7] and not lowered_design_positions[index]
+                sequence_tokens[index] for index in members if rows[index][7] and not lowered_design_positions[index]
             }
             if len(fixed_identities) > 1:
                 raise ValueError("NA-MPNN cannot tie residues fixed to different identities")

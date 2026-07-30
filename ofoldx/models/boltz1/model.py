@@ -8,14 +8,13 @@ import math
 import operator
 from collections.abc import Mapping
 from dataclasses import dataclass
-
-from tensordict import tensorclass
 from functools import partial
 from typing import TypeAlias, cast
 
 import numpy as np
 import torch
 import torch.nn.functional as F
+from tensordict import tensorclass
 from torch import Tensor, nn
 
 from ...data.molecular import AtomSite, ComponentReference, MolecularSystem
@@ -169,8 +168,8 @@ class Boltz1Model(Model):
         self.token_bond_projection = nn.Linear(1, pair_size, bias=False)
 
         self.single_recycle_norm = LayerNorm(single_size)
-        self.pair_recycle_norm = LayerNorm(pair_size)
         self.single_recycle_projection = nn.Linear(single_size, single_size, bias=False)
+        self.pair_recycle_norm = LayerNorm(pair_size)
         self.pair_recycle_projection = nn.Linear(pair_size, pair_size, bias=False)
         nn.init.zeros_(self.single_recycle_projection.weight)
         nn.init.zeros_(self.pair_recycle_projection.weight)
@@ -271,7 +270,7 @@ class Boltz1Model(Model):
         )
 
         confidence = config.confidence
-        self.confidence_head: _Boltz1ConfidenceHead | None = None
+        self.confidence_head: Boltz1TrunkImitationConfidenceHead | Boltz1TrunkReuseConfidenceHead | None = None
         if confidence.enabled:
             if confidence.imitate_trunk:
                 self.confidence_head = Boltz1TrunkImitationConfidenceHead(
@@ -1159,12 +1158,12 @@ class Boltz1MsaTrunk(nn.Module):
         super().__init__()
         self.vocab_size = vocab_size
         self.use_paired_feature = use_paired_feature
-        self.token_projection = nn.Linear(single_size, msa_size, bias=False)
         self.msa_projection = nn.Linear(
             vocab_size + 2 + int(use_paired_feature),
             msa_size,
             bias=False,
         )
+        self.token_projection = nn.Linear(single_size, msa_size, bias=False)
         self.num_blocks = num_blocks
         self.blocks = nn.ModuleList(
             Boltz1MsaBlock(
@@ -1253,6 +1252,7 @@ class Boltz1MsaBlock(nn.Module):
             head_dim=msa_head_dim,
             backend=backend,
         )
+        self.msa_dropout = StructuredDropout(msa_dropout, broadcast_dims=(-2, -1))
         self.msa_transition = Transition(msa_size, expansion=expansion, backend=backend)
         self.outer_product_mean = OuterProductMean(
             msa_size=msa_size,
@@ -1268,7 +1268,6 @@ class Boltz1MsaBlock(nn.Module):
             dropout=pair_dropout,
             backend=backend,
         )
-        self.msa_dropout = StructuredDropout(msa_dropout, broadcast_dims=(-2, -1))
 
     def forward(
         self,
@@ -1426,6 +1425,7 @@ class Boltz1TrianglePairUpdateBlock(nn.Module):
             outgoing=True,
             backend=backend,
         )
+        self.rowwise_dropout = StructuredDropout(dropout, broadcast_dims=(-2, -1))
         self.triangle_multiplication_incoming = TriangleMultiplication(
             pair_size=pair_size,
             hidden_size=triangle_multiplication_hidden_size,
@@ -1444,7 +1444,6 @@ class Boltz1TrianglePairUpdateBlock(nn.Module):
             num_attention_heads=num_triangle_attention_heads,
             backend=backend,
         )
-        self.rowwise_dropout = StructuredDropout(dropout, broadcast_dims=(-2, -1))
         self.columnwise_dropout = StructuredDropout(dropout, broadcast_dims=(-3, -1))
         self.transition = Transition(pair_size, expansion=expansion, backend=backend)
 
@@ -1805,9 +1804,9 @@ class Boltz1CoordinateDiffusion(nn.Module):
         fourier_embedding_size: int = 256,
     ) -> None:
         super().__init__()
-        self.denoiser = denoiser
         self.sigma_data = sigma_data
         self.preconditioner = EdmPreconditioner(sigma_data=sigma_data)
+        self.denoiser = denoiser
         self.min_noise_level = min_noise_level
         self.max_noise_level = max_noise_level
         self.rho = rho
@@ -2184,9 +2183,6 @@ class Boltz1DenoiserAtomEncoder(nn.Module):
         self.num_query_atoms = num_query_atoms
         self.num_key_atoms = num_key_atoms
         self.atom_feature_projection = nn.Linear(atom_feature_size, atom_hidden_size, bias=False)
-        self.distance_vector_projection = nn.Linear(3, atom_pair_hidden_size, bias=False)
-        self.inverse_distance_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
-        self.distance_mask_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
         self.single_trunk_norm = LayerNorm(single_size)
         self.single_trunk_projection = nn.Linear(single_size, atom_hidden_size, bias=False)
         self.pair_trunk_norm = LayerNorm(pair_size)
@@ -2195,6 +2191,9 @@ class Boltz1DenoiserAtomEncoder(nn.Module):
             atom_pair_hidden_size,
             bias=False,
         )
+        self.distance_vector_projection = nn.Linear(3, atom_pair_hidden_size, bias=False)
+        self.inverse_distance_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
+        self.distance_mask_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
         self.left_atom_projection = nn.Linear(
             atom_hidden_size,
             atom_pair_hidden_size,
@@ -2356,9 +2355,9 @@ class Boltz1OutputTokenFeatureUpdate(nn.Module):
         return accumulated + self.transition(next_repr, conditioning)
 
 
-class _Boltz1ConfidenceHead(nn.Module):
+class Boltz1ConfidenceConditioning(nn.Module):
     r"""
-    Shared sampled-coordinate conditioning and confidence-output tail.
+    Condition confidence single and pair representations on sampled coordinates.
     """
 
     diffusion_single_norm: nn.Module | None
@@ -2370,7 +2369,6 @@ class _Boltz1ConfidenceHead(nn.Module):
     single_to_pair_product_out: nn.Linear | None
     boundaries: Tensor
     distance_embedding: nn.Embedding
-    output_head: Boltz1ConfidenceOutputHead
 
     def __init__(
         self,
@@ -2378,45 +2376,33 @@ class _Boltz1ConfidenceHead(nn.Module):
         input_size: int,
         single_size: int,
         pair_size: int,
-        ranking_plddt_weight: float,
-        ranking_ptm_weight: float,
-    ) -> None:
-        super().__init__()
-        self.input_size = input_size
-        self.single_size = single_size
-        self.pair_size = pair_size
-        self.ranking_plddt_weight = ranking_plddt_weight
-        self.ranking_ptm_weight = ranking_ptm_weight
-
-    def _initialize_sample_conditioning(
-        self,
-        *,
         num_distogram_bins: int,
         max_distance: float,
         add_single_to_pair_product: bool,
         use_single_diffusion: bool,
         backend: str,
     ) -> None:
+        super().__init__()
         if use_single_diffusion:
-            self.diffusion_single_norm = LayerNorm(2 * self.single_size, backend=backend)
-            self.diffusion_single_projection = nn.Linear(2 * self.single_size, self.single_size, bias=False)
+            self.diffusion_single_norm = LayerNorm(2 * single_size, backend=backend)
+            self.diffusion_single_projection = nn.Linear(2 * single_size, single_size, bias=False)
         else:
             self.diffusion_single_norm = None
             self.diffusion_single_projection = None
 
-        self.single_to_pair_row = nn.Linear(self.input_size, self.pair_size, bias=False)
-        self.single_to_pair_col = nn.Linear(self.input_size, self.pair_size, bias=False)
+        self.single_to_pair_row = nn.Linear(input_size, pair_size, bias=False)
+        self.single_to_pair_col = nn.Linear(input_size, pair_size, bias=False)
         if add_single_to_pair_product:
-            self.single_to_pair_product_left = nn.Linear(self.input_size, self.pair_size, bias=False)
-            self.single_to_pair_product_right = nn.Linear(self.input_size, self.pair_size, bias=False)
-            self.single_to_pair_product_out = nn.Linear(self.pair_size, self.pair_size, bias=False)
+            self.single_to_pair_product_left = nn.Linear(input_size, pair_size, bias=False)
+            self.single_to_pair_product_right = nn.Linear(input_size, pair_size, bias=False)
+            self.single_to_pair_product_out = nn.Linear(pair_size, pair_size, bias=False)
         else:
             self.single_to_pair_product_left = None
             self.single_to_pair_product_right = None
             self.single_to_pair_product_out = None
 
         self.register_buffer("boundaries", torch.linspace(2.0, max_distance, num_distogram_bins - 1))
-        self.distance_embedding = nn.Embedding(num_distogram_bins, self.pair_size)
+        self.distance_embedding = nn.Embedding(num_distogram_bins, pair_size)
 
     def forward(
         self,
@@ -2425,15 +2411,11 @@ class _Boltz1ConfidenceHead(nn.Module):
         pair: Tensor,
         coordinates: Tensor,
         *,
-        input: Boltz1Input,
-        pred_distogram_logits: Tensor,
+        token_distogram_atom_index: Tensor,
+        token_mask: Tensor,
         single_diffusion: Tensor | None = None,
         multiplicity: int = 1,
-        msa_max_depth: int | None = None,
-        generator: torch.Generator | None = None,
-    ) -> dict[str, Tensor]:
-        single_inputs, single, pair = self._prepare_representations(single_inputs, single, pair, input=input)
-
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         single = single.repeat_interleave(multiplicity, 0)
         single_inputs = single_inputs.repeat_interleave(multiplicity, 0)
         if self.diffusion_single_projection is not None and self.diffusion_single_norm is not None:
@@ -2454,7 +2436,7 @@ class _Boltz1ConfidenceHead(nn.Module):
                 * self.single_to_pair_product_right(single_inputs).unsqueeze(-3)
             )
 
-        representative_atom_index = input.token_distogram_atom_index.repeat_interleave(
+        representative_atom_index = token_distogram_atom_index.repeat_interleave(
             multiplicity,
             0,
         )
@@ -2466,57 +2448,13 @@ class _Boltz1ConfidenceHead(nn.Module):
         distogram = (distances.unsqueeze(-1) > self.boundaries).sum(dim=-1).long()
         pair = pair + self.distance_embedding(distogram)
 
-        token_mask = input.token_mask.repeat_interleave(multiplicity, 0)
-        confidence_pair_mask = pair_mask_from_token_mask(token_mask)
-        single, pair = self._refine_representations(
-            single,
-            pair,
-            single_inputs=single_inputs,
-            input=input,
-            pair_mask=confidence_pair_mask,
-            msa_max_depth=msa_max_depth,
-            generator=generator,
+        pair_mask = pair_mask_from_token_mask(
+            token_mask.repeat_interleave(multiplicity, 0),
         )
-        logits = self.output_head(single, pair)
-        logits.update(
-            _boltz1_confidence_scores(
-                logits,
-                distances=distances,
-                input=input,
-                pred_distogram_logits=pred_distogram_logits,
-                coordinates=coordinates,
-                multiplicity=multiplicity,
-                ranking_plddt_weight=self.ranking_plddt_weight,
-                ranking_ptm_weight=self.ranking_ptm_weight,
-            )
-        )
-        return logits
-
-    def _prepare_representations(
-        self,
-        single_inputs: Tensor,
-        single: Tensor,
-        pair: Tensor,
-        *,
-        input: Boltz1Input,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        raise NotImplementedError
-
-    def _refine_representations(
-        self,
-        single: Tensor,
-        pair: Tensor,
-        *,
-        single_inputs: Tensor,
-        input: Boltz1Input,
-        pair_mask: Tensor,
-        msa_max_depth: int | None,
-        generator: torch.Generator | None,
-    ) -> tuple[Tensor, Tensor]:
-        raise NotImplementedError
+        return single_inputs, single, pair, distances, pair_mask
 
 
-class Boltz1TrunkImitationConfidenceHead(_Boltz1ConfidenceHead):
+class Boltz1TrunkImitationConfidenceHead(nn.Module):
     r"""
     Rebuild and refine a confidence-specific copy of the Boltz-1 trunk representations.
     """
@@ -2566,13 +2504,9 @@ class Boltz1TrunkImitationConfidenceHead(_Boltz1ConfidenceHead):
         relative_position_size: int = 139,
         backend: str = "auto",
     ) -> None:
-        super().__init__(
-            input_size=input_size,
-            single_size=single_size,
-            pair_size=pair_size,
-            ranking_plddt_weight=ranking_plddt_weight,
-            ranking_ptm_weight=ranking_ptm_weight,
-        )
+        super().__init__()
+        self.ranking_plddt_weight = ranking_plddt_weight
+        self.ranking_ptm_weight = ranking_ptm_weight
         self.input_embeddings = Boltz1InputEmbeddings(
             input_size=input_size,
             single_size=single_size,
@@ -2598,7 +2532,10 @@ class Boltz1TrunkImitationConfidenceHead(_Boltz1ConfidenceHead):
         nn.init.zeros_(self.single_recycle_projection.weight)
         nn.init.zeros_(self.pair_recycle_projection.weight)
 
-        self._initialize_sample_conditioning(
+        self.conditioning = Boltz1ConfidenceConditioning(
+            input_size=input_size,
+            single_size=single_size,
+            pair_size=pair_size,
             num_distogram_bins=num_distogram_bins,
             max_distance=max_distance,
             add_single_to_pair_product=add_single_to_pair_product,
@@ -2656,6 +2593,60 @@ class Boltz1TrunkImitationConfidenceHead(_Boltz1ConfidenceHead):
             num_pde_bins=num_pde_bins,
             compute_pae=compute_pae,
         )
+
+    def forward(
+        self,
+        single_inputs: Tensor,
+        single: Tensor,
+        pair: Tensor,
+        coordinates: Tensor,
+        *,
+        input: Boltz1Input,
+        pred_distogram_logits: Tensor,
+        single_diffusion: Tensor | None = None,
+        multiplicity: int = 1,
+        msa_max_depth: int | None = None,
+        generator: torch.Generator | None = None,
+    ) -> dict[str, Tensor]:
+        single_inputs, single, pair = self._prepare_representations(
+            single_inputs,
+            single,
+            pair,
+            input=input,
+        )
+        single_inputs, single, pair, distances, pair_mask = self.conditioning(
+            single_inputs,
+            single,
+            pair,
+            coordinates,
+            token_distogram_atom_index=input.token_distogram_atom_index,
+            token_mask=input.token_mask,
+            single_diffusion=single_diffusion,
+            multiplicity=multiplicity,
+        )
+        single, pair = self._refine_representations(
+            single,
+            pair,
+            single_inputs=single_inputs,
+            input=input,
+            pair_mask=pair_mask,
+            msa_max_depth=msa_max_depth,
+            generator=generator,
+        )
+        logits = self.output_head(single, pair)
+        logits.update(
+            _boltz1_confidence_scores(
+                logits,
+                distances=distances,
+                input=input,
+                pred_distogram_logits=pred_distogram_logits,
+                coordinates=coordinates,
+                multiplicity=multiplicity,
+                ranking_plddt_weight=self.ranking_plddt_weight,
+                ranking_ptm_weight=self.ranking_ptm_weight,
+            )
+        )
+        return logits
 
     def _prepare_representations(
         self,
@@ -2729,7 +2720,7 @@ class Boltz1TrunkImitationConfidenceHead(_Boltz1ConfidenceHead):
         return self.final_single_norm(single), self.final_pair_norm(pair)
 
 
-class Boltz1TrunkReuseConfidenceHead(_Boltz1ConfidenceHead):
+class Boltz1TrunkReuseConfidenceHead(nn.Module):
     r"""
     Normalize and refine the trunk representations supplied by the Boltz-1 model.
     """
@@ -2761,13 +2752,9 @@ class Boltz1TrunkReuseConfidenceHead(_Boltz1ConfidenceHead):
         relative_position_size: int = 139,
         backend: str = "auto",
     ) -> None:
-        super().__init__(
-            input_size=input_size,
-            single_size=single_size,
-            pair_size=pair_size,
-            ranking_plddt_weight=ranking_plddt_weight,
-            ranking_ptm_weight=ranking_ptm_weight,
-        )
+        super().__init__()
+        self.ranking_plddt_weight = ranking_plddt_weight
+        self.ranking_ptm_weight = ranking_ptm_weight
         self.input_single_norm = LayerNorm(input_size, backend=backend)
         self.single_norm: LayerNorm | None = None
         if update_single:
@@ -2782,7 +2769,10 @@ class Boltz1TrunkReuseConfidenceHead(_Boltz1ConfidenceHead):
             self.relative_position_embedder = RelativePositionEmbedder(relative_position_size, pair_size)
             self.token_bond_projection = nn.Linear(1, pair_size, bias=False)
 
-        self._initialize_sample_conditioning(
+        self.conditioning = Boltz1ConfidenceConditioning(
+            input_size=input_size,
+            single_size=single_size,
+            pair_size=pair_size,
             num_distogram_bins=num_distogram_bins,
             max_distance=max_distance,
             add_single_to_pair_product=add_single_to_pair_product,
@@ -2820,6 +2810,60 @@ class Boltz1TrunkReuseConfidenceHead(_Boltz1ConfidenceHead):
             num_pde_bins=num_pde_bins,
             compute_pae=compute_pae,
         )
+
+    def forward(
+        self,
+        single_inputs: Tensor,
+        single: Tensor,
+        pair: Tensor,
+        coordinates: Tensor,
+        *,
+        input: Boltz1Input,
+        pred_distogram_logits: Tensor,
+        single_diffusion: Tensor | None = None,
+        multiplicity: int = 1,
+        msa_max_depth: int | None = None,
+        generator: torch.Generator | None = None,
+    ) -> dict[str, Tensor]:
+        single_inputs, single, pair = self._prepare_representations(
+            single_inputs,
+            single,
+            pair,
+            input=input,
+        )
+        single_inputs, single, pair, distances, pair_mask = self.conditioning(
+            single_inputs,
+            single,
+            pair,
+            coordinates,
+            token_distogram_atom_index=input.token_distogram_atom_index,
+            token_mask=input.token_mask,
+            single_diffusion=single_diffusion,
+            multiplicity=multiplicity,
+        )
+        single, pair = self._refine_representations(
+            single,
+            pair,
+            single_inputs=single_inputs,
+            input=input,
+            pair_mask=pair_mask,
+            msa_max_depth=msa_max_depth,
+            generator=generator,
+        )
+        logits = self.output_head(single, pair)
+        logits.update(
+            _boltz1_confidence_scores(
+                logits,
+                distances=distances,
+                input=input,
+                pred_distogram_logits=pred_distogram_logits,
+                coordinates=coordinates,
+                multiplicity=multiplicity,
+                ranking_plddt_weight=self.ranking_plddt_weight,
+                ranking_ptm_weight=self.ranking_ptm_weight,
+            )
+        )
+        return logits
 
     def _prepare_representations(
         self,
@@ -4259,7 +4303,8 @@ class Boltz1ConfidenceOutput:
         plddt_logits: Per-token pLDDT logits with shape ``(B, S, N, D_p)``.
         pde_logits: PDE logits with shape ``(B, S, N, N, D_d)``.
         resolved_logits: Per-token resolved logits with shape ``(B, S, N, 2)``.
-        plddt: Expected per-token pLDDT fractions with shape ``(B, S, N)``.
+        plddt: Expected per-token pLDDT values on the ``0--100`` scale with
+            shape ``(B, S, N)``.
         pde: Expected PDE values with shape ``(B, S, N, N)``.
         complex_plddt: Mean complex pLDDT with shape ``(B, S)``.
         complex_iplddt: Interface-weighted pLDDT with shape ``(B, S)``.

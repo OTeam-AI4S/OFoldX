@@ -6,8 +6,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-
-from tensordict import tensorclass
 from typing import Any, cast
 
 import numpy as np
@@ -15,6 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from multimolecule import EsmCConfig, EsmCForMaskedLM, EsmCModel
+from tensordict import tensorclass
 from torch import Tensor
 
 from ...data.molecular import AtomSite, MolecularSystem
@@ -75,7 +74,7 @@ class EsmFold2Model(Model):
         ...         },
         ...         "language_model_encoder": {"enabled": False, "dropout": 0.0},
         ...         "msa_encoder": {"enabled": False},
-        ...         "folding_trunk": {"num_blocks": 1},
+        ...         "folding_stack": {"num_blocks": 1},
         ...         "parcae": {"num_coda_blocks": 0},
         ...         "diffusion_structure_head": {
         ...             "num_distogram_bins": 4,
@@ -96,7 +95,7 @@ class EsmFold2Model(Model):
         ...             "num_pde_bins": 4,
         ...             "num_pae_bins": 4,
         ...             "num_distogram_bins": 4,
-        ...             "folding_trunk": {"num_blocks": 1},
+        ...             "folding_stack": {"num_blocks": 1},
         ...         },
         ...     }
         ... )
@@ -151,8 +150,20 @@ class EsmFold2Model(Model):
             config.esmc.num_hidden_layers,
         )
 
+        parcae_decay_init = math.sqrt(1.0 / 5.0)
+        parcae_delta_init = -math.log(parcae_decay_init)
+        self.parcae_log_delta = nn.Parameter(
+            torch.full(
+                (pair_size,),
+                parcae_delta_init + math.log(-math.expm1(-parcae_delta_init)),
+                dtype=torch.float32,
+            )
+        )
+        self.parcae_log_decay = nn.Parameter(torch.zeros(pair_size))
+        self.parcae_input_matrix = nn.Parameter(torch.eye(pair_size))
+
         if config.language_model_encoder.enabled:
-            self.language_model_encoder: EsmFold2FoldingTrunk | None = EsmFold2FoldingTrunk(
+            self.language_model_encoder: EsmFold2FoldingStack | None = EsmFold2FoldingStack(
                 config.language_model_encoder.num_blocks,
                 pair_size,
                 expansion=4,
@@ -168,41 +179,28 @@ class EsmFold2Model(Model):
                 pair_size=pair_size,
                 input_size=input_size,
                 hidden_size=msa_config.hidden_size,
-                num_blocks=msa_config.num_blocks,
+                num_stages=msa_config.num_stages,
                 num_msa_attention_heads=msa_config.num_msa_attention_heads,
                 msa_head_dim=msa_config.msa_head_dim,
             )
 
-        folding_trunk_config = config.folding_trunk
-        # Construct in released RNG order, then register the child in forward order.
-        folding_trunk = EsmFold2FoldingTrunk(
-            folding_trunk_config.num_blocks,
+        self.parcae_input_norm = LayerNorm(pair_size)
+        folding_stack_config = config.folding_stack
+        self.folding_stack = EsmFold2FoldingStack(
+            folding_stack_config.num_blocks,
             pair_size,
             expansion=4,
         )
-        self.parcae_input_norm = LayerNorm(pair_size)
-        self.parcae_log_decay = nn.Parameter(torch.zeros(pair_size))
-        parcae_decay_init = math.sqrt(1.0 / 5.0)
-        parcae_delta_init = -math.log(parcae_decay_init)
-        self.parcae_log_delta = nn.Parameter(
-            torch.full(
-                (pair_size,),
-                parcae_delta_init + math.log(-math.expm1(-parcae_delta_init)),
-                dtype=torch.float32,
-            )
-        )
-        self.parcae_input_matrix = nn.Parameter(torch.eye(pair_size))
-        self.folding_trunk = folding_trunk
         self.parcae_readout = nn.Linear(pair_size, pair_size, bias=False)
         nn.init.eye_(self.parcae_readout.weight)
-        self.parcae_coda = EsmFold2FoldingTrunk(
+        self.parcae_coda = EsmFold2FoldingStack(
             config.parcae.num_coda_blocks,
             pair_size,
             expansion=4,
         )
 
-        self.diffusion_structure_head = EsmFold2DiffusionStructureHead(config)
         self.distogram_head = nn.Linear(pair_size, config.diffusion_structure_head.num_distogram_bins, bias=True)
+        self.diffusion_structure_head = EsmFold2DiffusionStructureHead(config)
         self.confidence_head = EsmFold2ConfidenceHead(config)
         self.post_init()
 
@@ -329,7 +327,7 @@ class EsmFold2Model(Model):
                 normalized_injected_pair.to(pair_state.dtype),
                 input_matrix,
             )
-            pair_state = self.folding_trunk(pair_state, pair_attention_mask=pair_mask)
+            pair_state = self.folding_stack(pair_state, pair_attention_mask=pair_mask)
 
         return pair_state
 
@@ -1091,7 +1089,7 @@ class EsmFold2ExperimentalModel(Model):
         ...             "max_position_embeddings": 16,
         ...         },
         ...         "msa_encoder": {"enabled": False},
-        ...         "folding_trunk": {"num_blocks": 1},
+        ...         "folding_stack": {"num_blocks": 1},
         ...         "diffusion_structure_head": {
         ...             "num_distogram_bins": 4,
         ...             "denoiser": {
@@ -1110,7 +1108,7 @@ class EsmFold2ExperimentalModel(Model):
         ...             "num_plddt_bins": 4,
         ...             "num_pae_bins": 4,
         ...             "num_distogram_bins": 4,
-        ...             "folding_trunk": {"num_blocks": 1},
+        ...             "folding_stack": {"num_blocks": 1},
         ...         },
         ...     }
         ... )
@@ -1158,49 +1156,44 @@ class EsmFold2ExperimentalModel(Model):
         # The head's forward reads ``lm_head.bias`` directly; keep that canonical
         # parameter and remove only the duplicate Linear registration.
         lm_head.decoder.bias = None
-        lm_head.requires_grad_(False)
-        self.esmc_lm_head = lm_head.eval()
         trunk = esmc.model
         trunk.requires_grad_(False)
         self.esmc = trunk.eval()
+        lm_head.requires_grad_(False)
+        self.esmc_lm_head = lm_head.eval()
         self.language_model_pair_encoder = EsmFold2LanguageModelPairEncoder(
             pair_size,
             config.esmc.hidden_size,
             config.esmc.num_hidden_layers,
         )
 
+        self.recycling_norm = LayerNorm(pair_size)
+        self.recycling_projection = nn.Linear(pair_size, pair_size, bias=False)
+        nn.init.zeros_(self.recycling_projection.weight)
+
         msa_config = config.msa_encoder
-        # Construct in released RNG order, then register the children in forward order.
-        msa_encoder: EsmFold2ExperimentalMsaEncoder | None = None
+        self.msa_encoder: EsmFold2ExperimentalMsaEncoder | None = None
         if msa_config.enabled:
-            msa_encoder = EsmFold2ExperimentalMsaEncoder(
+            # Every experimental MSA stage is one homogeneous block.
+            self.msa_encoder = EsmFold2ExperimentalMsaEncoder(
                 msa_size=msa_config.msa_size,
                 pair_size=pair_size,
                 input_size=input_size,
                 hidden_size=msa_config.hidden_size,
-                num_blocks=msa_config.num_blocks,
+                num_blocks=msa_config.num_stages,
                 num_msa_attention_heads=msa_config.num_msa_attention_heads,
                 msa_head_dim=msa_config.msa_head_dim,
             )
 
-        folding_trunk_config = config.folding_trunk
-        folding_trunk = EsmFold2FoldingTrunk(
-            folding_trunk_config.num_blocks,
+        folding_stack_config = config.folding_stack
+        self.folding_stack = EsmFold2FoldingStack(
+            folding_stack_config.num_blocks,
             pair_size,
             expansion=4,
         )
 
-        # Zero-initialized pair representation carried between recurrent trunk iterations.
-        recycling_norm = LayerNorm(pair_size)
-        recycling_projection = nn.Linear(pair_size, pair_size, bias=False)
-        nn.init.zeros_(recycling_projection.weight)
-        self.recycling_norm = recycling_norm
-        self.recycling_projection = recycling_projection
-        self.msa_encoder = msa_encoder
-        self.folding_trunk = folding_trunk
-
-        self.diffusion_structure_head = EsmFold2DiffusionStructureHead(config)
         self.distogram_head = nn.Linear(pair_size, config.diffusion_structure_head.num_distogram_bins, bias=True)
+        self.diffusion_structure_head = EsmFold2DiffusionStructureHead(config)
         # Distogram-only configurations omit the confidence head.
         self.confidence_head: EsmFold2ExperimentalConfidenceHead | None = (
             EsmFold2ExperimentalConfidenceHead(config) if config.confidence.enabled else None
@@ -1373,7 +1366,7 @@ class EsmFold2ExperimentalModel(Model):
                     deletion_value=zero_deletion_features,
                     msa_mask=msa_attention,
                 ).to(pair.dtype)
-            pair = self.folding_trunk(pair, pair_attention_mask=pair_mask)
+            pair = self.folding_stack(pair, pair_attention_mask=pair_mask)
 
         distogram_logits = self.distogram_head(pair + pair.transpose(-2, -3))
 
@@ -1795,9 +1788,9 @@ class EsmFold2SingleToPair(nn.Module):
         return self.pair_output_projection(self.activation(self.pair_input_projection(x)))
 
 
-class EsmFold2FoldingTrunk(nn.Module):
+class EsmFold2FoldingStack(nn.Module):
     r"""
-    Pair-only folding trunk composed of repeated folding blocks.
+    Homogeneous stack of pair-only folding blocks.
     """
 
     def __init__(
@@ -1823,6 +1816,9 @@ class EsmFold2FoldingTrunk(nn.Module):
 class EsmFold2MsaEncoder(nn.Module):
     r"""
     Homogeneous MSA blocks followed by one final OPM and pair update.
+
+    ``num_stages`` counts both the joint MSA/pair blocks and the distinct final
+    pair-only stage.
     """
 
     def __init__(
@@ -1831,13 +1827,13 @@ class EsmFold2MsaEncoder(nn.Module):
         pair_size: int,
         input_size: int,
         hidden_size: int = 32,
-        num_blocks: int = 4,
+        num_stages: int = 4,
         num_msa_attention_heads: int = 8,
         msa_head_dim: int = 16,
         backend: str = "auto",
     ) -> None:
         super().__init__()
-        self.num_blocks = num_blocks
+        self.num_stages = num_stages
         self.msa_projection = nn.Linear(35, msa_size, bias=False)
         self.input_projection = nn.Linear(input_size, msa_size, bias=False)
         self.blocks = nn.ModuleList(
@@ -1850,19 +1846,27 @@ class EsmFold2MsaEncoder(nn.Module):
                     msa_head_dim=msa_head_dim,
                     backend=backend,
                 )
-                for _ in range(num_blocks - 1)
+                for _ in range(num_stages - 1)
             ]
         )
-        self.final_outer_product_mean = EsmFold2OuterProductMean(
-            msa_size,
-            hidden_size,
-            pair_size,
-            backend,
+        self.final_outer_product_mean = (
+            EsmFold2OuterProductMean(
+                msa_size,
+                hidden_size,
+                pair_size,
+                backend,
+            )
+            if num_stages
+            else None
         )
-        self.final_pair_update = EsmFold2FoldingBlock(
-            backend,
-            pair_size=pair_size,
-            expansion=4,
+        self.final_pair_update = (
+            EsmFold2FoldingBlock(
+                backend,
+                pair_size=pair_size,
+                expansion=4,
+            )
+            if num_stages
+            else None
         )
 
     def forward(
@@ -1885,8 +1889,9 @@ class EsmFold2MsaEncoder(nn.Module):
         pair_attention_mask = token_mask.unsqueeze(2) & token_mask.unsqueeze(1)
         for block in self.blocks:
             m, pair = block(m, pair, msa_mask, pair_attention_mask)
-        pair = pair + self.final_outer_product_mean(m, msa_mask)
-        pair = self.final_pair_update(pair, pair_attention_mask)
+        if self.final_outer_product_mean is not None and self.final_pair_update is not None:
+            pair = pair + self.final_outer_product_mean(m, msa_mask)
+            pair = self.final_pair_update(pair, pair_attention_mask)
         return pair
 
 
@@ -1898,7 +1903,7 @@ class EsmFold2MsaEncoder(nn.Module):
 
 class EsmFold2ExperimentalMsaEncoder(nn.Module):
     r"""
-    Experimental MSA encoder: embeds MSA features and updates the pair representation.
+    Homogeneous experimental MSA blocks that update the pair representation.
     """
 
     def __init__(
@@ -1940,6 +1945,8 @@ class EsmFold2ExperimentalMsaEncoder(nn.Module):
         msa_mask: Tensor,
     ) -> Tensor:
         # All inputs are pre-transposed to [B, L, M, ...] before calling.
+        if not self.blocks:
+            return pair
         B, L, M = msa_mask.shape
         msa_features = torch.cat(
             [msa_residue_features, has_deletion.unsqueeze(-1), deletion_value.unsqueeze(-1)],
@@ -2133,10 +2140,9 @@ class EsmFold2DenoisingAtomEncoder(nn.Module):
         num_reference_space_rope_pairs: int = 10,
         reference_space_rope_base_frequency: float = 10000.0,
     ) -> None:
-        nn.Module.__init__(self)
+        super().__init__()
         self.atom_projection = nn.Linear(_ATOM_FEATURE_DIM, atom_hidden_size, bias=False)
         self.input_norm = LayerNorm(atom_hidden_size)
-        self.coordinate_projection = nn.Linear(6, atom_hidden_size, bias=False)
         self.encoder = EsmFold2AtomTransformerEncoder(
             backend=backend,
             atom_hidden_size=atom_hidden_size,
@@ -2149,6 +2155,7 @@ class EsmFold2DenoisingAtomEncoder(nn.Module):
             num_reference_space_rope_pairs=num_reference_space_rope_pairs,
             reference_space_rope_base_frequency=reference_space_rope_base_frequency,
         )
+        self.coordinate_projection = nn.Linear(6, atom_hidden_size, bias=False)
         self.token_projection = nn.Linear(atom_hidden_size, token_hidden_size, bias=False)
         self.atom_to_token_mean = AtomToTokenMean(backend=backend)
 
@@ -2453,7 +2460,20 @@ class EsmFold2Denoiser(nn.Module):
             reference_space_rope_base_frequency=reference_space_rope_base_frequency,
         )
 
-        atom_decoder = EsmFold2AtomDecoder(
+        self.single_norm = LayerNorm(token_hidden_size)
+        self.single_projection = nn.Linear(token_hidden_size, token_hidden_size, bias=False)
+        nn.init.zeros_(self.single_projection.weight)
+        self.token_encoder = EsmFold2DiffusionTransformerEncoder(
+            hidden_size=token_hidden_size,
+            pair_size=pair_size,
+            num_attention_heads=num_token_encoder_attention_heads,
+            num_blocks=num_token_encoder_blocks,
+            conditioning_size=token_hidden_size,
+            expansion=expansion,
+            backend=backend,
+        )
+        self.token_norm = LayerNorm(token_hidden_size)
+        self.atom_decoder = EsmFold2AtomDecoder(
             backend=backend,
             atom_hidden_size=atom_hidden_size,
             token_hidden_size=token_hidden_size,
@@ -2466,28 +2486,6 @@ class EsmFold2Denoiser(nn.Module):
             num_reference_space_rope_pairs=num_reference_space_rope_pairs,
             reference_space_rope_base_frequency=reference_space_rope_base_frequency,
         )
-
-        single_projection = nn.Linear(token_hidden_size, token_hidden_size, bias=False)
-        nn.init.zeros_(single_projection.weight)
-
-        token_encoder = EsmFold2DiffusionTransformerEncoder(
-            hidden_size=token_hidden_size,
-            pair_size=pair_size,
-            num_attention_heads=num_token_encoder_attention_heads,
-            num_blocks=num_token_encoder_blocks,
-            conditioning_size=token_hidden_size,
-            expansion=expansion,
-            backend=backend,
-        )
-
-        single_norm = LayerNorm(token_hidden_size)
-        token_norm = LayerNorm(token_hidden_size)
-
-        self.single_norm = single_norm
-        self.single_projection = single_projection
-        self.token_encoder = token_encoder
-        self.token_norm = token_norm
-        self.atom_decoder = atom_decoder
 
     def denoise(
         self,
@@ -2775,23 +2773,20 @@ class EsmFold2ExperimentalMsaEncoderBlock(nn.Module):
         backend: str = "auto",
     ) -> None:
         super().__init__()
-        outer_product_mean = EsmFold2ExperimentalOuterProductMean(
-            msa_size,
-            hidden_size,
-            pair_size,
-            backend,
-        )
-        msa_pair_weighted_averaging = MsaPairWeightedAveraging(
+        self.msa_pair_weighted_averaging = MsaPairWeightedAveraging(
             msa_size=msa_size,
             pair_size=pair_size,
             num_attention_heads=num_msa_attention_heads,
             head_dim=msa_head_dim,
             backend=backend,
         )
-        msa_transition = Transition(msa_size, expansion=4, backend=backend)
-        self.msa_pair_weighted_averaging = msa_pair_weighted_averaging
-        self.msa_transition = msa_transition
-        self.outer_product_mean = outer_product_mean
+        self.msa_transition = Transition(msa_size, expansion=4, backend=backend)
+        self.outer_product_mean = EsmFold2ExperimentalOuterProductMean(
+            msa_size,
+            hidden_size,
+            pair_size,
+            backend,
+        )
         self.triangle_multiplication_outgoing = EsmFold2TriangleMultiplication(
             pair_size,
             pair_size,
@@ -2952,8 +2947,8 @@ class EsmFold2TriangleMultiplication(nn.Module):
         self._einsum_equation = self._FLOW_TO_EINSUM[flow]
         self.input_norm = LayerNorm(self.input_channels, eps=_EPS)
         self.left_value_projection = nn.Linear(self.input_channels, self.latent_channels, bias=False)
-        self.right_value_projection = nn.Linear(self.input_channels, self.latent_channels, bias=False)
         self.left_gate_projection = nn.Linear(self.input_channels, self.latent_channels, bias=False)
+        self.right_value_projection = nn.Linear(self.input_channels, self.latent_channels, bias=False)
         self.right_gate_projection = nn.Linear(self.input_channels, self.latent_channels, bias=False)
         self.output_norm = LayerNorm(self.latent_channels, eps=_EPS)
         self.output_projection = nn.Linear(self.latent_channels, self.input_channels, bias=False)
@@ -3355,10 +3350,13 @@ class EsmFold2DiffusionConditioning(nn.Module):
         relative_position_encoding: Tensor,
         num_diffusion_samples: int = 1,
     ) -> tuple[Tensor, Tensor]:
-        return (
-            self.condition_single(noise_level, single_inputs, num_diffusion_samples),
-            self.condition_pair(pair, relative_position_encoding),
+        conditioned_pair = self.condition_pair(pair, relative_position_encoding)
+        conditioned_single = self.condition_single(
+            noise_level,
+            single_inputs,
+            num_diffusion_samples,
         )
+        return conditioned_single, conditioned_pair
 
 
 class EsmFold2RowAttentionPooling(nn.Module):
@@ -3754,7 +3752,6 @@ class EsmFold2ConfidenceHead(nn.Module):
             confidence_config.max_distance,
             confidence_config.num_distogram_bins - 1,
         )
-        self.register_buffer("distance_boundaries", distance_boundaries)
         self.input_norm = LayerNorm(input_size)
         self.pair_norm = LayerNorm(pair_size)
         self.left_pair_projection = nn.Linear(input_size, pair_size, bias=False)
@@ -3762,17 +3759,17 @@ class EsmFold2ConfidenceHead(nn.Module):
         self.left_product_projection = nn.Linear(input_size, pair_size, bias=False)
         self.right_product_projection = nn.Linear(input_size, pair_size, bias=False)
         self.product_output_projection = nn.Linear(pair_size, pair_size, bias=False)
+        self.register_buffer("distance_boundaries", distance_boundaries)
         self.distance_embedding = nn.Embedding(confidence_config.num_distogram_bins, pair_size)
 
-        self.row_attention_pooling = EsmFold2RowAttentionPooling(pair_size, single_size)
-
-        folding_trunk_config = confidence_config.folding_trunk
-        self.folding_trunk = EsmFold2FoldingTrunk(
-            folding_trunk_config.num_blocks,
+        folding_stack_config = confidence_config.folding_stack
+        self.folding_stack = EsmFold2FoldingStack(
+            folding_stack_config.num_blocks,
             pair_size,
             expansion=4,
             backend=backend,
         )
+        self.row_attention_pooling = EsmFold2RowAttentionPooling(pair_size, single_size)
         self.token_to_atom_broadcast = TokenToAtomBroadcast(backend=backend)
 
         # Heads.
@@ -3841,7 +3838,7 @@ class EsmFold2ConfidenceHead(nn.Module):
 
         pair_mask = expanded_token_mask[:, :, None].float() * expanded_token_mask[:, None, :].float()
 
-        folded_pair = self.folding_trunk(pair, pair_attention_mask=pair_mask)
+        folded_pair = self.folding_stack(pair, pair_attention_mask=pair_mask)
         pair = pair + folded_pair
         del folded_pair
         single = self.row_attention_pooling(pair, expanded_token_mask)
@@ -3987,7 +3984,6 @@ class EsmFold2ExperimentalConfidenceHead(nn.Module):
             confidence_config.max_distance,
             confidence_config.num_distogram_bins - 1,
         )
-        self.register_buffer("distance_boundaries", distance_boundaries)
         self.input_norm = LayerNorm(input_size)
         self.pair_norm = LayerNorm(pair_size)
         self.left_pair_projection = nn.Linear(input_size, pair_size, bias=False)
@@ -3995,17 +3991,17 @@ class EsmFold2ExperimentalConfidenceHead(nn.Module):
         self.left_product_projection = nn.Linear(input_size, pair_size, bias=False)
         self.right_product_projection = nn.Linear(input_size, pair_size, bias=False)
         self.product_output_projection = nn.Linear(pair_size, pair_size, bias=False)
+        self.register_buffer("distance_boundaries", distance_boundaries)
         self.distance_embedding = nn.Embedding(confidence_config.num_distogram_bins, pair_size)
 
-        self.row_attention_pooling = EsmFold2RowAttentionPooling(pair_size, single_size)
-
-        folding_trunk_config = confidence_config.folding_trunk
-        self.folding_trunk = EsmFold2FoldingTrunk(
-            folding_trunk_config.num_blocks,
+        folding_stack_config = confidence_config.folding_stack
+        self.folding_stack = EsmFold2FoldingStack(
+            folding_stack_config.num_blocks,
             pair_size,
             expansion=4,
             backend=backend,
         )
+        self.row_attention_pooling = EsmFold2RowAttentionPooling(pair_size, single_size)
         self.token_to_atom_broadcast = TokenToAtomBroadcast(backend=backend)
 
         self.plddt_norm = LayerNorm(single_size)
@@ -4066,7 +4062,7 @@ class EsmFold2ExperimentalConfidenceHead(nn.Module):
 
         pair_mask = expanded_token_mask[:, :, None].float() * expanded_token_mask[:, None, :].float()
 
-        folded_pair = self.folding_trunk(pair, pair_attention_mask=pair_mask)
+        folded_pair = self.folding_stack(pair, pair_attention_mask=pair_mask)
         pair = pair + folded_pair
         del folded_pair
         single = self.row_attention_pooling(pair, expanded_token_mask)

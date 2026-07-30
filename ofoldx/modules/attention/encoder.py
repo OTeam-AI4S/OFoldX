@@ -34,14 +34,14 @@ class PairBiasedSelfAttention(nn.Module):
     ) -> None:
         super().__init__()
         self.hidden_norm = LayerNorm(hidden_size, backend=backend)
+        self.pair_norm = LayerNorm(pair_size, bias=True, backend=backend)
+        self.bias_projection = nn.Linear(pair_size, num_attention_heads, bias=False)
         self.attention = GatedMultiheadAttention(
             hidden_size,
             num_attention_heads=num_attention_heads,
             query_bias=True,
             backend=backend,
         )
-        self.pair_norm = LayerNorm(pair_size, bias=True, backend=backend)
-        self.bias_projection = nn.Linear(pair_size, num_attention_heads, bias=False)
 
     def forward(
         self,

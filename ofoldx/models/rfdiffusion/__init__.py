@@ -11,7 +11,6 @@ from .config import (
     RfDiffusionDenoiserConfig,
     RfDiffusionDiffuserConfig,
     RfDiffusionPreprocessConfig,
-    RfDiffusionProcessorConfig,
     RfDiffusionSe3Config,
 )
 from .model import (

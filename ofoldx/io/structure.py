@@ -26,13 +26,12 @@ from ..data.molecular import (
     Molecule,
     PolymerSequence,
     PolymerType,
-    SystemBond,
 )
 from ..data.structure import ResidueNumber, Structure
 from .records import AtomRecord, ParsedStructure, atom_record_residue_key, unique_identifier
 
 if TYPE_CHECKING:
-    from .mmcif import MmcifEntityDeclarations
+    from .mmcif import _MmcifEntityDeclarations
 
 _FORMATS: dict[str, Literal["pdb", "mmcif"]] = {".pdb": "pdb", ".cif": "mmcif", ".mmcif": "mmcif"}
 _ATOM_LAYOUTS = frozenset({"observed", "complete_heavy", "complete_all"})
@@ -489,14 +488,16 @@ def _mmcif_residue_is_polymer(row: AtomRecord, entity_types: Mapping[str, str]) 
 
 
 def _declared_polymer_type(
-    declared_monomers: tuple[tuple[int, str], ...],
+    declared_monomers: tuple[tuple[int, tuple[str, ...]], ...],
     entity_poly_type: str | None,
 ) -> PolymerType | None:
     r"""
     Resolve a polymer entity's chemistry from its declared monomers.
     """
 
-    resolved = {get_builtin_component_polymer_type(mon_id) for _, mon_id in declared_monomers} - {None}
+    resolved = {
+        get_builtin_component_polymer_type(mon_id) for _, candidates in declared_monomers for mon_id in candidates
+    } - {None}
     if resolved == {"dna", "rna"}:
         return "dna_rna_hybrid"
     if len(resolved) == 1:
@@ -528,66 +529,62 @@ def _resolve_declared_component(
         return ChemicalComponent(component_id=mon_id, atoms=(), bonds=None)
 
 
-def _declared_polymer_entity(
+def _declared_polymer(
     entity_id: str,
-    declarations: MmcifEntityDeclarations,
+    declarations: _MmcifEntityDeclarations,
     component_table: Mapping[str, ChemicalComponent],
-    cache: dict[str, PolymerSequence | None],
-) -> PolymerSequence | None:
-    r"""
-    Build the one canonical polymer sequence declared for ``entity_id`` (cached).
-
-    The sequence follows ``_entity_poly_seq`` exactly, so every instance of the entity
-    is byte-identical and declared-but-unmodeled residues are retained as present
-    components. Returns ``None`` when the declaration is missing or malformed, so the
-    caller falls back to observed-residue construction.
-    """
-
-    if entity_id in cache:
-        return cache[entity_id]
-    declared_monomers = declarations.polymer_monomers.get(entity_id, ())
-    entity: PolymerSequence | None = None
-    if declared_monomers:
-        by_num: dict[int, str] = {}
-        for num, mon_id in declared_monomers:
-            by_num.setdefault(num, mon_id)
-        numbers = sorted(by_num)
-        if numbers == list(range(1, len(numbers) + 1)):
-            polymer_type = _declared_polymer_type(declared_monomers, declarations.entity_poly_types.get(entity_id))
-            if polymer_type is not None:
-                entity = PolymerSequence(
-                    polymer_type,
-                    tuple(_resolve_declared_component(by_num[num], component_table) for num in numbers),
-                )
-    cache[entity_id] = entity
-    return entity
-
-
-def _map_declared_indices(
     polymer_residues: list[tuple[object, ...]],
     residue_rows: Mapping[tuple[object, ...], list[AtomRecord]],
-    sequence_length: int,
-) -> tuple[tuple[int, tuple[object, ...]], ...] | None:
+) -> tuple[PolymerSequence, tuple[tuple[int, tuple[object, ...]], ...]] | None:
     r"""
-    Map observed polymer residues to declared component indices (``label_seq_id - 1``).
+    Resolve one observed chain against its declared polymer sequence.
 
-    Returns ``None`` when a residue lacks label numbering, falls outside the declared
-    sequence, or two residues collide on one declared position, so the caller falls back
-    to observed-residue construction.
+    Observed ``label_comp_id`` selects among microheterogeneous candidates. An
+    unmodeled position must have one unambiguous declared monomer.
     """
 
+    polymer_monomers = declarations.polymer_monomers
+    if polymer_monomers is None:
+        return None
+    declared_monomers = polymer_monomers.get(entity_id)
+    if not declared_monomers:
+        raise ValueError(f"mmCIF polymer entity {entity_id!r} has no _entity_poly_seq declaration")
+
+    observed_monomers: dict[int, str] = {}
     indexed: list[tuple[int, tuple[object, ...]]] = []
-    seen: set[int] = set()
     for key in polymer_residues:
-        label_seq_id = residue_rows[key][0].label_seq_id
-        if label_seq_id is None:
-            return None
-        index = label_seq_id - 1
-        if index < 0 or index >= sequence_length or index in seen:
-            return None
-        seen.add(index)
+        row = residue_rows[key][0]
+        if row.label_seq_id is None:
+            raise ValueError("observed mmCIF polymer residue lacks label_seq_id")
+        index = row.label_seq_id - 1
+        if index < 0 or index >= len(declared_monomers):
+            raise ValueError(f"observed mmCIF label_seq_id {row.label_seq_id} is outside the declared polymer sequence")
+        if index in observed_monomers:
+            raise ValueError(f"multiple observed mmCIF residues map to label_seq_id {row.label_seq_id}")
+        candidates = declared_monomers[index][1]
+        if row.component_id not in candidates:
+            raise ValueError(
+                f"observed mmCIF component {row.component_id!r} is not declared at "
+                f"entity {entity_id!r} position {row.label_seq_id}"
+            )
+        observed_monomers[index] = row.component_id
         indexed.append((index, key))
-    return tuple(indexed)
+
+    polymer_type = _declared_polymer_type(declared_monomers, declarations.entity_poly_types.get(entity_id))
+    if polymer_type is None:
+        raise ValueError(f"mmCIF polymer entity {entity_id!r} has ambiguous polymer type declarations")
+    components: list[ChemicalComponent] = []
+    for index, (_, candidates) in enumerate(declared_monomers):
+        monomer = observed_monomers.get(index)
+        if monomer is None:
+            if len(candidates) != 1:
+                raise ValueError(
+                    f"unmodeled mmCIF polymer position {index + 1} of entity {entity_id!r} "
+                    f"has ambiguous monomers {candidates!r}"
+                )
+            monomer = candidates[0]
+        components.append(_resolve_declared_component(monomer, component_table))
+    return PolymerSequence(polymer_type, tuple(components)), tuple(indexed)
 
 
 def _pdb_polymer_segments(
@@ -596,34 +593,25 @@ def _pdb_polymer_segments(
     segment_by_serial: Mapping[str, int],
 ) -> list[list[tuple[object, ...]]]:
     r"""
-    Split PDB polymer residues into segments at TER records and residue-number gaps.
+    Split PDB polymer residues at explicit ``TER`` records.
 
     A PDB has no ``_entity.type`` declaration, so a polymer is segmented from source
-    order: a ``TER`` within one chain, or a residue-number discontinuity, starts a new
-    polymer segment. Separate segments become separate instances, so no inter-residue
-    bond ever spans a gap.
+    order. Residue numbering is author metadata and may contain arbitrary gaps; only a
+    ``TER`` within one chain starts a new polymer segment.
     """
 
     segments: list[list[tuple[object, ...]]] = []
     current: list[tuple[object, ...]] = []
-    previous_number: int | None = None
     previous_segment: int | None = None
     for key in polymer_residues:
         row = residue_rows[key][0]
-        number = row.residue_id
         segment = segment_by_serial.get(row.serial) if row.serial is not None else None
         if current:
             broke_on_ter = previous_segment is not None and segment is not None and segment != previous_segment
-            broke_on_gap = (
-                number is not None
-                and previous_number is not None
-                and number not in (previous_number, previous_number + 1)
-            )
-            if broke_on_ter or broke_on_gap:
+            if broke_on_ter:
                 segments.append(current)
                 current = []
         current.append(key)
-        previous_number = number
         previous_segment = segment
     if current:
         segments.append(current)
@@ -648,28 +636,13 @@ def _build_structure(
         if residue_key not in order:
             order.append(residue_key)
 
-    for residue_key, residue in residue_rows.items():
-        component_id = residue[0].component_id
-        if component_id not in component_table:
-            raise ValueError(
-                f"unknown component {component_id!r}; pass components={{...}} with its complete declared graph"
-            )
-        source_atom_names = {row.atom_name for row in residue}
-        component_atom_names = {atom.atom_id for atom in component_table[component_id].atoms}
-        unknown_atoms = source_atom_names - component_atom_names
-        if unknown_atoms:
-            raise ValueError(
-                f"source residue {residue_key!r} contains atoms absent from component {component_id!r}: "
-                f"{sorted(unknown_atoms)!r}"
-            )
-
-    entity_declarations: MmcifEntityDeclarations | None = None
+    entity_declarations: _MmcifEntityDeclarations | None = None
     segment_by_serial: dict[str, int] = {}
     if parsed.format == "mmcif":
-        from .mmcif import read_mmcif_branch_entities, read_mmcif_entity_declarations
+        from .mmcif import _read_mmcif_entity_declarations, read_mmcif_branch_entities
 
         branch_entities, branch_component_indices = read_mmcif_branch_entities(parsed, component_table, rows)
-        entity_declarations = read_mmcif_entity_declarations(parsed)
+        entity_declarations = _read_mmcif_entity_declarations(parsed)
     else:
         from . import pdb as pdb_io
 
@@ -687,7 +660,6 @@ def _build_structure(
     ] = []
     used_instance_ids: set[str] = set()
     entity_by_id: dict[str, PolymerSequence | Molecule] = {}
-    declared_entity_cache: dict[str, PolymerSequence | None] = {}
     unmodeled_residue_numbers: dict[ComponentReference, ResidueNumber] = {}
 
     for (symmetry_id, chain_id), residue_order in chain_residue_order.items():
@@ -711,16 +683,23 @@ def _build_structure(
         for segment_ordinal, segment_residues in enumerate(polymer_segments):
             first = residue_rows[segment_residues[0]][0]
             source_entity_id = first.entity_id
-            declared_entity: PolymerSequence | None = None
-            declared_indices: tuple[tuple[int, tuple[object, ...]], ...] | None = None
+            declared: tuple[PolymerSequence, tuple[tuple[int, tuple[object, ...]], ...]] | None = None
             if parsed.format == "mmcif" and source_entity_id is not None and entity_declarations is not None:
-                declared_entity = _declared_polymer_entity(
-                    source_entity_id, entity_declarations, component_table, declared_entity_cache
+                declared = _declared_polymer(
+                    source_entity_id,
+                    entity_declarations,
+                    component_table,
+                    segment_residues,
+                    residue_rows,
                 )
-                if declared_entity is not None:
-                    declared_indices = _map_declared_indices(segment_residues, residue_rows, len(declared_entity))
-            if declared_entity is not None and declared_indices is not None:
-                entity_id = f"polymer_{source_entity_id}"
+            if declared is not None:
+                declared_entity, declared_indices = declared
+                base_entity_id = f"polymer_{source_entity_id}"
+                entity_id = base_entity_id
+                suffix = 2
+                while entity_id in entity_by_id and entity_by_id[entity_id] != declared_entity:
+                    entity_id = f"{base_entity_id}#{suffix}"
+                    suffix += 1
                 entity = _reuse_entity(entity_by_id, entity_id, declared_entity)
                 indexed = declared_indices
             else:
@@ -763,7 +742,7 @@ def _build_structure(
                 )
                 indexed = tuple(enumerate(segment_residues))
             instance_id = unique_identifier(base_instance_id, used_instance_ids)
-            if declared_entity is not None and declared_indices is not None and entity_declarations is not None:
+            if declared is not None and entity_declarations is not None:
                 observed_indices = {index for index, _ in indexed}
                 for component_index in range(len(entity)):
                     if component_index in observed_indices:
@@ -900,11 +879,16 @@ def _build_structure(
                 f"{atom.formal_charge!r} at {site!r}"
             )
 
-    source_bonds = _read_source_bonds(parsed, rows, site_by_row_index, provisional)
+    if parsed.format == "pdb":
+        from . import pdb as pdb_io
+
+        source_bonds = pdb_io.read_pdb_bonds(parsed, rows, site_by_row_index)
+    else:
+        from .mmcif import read_mmcif_bonds
+
+        source_bonds = read_mmcif_bonds(parsed, rows, site_by_row_index)
     system = MolecularSystem(entity_by_id, instances, frozenset(source_bonds))
     observed_sites = tuple(site_by_row_index[row.row_index] for row in rows)
-    if len(observed_sites) != len(set(observed_sites)):
-        raise ValueError("selected source rows map more than once to one canonical AtomSite")
     # Complete layouts are materialized from MolecularSystem atoms; complete_heavy
     # filters hydrogen atoms here.
     if atom_layout == "observed":
@@ -973,37 +957,3 @@ def _pdb_component_polymer_type(component: ChemicalComponent) -> PolymerType | N
     if all(elements_by_atom_id.get(atom_id) == element for atom_id, element in (("N", "N"), ("CA", "C"), ("C", "C"))):
         return "protein"
     return None
-
-
-def _read_source_bonds(
-    parsed: ParsedStructure,
-    selected_rows: tuple[AtomRecord, ...],
-    site_by_row_index: dict[int, AtomSite],
-    system: MolecularSystem,
-) -> tuple[SystemBond, ...]:
-    if parsed.format == "pdb":
-        from . import pdb as pdb_io
-
-        declared = pdb_io.read_pdb_bonds(parsed, selected_rows, site_by_row_index)
-    else:
-        from .mmcif import read_mmcif_bonds
-
-        declared = read_mmcif_bonds(parsed, selected_rows, site_by_row_index)
-    base_bonds = {frozenset((bond.site_a, bond.site_b)): bond for bond in system.iter_bonds()}
-    overlay: dict[frozenset[AtomSite], SystemBond] = {}
-    for bond in declared:
-        endpoints = frozenset((bond.site_a, bond.site_b))
-        base = base_bonds.get(endpoints)
-        if base is not None:
-            if (bond.order, bond.aromatic) != (base.order, base.aromatic):
-                raise ValueError(
-                    f"source bond conflicts with declared intrinsic topology: " f"{bond.site_a!r}, {bond.site_b!r}"
-                )
-            continue
-        previous = overlay.get(endpoints)
-        if previous is not None:
-            if (previous.order, previous.aromatic, previous.stereo) != (bond.order, bond.aromatic, bond.stereo):
-                raise ValueError(f"conflicting source bond declarations: {bond.site_a!r}, {bond.site_b!r}")
-            continue
-        overlay[endpoints] = bond
-    return tuple(overlay.values())

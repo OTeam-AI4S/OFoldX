@@ -8,7 +8,7 @@ subdirectories. Only the root carries ``pipeline.json``.
 from __future__ import annotations
 
 from os import PathLike
-from pathlib import Path, PurePosixPath, PureWindowsPath
+from pathlib import Path, PurePosixPath
 from typing import NamedTuple, cast
 
 import chanfig
@@ -19,7 +19,6 @@ from ..artifacts import clear_model_subrepositories, save_model
 from ..hub import (
     PROCESSOR_METADATA,
     ResolvedRepository,
-    build_registered_config,
     hydrate_weights,
     load_registered_model,
     load_registered_processor,
@@ -49,14 +48,6 @@ class CompositePair(NamedTuple):
     model_attribute: str
     processor_attribute: str | None
     wrap: type | None = None
-
-
-def _pair_directory(root: Path, subdirectory: str) -> Path:
-    posix = PurePosixPath(subdirectory)
-    windows = PureWindowsPath(subdirectory)
-    if posix.anchor or windows.anchor or ".." in posix.parts or ".." in windows.parts:
-        raise ValueError(f"composite pair path must stay within the repository: {subdirectory!r}")
-    return root / subdirectory
 
 
 class CompositePipeline:
@@ -120,11 +111,11 @@ class CompositePipeline:
         """
 
         for pair in self.pair_layout:
-            source = self._composite_pair_source(pair)
             if pair.wrap is not None:
                 getattr(self, pair.model_attribute).to(device=device, dtype=dtype)
                 continue
-            model, processor = source
+            model = getattr(self, pair.model_attribute)
+            processor = getattr(self, cast(str, pair.processor_attribute))
             model.to(device=device, dtype=dtype)
             processor.to(device=device, dtype=dtype)
         return self
@@ -160,7 +151,7 @@ class CompositePipeline:
         # Resolve every fixed slot before mutating the destination.
         plan: list[tuple[CompositePair, Path, tuple[Model, Processor]]] = []
         for pair in self.pair_layout:
-            pair_directory = _pair_directory(destination, pair.subdirectory)
+            pair_directory = destination / pair.subdirectory
             source = self._composite_pair_source(pair)
             plan.append((pair, pair_directory, source))
 
@@ -227,20 +218,14 @@ class CompositePipeline:
         )
         components: list[tuple[CompositePair, Model, Processor]] = []
         for pair in cls.pair_layout:
-            subrepository = ResolvedRepository(_pair_directory(resolved.path, pair.subdirectory))
-            if not (subrepository.path / "model.json").exists():
-                location = pair.subdirectory or "root"
-                raise ValueError(f"repository is missing the {location} pair required by {cls.__name__}")
-            if not (subrepository.path / "processor.json").exists():
-                location = pair.subdirectory or "root"
-                raise ValueError(f"repository is missing processor.json for the {location} pair")
+            subrepository = ResolvedRepository(resolved.path / pair.subdirectory)
             registration, values = model_values(subrepository.path)
             if registration.id != pair.architecture:
                 raise ValueError(
                     f"{cls.__name__} {pair.subdirectory or 'root'} requires architecture {pair.architecture!r}; "
                     f"repository declares {registration.id!r}"
                 )
-            config = build_registered_config(registration.model_config, values, f"{registration.id} model.json")
+            config = registration.model_config(values)
             with torch.device("meta"):
                 model = registration.model(config)
             processor = load_registered_processor(

@@ -10,7 +10,6 @@ from .config import (
     PxDesignConditionEmbeddingsConfig,
     PxDesignConfig,
     PxDesignDenoiserConfig,
-    PxDesignProcessorConfig,
     PxDesignSamplerConfig,
 )
 from .model import (

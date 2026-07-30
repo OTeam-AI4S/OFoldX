@@ -319,10 +319,7 @@ def optional_integer(value: object | None) -> int | None:
 
 def _optional_float(value: object | None) -> float | None:
     text = present_string(value)
-    if text is None:
-        return None
-    number = float(text)
-    return number if np.isfinite(number) else None
+    return None if text is None else float(text)
 
 
 def reject_duplicate_atom_records(records: tuple[AtomRecord, ...]) -> None:
@@ -464,7 +461,7 @@ def unique_identifier(seed: str, used: set[str]) -> str:
 
 def ordered_output_bonds(system: MolecularSystem) -> tuple[SystemBond, ...]:
     r"""
-    Return system bonds with normalized endpoints and stable output order.
+    Return canonical system bonds in stable output order.
 
     Args:
         system: Molecular system whose bonds are ordered.
@@ -473,24 +470,9 @@ def ordered_output_bonds(system: MolecularSystem) -> tuple[SystemBond, ...]:
         Bonds sorted by canonical endpoint identity.
     """
 
-    bonds: list[SystemBond] = []
-    for bond in system.iter_bonds():
-        key_a = (bond.site_a.instance_id, bond.site_a.component_index, bond.site_a.atom_id)
-        key_b = (bond.site_b.instance_id, bond.site_b.component_index, bond.site_b.atom_id)
-        if key_b < key_a:
-            bond = SystemBond(
-                bond.site_b,
-                bond.site_a,
-                order=bond.order,
-                aromatic=bond.aromatic,
-                stereo=bond.stereo,
-                stereo_sites=None if bond.stereo_sites is None else bond.stereo_sites[::-1],
-                origin=bond.origin,
-            )
-        bonds.append(bond)
     return tuple(
         sorted(
-            bonds,
+            system.iter_bonds(),
             key=lambda bond: (
                 bond.site_a.instance_id,
                 bond.site_a.component_index,

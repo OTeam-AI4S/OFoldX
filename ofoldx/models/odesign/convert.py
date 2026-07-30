@@ -150,7 +150,7 @@ def translate_odesign_state(model: ODesignModel, reference_state: Mapping[str, T
     Translate every parameter of one ODesign graph from released key names.
     """
 
-    msa_final_block = model.msa_trunk.num_blocks - 1
+    msa_final_block = len(model.msa_trunk.blocks)
 
     def reference_key(model_key: str) -> _ReferenceKey:
         return odesign_reference_key(model_key, msa_final_block=msa_final_block)

@@ -21,16 +21,16 @@ class MsaTrunk(nn.Module):
     MSA/pair trunk with homogeneous joint blocks and one final pair-only update.
 
     The trunk linearly projects the raw MSA features and an optional per-token embedding to width
-    ``msa_size``, runs ``num_blocks - 1`` homogeneous joint update blocks, then applies a
-    [`FinalMsaPairUpdate`][ofoldx.modules.trunk.msa.FinalMsaPairUpdate]. ``num_blocks=0`` skips both
-    stages, while ``num_blocks=1`` runs only the final pair update.
+    ``msa_size``, runs ``num_stages - 1`` homogeneous joint update blocks, then applies a
+    [`FinalMsaPairUpdate`][ofoldx.modules.trunk.msa.FinalMsaPairUpdate]. ``num_stages=0`` skips both
+    stages, while ``num_stages=1`` runs only the final pair update.
 
     Args:
         msa_size: Width of the projected MSA representation.
         pair_size: Width of the pair representation.
         msa_feature_size: Width of the raw per-residue MSA feature vector.
         token_feature_size: Width of the optional per-token embedding.
-        num_blocks: Total number of MSA/pair stages, including the final pair-only update.
+        num_stages: Total number of MSA/pair stages, including the final pair-only update.
         outer_product_hidden_size: Hidden width of the outer-product mean.
         num_msa_attention_heads: Number of heads in the MSA pair-weighted averaging.
         triangle_multiplication_hidden_size: Hidden width of each triangle-multiplication update.
@@ -48,7 +48,7 @@ class MsaTrunk(nn.Module):
         pair_size: int = 128,
         msa_feature_size: int = 34,
         token_feature_size: int = 449,
-        num_blocks: int = 4,
+        num_stages: int = 4,
         outer_product_hidden_size: int = 32,
         num_msa_attention_heads: int = 8,
         triangle_multiplication_hidden_size: int = 128,
@@ -62,7 +62,7 @@ class MsaTrunk(nn.Module):
         super().__init__()
         self.msa_projection = nn.Linear(msa_feature_size, msa_size, bias=False)
         self.token_projection = nn.Linear(token_feature_size, msa_size, bias=False)
-        self.num_blocks = num_blocks
+        self.num_stages = num_stages
         self.blocks = nn.ModuleList(
             MsaPairBlock(
                 msa_size=msa_size,
@@ -77,7 +77,7 @@ class MsaTrunk(nn.Module):
                 pair_dropout=pair_dropout,
                 backend=backend,
             )
-            for _ in range(num_blocks - 1)
+            for _ in range(num_stages - 1)
         )
         self.final_pair_update = (
             FinalMsaPairUpdate(
@@ -91,7 +91,7 @@ class MsaTrunk(nn.Module):
                 pair_dropout=pair_dropout,
                 backend=backend,
             )
-            if num_blocks
+            if num_stages
             else None
         )
 
@@ -440,6 +440,7 @@ class TrianglePairUpdateBlock(nn.Module):
             outgoing=True,
             backend=backend,
         )
+        self.rowwise_dropout = StructuredDropout(dropout, broadcast_dims=-3)
         self.triangle_multiplication_incoming = TriangleMultiplication(
             pair_size=pair_size,
             hidden_size=triangle_multiplication_hidden_size,
@@ -458,7 +459,6 @@ class TrianglePairUpdateBlock(nn.Module):
             num_attention_heads=num_triangle_attention_heads,
             backend=backend,
         )
-        self.rowwise_dropout = StructuredDropout(dropout, broadcast_dims=-3)
         self.transition = Transition(pair_size, expansion=expansion, backend=backend)
 
     def forward(self, pair: Tensor, pair_mask: Tensor | None = None) -> Tensor:

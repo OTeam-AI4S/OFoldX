@@ -131,7 +131,8 @@ class EsmFold2MsaEncoderConfig(Config):
         enabled: Whether to run the MSA encoder.
         msa_size: Width of MSA representations.
         hidden_size: Width of projected MSA features.
-        num_blocks: Number of MSA encoder blocks.
+        num_stages: Number of MSA encoder stages, including the distinct final
+            pair-only stage in the standard model.
         num_msa_attention_heads: Number of MSA attention heads.
         msa_head_dim: Per-head width of MSA attention.
     """
@@ -139,17 +140,17 @@ class EsmFold2MsaEncoderConfig(Config):
     enabled: bool = True
     msa_size: int = 128
     hidden_size: int = 32
-    num_blocks: int = 4
+    num_stages: int = 4
     num_msa_attention_heads: int = 8
     msa_head_dim: int = 16
 
 
-class EsmFold2FoldingTrunkConfig(Config):
+class EsmFold2FoldingStackConfig(Config):
     r"""
-    Configure the pair-only folding trunk.
+    Configure a homogeneous stack of pair-only folding blocks.
 
     Args:
-        num_blocks: Number of folding trunk blocks.
+        num_blocks: Number of folding blocks.
     """
 
     num_blocks: int = 48
@@ -237,7 +238,7 @@ class EsmFold2ConfidenceHeadConfig(Config):
         min_distance: Lower confidence distogram bound, in angstroms.
         max_distance: Upper confidence distogram bound, in angstroms.
         num_distogram_bins: Number of confidence distance bins.
-        folding_trunk: Four-block pair trunk used by the confidence head.
+        folding_stack: Four-block pair stack used by the confidence head.
     """
 
     num_plddt_bins: int = 50
@@ -246,7 +247,7 @@ class EsmFold2ConfidenceHeadConfig(Config):
     min_distance: float = 3.25
     max_distance: float = 50.75
     num_distogram_bins: int = 39
-    folding_trunk: EsmFold2FoldingTrunkConfig = EsmFold2FoldingTrunkConfig({"num_blocks": 4})
+    folding_stack: EsmFold2FoldingStackConfig = EsmFold2FoldingStackConfig({"num_blocks": 4})
 
 
 class EsmFold2Config(Config):
@@ -270,7 +271,7 @@ class EsmFold2Config(Config):
         esmc: MultiMolecule ESMC language-model configuration.
         language_model_encoder: Per-loop language-model pair encoder configuration.
         msa_encoder: MSA encoder configuration.
-        folding_trunk: Forty-eight-block pair folding trunk.
+        folding_stack: Forty-eight-block pair folding stack.
         parcae: Linear-recurrent trunk coda configuration.
         diffusion_structure_head: Diffusion score network and 14-step sampler configuration.
         confidence: pLDDT, PDE, and PAE heads with a four-block confidence trunk.
@@ -288,7 +289,7 @@ class EsmFold2Config(Config):
     esmc: EsmFold2EsmCConfig = EsmFold2EsmCConfig()
     language_model_encoder: EsmFold2LanguageModelEncoderConfig = EsmFold2LanguageModelEncoderConfig()
     msa_encoder: EsmFold2MsaEncoderConfig = EsmFold2MsaEncoderConfig()
-    folding_trunk: EsmFold2FoldingTrunkConfig = EsmFold2FoldingTrunkConfig()
+    folding_stack: EsmFold2FoldingStackConfig = EsmFold2FoldingStackConfig()
     parcae: EsmFold2ParcaeConfig = EsmFold2ParcaeConfig()
     diffusion_structure_head: EsmFold2DiffusionStructureHeadConfig = EsmFold2DiffusionStructureHeadConfig()
     confidence: EsmFold2ConfidenceHeadConfig = EsmFold2ConfidenceHeadConfig()
@@ -316,7 +317,7 @@ class EsmFold2ExperimentalConfidenceHeadConfig(Config):
         min_distance: Lower confidence distogram bound, in angstroms.
         max_distance: Upper confidence distogram bound, in angstroms.
         num_distogram_bins: Number of coarse confidence distance bins.
-        folding_trunk: Four-block pair trunk used by the confidence head.
+        folding_stack: Four-block pair stack used by the confidence head.
     """
 
     enabled: bool = True
@@ -325,7 +326,7 @@ class EsmFold2ExperimentalConfidenceHeadConfig(Config):
     min_distance: float = 2.0
     max_distance: float = 52.0
     num_distogram_bins: int = 128
-    folding_trunk: EsmFold2FoldingTrunkConfig = EsmFold2FoldingTrunkConfig({"num_blocks": 4})
+    folding_stack: EsmFold2FoldingStackConfig = EsmFold2FoldingStackConfig({"num_blocks": 4})
 
 
 class EsmFold2ExperimentalConfig(Config):
@@ -349,7 +350,7 @@ class EsmFold2ExperimentalConfig(Config):
         input_embeddings: Token and sliding-window atom input embedding configuration.
         esmc: MultiMolecule ESMC language-model configuration.
         msa_encoder: MSA encoder, disabled by default with a 32-wide attention head.
-        folding_trunk: Recurrent 24-block pair trunk.
+        folding_stack: Recurrent 24-block pair stack.
         diffusion_structure_head: Diffusion head overridden to 128 distogram bins.
         confidence: Experimental pLDDT/PAE confidence-head configuration.
     """
@@ -366,7 +367,7 @@ class EsmFold2ExperimentalConfig(Config):
     input_embeddings: EsmFold2InputEmbeddingsConfig = EsmFold2InputEmbeddingsConfig()
     esmc: EsmFold2EsmCConfig = EsmFold2EsmCConfig()
     msa_encoder: EsmFold2MsaEncoderConfig = EsmFold2MsaEncoderConfig({"enabled": False, "msa_head_dim": 32})
-    folding_trunk: EsmFold2FoldingTrunkConfig = EsmFold2FoldingTrunkConfig({"num_blocks": 24})
+    folding_stack: EsmFold2FoldingStackConfig = EsmFold2FoldingStackConfig({"num_blocks": 24})
     diffusion_structure_head: EsmFold2DiffusionStructureHeadConfig = EsmFold2DiffusionStructureHeadConfig(
         {"num_distogram_bins": 128}
     )

@@ -178,9 +178,3 @@ class RfDiffusionConfig(Config):
             raise ValueError("preprocess.template_single_feature_size must be 22, 24, or 28")
         if self.preprocess.template_pair_feature_size not in (44, 47):
             raise ValueError("preprocess.template_pair_feature_size must be 44 or 47")
-
-
-class RfDiffusionProcessorConfig(Config):
-    r"""
-    Configuration for the RFdiffusion processor.
-    """

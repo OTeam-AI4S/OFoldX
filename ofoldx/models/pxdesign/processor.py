@@ -13,7 +13,6 @@ from torch import Tensor
 from ...data import (
     ExistingSpan,
     GeneratedSegment,
-    InstanceIdAllocator,
     PlacementSpec,
     SymbolicResidueSite,
     validate_placement,
@@ -23,7 +22,6 @@ from ...data.conditions import Hotspot
 from ...data.molecular import AtomSite, ChemicalComponent, MolecularSystem, Molecule, PolymerSequence, SystemBond
 from ...data.structure import Structure
 from ...processor import Processor
-from .config import PxDesignProcessorConfig
 from .model import PxDesignInput, PxDesignLayout
 
 _RESIDUE_TYPE_INDEX = {
@@ -68,23 +66,16 @@ class PxDesignProcessor(Processor):
     Convert supported binder-design inputs into `PxDesignInput`.
 
     Args:
-        config: PXDesign input-processing options. Defaults to
-            ``PxDesignProcessorConfig()``.
         device: Device for produced tensors.
         dtype: Floating-point dtype for produced tensors.
     """
 
-    config_class = PxDesignProcessorConfig
-    config: PxDesignProcessorConfig
-
     def __init__(
         self,
-        config: PxDesignProcessorConfig | None = None,
         *,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
-        self.config = PxDesignProcessorConfig() if config is None else config
         super().__init__(device=device, dtype=dtype)
 
     def __call__(
@@ -108,9 +99,6 @@ class PxDesignProcessor(Processor):
             atom, hotspot, and molecular-layout axes.
         """
 
-        if input is not None and not isinstance(input, (MolecularSystem, Structure)):
-            raise TypeError("input must be a MolecularSystem, Structure, or None")
-
         condition_values = tuple(conditions)
         if any(not isinstance(condition, Hotspot) for condition in condition_values):
             unsupported = next(condition for condition in condition_values if not isinstance(condition, Hotspot))
@@ -129,8 +117,7 @@ class PxDesignProcessor(Processor):
         validate_placement(placement)
         # Each outer key is a declaration group (a chain); each inner key is a globally
         # unique placement_id. Identity rides the inner key, not a value field: the binder
-        # placement is KEYED by ``generated_id``, while its realized instance id is minted by the
-        # shared allocator (``chain_0``, below) per the uniform realized-id convention.
+        # placement is KEYED by ``generated_id``, while its realized instance is ``chain_0``.
         generated_items: list[tuple[str, str, GeneratedSegment]] = []
         for group, placements in placement.items():
             for placement_id, part in placements.items():
@@ -426,7 +413,7 @@ def _materialize_problem(
         {} if source is None else {entity_id: source.entities[entity_id] for entity_id in selected_entity_ids}
     )
 
-    # Generated entity ids remain PXDesign-owned; instance ids are allocated separately.
+    # Generated entity ids remain PXDesign-owned.
     entity_id = "pxdesign_entity_0"
     suffix = 1
     while entity_id in selected_entity_ids:
@@ -435,7 +422,7 @@ def _materialize_problem(
     entities[entity_id] = PolymerSequence("protein", (get_component("UNK"),) * generated.max_length)
 
     # PXDesign realizes one generated binder instance.
-    instance_id = InstanceIdAllocator().allocate()
+    instance_id = "chain_0"
     instances = dict(selected_instances)
     instances[instance_id] = entity_id
 
@@ -746,8 +733,6 @@ def from_binder(
         binder_label += "_"
     placement[binder_label] = {binder_label: GeneratedSegment("protein", binder_length, binder_length)}
 
-    # Enforce globally unique placement IDs at construction time.
-    validate_placement(placement)
     return placement
 
 

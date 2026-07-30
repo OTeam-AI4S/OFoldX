@@ -71,16 +71,20 @@ def read_msa(
         raise ValueError("MSA contains no biological sequence records")
 
     sequences = [record.sequence for record in records]
-    project = _project_a3m_row if a3m else _project_aligned_fasta_row
-
-    query_row, query_deletions = project(sequences[0], sequences[0], is_query=True)
+    if a3m:
+        query_row, query_deletions = _project_a3m_row(sequences[0], is_query=True)
+    else:
+        query_row, query_deletions = _project_aligned_fasta_row(sequences[0], sequences[0])
     width = len(query_row)
 
     unpaired_sequences: list[str] = [query_row]
     unpaired_deletion_counts = np.zeros((len(sequences), width), dtype=np.uint32)
     unpaired_deletion_counts[0] = query_deletions
     for row_index, sequence in enumerate(sequences[1:], start=1):
-        projected, deletions = project(sequence, sequences[0], is_query=False)
+        if a3m:
+            projected, deletions = _project_a3m_row(sequence, is_query=False)
+        else:
+            projected, deletions = _project_aligned_fasta_row(sequence, sequences[0])
         if len(projected) != width:
             raise ValueError("every MSA row must project to the query width")
         unpaired_sequences.append(projected)
@@ -95,12 +99,11 @@ def read_msa(
     )
 
 
-def _project_a3m_row(sequence: str, query: str, *, is_query: bool) -> tuple[str, list[int]]:
+def _project_a3m_row(sequence: str, *, is_query: bool) -> tuple[str, list[int]]:
     r"""
     Project one A3M row: uppercase/``-`` emit, lowercase count, ``.`` drop.
     """
 
-    del query  # A3M encodes insertions per row; no query mask is needed.
     aligned: list[str] = []
     deletions: list[int] = []
     insertion_count = 0
@@ -122,12 +125,11 @@ def _project_a3m_row(sequence: str, query: str, *, is_query: bool) -> tuple[str,
     return "".join(aligned), deletions
 
 
-def _project_aligned_fasta_row(sequence: str, query: str, *, is_query: bool) -> tuple[str, list[int]]:
+def _project_aligned_fasta_row(sequence: str, query: str) -> tuple[str, list[int]]:
     r"""
     Project one aligned-FASTA row against the query mask of retained columns.
     """
 
-    del is_query  # The query mask governs every row identically.
     row = _normalize_aligned_fasta(sequence)
     mask = _normalize_aligned_fasta(query)
     if len(row) != len(mask):

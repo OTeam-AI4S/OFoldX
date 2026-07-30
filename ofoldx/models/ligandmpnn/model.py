@@ -158,14 +158,6 @@ class LigandMpnnModel(Model):
         return coordinate_noise
 
     @staticmethod
-    def _validate_num_decoding_orders(num_decoding_orders: int) -> int:
-        r"""
-        Validate the independent decoding-order evaluation count.
-        """
-
-        return validate_positive_integer(num_decoding_orders, "num_decoding_orders")
-
-    @staticmethod
     def _require_single_target(input: LigandMpnnInput) -> None:
         r"""
         Reject an execution-batch axis on one-target biological operations.
@@ -240,34 +232,15 @@ class LigandMpnnModel(Model):
         Fixed rows receive a near-zero weight and therefore decode before every designed row; each row
         of the returned ``[B, L]`` permutation is an independent order.
 
-        ``decoding_priority`` is the per-residue nonnegative random priority. The Runner supplies it,
-        seeded per structure by global index, so a batched (and ragged) forward stays reproducible and
-        independent of batch composition; only a standalone call falls back to drawing it from
-        ``generator`` as ``randn.abs()``. Both the priority and the chain mask are derived from the
-        aligned ``residue_mask``/``design_positions``, so a ragged ``NestedTensor`` batch keeps each
-        structure's order over its own residues with no padded rows.
+        ``decoding_priority`` may provide nonnegative per-residue priorities
+        explicitly; otherwise they are drawn from ``generator`` as
+        ``randn.abs()``. The aligned masks keep ragged batches free of padded rows.
         """
 
         chain_mask = residue_mask.to(dtype=torch.float32) * design_positions.to(dtype=torch.float32)
         if decoding_priority is None:
             decoding_priority = torch.randn(chain_mask.shape, device=chain_mask.device, generator=generator).abs()
         return torch.argsort((chain_mask + 0.0001) * decoding_priority, dim=-1)
-
-    @staticmethod
-    def _ranks_from_order(decode_order: Tensor) -> Tensor:
-        r"""
-        Invert a drawn decoding permutation to per-residue ranks, ragged-natively.
-
-        Equivalent to :func:`decoding_order_to_ranks` for a full permutation, but every tensor is
-        derived from ``decode_order`` (``ones_like``/``cumsum``, out-of-place ``scatter``) so a ragged
-        ``NestedTensor`` batch keeps each structure's order over its own residues. The shared helper's
-        ``torch.arange(L).expand_as(...)`` would materialize a dense ``0..L-1`` row that cannot align
-        with a packed ragged batch. ``cumsum`` of ones is the per-row step index; scattering it through
-        the permutation places each residue's decode step at its own row.
-        """
-
-        positions = torch.ones_like(decode_order).cumsum(dim=-1) - 1
-        return torch.zeros_like(decode_order).scatter(-1, decode_order, positions)
 
     def _generate_ranks(self, input: LigandMpnnInput, generator: torch.Generator | None) -> Tensor:
         r"""
@@ -461,10 +434,9 @@ class LigandMpnnModel(Model):
             input: LigandMPNN tensors with batch size ``B`` and ``L`` residue rows.
             decoding_ranks: Optional ranks with shape ``(B, L)``; smaller values
                 decode earlier. A fixed-first random order is drawn when omitted.
-            decoding_priority: Optional per-residue nonnegative random priority ``(B, L)`` the order is
-                drawn from. The Runner seeds it per structure by global index; supplying it (rather than a
-                ``generator``) keeps a batched forward reproducible and independent of batch composition.
-                Ignored when ``decoding_ranks`` is given.
+            decoding_priority: Optional per-residue nonnegative random priority
+                ``(B, L)`` used to draw the order. Ignored when
+                ``decoding_ranks`` is given.
             coordinate_noise: Standard deviation of Gaussian noise in coordinate units.
             use_sidechain_context: Whether fixed protein side chains contribute context atoms.
             generator: Random generator used for the order (when no priority is supplied) and coordinate noise.
@@ -481,7 +453,7 @@ class LigandMpnnModel(Model):
             generator=generator,
         )
         if decoding_ranks is None:
-            decoding_ranks = self._ranks_from_order(
+            decoding_ranks = decoding_order_to_ranks(
                 self._draw_decode_orders(input.residue_mask, input.design_positions, generator, decoding_priority)
             )
         logits = self._decode_logits(
@@ -522,7 +494,7 @@ class LigandMpnnModel(Model):
         """
 
         self._require_single_target(input)
-        num_decoding_orders = self._validate_num_decoding_orders(num_decoding_orders)
+        num_decoding_orders = validate_positive_integer(num_decoding_orders, "num_decoding_orders")
         coordinate_noise = self._validate_coordinate_noise(coordinate_noise)
         repeated = self._repeat_input(input, num_decoding_orders)
         node_states, edge_states, neighbor_indices, neighbor_valid = self._encode(
@@ -571,7 +543,7 @@ class LigandMpnnModel(Model):
         """
 
         self._require_single_target(input)
-        num_decoding_orders = self._validate_num_decoding_orders(num_decoding_orders)
+        num_decoding_orders = validate_positive_integer(num_decoding_orders, "num_decoding_orders")
         coordinate_noise = self._validate_coordinate_noise(coordinate_noise)
         repeated = self._repeat_input(input, num_decoding_orders)
         node_states, edge_states, neighbor_indices, neighbor_valid = self._encode(
@@ -607,7 +579,7 @@ class LigandMpnnModel(Model):
         """
 
         self._require_single_target(input)
-        num_decoding_orders = self._validate_num_decoding_orders(num_decoding_orders)
+        num_decoding_orders = validate_positive_integer(num_decoding_orders, "num_decoding_orders")
         coordinate_noise = self._validate_coordinate_noise(coordinate_noise)
         repeated = self._repeat_input(input, num_decoding_orders)
         device = repeated.backbone_coordinates.device
@@ -1228,24 +1200,24 @@ class LigandMpnnFeatures(MpnnProteinFeatures):
             num_positional_embeddings=num_positional_embeddings,
             num_rbf=num_rbf,
         )
-        self.atom_projection = nn.Linear(5 * num_rbf + 64 + 4, hidden_size)
-        self.atom_norm = LayerNorm(hidden_size)
-        self.element_projection = nn.Linear(147, 64)
-        self.context_node_projection = nn.Linear(147, hidden_size, bias=False)
-        self.context_edge_projection = nn.Linear(num_rbf, hidden_size, bias=False)
-        self.context_edge_norm = LayerNorm(hidden_size)
-        self.context_node_norm = LayerNorm(hidden_size)
-        buffer_device = self.element_projection.weight.device
+        buffer_device = self.edge_projection.weight.device
         if buffer_device.type == "meta":
             buffer_device = torch.device("cpu")
-        group, period = periodic_group_period(device=buffer_device)
-        self.register_buffer("periodic_group", group, persistent=False)
-        self.register_buffer("periodic_period", period, persistent=False)
         self.register_buffer(
             "sidechain_atom_types",
             _sidechain_atom_types(device=buffer_device),
             persistent=False,
         )
+        group, period = periodic_group_period(device=buffer_device)
+        self.register_buffer("periodic_group", group, persistent=False)
+        self.register_buffer("periodic_period", period, persistent=False)
+        self.element_projection = nn.Linear(147, 64)
+        self.atom_projection = nn.Linear(5 * num_rbf + 64 + 4, hidden_size)
+        self.atom_norm = LayerNorm(hidden_size)
+        self.context_edge_projection = nn.Linear(num_rbf, hidden_size, bias=False)
+        self.context_edge_norm = LayerNorm(hidden_size)
+        self.context_node_projection = nn.Linear(147, hidden_size, bias=False)
+        self.context_node_norm = LayerNorm(hidden_size)
 
     def encode(
         self,

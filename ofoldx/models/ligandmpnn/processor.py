@@ -153,8 +153,6 @@ class LigandMpnnProcessor(Processor):
             nearest nonwater, nonprotein heavy atoms, padded to ``config.num_context_atoms``.
         """
 
-        if not isinstance(structure, Structure):
-            raise TypeError("LigandMpnnProcessor requires a Structure")
         cutoff = float(ligand_interface_cutoff)
 
         system = structure.system

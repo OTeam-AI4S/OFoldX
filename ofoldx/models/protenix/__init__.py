@@ -8,6 +8,7 @@ from ...modules.diffusion.loss import denoising_criterion_factory
 from ...pipelines.registry import PIPELINES as _PIPELINES
 from ..registry import MODELS as _MODELS
 from .config import (
+    ProtenixConfidenceConfig,
     ProtenixConfig,
     ProtenixConstraintConfig,
     ProtenixEsmConfig,

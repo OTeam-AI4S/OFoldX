@@ -26,17 +26,14 @@ from ...data.molecular import (
 from ...data.placement import (
     ExistingSpan,
     GeneratedSegment,
-    InstanceIdAllocator,
     PlacementSpec,
     PlacementValue,
     SymbolicAtomSite,
     SymbolicResidueSite,
 )
 from ...data.placement import instance_of as derive_instance_of
-from ...data.placement import symbolic_residue_aliases, validate_placement
 from ...data.structure import Structure
 from ...processor import Processor
-from .config import RfDiffusionProcessorConfig
 
 # RFdiffusion spatial controls are defined with the model. Topology is a separate
 # ``placement`` argument rather than a condition.
@@ -54,6 +51,8 @@ from .model import (
     RfDiffusionReferenceCoordinates,
     RfDiffusionSecondaryStructure,
     RfDiffusionSubstrateInteraction,
+    _index_output_residues,
+    _output_residue_row,
     rfdiffusion_residue_token_id,
     rfdiffusion_secondary_structure,
     rfdiffusion_terminal_cyclization_instance,
@@ -65,24 +64,16 @@ class RfDiffusionProcessor(Processor):
     Convert supported backbone-design inputs into `RfDiffusionInput`.
 
     Args:
-        config: RFdiffusion input-processing options. Defaults to
-            ``RfDiffusionProcessorConfig()``.
         device: Device for produced tensors.
         dtype: Floating-point dtype for produced tensors.
     """
 
-    config_class = RfDiffusionProcessorConfig
-    config: RfDiffusionProcessorConfig
-
     def __init__(
         self,
-        config: RfDiffusionProcessorConfig | None = None,
         *,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
-        config = RfDiffusionProcessorConfig() if config is None else config
-        self.config = config
         super().__init__(device=device, dtype=dtype)
 
     def __call__(
@@ -190,8 +181,6 @@ class RfDiffusionProcessor(Processor):
             placement = RfDiffusionPlacements(placements=default_placement) if default_placement else None
         if placement is None:
             raise ValueError("RFdiffusion requires a placement when no protein input can define one")
-        # Every placement_id must be globally unique across the whole PlacementSpec.
-        validate_placement(placement.placements)
         for group in placement.placements.values():
             for part in group.values():
                 if isinstance(part, GeneratedSegment):
@@ -220,10 +209,7 @@ class RfDiffusionProcessor(Processor):
             raise ValueError(f"secondary_structure must have shape ({output_length}, 4)")
         if block_adjacency is not None and block_adjacency.shape != (output_length, output_length, 3):
             raise ValueError(f"block_adjacency must have shape ({output_length}, {output_length}, 3)")
-        output_index = {reference: row for row, reference in enumerate(output_residues)}
-        output_index.update(
-            {alias: output_index[reference] for alias, reference in symbolic_residue_aliases(output_residues).items()}
-        )
+        output_index, symbolic_rows = _index_output_residues(output_residues)
         inpainted_residues = set(inpaint_sequence)
         if inpainted_residues:
             if system is None:
@@ -237,7 +223,7 @@ class RfDiffusionProcessor(Processor):
                 continue
             instance_id = rfdiffusion_terminal_cyclization_instance(
                 condition,
-                output_index,
+                output_residues,
                 output_instances,
             )
             cyclic_mask |= torch.tensor([value == instance_id for value in output_instances])
@@ -358,7 +344,7 @@ class RfDiffusionProcessor(Processor):
                         if isinstance(reference, SymbolicResidueSite) and reference.placement_id == target
                     )
                 else:
-                    identity_rows.append(output_index[target])
+                    identity_rows.append(_output_residue_row(target, output_index, symbolic_rows))
             for row in identity_rows:
                 previous = conditioned_tokens.get(row)
                 if previous is not None and previous != token:
@@ -453,7 +439,13 @@ class RfDiffusionProcessor(Processor):
                         if isinstance(reference, SymbolicResidueSite) and reference.placement_id == secondary_target
                     )
                 else:
-                    secondary_rows.append(output_index[cast(tuple[str, int] | SymbolicResidueSite, secondary_target)])
+                    secondary_rows.append(
+                        _output_residue_row(
+                            cast(tuple[str, int] | SymbolicResidueSite, secondary_target),
+                            output_index,
+                            symbolic_rows,
+                        )
+                    )
             row_tensor = torch.tensor(secondary_rows, dtype=torch.int64)
             if bool(fixed_structure[row_tensor].any()):
                 raise ValueError("RfDiffusionSecondaryStructure targets must be structure-inpainted, not fixed")
@@ -546,13 +538,8 @@ def _resolve_placement(
 ]:
     residues: list[tuple[str, int] | SymbolicResidueSite] = []
     instance_ids: list[str] = []
-    # Mint realized output instance IDs with the shared `InstanceIdAllocator`, walking declaration groups in
-    # order and calling `allocate()` once per realized output chain with >=1 occurrence — the
-    # canonical `chain_{n}` IDs (uniform and 0-based). A declaration group that
-    # realizes to zero residues mints no chain and consumes no index. Identical to the
-    # post-sample re-lowering in `RfDiffusionModel._sample_variable_lengths`. Numerically inert:
-    # `residue_index` is computed from chain boundaries below, not from this id string.
-    allocator = InstanceIdAllocator()
+    # Mint canonical `chain_{n}` IDs in declaration order for nonempty groups.
+    next_instance = 0
     for group in placement.placements.values():
         group_residues: list[tuple[str, int] | SymbolicResidueSite] = []
         for placement_id, part in group.items():
@@ -567,7 +554,8 @@ def _resolve_placement(
             group_residues.extend(group_references)
         if not group_residues:
             continue  # zero-length declaration group mints no realized chain, consumes no index
-        instance_id = allocator.allocate()
+        instance_id = f"chain_{next_instance}"
+        next_instance += 1
         residues.extend(group_residues)
         instance_ids.extend([instance_id] * len(group_residues))
     return tuple(residues), tuple(instance_ids)

@@ -6,13 +6,12 @@ from __future__ import annotations
 
 import operator
 from dataclasses import dataclass, field
-
-from tensordict import tensorclass
 from functools import partial
 from typing import Literal, cast
 
 import torch
 import torch.nn.functional as F
+from tensordict import tensorclass
 from torch import Tensor, nn
 
 from ...data.bonds import SymbolicBond
@@ -163,17 +162,19 @@ class _BoltzGenStructureModel(Model):
             pair_size, cutoff_min=config.conditioning_cutoff_min, cutoff_max=config.conditioning_cutoff_max
         )
         self.single_recycle_norm = LayerNorm(single_size)
-        self.pair_recycle_norm = LayerNorm(pair_size)
         self.single_recycle_projection = nn.Linear(single_size, single_size, bias=False)
+        self.pair_recycle_norm = LayerNorm(pair_size)
         self.pair_recycle_projection = nn.Linear(pair_size, pair_size, bias=False)
         nn.init.zeros_(self.single_recycle_projection.weight)
         nn.init.zeros_(self.pair_recycle_projection.weight)
 
         # Token-distance conditioning precedes template conditioning in the released constructor.
-        token_distance_embedder: BoltzGenTokenDistanceEmbedder | None = None
+        self.token_distance_embedder: BoltzGenTokenDistanceEmbedder | BoltzGenMiniformerTokenDistanceEmbedder | None = (
+            None
+        )
         if design.use_token_distance:
             if design.token_distance_miniformer_blocks:
-                token_distance_embedder = BoltzGenMiniformerTokenDistanceEmbedder(
+                self.token_distance_embedder = BoltzGenMiniformerTokenDistanceEmbedder(
                     pair_size=pair_size,
                     token_distance_size=design.token_distance_size,
                     num_blocks=design.num_token_distance_blocks,
@@ -187,7 +188,7 @@ class _BoltzGenStructureModel(Model):
                     backend="auto",
                 )
             else:
-                token_distance_embedder = BoltzGenTokenDistanceEmbedder(
+                self.token_distance_embedder = BoltzGenTokenDistanceEmbedder(
                     pair_size=pair_size,
                     token_distance_size=design.token_distance_size,
                     num_blocks=design.num_token_distance_blocks,
@@ -201,10 +202,10 @@ class _BoltzGenStructureModel(Model):
                     use_token_distance_features=design.use_token_distance_features,
                     backend="auto",
                 )
-        self.token_distance_embedder = token_distance_embedder
 
+        self.template_embedder: BoltzGenTemplateEmbedder | BoltzGenMiniformerTemplateEmbedder
         if design.template_miniformer_blocks:
-            template_embedder: BoltzGenTemplateEmbedder = BoltzGenMiniformerTemplateEmbedder(
+            self.template_embedder = BoltzGenMiniformerTemplateEmbedder(
                 pair_size=pair_size,
                 template_size=design.template_size,
                 num_blocks=design.num_template_blocks,
@@ -217,7 +218,7 @@ class _BoltzGenStructureModel(Model):
                 backend="auto",
             )
         else:
-            template_embedder = BoltzGenTemplateEmbedder(
+            self.template_embedder = BoltzGenTemplateEmbedder(
                 pair_size=pair_size,
                 template_size=design.template_size,
                 num_blocks=design.num_template_blocks,
@@ -230,7 +231,6 @@ class _BoltzGenStructureModel(Model):
                 dropout=design.template_dropout,
                 backend="auto",
             )
-        self.template_embedder = template_embedder
 
         self.msa_trunk = (
             BoltzGenMsaTrunk(
@@ -986,11 +986,12 @@ class BoltzGenConfidenceModel(_BoltzGenStructureModel):
                 num_samples,
                 *denoised_coordinate_trajectory.shape[1:],
             )
+        bfactor_logits = self.bfactor_head(trunk.single)
         confidence = self._score_confidence(input, trunk=trunk, coordinates=coordinates)
         return BoltzGenSampleWithConfidenceOutput(
             coordinates=coordinates,
             distogram_logits=trunk.distogram_logits,
-            bfactor_logits=self.bfactor_head(trunk.single),
+            bfactor_logits=bfactor_logits,
             confidence=confidence,
             coordinate_trajectory=coordinate_trajectory,
             denoised_coordinate_trajectory=denoised_coordinate_trajectory,
@@ -1430,10 +1431,6 @@ class BoltzGenTemplateEmbedder(nn.Module):
         self.min_dist = min_dist
         self.max_dist = max_dist
         self.num_bins = num_bins
-        self.relu = nn.ReLU()
-        self.pair_norm = LayerNorm(pair_size, backend=backend)
-        self.hidden_norm = LayerNorm(template_size, backend=backend)
-        self.pair_projection = nn.Linear(pair_size, template_size, bias=False)
         self.template_feature_projection = FactorizedPairLinear(
             pair_size=num_bins + 5,
             token_size=vocab_size,
@@ -1441,7 +1438,8 @@ class BoltzGenTemplateEmbedder(nn.Module):
             bias=False,
             backend=backend,
         )
-        self.output_projection = nn.Linear(template_size, pair_size, bias=False)
+        self.pair_norm = LayerNorm(pair_size, backend=backend)
+        self.pair_projection = nn.Linear(pair_size, template_size, bias=False)
         self.blocks = nn.ModuleList(
             BoltzGenTrianglePairUpdateBlock(
                 pair_size=template_size,
@@ -1453,6 +1451,9 @@ class BoltzGenTemplateEmbedder(nn.Module):
             )
             for _ in range(num_blocks)
         )
+        self.hidden_norm = LayerNorm(template_size, backend=backend)
+        self.relu = nn.ReLU()
+        self.output_projection = nn.Linear(template_size, pair_size, bias=False)
 
     def forward(self, pair: Tensor, input: BoltzGenInput, pair_mask: Tensor | None = None) -> Tensor:
         residue_type_features = cast(Tensor, input.template_residue_type_features)
@@ -1523,7 +1524,7 @@ class BoltzGenTemplateEmbedder(nn.Module):
         return self.output_projection(self.relu(aggregated))
 
 
-class BoltzGenMiniformerTemplateEmbedder(BoltzGenTemplateEmbedder):
+class BoltzGenMiniformerTemplateEmbedder(nn.Module):
     r"""
     Embed template geometry with homogeneous BoltzGen Miniformer pair updates.
     """
@@ -1541,15 +1542,11 @@ class BoltzGenMiniformerTemplateEmbedder(BoltzGenTemplateEmbedder):
         post_layer_norm: bool = False,
         backend: str = "auto",
     ) -> None:
-        nn.Module.__init__(self)
+        super().__init__()
         self.num_blocks = num_blocks
         self.min_dist = min_dist
         self.max_dist = max_dist
         self.num_bins = num_bins
-        self.relu = nn.ReLU()
-        self.pair_norm = LayerNorm(pair_size, backend=backend)
-        self.hidden_norm = LayerNorm(template_size, backend=backend)
-        self.pair_projection = nn.Linear(pair_size, template_size, bias=False)
         self.template_feature_projection = FactorizedPairLinear(
             pair_size=num_bins + 5,
             token_size=vocab_size,
@@ -1557,7 +1554,8 @@ class BoltzGenMiniformerTemplateEmbedder(BoltzGenTemplateEmbedder):
             bias=False,
             backend=backend,
         )
-        self.output_projection = nn.Linear(template_size, pair_size, bias=False)
+        self.pair_norm = LayerNorm(pair_size, backend=backend)
+        self.pair_projection = nn.Linear(pair_size, template_size, bias=False)
         self.blocks = nn.ModuleList(
             BoltzGenMiniTrianglePairUpdateBlock(
                 pair_size=template_size,
@@ -1567,6 +1565,77 @@ class BoltzGenMiniformerTemplateEmbedder(BoltzGenTemplateEmbedder):
             )
             for _ in range(num_blocks)
         )
+        self.hidden_norm = LayerNorm(template_size, backend=backend)
+        self.relu = nn.ReLU()
+        self.output_projection = nn.Linear(template_size, pair_size, bias=False)
+
+    def forward(self, pair: Tensor, input: BoltzGenInput, pair_mask: Tensor | None = None) -> Tensor:
+        residue_type_features = cast(Tensor, input.template_residue_type_features)
+        frame_mask = cast(Tensor, input.template_frame_mask)
+        frame_rotations = cast(Tensor, input.template_frame_rotations)
+        frame_translations = cast(Tensor, input.template_frame_translations)
+        beta_carbon_positions = cast(Tensor, input.template_beta_carbon_positions)
+        alpha_carbon_positions = cast(Tensor, input.template_alpha_carbon_positions)
+        beta_carbon_mask = cast(Tensor, input.template_beta_carbon_mask)
+        template_mask = cast(Tensor, input.template_mask)
+        visibility_index = cast(Tensor, input.template_visibility_index)
+        present = template_mask.any(dim=2).float()
+        count = present.sum(dim=1).clamp(min=1)
+        batch_size, num_templates, num_tokens = residue_type_features.shape[:3]
+
+        pair_beta_carbon_mask = (beta_carbon_mask[..., :, None] * beta_carbon_mask[..., None, :]).unsqueeze(-1)
+        pair_frame_mask = (frame_mask[..., :, None] * frame_mask[..., None, :]).unsqueeze(-1)
+        same_visibility = (visibility_index[..., :, None] == visibility_index[..., None, :]).float()
+
+        beta_carbon_distances = torch.cdist(
+            beta_carbon_positions,
+            beta_carbon_positions,
+        )
+        boundaries = torch.linspace(
+            self.min_dist,
+            self.max_dist,
+            self.num_bins - 1,
+            device=beta_carbon_distances.device,
+        )
+        distogram = F.one_hot(
+            (beta_carbon_distances[..., None] > boundaries).sum(dim=-1).long(),
+            num_classes=self.num_bins,
+        )
+
+        rotation = frame_rotations.unsqueeze(2).transpose(-1, -2)
+        translation = frame_translations.unsqueeze(2).unsqueeze(-1)
+        targets = alpha_carbon_positions.unsqueeze(3).unsqueeze(-1)
+        vector = torch.matmul(rotation, targets - translation)
+        norm = torch.norm(vector, dim=-1, keepdim=True)
+        unit_vector = torch.where(norm > 0, vector / norm, torch.zeros_like(vector)).squeeze(-1)
+
+        geometry = torch.cat(
+            [
+                distogram.to(pair.dtype),
+                pair_beta_carbon_mask,
+                unit_vector,
+                pair_frame_mask,
+            ],
+            dim=-1,
+        )
+        geometry = geometry * same_visibility.unsqueeze(-1)
+        template_residue_features = residue_type_features.to(pair.dtype)
+        feature_value = self.template_feature_projection(geometry.to(pair.dtype), template_residue_features)
+        value = self.pair_projection(self.pair_norm(pair[:, None])) + feature_value
+        value = value.reshape(batch_size * num_templates, num_tokens, num_tokens, -1)
+        if pair_mask is not None:
+            pair_mask = (
+                pair_mask[:, None]
+                .expand(-1, num_templates, -1, -1)
+                .reshape(batch_size * num_templates, num_tokens, num_tokens)
+            )
+        refined = value
+        for block in self.blocks:
+            refined = block(refined, pair_mask=pair_mask)
+        value = self.hidden_norm(value + refined).reshape(batch_size, num_templates, num_tokens, num_tokens, -1)
+
+        aggregated = (value * present[:, :, None, None, None]).sum(dim=1) / count[:, None, None, None].to(value.dtype)
+        return self.output_projection(self.relu(aggregated))
 
 
 class BoltzGenTokenDistanceEmbedder(nn.Module):
@@ -1595,16 +1664,22 @@ class BoltzGenTokenDistanceEmbedder(nn.Module):
         self.max_dist = max_dist
         self.num_bins = num_bins
         self.use_token_distance_features = use_token_distance_features
-        self.relu = nn.ReLU()
+        self.distance_encoder = (
+            BoltzGenDistanceTokenEncoder(
+                distance_gaussian_dim=distance_gaussian_dim,
+                pair_size=pair_size,
+                output_size=pair_size,
+            )
+            if use_token_distance_features
+            else None
+        )
         self.pair_norm = LayerNorm(pair_size, backend=backend)
-        self.hidden_norm = LayerNorm(token_distance_size, backend=backend)
         self.pair_projection = nn.Linear(pair_size, token_distance_size, bias=False)
         self.distance_feature_projection = nn.Linear(
             num_bins + (4 * pair_size if use_token_distance_features else 0),
             token_distance_size,
             bias=False,
         )
-        self.output_projection = nn.Linear(token_distance_size, pair_size, bias=False)
         self.blocks = nn.ModuleList(
             BoltzGenTrianglePairUpdateBlock(
                 pair_size=token_distance_size,
@@ -1616,15 +1691,9 @@ class BoltzGenTokenDistanceEmbedder(nn.Module):
             )
             for _ in range(num_blocks)
         )
-        self.distance_encoder = (
-            BoltzGenDistanceTokenEncoder(
-                distance_gaussian_dim=distance_gaussian_dim,
-                pair_size=pair_size,
-                output_size=pair_size,
-            )
-            if use_token_distance_features
-            else None
-        )
+        self.hidden_norm = LayerNorm(token_distance_size, backend=backend)
+        self.relu = nn.ReLU()
+        self.output_projection = nn.Linear(token_distance_size, pair_size, bias=False)
 
     def forward(
         self,
@@ -1663,7 +1732,7 @@ class BoltzGenTokenDistanceEmbedder(nn.Module):
         return self.output_projection(self.relu(value))
 
 
-class BoltzGenMiniformerTokenDistanceEmbedder(BoltzGenTokenDistanceEmbedder):
+class BoltzGenMiniformerTokenDistanceEmbedder(nn.Module):
     r"""
     Encode inter-token backbone geometry with homogeneous Miniformer pair updates.
     """
@@ -1682,31 +1751,12 @@ class BoltzGenMiniformerTokenDistanceEmbedder(BoltzGenTokenDistanceEmbedder):
         use_token_distance_features: bool = True,
         backend: str = "auto",
     ) -> None:
-        nn.Module.__init__(self)
+        super().__init__()
         self.num_blocks = num_blocks
         self.min_dist = min_dist
         self.max_dist = max_dist
         self.num_bins = num_bins
         self.use_token_distance_features = use_token_distance_features
-        self.relu = nn.ReLU()
-        self.pair_norm = LayerNorm(pair_size, backend=backend)
-        self.hidden_norm = LayerNorm(token_distance_size, backend=backend)
-        self.pair_projection = nn.Linear(pair_size, token_distance_size, bias=False)
-        self.distance_feature_projection = nn.Linear(
-            num_bins + (4 * pair_size if use_token_distance_features else 0),
-            token_distance_size,
-            bias=False,
-        )
-        self.output_projection = nn.Linear(token_distance_size, pair_size, bias=False)
-        self.blocks = nn.ModuleList(
-            BoltzGenMiniTrianglePairUpdateBlock(
-                pair_size=token_distance_size,
-                dropout=dropout,
-                post_layer_norm=post_layer_norm,
-                backend=backend,
-            )
-            for _ in range(num_blocks)
-        )
         self.distance_encoder = (
             BoltzGenDistanceTokenEncoder(
                 distance_gaussian_dim=distance_gaussian_dim,
@@ -1716,6 +1766,61 @@ class BoltzGenMiniformerTokenDistanceEmbedder(BoltzGenTokenDistanceEmbedder):
             if use_token_distance_features
             else None
         )
+        self.pair_norm = LayerNorm(pair_size, backend=backend)
+        self.pair_projection = nn.Linear(pair_size, token_distance_size, bias=False)
+        self.distance_feature_projection = nn.Linear(
+            num_bins + (4 * pair_size if use_token_distance_features else 0),
+            token_distance_size,
+            bias=False,
+        )
+        self.blocks = nn.ModuleList(
+            BoltzGenMiniTrianglePairUpdateBlock(
+                pair_size=token_distance_size,
+                dropout=dropout,
+                post_layer_norm=post_layer_norm,
+                backend=backend,
+            )
+            for _ in range(num_blocks)
+        )
+        self.hidden_norm = LayerNorm(token_distance_size, backend=backend)
+        self.relu = nn.ReLU()
+        self.output_projection = nn.Linear(token_distance_size, pair_size, bias=False)
+
+    def forward(
+        self,
+        pair: Tensor,
+        input: BoltzGenInput,
+        relative_position_encoding: Tensor,
+        pair_mask: Tensor | None = None,
+    ) -> Tensor:
+        coords = input.center_coordinates
+        distances = torch.cdist(coords, coords)
+        boundaries = torch.linspace(self.min_dist, self.max_dist, self.num_bins - 1, device=distances.device)
+        distogram = F.one_hot((distances[..., None] > boundaries).sum(dim=-1).long(), num_classes=self.num_bins)
+
+        distance_features = (
+            torch.cat(
+                [
+                    distogram,
+                    cast(BoltzGenDistanceTokenEncoder, self.distance_encoder)(
+                        relative_position_encoding,
+                        input,
+                    ),
+                ],
+                dim=-1,
+            )
+            if self.use_token_distance_features
+            else distogram
+        )
+        distance_features = distance_features * input.token_distance_mask.unsqueeze(-1)
+        value = self.pair_projection(self.pair_norm(pair)) + self.distance_feature_projection(
+            distance_features.to(pair.dtype)
+        )
+        refined = value
+        for block in self.blocks:
+            refined = block(refined, pair_mask=pair_mask)
+        value = self.hidden_norm(value + refined)  # one outer residual around the (internally-residual) stack
+        return self.output_projection(self.relu(value))
 
 
 class BoltzGenDistanceTokenEncoder(nn.Module):
@@ -1799,12 +1904,12 @@ class BoltzGenMsaTrunk(nn.Module):
         super().__init__()
         self.vocab_size = vocab_size
         self.use_paired_feature = use_paired_feature
-        self.token_projection = nn.Linear(single_size, msa_size, bias=False)
         self.msa_projection = nn.Linear(
             vocab_size + 2 + int(use_paired_feature),
             msa_size,
             bias=False,
         )
+        self.token_projection = nn.Linear(single_size, msa_size, bias=False)
         self.num_blocks = num_blocks
         self.blocks = nn.ModuleList(
             BoltzGenMsaBlock(
@@ -1877,6 +1982,7 @@ class BoltzGenMsaBlock(nn.Module):
             head_dim=msa_head_dim,
             backend=backend,
         )
+        self.msa_dropout = StructuredDropout(msa_dropout, broadcast_dims=(-2, -1))
         self.msa_transition = Transition(msa_size, expansion=expansion, backend=backend)
         self.outer_product_mean = OuterProductMean(
             msa_size=msa_size,
@@ -1892,7 +1998,6 @@ class BoltzGenMsaBlock(nn.Module):
             dropout=pair_dropout,
             backend=backend,
         )
-        self.msa_dropout = StructuredDropout(msa_dropout, broadcast_dims=(-2, -1))
 
     def forward(
         self,
@@ -2017,6 +2122,7 @@ class BoltzGenTrianglePairUpdateBlock(nn.Module):
             outgoing=True,
             backend=backend,
         )
+        self.rowwise_dropout = StructuredDropout(dropout, broadcast_dims=(-2, -1))
         self.triangle_multiplication_incoming = TriangleMultiplication(
             pair_size=pair_size,
             hidden_size=triangle_multiplication_hidden_size,
@@ -2035,7 +2141,6 @@ class BoltzGenTrianglePairUpdateBlock(nn.Module):
             num_attention_heads=num_triangle_attention_heads,
             backend=backend,
         )
-        self.rowwise_dropout = StructuredDropout(dropout, broadcast_dims=(-2, -1))
         self.columnwise_dropout = StructuredDropout(dropout, broadcast_dims=(-3, -1))
         self.transition = Transition(pair_size, expansion=expansion, backend=backend)
 
@@ -2077,12 +2182,12 @@ class BoltzGenMiniformerMsaTrunk(nn.Module):
         self.num_blocks = num_blocks
         self.vocab_size = vocab_size
         self.use_paired_feature = use_paired_feature
-        self.token_projection = nn.Linear(single_size, msa_size, bias=False)
         self.msa_projection = nn.Linear(
             vocab_size + 2 + int(use_paired_feature),
             msa_size,
             bias=False,
         )
+        self.token_projection = nn.Linear(single_size, msa_size, bias=False)
         self.blocks = nn.ModuleList(
             [
                 BoltzGenMiniformerMsaBlock(
@@ -2152,6 +2257,7 @@ class BoltzGenMiniformerMsaBlock(nn.Module):
             head_dim=msa_head_dim,
             backend=backend,
         )
+        self.msa_dropout = StructuredDropout(msa_dropout, broadcast_dims=(-2, -1))
         self.msa_transition = Transition(msa_size, expansion=expansion, backend=backend)
         self.outer_product_mean = OuterProductMean(
             msa_size=msa_size,
@@ -2165,7 +2271,6 @@ class BoltzGenMiniformerMsaBlock(nn.Module):
             dropout=pair_dropout,
             backend=backend,
         )
-        self.msa_dropout = StructuredDropout(msa_dropout, broadcast_dims=(-2, -1))
 
     def forward(
         self,
@@ -2239,15 +2344,15 @@ class BoltzGenMiniformerBlock(nn.Module):
         backend: str = "auto",
     ) -> None:
         super().__init__()
-        self.triangle_multiplication = BoltzGenBidirectionalTriangleMultiplication(pair_size)
-        self.rowwise_dropout = StructuredDropout(dropout, broadcast_dims=(-2, -1))
-        self.pair_transition = Transition(pair_size, expansion=expansion, backend=backend)
         self.single_to_pair_left_projection = (
             nn.Linear(single_size, pair_size, bias=False) if use_single_to_pair else None
         )
         self.single_to_pair_right_projection = (
             nn.Linear(single_size, pair_size, bias=False) if use_single_to_pair else None
         )
+        self.triangle_multiplication = BoltzGenBidirectionalTriangleMultiplication(pair_size)
+        self.rowwise_dropout = StructuredDropout(dropout, broadcast_dims=(-2, -1))
+        self.pair_transition = Transition(pair_size, expansion=expansion, backend=backend)
         self.attention = PairBiasedSelfAttention(
             hidden_size=single_size,
             pair_size=pair_size,
@@ -2775,9 +2880,9 @@ class BoltzGenCoordinateDiffusion(nn.Module):
         noise_log_std: float = 1.5,
     ) -> None:
         super().__init__()
-        self.denoiser = denoiser
         self.sigma_data = sigma_data
         self.preconditioner = EdmPreconditioner(sigma_data=sigma_data)
+        self.denoiser = denoiser
         self.min_noise_level = min_noise_level
         self.max_noise_level = max_noise_level
         self.rho = rho
@@ -3087,9 +3192,6 @@ class BoltzGenDenoiserAtomEncoder(nn.Module):
         self.num_query_atoms = num_query_atoms
         self.num_key_atoms = num_key_atoms
         self.atom_feature_projection = nn.Linear(atom_feature_size, atom_hidden_size)
-        self.distance_vector_projection = nn.Linear(3, atom_pair_hidden_size, bias=False)
-        self.inverse_distance_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
-        self.distance_mask_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
         self.single_trunk_norm = LayerNorm(single_size)
         self.single_trunk_projection = nn.Linear(single_size, atom_hidden_size, bias=False)
         self.pair_trunk_norm = LayerNorm(pair_size)
@@ -3098,6 +3200,9 @@ class BoltzGenDenoiserAtomEncoder(nn.Module):
             atom_pair_hidden_size,
             bias=False,
         )
+        self.distance_vector_projection = nn.Linear(3, atom_pair_hidden_size, bias=False)
+        self.inverse_distance_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
+        self.distance_mask_projection = nn.Linear(1, atom_pair_hidden_size, bias=False)
         self.left_atom_projection = nn.Linear(
             atom_hidden_size,
             atom_pair_hidden_size,
@@ -3269,22 +3374,22 @@ class BoltzGenConfidenceHead(nn.Module):
         self.add_single_to_pair_product = add_single_to_pair_product
         self.return_latent_features = return_latent_features
 
-        self.register_buffer(
-            "boundaries",
-            torch.linspace(2.0, max_distance, num_distogram_bins - 1),
-        )
-        self.distance_embedding = nn.Embedding(num_distogram_bins, pair_size)
+        self.input_single_norm = LayerNorm(single_size, backend=backend)
+        self.single_norm = LayerNorm(single_size, backend=backend)
+        if add_single_input:
+            self.input_single_projection = nn.Linear(single_size, single_size, bias=False)
+        self.pair_norm = LayerNorm(pair_size, backend=backend)
         self.single_to_pair_row = nn.Linear(single_size, pair_size, bias=False)
         self.single_to_pair_col = nn.Linear(single_size, pair_size, bias=False)
         if add_single_to_pair_product:
             self.single_to_pair_product_left = nn.Linear(single_size, pair_size, bias=False)
             self.single_to_pair_product_right = nn.Linear(single_size, pair_size, bias=False)
             self.single_to_pair_product_out = nn.Linear(pair_size, pair_size, bias=False)
-        if add_single_input:
-            self.input_single_projection = nn.Linear(single_size, single_size, bias=False)
-        self.input_single_norm = LayerNorm(single_size, backend=backend)
-        self.single_norm = LayerNorm(single_size, backend=backend)
-        self.pair_norm = LayerNorm(pair_size, backend=backend)
+        self.register_buffer(
+            "boundaries",
+            torch.linspace(2.0, max_distance, num_distogram_bins - 1),
+        )
+        self.distance_embedding = nn.Embedding(num_distogram_bins, pair_size)
         self.pairformer_stack = BoltzGenPairformerStack(
             num_blocks=num_blocks,
             single_size=single_size,
@@ -3481,6 +3586,7 @@ class BoltzGenInverseFoldingEncoder(nn.Module):
         # + bond (token_bonds + one-hot bond type).
         self.edge_input_size = 256 + (2 * max_relative_position + 2) + 2 + 1 + (_NUM_BOND_TYPES + 1)
 
+        self.distance_smearing = BoltzGenGaussianSmearing(start=0.0, stop=20.0, num_gaussians=16)
         self.node_input_projection = nn.Linear(single_size, node_size)
         self.edge_input_projection = nn.Linear(self.edge_input_size, edge_size)
         self.blocks = nn.ModuleList(
@@ -3494,7 +3600,6 @@ class BoltzGenInverseFoldingEncoder(nn.Module):
             )
             for _ in range(num_blocks)
         )
-        self.distance_smearing = BoltzGenGaussianSmearing(start=0.0, stop=20.0, num_gaussians=16)
 
     @torch.no_grad()
     def build_knn_graph(self, input: BoltzGenInverseFoldingInput) -> tuple[Tensor, Tensor, Tensor]:
@@ -3615,6 +3720,7 @@ class BoltzGenInverseFoldingDecoder(nn.Module):
         self.vocab_size = vocab_size
         # Each block's edge state is cat[encoder_edge, neighbour_node + residue_rep] = edge_size + node_size.
         decoder_edge_size = edge_size + node_size
+        self.residue_type_projection = nn.Linear(vocab_size, node_size)
         self.blocks = nn.ModuleList(
             BoltzGenInverseFoldingGraphDecoderBlock(
                 node_size=node_size,
@@ -3626,7 +3732,6 @@ class BoltzGenInverseFoldingDecoder(nn.Module):
             )
             for _ in range(num_blocks)
         )
-        self.residue_type_projection = nn.Linear(vocab_size, node_size)
         self.residue_type_head = nn.Linear(node_size, vocab_size, bias=False)
 
     def forward(
@@ -3958,11 +4063,11 @@ class BoltzGenInverseFoldingGraphFeedForward(nn.Module):
     ) -> None:
         super().__init__()
         self.input_projection = nn.Linear(input_size, hidden_size)
+        self.activation = nn.GELU()
         self.hidden_projections = nn.ModuleList(
             nn.Linear(hidden_size, hidden_size) for _ in range(num_hidden_layers - 1)
         )
         self.output_projection = nn.Linear(hidden_size, output_size)
-        self.activation = nn.GELU()
 
     def forward(self, features: Tensor) -> Tensor:
         hidden = self.activation(self.input_projection(features))
@@ -4763,6 +4868,10 @@ class BoltzGenStructureGroup:
 
     members: tuple[ComponentReference, ...]
     group_id: int
+
+    def __post_init__(self) -> None:
+        if self.group_id < 0:
+            raise ValueError("group_id must be nonnegative")
 
 
 @dataclass(frozen=True)

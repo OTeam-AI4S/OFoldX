@@ -261,13 +261,8 @@ def decoding_order_to_ranks(decoding_order: Tensor) -> Tensor:
         Per-residue decoding ranks with the same shape and dtype.
     """
 
-    ranks = torch.empty_like(decoding_order)
-    ranks.scatter_(
-        -1,
-        decoding_order,
-        torch.arange(decoding_order.shape[-1], device=decoding_order.device).expand_as(decoding_order),
-    )
-    return ranks
+    positions = torch.ones_like(decoding_order).cumsum(dim=-1) - 1
+    return torch.zeros_like(decoding_order).scatter(-1, decoding_order, positions)
 
 
 def tied_groups_from_ids(
@@ -378,9 +373,9 @@ class MpnnMessage(nn.Module):
     def __init__(self, input_size: int, hidden_size: int) -> None:
         super().__init__()
         self.input_projection = nn.Linear(input_size, hidden_size)
+        self.activation = nn.GELU()
         self.hidden_projection = nn.Linear(hidden_size, hidden_size)
         self.output_projection = nn.Linear(hidden_size, hidden_size)
-        self.activation = nn.GELU()
 
     def forward(self, x: Tensor) -> Tensor:
         r"""
@@ -412,8 +407,8 @@ class MpnnFeedForward(nn.Module):
     def __init__(self, hidden_size: int, intermediate_size: int) -> None:
         super().__init__()
         self.input_projection = nn.Linear(hidden_size, intermediate_size)
-        self.output_projection = nn.Linear(intermediate_size, hidden_size)
         self.activation = nn.GELU()
+        self.output_projection = nn.Linear(intermediate_size, hidden_size)
 
     def forward(self, x: Tensor) -> Tensor:
         r"""

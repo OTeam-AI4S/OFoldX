@@ -816,7 +816,7 @@ _TRUNK_FLAT = {
 }
 
 _CONFIDENCE_FLAT = {
-    "boundaries": "boundaries",
+    "boundaries": "conditioning.boundaries",
     "s_init.weight": "single_init_projection.weight",
     "z_init_1.weight": "pair_left_projection.weight",
     "z_init_2.weight": "pair_right_projection.weight",
@@ -835,16 +835,16 @@ _CONFIDENCE_FLAT = {
 }
 
 _CONFIDENCE_PREFIXES = (
-    ("dist_bin_pairwise_embed.", "distance_embedding."),
-    ("s_diffusion_norm.", "diffusion_single_norm."),
-    ("s_diffusion_to_s.", "diffusion_single_projection."),
+    ("dist_bin_pairwise_embed.", "conditioning.distance_embedding."),
+    ("s_diffusion_norm.", "conditioning.diffusion_single_norm."),
+    ("s_diffusion_to_s.", "conditioning.diffusion_single_projection."),
     ("s_inputs_norm.", "input_single_norm."),
     ("s_input_to_s.", "input_single_projection."),
-    ("s_to_z_transpose.", "single_to_pair_col."),
-    ("s_to_z_prod_in1.", "single_to_pair_product_left."),
-    ("s_to_z_prod_in2.", "single_to_pair_product_right."),
-    ("s_to_z_prod_out.", "single_to_pair_product_out."),
-    ("s_to_z.", "single_to_pair_row."),
+    ("s_to_z_transpose.", "conditioning.single_to_pair_col."),
+    ("s_to_z_prod_in1.", "conditioning.single_to_pair_product_left."),
+    ("s_to_z_prod_in2.", "conditioning.single_to_pair_product_right."),
+    ("s_to_z_prod_out.", "conditioning.single_to_pair_product_out."),
+    ("s_to_z.", "conditioning.single_to_pair_row."),
 )
 
 

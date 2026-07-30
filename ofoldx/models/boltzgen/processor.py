@@ -5,7 +5,7 @@ Input processing for BoltzGen structure design and inverse folding.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
 
@@ -28,7 +28,6 @@ from ...data.molecular import (
 from ...data.placement import (
     ExistingSpan,
     GeneratedSegment,
-    InstanceIdAllocator,
     PlacementMap,
     PlacementSpec,
     PlacementValue,
@@ -515,8 +514,6 @@ class BoltzGenInverseFoldingProcessor(Processor):
             token, atom, design-mask, amino-acid-constraint, and symmetry axes.
         """
 
-        if not isinstance(input, Structure):
-            raise TypeError("BoltzGenInverseFoldingProcessor requires a fixed backbone Structure")
         system = input.system
         if not system.instances:
             raise ValueError("BoltzGen inverse folding requires at least one molecular instance")
@@ -552,8 +549,6 @@ class BoltzGenInverseFoldingProcessor(Processor):
         and the residue objective.
         """
 
-        if not isinstance(input, Structure):
-            raise TypeError("BoltzGenInverseFoldingProcessor requires a fixed backbone Structure")
         system = input.system
         if not system.instances:
             raise ValueError("BoltzGen inverse folding requires at least one molecular instance")
@@ -715,22 +710,15 @@ class BoltzGenInverseFoldingProcessor(Processor):
         )
 
 
-@dataclass(frozen=True)
-class DesignMaskResidue:
-    r"""
-    Describe one generated or retained residue in a BoltzGen design mask.
-    """
-
-    designed: bool
-    polymer_type: PolymerType | None = None
-    source: ComponentReference | None = None
+#: One designed polymer type or fixed source residue in a BoltzGen design mask.
+DesignMaskResidue = PolymerType | ComponentReference
 
 
 def from_design_mask(
     residues: Sequence[DesignMaskResidue],
     *,
-    group_of: Callable[[int], str],
-    placement_id_of: Callable[[int], str],
+    groups: Sequence[str],
+    placement_ids: Sequence[str],
 ) -> PlacementSpec:
     r"""
     Convert BoltzGen residue design specifications to placements.
@@ -756,9 +744,7 @@ def from_design_mask(
         placement.setdefault(run_group, {})[run_placement_id] = _placement_value_of_run(run_placement_id, run)
         run = []
 
-    for index, residue in enumerate(residues):
-        group = group_of(index)
-        placement_id = placement_id_of(index)
+    for residue, group, placement_id in zip(residues, groups, placement_ids, strict=True):
         if placement_id != run_placement_id or group != run_group:
             flush()
             run_group = group
@@ -788,34 +774,23 @@ def to_design_mask(
 
 
 def _placement_value_of_run(placement_id: str, run: list[DesignMaskResidue]) -> PlacementValue:
-    designed = run[0].designed
-    if any(residue.designed != designed for residue in run):
+    designed = isinstance(run[0], str)
+    if any(isinstance(residue, str) != designed for residue in run):
         raise ValueError(
             f"placement {placement_id!r} mixes designed and fixed residues; a placement_id must be "
             "either wholly designed (GeneratedSegment) or wholly fixed (ExistingSpan)"
         )
 
     if designed:
-        polymer_type = run[0].polymer_type
-        if polymer_type is None:
-            raise ValueError(
-                f"designed placement {placement_id!r} has no polymer_type: a designed non-polymer "
-                "(GAP-1 de-novo ligand) has no PlacementValue and must be routed out-of-band"
-            )
-        if any(residue.polymer_type != polymer_type for residue in run):
+        polymer_type = cast(PolymerType, run[0])
+        if any(residue != polymer_type for residue in run):
             raise ValueError(
                 f"designed placement {placement_id!r} spans more than one polymer type; a maximal "
                 "designed run is one polymer type"
             )
-        if any(residue.source is not None for residue in run):
-            raise ValueError(f"designed placement {placement_id!r} carries a source reference")
         return GeneratedSegment(polymer_type, len(run), len(run))
 
-    sources: list[ComponentReference] = []
-    for residue in run:
-        if residue.source is None:
-            raise ValueError(f"fixed placement {placement_id!r} has a residue with no source reference")
-        sources.append(residue.source)
+    sources = [residue for residue in run if not isinstance(residue, str)]
     instance_id = sources[0][0]
     start = sources[0][1]
     for offset, source in enumerate(sources):
@@ -937,7 +912,7 @@ def _materialize_assembly(
     entities: dict[str, PolymerSequence | Molecule] = {}
     instances: dict[str, str] = {}
     placement_map: PlacementMap = {}
-    allocator = InstanceIdAllocator()
+    next_instance = 0
     entity_index = 0
     for group, chain in placements.items():
         realized_group: dict[str, tuple[ComponentReference, ...]] = {}
@@ -958,7 +933,8 @@ def _materialize_assembly(
             if length == 0:
                 realized_group[placement_id] = ()
                 continue
-            instance_id = allocator.allocate()
+            instance_id = f"chain_{next_instance}"
+            next_instance += 1
             entity_id = f"boltzgen_entity_{entity_index}"
             entity_index += 1
             component = get_component(_GENERATED_COMPONENT[polymer_type])
@@ -1022,11 +998,13 @@ def _materialize_extension(
     generated: set[ComponentReference] = set()
     placement_map: PlacementMap = {}
 
-    allocator = InstanceIdAllocator()
+    next_instance = 0
 
     def _mint_instance() -> str:
+        nonlocal next_instance
         while True:
-            candidate = allocator.allocate()
+            candidate = f"chain_{next_instance}"
+            next_instance += 1
             if candidate not in source_ids and candidate not in instances:
                 return candidate
 
@@ -2090,11 +2068,6 @@ def _structure_group_ids(
     for condition in conditions:
         if not isinstance(condition, BoltzGenStructureGroup):
             continue
-        if condition.group_id < 0:
-            raise ValueError(
-                f"BoltzGenStructureGroup group_id must be >= 0 (0 is the free/ungrouped class), "
-                f"got {condition.group_id}"
-            )
         for reference in condition.members:
             token = _component_reference_to_token(reference, token_index_by_residue)
             if condition.group_id != 0 and bool(design_mask[token]):
