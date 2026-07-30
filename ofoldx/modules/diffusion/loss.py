@@ -72,9 +72,11 @@ def edm_denoising_loss(pred: Any, resolved: Tensor, *, sigma_data: float) -> Ten
             [`resolved_atom_mask`][ofoldx.modules.diffusion.loss.resolved_atom_mask].
         sigma_data: EDM data scale (from the model's ``config.denoiser.sigma_data``).
 
-    An empty resolved scope gives a NaN mean -- surfaced, not hidden by a fallback. The denominator is the
-    same resolved-atom count the training batch reports as its ``loss_normalizer``, so DanLing's
-    accumulation/DDP reduction forms the true global per-atom mean.
+    The denominator is the same resolved-atom count the training batch reports as its
+    ``loss_normalizer``, so DanLing's accumulation/DDP reduction forms the true global per-atom mean.
+
+    Raises:
+        ValueError: If the batch scores no resolved atom.
     """
 
     # Rigidly align the augmented target onto the prediction (per sample, over resolved atoms) before the
@@ -94,7 +96,15 @@ def edm_denoising_loss(pred: Any, resolved: Tensor, *, sigma_data: float) -> Ten
     weight = edm_loss_weight(pred.noise_level, sigma_data).unsqueeze(-1)  # (B, S, 1)
     weighted_error = weight * squared_error  # (B, S, A)
     mask = resolved.to(weighted_error.dtype).unsqueeze(1).expand_as(weighted_error)  # (B, S, A)
-    return (weighted_error * mask).sum() / mask.sum()
+    scope = mask.sum()
+    # An empty scope would divide by zero; the resulting NaN reaches the optimizer and permanently
+    # poisons both the weights and the optimizer state, so refuse the batch instead of scoring it.
+    if not scope:
+        raise ValueError(
+            "coordinate-denoising loss has no resolved atom to score: the resolved mask is empty for "
+            "every structure in this batch"
+        )
+    return (weighted_error * mask).sum() / scope
 
 
 def denoising_criterion_factory(model: Any, processor: Any) -> Any:

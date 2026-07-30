@@ -21,13 +21,22 @@ def criterion(pred: Any, target: Any, *, label_smoothing: float = 0.1) -> Tensor
         pred: The model output (``ProteinMpnnOutput`` with ``logits``).
         target: The batched ``ProteinMpnnInput`` carrying ``sequence_tokens`` and the masks.
 
-    An empty design scope gives a NaN mean -- surfaced, not hidden by a fallback.
+    Raises:
+        ValueError: If the batch scores no designable residue.
     """
 
     log_probabilities = F.log_softmax(pred.logits, dim=-1)
     per_residue = smoothed_loss(target.sequence_tokens, log_probabilities, weight=label_smoothing)
     mask = (target.residue_mask & target.design_positions).to(per_residue.dtype)
-    return (per_residue * mask).sum() / mask.sum()
+    scope = mask.sum()
+    # An empty scope would divide by zero; the resulting NaN reaches the optimizer and permanently
+    # poisons both the weights and the optimizer state, so refuse the batch instead of scoring it.
+    if not scope:
+        raise ValueError(
+            "ProteinMPNN loss has no designable residue to score: residue_mask & design_positions is "
+            "empty for every structure in this batch"
+        )
+    return (per_residue * mask).sum() / scope
 
 
 def criterion_factory(model: Any, processor: Any) -> Any:
