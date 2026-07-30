@@ -32,8 +32,6 @@ _MODELS.register(
     "nampnn",
     model=NaMpnnModel,
     processor=NaMpnnProcessor,
-    criterion=criterion_factory,
-    strategy="sequence",
 )
 _PIPELINES.register(
     "nampnn",

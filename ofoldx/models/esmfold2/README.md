@@ -69,12 +69,13 @@ pip install ofoldx
 
 ### Structure Prediction
 
-Use the high-level `fold` API:
+Load the concrete folding Pipeline:
 
 ```python
 import ofoldx
 
-output = ofoldx.fold("MKTAYIAKQRQISFVKSHFSRQ", model="oteam/esmfold2")
+pipeline = ofoldx.pipeline("fold", model="oteam/esmfold2")
+output = pipeline.fold("MKTAYIAKQRQISFVKSHFSRQ")
 ```
 
 ### Binder Design
@@ -128,6 +129,13 @@ It performs gradient descent over soft binder-sequence logits under the
 released distogram contact objective and ESMC pseudo-perplexity regularizer.
 Low-temperature coordinate samples are scored by actual iPTM, and each
 candidate retains its best observed sequence and structure.
+
+## Limitations
+
+The released sources do not specify every target, mask, mini-rollout, batching,
+and reduction needed for a faithful training objective. OFoldX therefore
+provides no built-in Runner objective for ESMFold2; binder design is the
+documented inference-time optimization procedure, not model training.
 
 ## Citation
 

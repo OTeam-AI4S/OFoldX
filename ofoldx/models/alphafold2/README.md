@@ -79,12 +79,13 @@ pip install ofoldx
 
 ### Structure Prediction
 
-Use the high-level `fold` API:
+Load the concrete folding Pipeline:
 
 ```python
 import ofoldx
 
-output = ofoldx.fold("MKTAYIAKQRQISFVKSHFSRQ", model="oteam/alphafold2")
+pipeline = ofoldx.pipeline("fold", model="oteam/alphafold2")
+output = pipeline.fold("MKTAYIAKQRQISFVKSHFSRQ")
 ```
 
 Convert the official parameter directory or tar into the fixed composite:
@@ -153,8 +154,14 @@ released auxiliary losses; the pTM variants were fine-tuned with the
 predicted-aligned-error head. AlphaFold-Multimer adds paired-MSA and
 chain-relative features and interface confidence.
 
-OFoldX preserves a differentiable final recycle and the released inference
-module boundaries.
+OFoldX preserves a differentiable final recycle and provides the released
+masked-MSA reconstruction loss as its built-in Runner objective.
+
+## Limitations
+
+The built-in Runner objective covers masked-MSA reconstruction only; it is not
+the complete released structural and auxiliary-loss program. MSA, template,
+and sequence-database generation remain caller-owned.
 
 ## Citation
 

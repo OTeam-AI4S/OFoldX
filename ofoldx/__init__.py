@@ -5,7 +5,7 @@ Public models, processors, task pipelines, and scientific results.
 from __future__ import annotations
 
 from ._version import __version__, version
-from .api import TASKS, Task, fold, pack, pipeline, score
+from .api import TASKS, Task, pipeline
 from .artifacts import save_model
 from .auto import AutoModel, AutoProcessor
 from .data.conditions import Contact, Hotspot
@@ -22,6 +22,7 @@ from .results import (
     FoldResult,
     Metric,
     MetricReference,
+    MpnnProbabilityResult,
     PackPrediction,
     PackResult,
     PairMetric,
@@ -30,11 +31,4 @@ from .results import (
     ScoreResult,
     best,
 )
-
-
-def __getattr__(name: str):
-    if name == "Runner":
-        from .runners import Runner
-
-        return Runner
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+from .runners import Runner

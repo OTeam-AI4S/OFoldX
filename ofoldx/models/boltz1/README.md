@@ -66,12 +66,13 @@ pip install ofoldx
 
 ### Structure Prediction
 
-Use the high-level `fold` API:
+Load the concrete folding Pipeline:
 
 ```python
 import ofoldx
 
-output = ofoldx.fold("input.cif", model="oteam/boltz1")
+pipeline = ofoldx.pipeline("fold", model="oteam/boltz1")
+output = pipeline.fold("input.cif")
 ```
 
 ## Training Details
@@ -89,6 +90,12 @@ drawn as
 `sigma = sigma_data * exp(-1.2 + 1.5 * z)`, where `z ~ N(0, 1)`, and the
 coordinate loss weight is
 `(sigma^2 + sigma_data^2) / (sigma * sigma_data)^2`.
+
+## Limitations
+
+The built-in Runner objective covers the EDM coordinate-denoising term. It does
+not reproduce the upstream joint schedule for distogram, confidence, and
+ranking-head training, or the upstream data pipeline.
 
 ## Citation
 

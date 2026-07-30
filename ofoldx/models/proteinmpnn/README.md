@@ -93,6 +93,12 @@ differentiable and exposes the logits needed to train or fine-tune the model.
 `nll_loss` and 21-class `smoothed_loss`; masking and reduction remain
 caller-owned.
 
+## Limitations
+
+The built-in Runner covers masked sequence recovery on caller-supplied
+structures. It does not reproduce the upstream training-set construction or
+sequence-clustering pipeline.
+
 ## Citation
 
 ```bibtex

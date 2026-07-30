@@ -68,8 +68,8 @@ def test_token_pair_dense_broadcast() -> None:
 @pytest.mark.parametrize(
     ("atom_to_token", "expected"),
     [
-        # Shared-across-batch layout -> oops windowing kernel path. q=2,k=4 over 4 atoms gives 2 windows;
-        # key_padding_left=(4-2)//2=1 so window w spans atoms [2w-1 .. 2w+2], F.pad backfilling token id 0.
+        # Shared-across-batch layout. q=2,k=4 over 4 atoms gives 2 windows; the centred key offset
+        # is (4-2)//2=1, so window w spans atoms [2w-1 .. 2w+2] with token id 0 in padded slots.
         (
             torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]]),
             torch.tensor(
@@ -85,8 +85,8 @@ def test_token_pair_dense_broadcast() -> None:
                 ]
             ),
         ),
-        # Distinct per-batch layout -> torch fallback path (_shared_atom_to_token returns None); batch 1 reverses
-        # its assignment to tokens [3, 2, 1, 0], same window geometry over different gathered ids.
+        # Distinct per-batch layout; batch 1 reverses its assignment to tokens [3, 2, 1, 0], using the
+        # same centred window geometry over different gathered ids.
         (
             torch.tensor([[0, 1, 2, 3], [3, 2, 1, 0]]),
             torch.tensor(

@@ -198,15 +198,15 @@ class TokenPairToLocalAtomPairBroadcast(nn.Module):
         self.windowing = LocalAtomWindowing(num_query_atoms=num_query_atoms, num_key_atoms=num_key_atoms)
         self.backend = resolve_config_backend(backend, supported=("oops", "eager"), public_default="eager")
 
-    def forward(self, token_pair: Tensor, atom_to_token: Tensor, num_valid_atoms: int | None = None) -> Tensor:
+    def forward(self, token_pair: Tensor, atom_to_token: Tensor, key_index: Tensor | None = None) -> Tensor:
         r"""
         Broadcast token-pair features to local atom-pair windows.
 
         Args:
             token_pair: ``[..., N_token, N_token, C]`` token-pair features.
             atom_to_token: ``[..., N_atom]`` token index for each atom.
-            num_valid_atoms: Number of real atoms; enables clamped key windows so pair-bias windows align
-                with attention key gathering. Unset keeps the fixed padded window.
+            key_index: Optional ``[..., N_window, num_key_atoms]`` atom indices
+                shared with geometry and attention gathering.
 
         Returns:
             ``[..., N_window, num_query_atoms, num_key_atoms, C]`` local atom-pair features.
@@ -219,7 +219,7 @@ class TokenPairToLocalAtomPairBroadcast(nn.Module):
             n_queries=self.windowing.num_query_atoms,
             n_keys=self.windowing.num_key_atoms,
             backend=self.backend,
-            num_valid_atoms=num_valid_atoms,
+            key_index=key_index,
         )
 
 

@@ -431,7 +431,7 @@ def load_registered_processor(
     values = load_json_object(config_path)
     if "architecture" in values:
         raise ValueError("processor.json must not repeat the model architecture")
-    saved_dtype_name = values.pop("dtype")
+    saved_dtype_name = values.pop("dtype", None)
     if not isinstance(saved_dtype_name, str):
         raise TypeError("processor.json dtype must be a torch dtype name")
     saved_dtype = getattr(torch, saved_dtype_name, None)

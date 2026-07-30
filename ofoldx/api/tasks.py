@@ -1,18 +1,14 @@
 r"""
-Repository-backed Pipeline selection and the shared one-shot tasks.
+Repository-backed Pipeline selection.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
 from os import PathLike
-from typing import Any, Literal, TypeAlias
+from typing import Any, Literal
 
 import torch
 
-from ..data.evidence import MSA, MSACollection, Template
-from ..data.molecular import ComponentReference, MolecularSystem, PolymerSequence
-from ..data.structure import Structure
 from ..hub import load_json_object, resolve_repository
 from ..pipelines.registry import PIPELINES
 
@@ -20,17 +16,6 @@ from ..pipelines.registry import PIPELINES
 Task = Literal["fold", "design", "score", "pack"]
 #: All standard task names.
 TASKS: frozenset[Task] = frozenset({"fold", "design", "score", "pack"})
-
-#: Inputs accepted by the high-level [`fold`][] task.
-FoldInput: TypeAlias = str | PathLike[str] | PolymerSequence | MolecularSystem | Structure
-#: Inputs accepted by the high-level [`score`][] task.
-ScoreInput: TypeAlias = MolecularSystem | Structure | str | PathLike[str]
-#: Inputs accepted by the high-level [`pack`][] task.
-PackInput: TypeAlias = Structure | str | PathLike[str]
-#: MSA evidence accepted by the high-level folding task.
-MSAInput: TypeAlias = MSA | MSACollection
-#: Template evidence accepted by the high-level folding task.
-TemplateInput: TypeAlias = Template
 
 
 def pipeline(
@@ -92,153 +77,3 @@ def pipeline(
         device=device,
         dtype=dtype,
     )
-
-
-def fold(
-    input: FoldInput,
-    *,
-    model: str | PathLike[str],
-    revision: str | None = None,
-    token: str | None = None,
-    device: torch.device | str | None = None,
-    dtype: torch.dtype | None = None,
-    msa: MSAInput | None = None,
-    templates: Sequence[TemplateInput] = (),
-    num_samples: int = 1,
-    seed: int | None = None,
-    generator: torch.Generator | None = None,
-) -> Any:
-    r"""
-    Predict a structure with a repository-backed folding pipeline.
-
-    Args:
-        input: Sequence, molecular system, structure, or supported input file.
-        model: Local model repository or Hugging Face Hub repository ID.
-        revision: Hub revision to load.
-        token: Hugging Face access token used for private repositories.
-        device: Device onto which model parameters are loaded.
-        dtype: Floating-point dtype used for inference.
-        msa: Optional MSA evidence.
-        templates: Optional structural templates.
-        num_samples: Number of structures to sample when supported by the model.
-        seed: Seed for stochastic inference.
-        generator: PyTorch random generator for stochastic inference.
-
-    Returns:
-        The folding result produced by the selected pipeline.
-    """
-
-    fold_pipeline = pipeline(
-        "fold",
-        model=model,
-        revision=revision,
-        token=token,
-        device=device,
-        dtype=dtype,
-    )
-    arguments: dict[str, object] = {"num_samples": num_samples}
-    if msa is not None:
-        arguments["msa"] = msa
-    if templates:
-        arguments["templates"] = templates
-    if seed is not None:
-        arguments["seed"] = seed
-    if generator is not None:
-        arguments["generator"] = generator
-    return fold_pipeline.fold(input, **arguments)
-
-
-def score(
-    input: ScoreInput,
-    *,
-    model: str | PathLike[str],
-    revision: str | None = None,
-    token: str | None = None,
-    device: torch.device | str | None = None,
-    dtype: torch.dtype | None = None,
-    seed: int | None = None,
-    generator: torch.Generator | None = None,
-) -> Any:
-    r"""
-    Score a molecular input with a repository-backed pipeline.
-
-    Args:
-        input: Molecular system, structure, or supported structure file.
-        model: Local model repository or Hugging Face Hub repository ID.
-        revision: Hub revision to load.
-        token: Hugging Face access token used for private repositories.
-        device: Device onto which model parameters are loaded.
-        dtype: Floating-point dtype used for inference.
-        seed: Seed for stochastic inference.
-        generator: PyTorch random generator for stochastic inference.
-
-    Returns:
-        The scoring result produced by the selected pipeline.
-    """
-
-    arguments: dict[str, object] = {}
-    if seed is not None:
-        arguments["seed"] = seed
-    if generator is not None:
-        arguments["generator"] = generator
-    return pipeline(
-        "score",
-        model=model,
-        revision=revision,
-        device=device,
-        dtype=dtype,
-        token=token,
-    ).score(input, **arguments)
-
-
-def pack(
-    input: PackInput,
-    *,
-    model: str | PathLike[str],
-    revision: str | None = None,
-    token: str | None = None,
-    device: torch.device | str | None = None,
-    dtype: torch.dtype | None = None,
-    sequence: str | Mapping[str, str | Sequence[str]] | None = None,
-    pack_positions: Sequence[ComponentReference] | None = None,
-    num_samples: int = 1,
-    seed: int | None = None,
-    generator: torch.Generator | None = None,
-) -> Any:
-    r"""
-    Pack side chains with a repository-backed pipeline.
-
-    Args:
-        input: Structure or supported structure file.
-        model: Local model repository or Hugging Face Hub repository ID.
-        revision: Hub revision to load.
-        token: Hugging Face access token used for private repositories.
-        device: Device onto which model parameters are loaded.
-        dtype: Floating-point dtype used for inference.
-        sequence: Optional replacement sequence, globally or by instance.
-        pack_positions: Optional component occurrences to repack.
-        num_samples: Number of packed structures to sample.
-        seed: Seed for stochastic inference.
-        generator: PyTorch random generator for stochastic inference.
-
-    Returns:
-        The side-chain packing result produced by the selected pipeline.
-    """
-
-    arguments: dict[str, object] = {
-        "sequence": sequence,
-        "pack_positions": pack_positions,
-        "num_samples": num_samples,
-    }
-    if seed is not None:
-        arguments["seed"] = seed
-    if generator is not None:
-        arguments["generator"] = generator
-    return pipeline(
-        "pack",
-        model=model,
-        revision=revision,
-        device=device,
-        dtype=dtype,
-        token=token,
-    ).pack(input, **arguments)

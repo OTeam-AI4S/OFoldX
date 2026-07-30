@@ -1,7 +1,7 @@
 r"""
 Built-in nucleic component graphs and reference coordinates.
 
-The eight standard components are graph and ideal-coordinate facts from the wwPDB
+The eight standard component graphs are facts from the wwPDB
 ``components.v20240608.cif`` snapshot (SHA-256
 ``7240b17369ccfbbcc86e2d02dc8c9db59f46c32e0420f58889c6c121c60bfef0``).
 CCD aromatic flags are represented by OFoldX's canonical aromatic bond order ``1.5``.
@@ -722,11 +722,12 @@ COMPONENT_ROWS: Mapping[str, ComponentRows] = {
 }
 
 # Reference conformers are the wwPDB Chemical Component Dictionary ideal coordinates
-# (``pdbx_model_Cartn_*_ideal``), generated offline via ``ofoldx.data.ccd.build`` from the
-# pinned CCD snapshot -- the same canonical source ``ofoldx.data.ccd.resolve_ccd_component``
-# reads for arbitrary ligands. Each standard component carries a complete ideal conformer:
-# every heavy atom and every hydrogen. The ``N`` / ``DN`` generated placeholders are not CCD
-# entries and keep their own rows. Component construction aligns the rows to the atom tuple.
+# (``pdbx_model_Cartn_*_ideal``), generated offline via ``ofoldx.data.ccd.build`` from
+# the Protenix ``common/components.cif`` snapshot (SHA-256
+# ``bb31ae5cf6c8bc669924313077cb4231ee5ffefd3a20118cd14f3ec89f8bb6a5``).
+# Each standard component carries a complete ideal conformer: every heavy atom and every
+# hydrogen. The ``N`` / ``DN`` generated placeholders are not CCD entries and keep their
+# own rows. Component construction aligns the rows to the atom tuple.
 REFERENCE_COORDINATE_ROWS: Mapping[str, _RawReferenceCoordinates] = {
     "A": (
         ("OP3", (2.135, -1.141, -5.313)),

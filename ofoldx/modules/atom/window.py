@@ -12,49 +12,53 @@ from torch import Tensor, nn
 
 
 def key_window_starts(
-    num_windows: int, num_query_atoms: int, num_key_atoms: int, num_valid_atoms: int, device: torch.device
+    num_windows: int,
+    num_query_atoms: int,
+    num_key_atoms: int,
+    valid_extent: Tensor,
 ) -> Tensor:
     r"""
-    Return per-window start offsets for clamped key neighborhoods.
+    Return row-specific start offsets for local key neighborhoods.
 
     Each key window is centred on its query window (``num_query_atoms`` wide) and reaches
     ``(num_key_atoms - num_query_atoms) / 2`` atoms to either side, then is **shifted inwards** so it
-    lies fully inside the ``[0, num_valid_atoms)`` real-atom range. Boundary windows therefore keep a full
-    ``num_key_atoms`` of real keys instead of padding. Requires ``num_valid_atoms >= num_key_atoms``.
+    lies fully inside the row's real-atom extent when that extent is at least ``num_key_atoms``.
+    Shorter rows retain the centred layout and use invalid key indices for padding.
 
     Args:
         num_windows: Number of query windows.
         num_query_atoms: Query atoms per window.
         num_key_atoms: Key atoms gathered per window.
-        num_valid_atoms: Number of real (non-padding) atoms, packed contiguously at the front.
-        device: Device for the returned index tensor.
+        valid_extent: ``[...]`` exclusive upper bound of the last valid atom in each row.
 
     Returns:
-        ``[num_windows]`` integer start offsets, each in ``[0, num_valid_atoms - num_key_atoms]``.
+        ``[..., num_windows]`` integer start offsets.
     """
 
     key_padding_left = (num_key_atoms - num_query_atoms) // 2
-    base = torch.arange(num_windows, device=device) * num_query_atoms - key_padding_left
-    return base.clamp(0, num_valid_atoms - num_key_atoms)
+    base = torch.arange(num_windows, device=valid_extent.device) * num_query_atoms - key_padding_left
+    base = base.reshape(*((1,) * valid_extent.dim()), num_windows).expand(*valid_extent.shape, num_windows)
+    shifted = torch.minimum(base.clamp_min(0), (valid_extent - num_key_atoms).clamp_min(0).unsqueeze(-1))
+    return torch.where((valid_extent >= num_key_atoms).unsqueeze(-1), shifted, base)
 
 
 def gather_key_windows(
-    single: Tensor, num_query_atoms: int, num_key_atoms: int, num_valid_atoms: int | None = None
+    single: Tensor,
+    num_query_atoms: int,
+    num_key_atoms: int,
+    key_index: Tensor | None = None,
 ) -> Tensor:
     r"""
     Gather each query window's overlapping key-atom neighbourhood from a flat ``(B, N, D)`` atom tensor.
 
-    With ``num_valid_atoms`` unset (or below ``num_key_atoms``) the fixed zero-padded window is used:
-    a strided ``unfold`` view (O(N), no matmul) equivalent to a one-hot indexing-matrix einsum, with slots
-    past the atom range read as zero. With ``num_valid_atoms`` given (and ``>= num_key_atoms``), a
-    **clamped/shifted** window is used instead: boundary windows are slid inwards so every key is a real
-    atom (see [`key_window_starts`][ofoldx.modules.atom.window.key_window_starts]).
+    ``key_index`` carries the exact layout as atom indices with ``-1`` marking invalid
+    slots. When omitted, the ordinary centred zero-padded layout is constructed.
 
     Args:
         single: ``[..., N_atom, C]`` atom features.
         num_query_atoms: Number of query atoms per local window.
         num_key_atoms: Number of key atoms gathered around each query window.
-        num_valid_atoms: Number of real atoms (contiguous at the front); enables the clamped layout.
+        key_index: Optional ``[..., N_window, num_key_atoms]`` atom indices.
 
     Returns:
         ``[..., N_window, num_key_atoms, C]`` key windows.
@@ -62,14 +66,23 @@ def gather_key_windows(
 
     num_atoms = single.shape[-2]
     num_windows = (num_atoms + num_query_atoms - 1) // num_query_atoms
-    if num_valid_atoms is not None and num_valid_atoms >= num_key_atoms:
-        starts = key_window_starts(num_windows, num_query_atoms, num_key_atoms, num_valid_atoms, single.device)
-        key_index = starts[:, None] + torch.arange(num_key_atoms, device=single.device)[None, :]
-        return single[..., key_index, :]
-    key_padding_left = (num_key_atoms - num_query_atoms) // 2
-    key_padding_right = int((num_windows - 0.5) * num_query_atoms + num_key_atoms / 2 - num_atoms + 0.5)
-    padded = F.pad(single, (0, 0, key_padding_left, key_padding_right))
-    return padded.unfold(-2, num_key_atoms, num_query_atoms).movedim(-1, -2)
+    if key_index is None:
+        key_padding_left = (num_key_atoms - num_query_atoms) // 2
+        key_padding_right = int((num_windows - 0.5) * num_query_atoms + num_key_atoms / 2 - num_atoms + 0.5)
+        padded = F.pad(single, (0, 0, key_padding_left, key_padding_right))
+        return padded.unfold(-2, num_key_atoms, num_query_atoms).movedim(-1, -2)
+
+    source_prefix = tuple(key_index.shape[:-2])
+    target_prefix = tuple(single.shape[:-2])
+    missing = len(target_prefix) - len(source_prefix)
+    if missing:
+        key_index = key_index.reshape(*source_prefix, *((1,) * missing), *key_index.shape[-2:])
+    key_index = key_index.expand(*target_prefix, *key_index.shape[-2:])
+
+    gather_index = key_index.clamp_min(0).unsqueeze(-1).expand(*key_index.shape, single.shape[-1])
+    source = single.unsqueeze(-3).expand(*target_prefix, num_windows, num_atoms, single.shape[-1])
+    gathered = source.gather(-2, gather_index)
+    return gathered * (key_index >= 0).unsqueeze(-1).to(dtype=single.dtype)
 
 
 @dataclass(eq=False)
@@ -77,24 +90,19 @@ class LocalAtomWindowInfo:
     r"""
     Padding and masking metadata describing one local-window partition of an atom axis.
 
-    Records how the atom axis was padded to fill whole windows and which query/key positions are
-    real, so downstream attention can mask out the padded slots without re-deriving them.
+    Carries an optional row-specific key layout and the corresponding pair mask so
+    every downstream gather uses the same windows.
 
     Args:
         attention_mask: `[..., N_window, num_query_atoms, num_key_atoms]` boolean mask; ``True``
             where both the query and key atom of a window slot are real (not padding).
-        query_padding: Number of padded query atoms appended to reach a whole number of windows.
-        key_padding_left: Number of padded key atoms before the first real atom.
-        key_padding_right: Number of padded key atoms after the last real atom.
-        num_valid_atoms: Number of contiguous valid atoms at the start of the atom
-            axis, or ``None`` when all atom rows participate in window placement.
+        key_index: Optional `[..., N_window, num_key_atoms]` row-specific atom
+            indices; ``-1`` marks an invalid key and ``None`` selects the
+            reconstructible centred layout.
     """
 
     attention_mask: Tensor
-    query_padding: int
-    key_padding_left: int
-    key_padding_right: int
-    num_valid_atoms: int | None = None
+    key_index: Tensor | None
 
 
 @dataclass(eq=False)
@@ -149,7 +157,10 @@ class LocalAtomGeometryBuilder(nn.Module):
         self.windowing = LocalAtomWindowing(num_query_atoms=num_query_atoms, num_key_atoms=num_key_atoms)
 
     def forward(
-        self, reference_positions: Tensor, reference_space_id: Tensor, num_valid_atoms: int | None = None
+        self,
+        reference_positions: Tensor,
+        reference_space_id: Tensor,
+        atom_mask: Tensor | None = None,
     ) -> LocalAtomGeometry:
         r"""
         Build local displacement vectors and same-space masks.
@@ -157,19 +168,43 @@ class LocalAtomGeometryBuilder(nn.Module):
         Args:
             reference_positions: ``[..., N_atom, 3]`` reference coords.
             reference_space_id: ``[..., N_atom]`` reference-space ids.
-            num_valid_atoms: Number of real atoms; enables the clamped key window (see
-                [`gather_key_windows`][ofoldx.modules.atom.window.gather_key_windows]).
+            atom_mask: Optional ``[..., N_atom]`` valid-atom mask selecting
+                row-specific clamped key windows.
 
         Returns:
             Local atom geometry for atom-pair encoding.
         """
 
-        position_windows = self.windowing(reference_positions, num_valid_atoms)
-        space_windows = self.windowing(reference_space_id.unsqueeze(-1), num_valid_atoms)
-        distance_vectors = position_windows.query[..., None, :] - position_windows.key[..., None, :, :]
-        distance_mask = (space_windows.query.unsqueeze(-2) == space_windows.key.unsqueeze(-3)).to(
-            dtype=reference_positions.dtype
+        position_windows = self.windowing(reference_positions, atom_mask)
+        target_prefix = tuple(reference_positions.shape[:-2])
+        source_prefix = tuple(reference_space_id.shape[:-1])
+        missing = len(target_prefix) - len(source_prefix)
+        if missing:
+            reference_space_id = reference_space_id.reshape(
+                *source_prefix,
+                *((1,) * missing),
+                reference_space_id.shape[-1],
+            )
+        reference_space_id = reference_space_id.expand(*target_prefix, reference_space_id.shape[-1])
+        num_windows = position_windows.query.shape[-3]
+        query_padding = num_windows * self.windowing.num_query_atoms - reference_space_id.shape[-1]
+        space_queries = F.pad(reference_space_id.unsqueeze(-1), (0, 0, 0, query_padding))
+        space_queries = space_queries.reshape(
+            *reference_space_id.shape[:-1],
+            num_windows,
+            self.windowing.num_query_atoms,
+            1,
         )
+        space_keys = gather_key_windows(
+            reference_space_id.unsqueeze(-1),
+            self.windowing.num_query_atoms,
+            self.windowing.num_key_atoms,
+            position_windows.info.key_index,
+        )
+        distance_vectors = position_windows.query[..., None, :] - position_windows.key[..., None, :, :]
+        distance_mask = (space_queries.unsqueeze(-2) == space_keys.unsqueeze(-3)).to(
+            reference_positions.dtype
+        ) * position_windows.info.attention_mask.unsqueeze(-1)
         return LocalAtomGeometry(
             distance_vectors=distance_vectors,
             distance_mask=distance_mask,
@@ -201,16 +236,14 @@ class LocalAtomWindowing(nn.Module):
         self.num_query_atoms = num_query_atoms
         self.num_key_atoms = num_key_atoms
 
-    def forward(self, tensor: Tensor, num_valid_atoms: int | None = None) -> LocalAtomWindows:
+    def forward(self, tensor: Tensor, atom_mask: Tensor | None = None) -> LocalAtomWindows:
         r"""
         Split an atom-axis tensor into query and key windows.
 
         Args:
             tensor: ``[..., N_atom, C]`` atom-axis tensor.
-            num_valid_atoms: Number of real atoms (contiguous at the front). When given (and
-                ``>= num_key_atoms``), a clamped/shifted key window is used, so boundary
-                windows carry a full ``num_key_atoms`` of real keys; otherwise the fixed zero-padded window
-                is used. See [`gather_key_windows`][ofoldx.modules.atom.window.gather_key_windows].
+            atom_mask: Optional ``[..., N_atom]`` valid-atom mask. Each row uses
+                its own clamped key layout; omitted selects the fixed centred layout.
 
         Returns:
             Local query/key windows and padding metadata.
@@ -223,40 +256,56 @@ class LocalAtomWindowing(nn.Module):
         query_windows = F.pad(tensor, (0, 0, 0, query_padding))
         query_windows = query_windows.reshape(*tensor.shape[:-2], num_windows, self.num_query_atoms, tensor.shape[-1])
 
-        key_padding_left = (self.num_key_atoms - self.num_query_atoms) // 2
-        key_padding_right = int((num_windows - 0.5) * self.num_query_atoms + self.num_key_atoms / 2 - num_atoms + 0.5)
-        key_windows = gather_key_windows(tensor, self.num_query_atoms, self.num_key_atoms, num_valid_atoms)
-        # Build the window attention mask directly in windowed (num_windows, query, key) layout. Deriving it from
-        # a dense (num_atoms, num_atoms) pad mask is quadratic in the atom count (costly memory at large N); this
-        # form is linear in num_windows and is exactly equal to the dense-derived mask.
         device = tensor.device
-        window_start = torch.arange(num_windows, device=device).unsqueeze(-1) * self.num_query_atoms
-        query_index = window_start + torch.arange(self.num_query_atoms, device=device)
-        clamped = num_valid_atoms is not None and num_valid_atoms >= self.num_key_atoms
-        if clamped:
-            # Clamped/shifted keys are all real, so a pair is valid iff its query atom is real.
-            query_valid = query_index < num_valid_atoms
-            window_mask = query_valid[:, :, None].expand(-1, -1, self.num_key_atoms)
+        window_start = torch.arange(num_windows, device=device) * self.num_query_atoms
+        query_index = window_start[:, None] + torch.arange(self.num_query_atoms, device=device)
+        key_padding_left = (self.num_key_atoms - self.num_query_atoms) // 2
+        if atom_mask is None:
+            starts = window_start - key_padding_left
+            centered_index = starts[:, None] + torch.arange(self.num_key_atoms, device=device)[None, :]
+            key_valid = (centered_index >= 0) & (centered_index < num_atoms)
+            query_valid = query_index < num_atoms
+            singleton_prefix = (1,) * len(tensor.shape[:-2])
+            key_valid = key_valid.reshape(*singleton_prefix, num_windows, self.num_key_atoms)
+            query_valid = query_valid.reshape(*singleton_prefix, num_windows, self.num_query_atoms)
+            key_index = None
         else:
-            # A pair is valid iff the query atom is real and the key atom (the query window shifted left by the
-            # key padding) lies in [0, num_atoms).
-            key_index = window_start - key_padding_left + torch.arange(self.num_key_atoms, device=device)
-            window_mask = (
-                (query_index[:, :, None] < num_atoms)
-                & (key_index[:, None, :] >= 0)
-                & (key_index[:, None, :] < num_atoms)
+            atom_mask = atom_mask.to(torch.bool)
+            target_prefix = tuple(tensor.shape[:-2])
+            source_prefix = tuple(atom_mask.shape[:-1])
+            missing = len(target_prefix) - len(source_prefix)
+            if missing:
+                atom_mask = atom_mask.reshape(*source_prefix, *((1,) * missing), atom_mask.shape[-1])
+            atom_mask = atom_mask.expand(*target_prefix, num_atoms)
+            atom_index = torch.arange(num_atoms, device=device)
+            valid_extent = torch.where(atom_mask, atom_index + 1, 0).amax(dim=-1)
+            starts = key_window_starts(
+                num_windows,
+                self.num_query_atoms,
+                self.num_key_atoms,
+                valid_extent,
             )
-        window_mask = window_mask.reshape(
-            *((1,) * len(tensor.shape[:-2])), num_windows, self.num_query_atoms, self.num_key_atoms
+            key_index = starts.unsqueeze(-1) + torch.arange(self.num_key_atoms, device=device)
+            in_bounds = (key_index >= 0) & (key_index < num_atoms)
+            safe_index = key_index.clamp(0, num_atoms - 1)
+            key_valid = in_bounds & atom_mask.unsqueeze(-2).gather(-1, safe_index)
+            key_index = torch.where(key_valid, safe_index, -1)
+            query_valid = F.pad(atom_mask, (0, query_padding)).reshape(
+                *atom_mask.shape[:-1], num_windows, self.num_query_atoms
+            )
+
+        key_windows = gather_key_windows(
+            tensor,
+            self.num_query_atoms,
+            self.num_key_atoms,
+            key_index,
         )
+        window_mask = query_valid.unsqueeze(-1) & key_valid.unsqueeze(-2)
         return LocalAtomWindows(
             query=query_windows,
             key=key_windows,
             info=LocalAtomWindowInfo(
                 attention_mask=window_mask,
-                query_padding=query_padding,
-                key_padding_left=key_padding_left,
-                key_padding_right=key_padding_right,
-                num_valid_atoms=num_valid_atoms,
+                key_index=key_index,
             ),
         )

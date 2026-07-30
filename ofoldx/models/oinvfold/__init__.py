@@ -21,6 +21,7 @@ from .model import (
     OInvFoldPolymerInput,
     OInvFoldPolymerModel,
 )
+from .objectives import criterion_factory, masked_nll_criterion
 from .pipeline import (
     OInvFoldLigandCandidate,
     OInvFoldLigandPipeline,

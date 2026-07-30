@@ -204,12 +204,18 @@ def decode_canonical_mmcif(parsed: ParsedStructure) -> Structure:
     if not isinstance(coordinate_dtype_value, str):
         raise ValueError("canonical mmCIF coordinate dtype is missing")
     coordinate_dtype = np.dtype(coordinate_dtype_value)
+    cif_file = cast(_CifFile, parsed.mmcif_file)
+    atom_site = cif_file.block["atom_site"]
+    coordinate_columns = tuple(_cif_column(atom_site, name) for name in ("Cartn_x", "Cartn_y", "Cartn_z"))
     occupancy_dtype_value = payload.get("occupancy_dtype")
     occupancy_dtype = None if occupancy_dtype_value is None else np.dtype(occupancy_dtype_value)
     b_factor_dtype_value = payload.get("b_factor_dtype")
     b_factor_dtype = None if b_factor_dtype_value is None else np.dtype(b_factor_dtype_value)
     arrays: dict[str, np.ndarray] = {
-        coordinates_key: np.asarray([row.coordinates for row in rows], dtype=coordinate_dtype),
+        coordinates_key: np.asarray(
+            [tuple(column[row.row_index] for column in coordinate_columns) for row in rows],
+            dtype=coordinate_dtype,
+        ),
         coordinate_mask_key: np.asarray([row.coordinate_present for row in rows], dtype=np.bool_),
     }
     if occupancy_key is not None:
@@ -217,8 +223,9 @@ def decode_canonical_mmcif(parsed: ParsedStructure) -> Structure:
             raise ValueError("canonical mmCIF payload has invalid occupancy array reference")
         if occupancy_dtype is None:
             raise ValueError("canonical mmCIF occupancy dtype is missing")
+        occupancy_column = _cif_column(atom_site, "occupancy")
         arrays[occupancy_key] = np.asarray(
-            [np.nan if row.occupancy is None else row.occupancy for row in rows],
+            [np.nan if occupancy_column[row.row_index] is None else occupancy_column[row.row_index] for row in rows],
             dtype=occupancy_dtype,
         )
     if b_factor_key is not None:
@@ -226,16 +233,16 @@ def decode_canonical_mmcif(parsed: ParsedStructure) -> Structure:
             raise ValueError("canonical mmCIF payload has invalid b_factor array reference")
         if b_factor_dtype is None:
             raise ValueError("canonical mmCIF B-factor dtype is missing")
+        b_factor_column = _cif_column(atom_site, "B_iso_or_equiv")
         arrays[b_factor_key] = np.asarray(
-            [np.nan if row.b_factor is None else row.b_factor for row in rows],
+            [np.nan if b_factor_column[row.row_index] is None else b_factor_column[row.row_index] for row in rows],
             dtype=b_factor_dtype,
         )
     structure = decode_structure(payload, arrays)
     row_sites = tuple(row.canonical_site for row in rows)
     if any(site is None for site in row_sites) or row_sites != structure.sites:
         raise ValueError("canonical mmCIF atom_site identity does not match _ofoldx_structure payload")
-    cif_file = cast(_CifFile, parsed.mmcif_file)
-    formal_charges = _cif_column(cif_file.block["atom_site"], "pdbx_formal_charge")
+    formal_charges = _cif_column(atom_site, "pdbx_formal_charge")
     for row, site in zip(rows, structure.sites):
         atom = structure.system.atom(site)
         if row.element != atom.element:
@@ -663,7 +670,9 @@ def read_mmcif_bonds(
     ins_2 = _cif_column(category, "pdbx_ptnr2_PDB_ins_code")
     symmetry_1 = _cif_column(category, "ptnr1_symmetry")
     symmetry_2 = _cif_column(category, "ptnr2_symmetry")
-    value_orders = _cif_column(category, "pdbx_value_order")
+    value_orders = (
+        _cif_column(category, "pdbx_value_order") if "pdbx_value_order" in category else ("sing",) * category.row_count
+    )
     selected_sites = selected_source_sites(selected_rows, site_by_row_index)
     symmetry_ids = {row.symmetry_id for row in selected_rows}
     bonds: list[SystemBond] = []
@@ -805,20 +814,18 @@ def write_mmcif(structure: Structure, path: Path) -> None:
             raise ValueError("mmCIF cannot represent non-finite coordinates")
         if not coordinate_present and not np.all(np.isfinite(coordinate)):
             coordinate = np.zeros(3, dtype=structure.coordinates.dtype)
-        occupancy = (
-            "."
-            if structure.occupancy is None or np.isnan(structure.occupancy[index])
-            else float(structure.occupancy[index])
-        )
-        if occupancy != "." and not np.isfinite(occupancy):
+        if structure.occupancy is None or np.isnan(structure.occupancy[index]):
+            occupancy = "."
+        elif not np.isfinite(structure.occupancy[index]):
             raise ValueError("mmCIF cannot represent non-finite occupancy")
-        b_factor = (
-            "."
-            if structure.b_factor is None or np.isnan(structure.b_factor[index])
-            else float(structure.b_factor[index])
-        )
-        if b_factor != "." and not np.isfinite(b_factor):
+        else:
+            occupancy = str(structure.occupancy[index])
+        if structure.b_factor is None or np.isnan(structure.b_factor[index]):
+            b_factor = "."
+        elif not np.isfinite(structure.b_factor[index]):
             raise ValueError("mmCIF cannot represent non-finite B factor")
+        else:
+            b_factor = str(structure.b_factor[index])
         altloc = "."
         values = {
             "group_PDB": group,
@@ -831,9 +838,9 @@ def write_mmcif(structure: Structure, path: Path) -> None:
             "label_entity_id": label_entity_id,
             "label_seq_id": label_seq_id,
             "pdbx_PDB_ins_code": insertion_code,
-            "Cartn_x": float(coordinate[0]),
-            "Cartn_y": float(coordinate[1]),
-            "Cartn_z": float(coordinate[2]),
+            "Cartn_x": str(coordinate[0]),
+            "Cartn_y": str(coordinate[1]),
+            "Cartn_z": str(coordinate[2]),
             "occupancy": occupancy,
             "B_iso_or_equiv": b_factor,
             "pdbx_formal_charge": "?" if atom.formal_charge is None else atom.formal_charge,

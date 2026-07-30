@@ -82,9 +82,12 @@ class AtomToTokenEncoder(nn.Module):
         self.atom_to_token_mean = AtomToTokenMean(backend=backend)
 
     def build_local_geometry(
-        self, reference_positions: Tensor, reference_space_id: Tensor, num_valid_atoms: int | None = None
+        self,
+        reference_positions: Tensor,
+        reference_space_id: Tensor,
+        atom_mask: Tensor | None = None,
     ) -> LocalAtomGeometry:
-        return self.atom_pair_encoder.build_local_geometry(reference_positions, reference_space_id, num_valid_atoms)
+        return self.atom_pair_encoder.build_local_geometry(reference_positions, reference_space_id, atom_mask)
 
     def forward(
         self,
@@ -116,7 +119,7 @@ class AtomToTokenEncoder(nn.Module):
             atom_pair,
             atom_mask=atom_mask,
             attention_layout=attention_layout,
-            num_valid_atoms=None if local_geometry is None else local_geometry.window_info.num_valid_atoms,
+            key_index=None if local_geometry is None else local_geometry.window_info.key_index,
         )
         token_hidden = self.relu(self.token_projection(atom_query))
         token_hidden = self.atom_to_token_mean(
@@ -192,9 +195,12 @@ class CoordinateAtomToTokenEncoder(nn.Module):
         self.atom_to_token_mean = AtomToTokenMean(backend=backend)
 
     def build_local_geometry(
-        self, reference_positions: Tensor, reference_space_id: Tensor, num_valid_atoms: int | None = None
+        self,
+        reference_positions: Tensor,
+        reference_space_id: Tensor,
+        atom_mask: Tensor | None = None,
     ) -> LocalAtomGeometry:
-        return self.atom_pair_encoder.build_local_geometry(reference_positions, reference_space_id, num_valid_atoms)
+        return self.atom_pair_encoder.build_local_geometry(reference_positions, reference_space_id, atom_mask)
 
     def forward(
         self,
@@ -243,9 +249,7 @@ class CoordinateAtomToTokenEncoder(nn.Module):
             reference_charges=reference_charges,
             reference_mask=reference_mask,
         )
-        # The valid-atom count selects clamped key windows. Pair broadcast and attention gathering share
-        # that count so their key panes stay aligned; ``None`` keeps the fixed padded layout.
-        num_valid_atoms = None if local_geometry is None else local_geometry.window_info.num_valid_atoms
+        key_index = None if local_geometry is None else local_geometry.window_info.key_index
         atom_conditioning = self._add_single_conditioning(atom_conditioning, single, atom_to_token)
         atom_pair = self._build_atom_pair(
             atom_conditioning,
@@ -262,7 +266,7 @@ class CoordinateAtomToTokenEncoder(nn.Module):
             atom_pair,
             atom_mask=atom_mask,
             attention_layout=attention_layout,
-            num_valid_atoms=num_valid_atoms,
+            key_index=key_index,
         )
         token_hidden = self.relu(self.token_projection(atom_query))
         token_hidden = self.atom_to_token_mean(
@@ -328,7 +332,9 @@ class CoordinateAtomToTokenEncoder(nn.Module):
                 pair=pair,
             )
         local_pair = self.token_pair_to_local_atom_pair_broadcast(
-            pair, atom_to_token, num_valid_atoms=local_geometry.window_info.num_valid_atoms
+            pair,
+            atom_to_token,
+            key_index=local_geometry.window_info.key_index,
         )
         return self.atom_pair_encoder(atom_conditioning, local_geometry=local_geometry, pair=local_pair)
 
@@ -450,7 +456,10 @@ class AtomPairEncoder(nn.Module):
         return self.feed_forward_output_projection(self.activation(pair))
 
     def build_local_geometry(
-        self, reference_positions: Tensor, reference_space_id: Tensor, num_valid_atoms: int | None = None
+        self,
+        reference_positions: Tensor,
+        reference_space_id: Tensor,
+        atom_mask: Tensor | None = None,
     ) -> LocalAtomGeometry:
         r"""
         Precompute the windowed atom-pair geometry for the local encoding layout.
@@ -458,14 +467,14 @@ class AtomPairEncoder(nn.Module):
         Args:
             reference_positions: `[..., N_atom, 3]` reference coordinates.
             reference_space_id: `[..., N_atom]` reference-space ids grouping atoms that may interact.
-            num_valid_atoms: Number of real atoms; enables the clamped/shifted key window.
+            atom_mask: Optional valid-atom mask selecting row-specific key windows.
 
         Returns:
             A [`LocalAtomGeometry`][ofoldx.modules.atom.window.LocalAtomGeometry] to pass to
             [`encode_local`][ofoldx.modules.atom.encoders.AtomPairEncoder.encode_local].
         """
 
-        return self.local_geometry_builder(reference_positions, reference_space_id, num_valid_atoms)
+        return self.local_geometry_builder(reference_positions, reference_space_id, atom_mask)
 
     def forward(
         self,
@@ -570,14 +579,26 @@ class AtomPairEncoder(nn.Module):
         window_mask = local_geometry.window_info.attention_mask.to(
             device=distance_vectors.device, dtype=distance_vectors.dtype
         ).unsqueeze(-1)
-        conditioning_windows = self.local_geometry_builder.windowing(
-            atom_conditioning, local_geometry.window_info.num_valid_atoms
+        windowing = self.local_geometry_builder.windowing
+        num_windows = distance_vectors.shape[-4]
+        query_padding = num_windows * windowing.num_query_atoms - atom_conditioning.shape[-2]
+        conditioning_queries = F.pad(atom_conditioning, (0, 0, 0, query_padding)).reshape(
+            *atom_conditioning.shape[:-2],
+            num_windows,
+            windowing.num_query_atoms,
+            atom_conditioning.shape[-1],
+        )
+        conditioning_keys = gather_key_windows(
+            atom_conditioning,
+            windowing.num_query_atoms,
+            windowing.num_key_atoms,
+            local_geometry.window_info.key_index,
         )
         return encode_atom_pair(
             self,
             distance_vectors,
-            self.activation(conditioning_windows.query[..., None, :]),
-            self.activation(conditioning_windows.key[..., None, :, :]),
+            self.activation(conditioning_queries[..., None, :]),
+            self.activation(conditioning_keys[..., None, :, :]),
             distance_term_mask=distance_mask * window_mask,
             inverse_term_mask=distance_mask,
             valid_mask=distance_mask,
@@ -735,7 +756,7 @@ class PackedAtomAttention(nn.Module):
         *,
         atom_mask: Tensor | None = None,
         attention_layout: AttentionLayout = "dense",
-        num_valid_atoms: int | None = None,
+        key_index: Tensor | None = None,
     ) -> Tensor:
         r"""
         Apply atom attention in the dense or local-window layout.
@@ -752,8 +773,7 @@ class PackedAtomAttention(nn.Module):
                 `[..., N_window, num_query_atoms, num_key_atoms, depth * heads]`.
             atom_mask: Optional `[..., N_atom]` attention mask; defaults to all-valid.
             attention_layout: Either ``"dense"`` (global) or ``"local"`` (windowed).
-            num_valid_atoms: Number of real atoms; enables the clamped/shifted key gather so the
-                windowed key panes match the pair-bias windows. Unset keeps the fixed zero-padded gather.
+            key_index: Optional row-specific atom indices for the local key panes.
 
         Returns:
             Updated atom hidden states of shape `[..., N_atom, atom_hidden_size]`.
@@ -773,6 +793,8 @@ class PackedAtomAttention(nn.Module):
         conditioning = _flatten_batch(conditioning, prefix, 2)
         bias = _flatten_batch(packed_bias, prefix, 4 if attention_layout == "local" else 3)
         mask = _flatten_batch(atom_mask, prefix, 1).float()
+        if key_index is not None:
+            key_index = _flatten_batch(key_index, prefix, 2)
 
         if attention_layout == "dense":
             output = self.transformer(query, conditioning, bias, mask, to_keys=None)
@@ -794,7 +816,7 @@ class PackedAtomAttention(nn.Module):
             gather_key_windows,
             num_query_atoms=num_query_atoms,
             num_key_atoms=self.num_key_atoms,
-            num_valid_atoms=num_valid_atoms,
+            key_index=key_index,
         )
 
         def to_keys_windowed(hidden: Tensor) -> Tensor:
@@ -1094,7 +1116,7 @@ class AtomSelfAttention(nn.Module):
         pair: Tensor,
         atom_mask: Tensor | None = None,
         attention_layout: AttentionLayout = "dense",
-        num_valid_atoms: int | None = None,
+        key_index: Tensor | None = None,
     ) -> Tensor:
         packed_bias = torch.cat(
             [projection(norm(pair)) for norm, projection in zip(self.pair_norms, self.bias_projections)],
@@ -1106,7 +1128,7 @@ class AtomSelfAttention(nn.Module):
             packed_bias,
             atom_mask=atom_mask,
             attention_layout=attention_layout,
-            num_valid_atoms=num_valid_atoms,
+            key_index=key_index,
         )
 
 
@@ -1150,7 +1172,7 @@ class NormalizedKeyAtomSelfAttention(nn.Module):
         pair: Tensor,
         atom_mask: Tensor | None = None,
         attention_layout: AttentionLayout = "dense",
-        num_valid_atoms: int | None = None,
+        key_index: Tensor | None = None,
     ) -> Tensor:
         packed_bias = torch.cat(
             [projection(norm(pair)) for norm, projection in zip(self.pair_norms, self.bias_projections)],
@@ -1162,7 +1184,7 @@ class NormalizedKeyAtomSelfAttention(nn.Module):
             packed_bias,
             atom_mask=atom_mask,
             attention_layout=attention_layout,
-            num_valid_atoms=num_valid_atoms,
+            key_index=key_index,
         )
 
 
@@ -1209,9 +1231,12 @@ class NormalizedKeyAtomToTokenEncoder(nn.Module):
         self.atom_to_token_mean = AtomToTokenMean(backend=backend)
 
     def build_local_geometry(
-        self, reference_positions: Tensor, reference_space_id: Tensor, num_valid_atoms: int | None = None
+        self,
+        reference_positions: Tensor,
+        reference_space_id: Tensor,
+        atom_mask: Tensor | None = None,
     ) -> LocalAtomGeometry:
-        return self.atom_pair_encoder.build_local_geometry(reference_positions, reference_space_id, num_valid_atoms)
+        return self.atom_pair_encoder.build_local_geometry(reference_positions, reference_space_id, atom_mask)
 
     def forward(
         self,
@@ -1243,7 +1268,7 @@ class NormalizedKeyAtomToTokenEncoder(nn.Module):
             atom_pair,
             atom_mask=atom_mask,
             attention_layout=attention_layout,
-            num_valid_atoms=None if local_geometry is None else local_geometry.window_info.num_valid_atoms,
+            key_index=None if local_geometry is None else local_geometry.window_info.key_index,
         )
         token_hidden = self.relu(self.token_projection(atom_query))
         token_hidden = self.atom_to_token_mean(
@@ -1316,9 +1341,12 @@ class NormalizedKeyCoordinateAtomToTokenEncoder(nn.Module):
         self.atom_to_token_mean = AtomToTokenMean(backend=backend)
 
     def build_local_geometry(
-        self, reference_positions: Tensor, reference_space_id: Tensor, num_valid_atoms: int | None = None
+        self,
+        reference_positions: Tensor,
+        reference_space_id: Tensor,
+        atom_mask: Tensor | None = None,
     ) -> LocalAtomGeometry:
-        return self.atom_pair_encoder.build_local_geometry(reference_positions, reference_space_id, num_valid_atoms)
+        return self.atom_pair_encoder.build_local_geometry(reference_positions, reference_space_id, atom_mask)
 
     def forward(
         self,
@@ -1341,7 +1369,7 @@ class NormalizedKeyCoordinateAtomToTokenEncoder(nn.Module):
             reference_charges=reference_charges,
             reference_mask=reference_mask,
         )
-        num_valid_atoms = None if local_geometry is None else local_geometry.window_info.num_valid_atoms
+        key_index = None if local_geometry is None else local_geometry.window_info.key_index
         atom_conditioning = self._add_single_conditioning(atom_conditioning, single, atom_to_token)
         atom_pair = self._build_atom_pair(
             atom_conditioning,
@@ -1358,7 +1386,7 @@ class NormalizedKeyCoordinateAtomToTokenEncoder(nn.Module):
             atom_pair,
             atom_mask=atom_mask,
             attention_layout=attention_layout,
-            num_valid_atoms=num_valid_atoms,
+            key_index=key_index,
         )
         token_hidden = self.relu(self.token_projection(atom_query))
         token_hidden = self.atom_to_token_mean(
@@ -1398,7 +1426,9 @@ class NormalizedKeyCoordinateAtomToTokenEncoder(nn.Module):
                 pair=pair,
             )
         local_pair = self.token_pair_to_local_atom_pair_broadcast(
-            pair, atom_to_token, num_valid_atoms=local_geometry.window_info.num_valid_atoms
+            pair,
+            atom_to_token,
+            key_index=local_geometry.window_info.key_index,
         )
         return self.atom_pair_encoder(atom_conditioning, local_geometry=local_geometry, pair=local_pair)
 
@@ -1458,7 +1488,7 @@ class TokenToAtomDecoder(nn.Module):
         atom_context: AtomContext,
         atom_mask: Tensor | None = None,
         attention_layout: AttentionLayout = "dense",
-        num_valid_atoms: int | None = None,
+        key_index: Tensor | None = None,
     ) -> Tensor:
         atom_query = atom_query + self.token_to_atom_broadcast(self.token_projection(token_hidden), atom_to_token)
         atom_query = self.atom_self_attention(
@@ -1467,7 +1497,7 @@ class TokenToAtomDecoder(nn.Module):
             pair=atom_context.pair,
             atom_mask=atom_mask,
             attention_layout=attention_layout,
-            num_valid_atoms=num_valid_atoms,
+            key_index=key_index,
         )
         return self.output_projection(self.query_norm(atom_query))
 
@@ -1513,7 +1543,7 @@ class NormalizedKeyTokenToAtomDecoder(nn.Module):
         atom_context: AtomContext,
         atom_mask: Tensor | None = None,
         attention_layout: AttentionLayout = "dense",
-        num_valid_atoms: int | None = None,
+        key_index: Tensor | None = None,
     ) -> Tensor:
         atom_query = atom_query + self.token_to_atom_broadcast(self.token_projection(token_hidden), atom_to_token)
         atom_query = self.atom_self_attention(
@@ -1522,7 +1552,7 @@ class NormalizedKeyTokenToAtomDecoder(nn.Module):
             pair=atom_context.pair,
             atom_mask=atom_mask,
             attention_layout=attention_layout,
-            num_valid_atoms=num_valid_atoms,
+            key_index=key_index,
         )
         return self.output_projection(self.query_norm(atom_query))
 
@@ -1547,5 +1577,5 @@ def _flatten_batch(tensor: Tensor, prefix: tuple[int, ...], payload_ndim: int) -
     missing = len(prefix) - matched
     if missing:
         tensor = tensor.reshape(*tensor.shape[:matched], *(1,) * missing, *tensor.shape[matched:])
-        tensor = tensor.expand(*prefix, *tensor.shape[len(prefix) :])
+    tensor = tensor.expand(*prefix, *tensor.shape[len(prefix) :])
     return tensor.reshape(-1, *tensor.shape[len(prefix) :])

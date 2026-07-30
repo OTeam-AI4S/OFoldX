@@ -140,13 +140,17 @@ repository.
 
 ## Training Details
 
-OFoldX preserves the checkpoint-backed encoder corruption and the polymer
-teacher-forced autoregressive computation as raw Model operations. It does not
-claim an OInvFold training pipeline or objective because the exact upstream
-tree publishes neither; consult the upstream project for training data.
-Polymer and ligand `encode`/`forward`, and the polymer autoregressive operation,
-accept one optional `torch.Generator` that controls every per-block graph
-corruption draw.
+OFoldX preserves the checkpoint-backed encoder corruption and provides the
+released masked polymer negative log likelihood as the built-in Runner
+objective. Polymer and ligand `encode`/`forward`, and the polymer
+autoregressive operation, accept one optional `torch.Generator` that controls
+every per-block graph corruption draw.
+
+## Limitations
+
+The built-in Runner objective covers polymer identity prediction only; ligand
+graphs carry no target atom identities. Ligand decoding assigns elements only;
+connectivity, formal charge, and canonical component identity remain unresolved.
 
 ## Citation
 

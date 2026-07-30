@@ -232,7 +232,7 @@ class ODesignProcessor(Processor):
     def process_training(
         self,
         input: MolecularSystem | Structure | None,
-        target: Structure,
+        target: Structure | None = None,
         *,
         placement: ODesignPlacements | None = None,
         msa: MSA | MSACollection | None = None,
@@ -247,8 +247,9 @@ class ODesignProcessor(Processor):
         Args:
             input: Optional canonical context system or structure visible to the
                 Model.
-            target: Canonical target Structure whose coordinate rows form the
-                complete target pool.
+            target: Optional separate canonical target Structure whose coordinate
+                rows form the complete target pool. A Structure input is its own
+                target when this is omitted.
             placement: Optional topology of existing and generated molecular
                 segments.
             msa: Optional canonical MSA evidence.
@@ -258,6 +259,11 @@ class ODesignProcessor(Processor):
         Returns:
             The ordinary Model input and a separate target-to-atom-axis mapping.
         """
+
+        if target is None:
+            if not isinstance(input, Structure):
+                raise TypeError("ODesign training requires a target Structure")
+            target = input
 
         plan = self._plan(input, placement, conditions)
         model_input = self._lower(plan, msa)

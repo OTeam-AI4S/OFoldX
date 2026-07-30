@@ -89,6 +89,12 @@ and polymer-specific `smoothed_loss`. The latter supports both shared and
 separate DNA/RNA token layouts and the released aligned target-probability rows;
 masking and reduction remain caller-owned.
 
+## Limitations
+
+The built-in Runner covers masked polymer sequence recovery. It does not
+reproduce the upstream specificity-training dataset or its complete training
+orchestration.
+
 ## Citation
 
 Please cite the upstream preprint,

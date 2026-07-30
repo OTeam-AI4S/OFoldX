@@ -71,22 +71,24 @@ pip install ofoldx
 
 ### Structure Prediction
 
-Use the high-level `fold` API:
+Load the concrete folding Pipeline:
 
 ```python
 import ofoldx
 
-output = ofoldx.fold("complex.cif", model="oteam/boltz2")
+pipeline = ofoldx.pipeline("fold", model="oteam/boltz2")
+output = pipeline.fold("complex.cif")
 ```
 
 ### Binding Affinity Prediction
 
-Use the high-level `score` API:
+Load the concrete affinity-scoring Pipeline:
 
 ```python
 import ofoldx
 
-output = ofoldx.score("complex.cif", model="oteam/boltz2-affinity")
+pipeline = ofoldx.pipeline("score", model="oteam/boltz2-affinity")
+output = pipeline.score("complex.cif")
 ```
 
 ## Training Details
@@ -106,6 +108,12 @@ Training is staged across structure, confidence, and affinity
 objectives. The report describes detached-trunk absolute and difference Huber
 losses for affinity values and a focal binary objective for binder
 classification.
+
+## Limitations
+
+The built-in Runner objective covers structure coordinate denoising only. It
+does not reproduce the staged confidence and affinity training objectives or
+the data and decoy-generation pipelines described in the report.
 
 ## Citation
 

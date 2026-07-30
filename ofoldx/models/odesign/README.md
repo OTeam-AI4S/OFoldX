@@ -75,6 +75,23 @@ canonical molecule from those predictions.
 - **Model type**: All-atom, condition-guided biomolecular diffusion model
 - **Original Repository**: [The-Institute-for-AI-Molecular-Design/ODesign](https://github.com/The-Institute-for-AI-Molecular-Design/ODesign)
 
+## Conversion
+
+Convert an explicitly selected released artifact together with the child
+repositories that its concrete Pipeline owns. For example:
+
+```bash
+python -m ofoldx.models.odesign.convert protein-flex \
+  released-odesign.ckpt /path/to/converted-odesign-protein-flex \
+  --protein-designer /path/to/converted-proteinmpnn \
+  --ligand-designer /path/to/converted-ligandmpnn
+```
+
+The same command accepts the `protein-rigid`, `nucleic-acid-rigid`, and
+`ligand-rigid` selectors described above, with their corresponding
+`--dna-designer`/`--rna-designer` or `--element-designer` child repositories.
+Run `python -m ofoldx.models.odesign.convert --help` for the exact alternatives.
+
 ## Usage
 
 The model depends on the [`ofoldx`](https://github.com/OTeam-AI4S/OFoldX)
@@ -142,10 +159,19 @@ upstream training corpus and data construction.
 
 ### Training Procedure
 
-OFoldX preserves the released inference graph and exposes the differentiable
-one-step denoiser. It does not add an OFoldX-specific training objective to the
-model. Rigid and flexible receptor behavior is Processor conditioning rather
-than a separate architecture.
+OFoldX preserves the released inference graph and exposes the official
+molecule-weighted coordinate objective through the Runner: resolved, non-fixed
+atoms are independently rigid-aligned, weighted by chemistry (protein `1`,
+DNA/RNA `6`, ligand `11`), and scored with the EDM-weighted MSE. Rigid and
+flexible receptor behavior is Processor conditioning rather than a separate
+architecture.
+
+## Limitations
+
+The built-in Runner objective covers the canonical polymer Processor only; the
+provisional ligand artifact has no complete target-identity contract. Ligand
+outputs remain provisional atom slots until an external chemical-realization
+step supplies bonds, formal charges, and component identity.
 
 ## Citation
 

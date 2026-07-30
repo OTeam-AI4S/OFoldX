@@ -22,8 +22,6 @@ _MODELS.register(
     "ligandmpnn",
     model=LigandMpnnModel,
     processor=LigandMpnnProcessor,
-    criterion=criterion_factory,
-    strategy="sequence_single",
 )
 _PIPELINES.register(
     "ligandmpnn",

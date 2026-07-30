@@ -669,6 +669,7 @@ class PostProjectionOuterProductMean(nn.Module):
         pair_size: Width of the produced pair update.
         eps: Epsilon added to the per-pair valid-row count after projection.
         backend: Backend selector; resolves to ``"oops"`` or ``"eager"``.
+        projection_bias: Whether the left and right MSA projections include biases.
     """
 
     def __init__(
@@ -678,13 +679,15 @@ class PostProjectionOuterProductMean(nn.Module):
         pair_size: int = 128,
         eps: float = 1e-3,
         backend: str = "auto",
+        *,
+        projection_bias: bool = False,
     ) -> None:
         super().__init__()
         self.backend = resolve_config_backend(backend, supported=("oops", "eager"), public_default="eager")
         self.eps = eps
         self.msa_norm = LayerNorm(msa_size, backend=backend)
-        self.left_projection = nn.Linear(msa_size, hidden_size, bias=False)
-        self.right_projection = nn.Linear(msa_size, hidden_size, bias=False)
+        self.left_projection = nn.Linear(msa_size, hidden_size, bias=projection_bias)
+        self.right_projection = nn.Linear(msa_size, hidden_size, bias=projection_bias)
         self.output_projection = nn.Linear(hidden_size * hidden_size, pair_size)
 
     def forward(self, msa: Tensor, msa_mask: Tensor | None = None) -> Tensor:

@@ -8,6 +8,7 @@ from typing import Any
 
 import chanfig
 import danling as dl
+from danling.runners.config import DdpConfig as DanlingDdpConfig
 
 
 class ModelConfig(chanfig.Config):
@@ -65,6 +66,12 @@ class DataConfig(chanfig.Config):
                 self[split] = DatasetConfig(spec) if isinstance(spec, dict) else DatasetConfig(source=spec)
 
 
+class DdpConfig(DanlingDdpConfig):
+    r"""DDP settings whose unused-parameter policy defaults to the selected objective."""
+
+    find_unused_parameters: bool | None = None  # type: ignore[assignment]
+
+
 class RunnerConfig(dl.RunnerConfig):
     r"""
     Configure OFoldX training and evaluation.
@@ -82,6 +89,7 @@ class RunnerConfig(dl.RunnerConfig):
     model: ModelConfig
     processor: chanfig.Config
     data: DataConfig
+    ddp: DdpConfig = DdpConfig()
 
     def __post_init__(self, *args: Any, **kwargs: Any) -> None:
         super().__post_init__(*args, **kwargs)

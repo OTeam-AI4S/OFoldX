@@ -152,6 +152,13 @@ uses a separate structure-conditioned residue-prediction objective. Its
 coordinate noise, teacher-forcing visibility, decode order, and categorical
 sampling.
 
+## Limitations
+
+The built-in Runner objective covers the structure model's EDM denoising term.
+The confidence and inverse-folding models expose their raw computations but do
+not have built-in Runner objectives, and the released multi-model design
+protocol still requires all of its converted child repositories.
+
 ## Citation
 
 ```bibtex

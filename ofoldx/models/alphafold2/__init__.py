@@ -38,6 +38,7 @@ from .model import (
     alphafold2_predicted_tm_score,
 )
 from .multimer_processor import AlphaFold2MultimerProcessor
+from .objectives import criterion_factory, masked_msa_criterion
 from .pipeline import (
     AlphaFold2Casp14Pipeline,
     AlphaFold2Casp14Prediction,

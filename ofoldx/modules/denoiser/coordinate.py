@@ -116,7 +116,7 @@ class CoordinateDenoiser(nn.Module):
         self,
         reference_positions: Tensor,
         reference_space_id: Tensor,
-        num_valid_atoms: int | None = None,
+        atom_mask: Tensor | None = None,
     ) -> LocalAtomGeometry:
         r"""
         Build local atom-pair geometry using the denoising atom-encoder windows.
@@ -125,7 +125,7 @@ class CoordinateDenoiser(nn.Module):
         return self.atom_encoder.build_local_geometry(
             reference_positions,
             reference_space_id,
-            num_valid_atoms,
+            atom_mask,
         )
 
     def predict_coordinate_update(self, inputs: CoordinateDenoisingInput) -> Tensor:
@@ -159,9 +159,9 @@ class CoordinateDenoiser(nn.Module):
             token_hidden=token_hidden,
             atom_query=atom_output.atom_query,
             atom_context=atom_output.atom_context,
-            atom_mask=None,
+            atom_mask=inputs.atom_mask,
             attention_layout="local",
-            num_valid_atoms=inputs.local_geometry.window_info.num_valid_atoms,
+            key_index=inputs.local_geometry.window_info.key_index,
         )
 
     def forward(self, inputs: CoordinateDenoisingInput) -> Tensor:
@@ -446,9 +446,8 @@ def _broadcast_local_geometry(geometry: LocalAtomGeometry, target_prefix: tuple[
         distance_mask=_broadcast_prefix(geometry.distance_mask, target_prefix, tail_dims=4),
         window_info=LocalAtomWindowInfo(
             attention_mask=_broadcast_prefix(info.attention_mask, target_prefix, tail_dims=3),
-            query_padding=info.query_padding,
-            key_padding_left=info.key_padding_left,
-            key_padding_right=info.key_padding_right,
-            num_valid_atoms=info.num_valid_atoms,
+            key_index=(
+                None if info.key_index is None else _broadcast_prefix(info.key_index, target_prefix, tail_dims=2)
+            ),
         ),
     )

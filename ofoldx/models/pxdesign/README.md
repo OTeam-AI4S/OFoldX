@@ -141,6 +141,13 @@ target-conditioned backbone generation.
 PXDesign-d uses an EDM coordinate-denoising objective. OFoldX exposes the
 differentiable one-step denoiser for training and fine-tuning.
 
+## Limitations
+
+PXDesign-d has no built-in Runner objective; the exposed one-step denoiser does
+not reproduce its full training pipeline. Preview and Extended are fixed
+multi-model inference compositions and require all converted child repositories
+listed above.
+
 ## Citation
 
 Please cite the PXDesign work and repository described by the

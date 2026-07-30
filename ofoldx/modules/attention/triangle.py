@@ -103,6 +103,7 @@ class TriangleMultiplication(nn.Module):
         hidden_size: Width of the intermediate left/right factors.
         outgoing: If ``True`` contract as ``ikh,jkh->ijh`` (outgoing edges); otherwise ``kih,kjh->ijh``
             (incoming edges).
+        projection_bias: Whether the value, gate, and output projections include biases.
         backend: Operator provider; see [ofoldx.modules.backend][].
     """
 
@@ -112,19 +113,20 @@ class TriangleMultiplication(nn.Module):
         hidden_size: int = 128,
         *,
         outgoing: bool,
+        projection_bias: bool = False,
         backend: str = "auto",
     ) -> None:
         super().__init__()
         self.outgoing = outgoing
         self.backend = resolve_config_backend(backend, supported=("oops", "eager"), public_default="eager")
         self.input_norm = LayerNorm(pair_size, backend=backend)
-        self.left_projection = nn.Linear(pair_size, hidden_size, bias=False)
-        self.left_gate_projection = nn.Linear(pair_size, hidden_size, bias=False)
-        self.right_projection = nn.Linear(pair_size, hidden_size, bias=False)
-        self.right_gate_projection = nn.Linear(pair_size, hidden_size, bias=False)
+        self.left_projection = nn.Linear(pair_size, hidden_size, bias=projection_bias)
+        self.left_gate_projection = nn.Linear(pair_size, hidden_size, bias=projection_bias)
+        self.right_projection = nn.Linear(pair_size, hidden_size, bias=projection_bias)
+        self.right_gate_projection = nn.Linear(pair_size, hidden_size, bias=projection_bias)
         self.output_norm = LayerNorm(hidden_size, backend=backend)
-        self.output_projection = nn.Linear(hidden_size, pair_size, bias=False)
-        self.gate_projection = nn.Linear(pair_size, pair_size, bias=False)
+        self.output_projection = nn.Linear(hidden_size, pair_size, bias=projection_bias)
+        self.gate_projection = nn.Linear(pair_size, pair_size, bias=projection_bias)
 
     def forward(
         self,

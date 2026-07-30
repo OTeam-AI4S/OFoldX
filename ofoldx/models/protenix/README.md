@@ -89,6 +89,20 @@ Direct `ProtenixNoisyStructureEmbedder` callers may enable its released
 - **Model type**: Pairformer-based all-atom biomolecular structure predictor with optional learned constraints
 - **Original Repository**: [bytedance/Protenix](https://github.com/bytedance/Protenix)
 
+## Conversion
+
+Conversion requires the exact released variant rather than inferring it from
+the checkpoint filename:
+
+```bash
+python -m ofoldx.models.protenix.convert \
+  released-protenix.pt /path/to/converted-protenix \
+  --variant protenix_base_default_v0.5.0
+```
+
+The mini ESM and mini ISM variants additionally require their released ESM2
+companion through `--esm-checkpoint`.
+
 ## Usage
 
 The model depends on the [`ofoldx`](https://github.com/OTeam-AI4S/OFoldX)
@@ -100,15 +114,13 @@ pip install ofoldx
 
 ### Structure Prediction
 
-Load any converted repository through the standard folding API:
+Load any converted repository through its concrete folding Pipeline:
 
 ```python
 import ofoldx
 
-output = ofoldx.fold(
-    "input.cif",
-    model="/path/to/converted-protenix",
-)
+pipeline = ofoldx.pipeline("fold", model="/path/to/converted-protenix")
+output = pipeline.fold("input.cif")
 ```
 
 Template variants additionally accept `templates=`. Constraint repositories
@@ -139,8 +151,8 @@ output = pipeline.fold(
 
 Leaving `tfg_guidance` as `None` disables guidance. The guidance value exposes
 the eight named chemical terms, schedules, Monte Carlo smoothing, and iteration
-counts; setting one term to `None` removes that term. TFG is family-specific, so
-it is passed to the concrete Pipeline rather than the common `ofoldx.fold` task.
+counts; setting one term to `None` removes that term. TFG is family-specific and
+therefore remains an argument of the concrete Pipeline.
 
 ## Training Details
 
@@ -156,6 +168,13 @@ OFoldX reproduces the complete released Model graph, not Protenix's complete
 four-stage training program. Dataset policy, objectives, stage weights,
 condition-dropout curriculum, optimizer, and training runner remain the
 responsibility of the training application.
+
+## Limitations
+
+The built-in Runner objective covers the EDM coordinate-denoising term, not
+Protenix's complete four-stage training program or its auxiliary-head and
+condition-dropout schedules. The selected converted checkpoint determines
+which of the four concrete input contracts is available.
 
 ## Citation
 

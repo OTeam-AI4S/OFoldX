@@ -84,6 +84,12 @@ LigandMPNN uses autoregressive sequence recovery with coordinate perturbations
 for robustness. OFoldX exposes a differentiable teacher-forced
 `forward` path for training and fine-tuning.
 
+## Limitations
+
+The built-in Runner covers masked sequence recovery on already lowered
+structures. It does not reproduce the upstream structure selection, atomic
+context construction, or training-data pipeline.
+
 ## Citation
 
 ```bibtex

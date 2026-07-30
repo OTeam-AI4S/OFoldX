@@ -29,8 +29,7 @@ from ...io.msa import read_msa
 from ...io.structure import read_structure
 from ...pipelines import CompositePair, CompositePipeline, resolve_generator
 from ...results import FoldPrediction, ScoreResult
-from ..boltz2.model import Boltz2AffinityModel, Boltz2Model
-from ..boltz2.processor import Boltz2AffinityProcessor, Boltz2Processor
+from ..boltz2 import Boltz2AffinityModel, Boltz2AffinityProcessor, Boltz2Model, Boltz2Processor
 from .analysis import (
     AnalysisValue,
     BoltzGenDiversityMetrics,

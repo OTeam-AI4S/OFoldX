@@ -66,17 +66,18 @@ pip install ofoldx
 
 ### Structure Prediction
 
-Use the high-level `fold` API:
+Load the concrete folding Pipeline:
 
 ```python
 import ofoldx
 
-output = ofoldx.fold("input.cif", model="oteam/alphafold3")
+pipeline = ofoldx.pipeline("fold", model="oteam/alphafold3")
+output = pipeline.fold("input.cif")
 ```
 
 `AlphaFold3Model.sample` exposes the raw final single and pair representations,
-coordinate samples, distogram logits, and confidence logits. The high-level
-`fold` API decodes those predictions into a `FoldResult`.
+coordinate samples, distogram logits, and confidence logits. The Pipeline
+decodes those predictions into a `FoldResult`.
 
 ## Training Details
 
@@ -92,6 +93,12 @@ information for the authoritative data description.
 AlphaFold 3 is trained end to end with a diffusion coordinate objective and
 auxiliary distogram and confidence objectives. OFoldX preserves the inference
 architecture and exposes the differentiable denoising step.
+
+## Limitations
+
+The exposed denoising operation is not a reproduction of AlphaFold 3's complete
+end-to-end training program, so this family has no built-in Runner objective.
+OFoldX also does not supply the upstream training corpus or evidence pipelines.
 
 ## Citation
 

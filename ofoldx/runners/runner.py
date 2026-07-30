@@ -1,20 +1,16 @@
 r"""
 Training and evaluation runner for the trainable model families.
 
-Trainability is bound to the **exact** registered architecture: an architecture is trainable iff its
-[`register`][ofoldx.models.registry.ModelRegistry.register] call declared a training ``criterion`` (and a
-``strategy``), verified *before* any model build or weight download. The Runner resolves the architecture
-(fresh from ``model.name`` or loaded from ``model.pretrained``), builds the Model and a config-consistent
-Processor, then applies the registration's config-aware criterion and one of the generic batching/lowering/
-strategies below (the only generic Runner-side training knowledge).
+The Model registry owns only Model/Processor construction identity. The Runner
+resolves that pair, then selects its own exact architecture objective and
+batching/lowering behavior below. A registered architecture
+without a faithful built-in objective remains fully usable for model construction,
+loading, and inference; selecting it for this training Runner raises directly.
 
 DanLing drives forward → criterion → loss-normalizer → backward → step, and toggles train/eval module mode
 itself (train_epoch/evaluate_epoch/infer set ``self.mode``). The Runner adds only what DanLing cannot know
-generically: a config-bound criterion, DDP ``find_unused_parameters=True`` (the objective trains only the
-loss-path parameters, so auxiliary heads, sampling-only modules, and unexercised conditioning embedders get
-no gradient; the models return ``tensorclass`` outputs, which DDP can walk to find them), and an
-``infer_step`` that runs the family's inference entry point on its ``tensorclass`` output instead of
-DanLing's tensor-shaped default.
+generically: the architecture's objective and batching, its DDP unused-parameter setting, and an
+``infer_step`` that handles structured scientific outputs instead of DanLing's tensor-shaped default.
 """
 
 from __future__ import annotations
@@ -37,34 +33,63 @@ from .config import RunnerConfig
 _SUPPORTED_STACK = "ddp"
 
 
-#: Strategy name -> (collate, whether lowering uses the denoising training path).
-#: The sequence families collate to a ragged ``NestedTensor`` batch so each structure
-#: runs at its own length and padding cannot contaminate k-NN or attention.
-#: The diffusion families are batch=1 and lower structures to the ``(input, target)`` the denoising loss
-#: needs. The only generic Runner-side training knowledge; a trainable architecture registers a strategy.
-_STRATEGIES = {
-    "sequence": (_collate.collate_sequence, False),
-    "sequence_single": (_collate.collate_sequence_single, False),
-    "denoising": (_collate.collate_denoising, True),
-}
-
-
-def _require_trainable(registration: ModelRegistration) -> None:
+def _resolve_objective(
+    architecture: str,
+) -> tuple[
+    Callable[[Model, Processor], Callable[[Any, Any], torch.Tensor]],
+    Callable[[list[Any]], dict[str, Any]],
+    bool,
+    bool,
+]:
     r"""
-    Raise unless the architecture is trainable: its registration declares a training ``criterion`` and a
-    ``strategy`` the Runner implements. Trainability is a property of the exact registered architecture, so a
-    same-family variant that registered no criterion is simply not trainable.
+    Resolve one Runner-owned objective and its batching behavior.
+
+    The booleans independently select ``Processor.process_training`` and DDP
+    unused-parameter traversal. Family imports stay local so importing OFoldX
+    does not execute every model package.
     """
 
-    if registration.criterion is None:
-        raise ValueError(
-            f"architecture {registration.id!r} is not trainable: its registration declares no training criterion"
-        )
-    if registration.strategy not in _STRATEGIES:
-        raise ValueError(
-            f"architecture {registration.id!r} registers unknown training strategy {registration.strategy!r}; "
-            f"known strategies are {', '.join(sorted(_STRATEGIES))}"
-        )
+    if architecture == "proteinmpnn":
+        from ..models.proteinmpnn.objectives import criterion_factory
+
+        return criterion_factory, _collate.collate_sequence, False, False
+    if architecture == "ligandmpnn":
+        from ..models.ligandmpnn.objectives import criterion_factory
+
+        return criterion_factory, _collate.collate_sequence_single, False, False
+    if architecture == "nampnn":
+        from ..models.nampnn.objectives import criterion_factory
+
+        return criterion_factory, _collate.collate_sequence, False, False
+    if architecture in {
+        "boltz1",
+        "boltz2",
+        "boltzgen",
+        "protenix",
+        "protenix_template",
+        "protenix_structure_condition",
+        "protenix_constraint",
+    }:
+        from ..modules.diffusion.loss import denoising_criterion_factory
+
+        return denoising_criterion_factory, _collate.collate_denoising, True, True
+    if architecture in {"alphafold2", "alphafold2_initial_guess", "alphafold2_multimer"}:
+        from ..models.alphafold2.objectives import criterion_factory
+
+        return criterion_factory, _collate.collate_alphafold2, False, True
+    if architecture == "grnade":
+        from ..models.grnade.objectives import criterion_factory
+
+        return criterion_factory, _collate.collate_grnade, False, False
+    if architecture == "oinvfold":
+        from ..models.oinvfold.objectives import criterion_factory
+
+        return criterion_factory, _collate.collate_oinvfold, False, True
+    if architecture == "odesign":
+        from ..models.odesign.objectives import criterion_factory
+
+        return criterion_factory, _collate.collate_odesign, True, True
+    raise ValueError(f"architecture {architecture!r} has no built-in Runner objective")
 
 
 class Runner(dl.Runner):
@@ -96,22 +121,21 @@ class Runner(dl.Runner):
         # matches the snapshot actually loaded.
         repository = self._prepare_repository(config) if config.model.get("pretrained") else None
         # Resolve the architecture (no model build) so ``find_unused_parameters`` can be derived from the
-        # strategy BEFORE ``super().__init__``. It is a DDP graph-traversal flag, but DanLing's ``config_id``
-        # is ``hash(config)`` -- which includes ``ddp`` -- so it must be settled before the identity is
-        # frozen. Only the denoising families compute auxiliary heads (confidence, distogram, ...) the
-        # objective leaves untrained, so DDP must walk the ``tensorclass`` output to tolerate them; the
-        # sequence families train every forward-computed parameter and skip the traversal. An explicit user
-        # setting wins (``None`` is "unset").
+        # Runner-owned training behavior BEFORE ``super().__init__``. It is a DDP graph-traversal flag, but
+        # DanLing's ``config_id`` is ``hash(config)`` -- which includes ``ddp`` -- so it must be settled
+        # before DanLing freezes the run identity. Architectures with auxiliary heads or alternate decoders
+        # need the traversal independently of whether their Processor has a separate training lowering.
+        # An explicit user setting wins (``None`` is "unset").
         registration = self._resolve_registration(config, repository)
+        criterion_factory, collate_fn, process_training, find_unused_parameters = _resolve_objective(registration.id)
         if config.ddp.get("find_unused_parameters") is None:
-            config.ddp.find_unused_parameters = registration.strategy == "denoising"
+            config.ddp.find_unused_parameters = find_unused_parameters
         super().__init__(config)
 
         self.model, self.processor = self._build(repository, registration)
-        criterion, strategy = registration.criterion, registration.strategy
-        assert criterion is not None and strategy is not None  # _resolve_registration enforced trainability
-        self.criterion = criterion(self.model, self.processor)
-        self.collate_fn, self._process_training = _STRATEGIES[strategy]
+        self.criterion = criterion_factory(self.model, self.processor)
+        self.collate_fn = collate_fn
+        self._process_training = process_training
         # DanLing toggles module mode from its ``mode`` setter (train_epoch/evaluate_epoch/infer set it), but
         # it fixed ``mode=train`` before this model existed, so the first train_epoch's mode=train is a no-op
         # that will not force train mode -- and a repository model loads in eval(). Establish train mode here.
@@ -122,9 +146,8 @@ class Runner(dl.Runner):
 
     def _resolve_registration(self, config: RunnerConfig, repository: Any) -> ModelRegistration:
         r"""
-        Resolve the architecture registration WITHOUT building the model, and confirm it is trainable, so the
-        strategy is available before ``super().__init__`` and no download/build happens for an untrainable
-        architecture. A repository run resolves from the pinned snapshot metadata and asserts any
+        Resolve the architecture registration without building the model. A
+        repository run resolves from the pinned snapshot metadata and asserts any
         ``model.name`` against it; a fresh run resolves from ``model.name``.
         """
 
@@ -140,7 +163,6 @@ class Runner(dl.Runner):
                 )
         else:
             registration = MODELS.lookup_model(model_config["name"])
-        _require_trainable(registration)  # fail fast before downloading/building
         return registration
 
     def _build(self, repository: Any, registration: ModelRegistration) -> tuple[Model, Processor]:
@@ -198,8 +220,8 @@ class Runner(dl.Runner):
 
     def _build_from_repository(self, repository: Any) -> tuple[Model, Processor]:
         r"""
-        Load a Model/Processor pair from the already-resolved repository snapshot (architecture and
-        trainability were settled in ``_resolve_registration``). Load the Processor first -- it validates
+        Load a Model/Processor pair from the already-resolved repository snapshot. Load the Processor first --
+        it validates
         ``processor.json`` from the metadata-only snapshot before ``load_model`` hydrates the full weights.
         """
 
@@ -235,7 +257,7 @@ class Runner(dl.Runner):
         Run the family's inference entry point on the whole batch and return one output per structure on the CPU.
 
         DanLing's default ``infer_step`` calls ``pred.squeeze(-1).tolist()``, which AttributeErrors on the
-        family dataclass outputs. This override runs the strategy's inference entry point under DanLing's
+        family dataclass outputs. This override runs the family's inference entry point under DanLing's
         ``infer_context`` -- the plain forward for the sequence families (over a ragged ``NestedTensor`` batch),
         ``model.sample`` for the diffusion families (batch=1). Randomness is seeded from ``config.seed`` and
         the ordinary process-local RNG initialized by DanLing. The ragged output un-nests per structure with

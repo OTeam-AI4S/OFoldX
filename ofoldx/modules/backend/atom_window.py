@@ -107,7 +107,7 @@ def token_pair_to_atom_window_gather(
     n_queries: int,
     n_keys: int,
     backend: str,
-    num_valid_atoms: int | None = None,
+    key_index: Tensor | None = None,
 ) -> Tensor:
     r"""
     Gather token-pair features into atom-local pair windows on the selected backend.
@@ -119,9 +119,8 @@ def token_pair_to_atom_window_gather(
         n_queries: Query atoms per window.
         n_keys: Key atoms gathered around each query window.
         backend: Operator provider; see [ofoldx.modules.backend][].
-        num_valid_atoms: Number of contiguous valid atoms at the start of the atom
-            axis. When provided, key windows are shifted away from padding where
-            possible.
+        key_index: Optional ``[..., N_block, n_keys]`` atom indices carrying an
+            explicit row-specific key layout. ``-1`` marks invalid keys.
 
     Returns:
         ``[..., N_blocks, n_queries, n_keys, C]`` local atom-pair features.
@@ -129,8 +128,8 @@ def token_pair_to_atom_window_gather(
 
     backend = resolve_tensor_backend(
         backend,
-        tensors=(token_pair, atom_to_token),
-        supported=_SUPPORTED,
+        tensors=(token_pair, atom_to_token, key_index),
+        supported=("eager",) if key_index is not None else _SUPPORTED,
         public_default="eager",
     )
     if backend == "oops":
@@ -139,11 +138,8 @@ def token_pair_to_atom_window_gather(
             atom_to_token,
             n_queries=n_queries,
             n_keys=n_keys,
-            num_valid_atoms=num_valid_atoms,
         )
-    # Build per-window query/key token indices (zero-padded past the atom range, or clamped and shifted
-    # inward when num_valid_atoms is set), then gather token_pair[..., query, key, :].
-    query_indices, key_indices = _local_indices(atom_to_token, n_queries, n_keys, num_valid_atoms)
+    query_indices, key_indices = _local_indices(atom_to_token, n_queries, n_keys, key_index)
     prefix = tuple(token_pair.shape[:-3])
     blocks = query_indices.shape[-2]
     channels = token_pair.shape[-1]
@@ -158,22 +154,25 @@ def token_pair_to_atom_window_gather(
 
 
 def _local_indices(
-    atom_to_token: Tensor, n_queries: int, n_keys: int, num_valid_atoms: int | None = None
+    atom_to_token: Tensor,
+    n_queries: int,
+    n_keys: int,
+    key_index: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
     r"""
     Build the per-window query/key token indices for the atom-local pair windows.
 
     Splits the atoms into ``ceil(N_atom / n_queries)`` blocks and, for each block, records the token
-    index of every query atom and of the ``n_keys`` atoms in the key window. With ``num_valid_atoms`` unset
-    the key window is fixed and centered, with zeros beyond the atom range. With ``num_valid_atoms`` given
-    (and ``>= n_keys``), the window is clamped and shifted inward so
-    every key is a real atom and the pair-bias windows match the attention key gather.
+    index of every query atom and of the ``n_keys`` atoms in the key window.
+    ``key_index`` supplies the exact atom indices used by geometry and attention;
+    otherwise the fixed centred layout is constructed.
 
     Args:
         atom_to_token: ``[..., N_atom]`` long token indices.
         n_queries: Query atoms per window.
         n_keys: Key atoms gathered around each query window.
-        num_valid_atoms: Number of real atoms (contiguous at the front); enables the clamped layout.
+        key_index: Optional ``[..., N_block, n_keys]`` atom indices. ``-1`` marks
+            invalid keys.
 
     Returns:
         A ``(query_indices, key_indices)`` pair of shapes ``[N_blocks, n_queries]`` and
@@ -184,12 +183,17 @@ def _local_indices(
     q_pad = n_blocks * n_queries - atoms
     pad_left = (n_keys - n_queries) // 2
     query_indices = F.pad(atom_to_token, (0, q_pad), value=0).reshape(*atom_to_token.shape[:-1], n_blocks, n_queries)
-    if num_valid_atoms is not None and num_valid_atoms >= n_keys:
-        starts = (torch.arange(n_blocks, device=atom_to_token.device) * n_queries - pad_left).clamp(
-            0, num_valid_atoms - n_keys
+    if key_index is not None:
+        source_prefix = tuple(key_index.shape[:-2])
+        target_prefix = tuple(atom_to_token.shape[:-1])
+        missing = len(target_prefix) - len(source_prefix)
+        if missing:
+            key_index = key_index.reshape(*source_prefix, *((1,) * missing), *key_index.shape[-2:])
+        key_index = key_index.expand(*target_prefix, n_blocks, n_keys)
+        key_indices = (
+            atom_to_token.unsqueeze(-2).expand(*target_prefix, n_blocks, atoms).gather(-1, key_index.clamp_min(0))
         )
-        key_atom_index = starts[:, None] + torch.arange(n_keys, device=atom_to_token.device)[None, :]
-        key_indices = atom_to_token[..., key_atom_index]
+        key_indices = torch.where(key_index >= 0, key_indices, 0)
         return query_indices, key_indices
     pad_right = int((n_blocks - 1 / 2) * n_queries + n_keys / 2 - atoms + 1 / 2)
     key_indices = F.pad(atom_to_token, (pad_left, pad_right), value=0).unfold(-1, n_keys, n_queries)

@@ -103,9 +103,15 @@ the Model.
 ## Training Details
 
 OFoldX preserves the released model graph and differentiable teacher-forced
-`forward` operation. It does not reproduce the upstream dataset, batching,
-loss, screening models, experiment tracking, or training executable. A unified
-OFoldX Runner or user training loop can consume the public Model output.
+`forward` operation. The built-in Runner applies cross entropy to designable
+canonical-RNA targets, with the released `0.05` training label smoothing and
+unsmoothed evaluation loss.
+
+## Limitations
+
+Dataset construction, screening models, experiment tracking, and the upstream
+training executable remain caller-owned. The raw teacher-forced Model output is
+also available to custom training loops.
 
 ## Citation
 

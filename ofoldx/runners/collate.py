@@ -4,9 +4,9 @@ Batching of family training Inputs into DanLing's ``{"input", "target", "loss_no
 This is Runner plumbing, not model math: it turns a list of per-structure processed items into one batch
 and reports the ``loss_normalizer`` -- the exact count each family's criterion averages over, so DanLing's
 accumulation/DDP reduction (which scales the backward by ``normalizer / Σnormalizer``) forms a true global
-per-unit mean. The sequence families average over designable residues; the diffusion families average over
-resolved atoms. ``collate_single`` and ``collate_denoising`` are batch_size=1 (large single-structure models
--- multi-structure training comes from gradient accumulation weighted by the normalizer).
+per-unit mean. The sequence families average over scored residues; the diffusion families average over
+scored atoms. Large structure models remain batch_size=1; multi-structure training comes from gradient
+accumulation weighted by the normalizer.
 """
 
 from __future__ import annotations
@@ -91,6 +91,30 @@ def collate_sequence_single(batch: list[Any]) -> dict[str, Any]:
     return {"input": batched, "target": batched, "loss_normalizer": _design_count(batched)}
 
 
+def collate_alphafold2(batch: list[Any]) -> dict[str, Any]:
+    r"""Batch one AlphaFold 2 example; its masked-MSA loss is normalized per example."""
+
+    batched = collate_single(batch)
+    return {"input": batched, "target": batched, "loss_normalizer": 1}
+
+
+def collate_grnade(batch: list[Any]) -> dict[str, Any]:
+    r"""Batch one gRNAde graph, normalized by designable canonical-RNA targets."""
+
+    from ..models.grnade.model import GRNADE_UNKNOWN_TOKEN
+
+    batched = collate_single(batch)
+    known_design = batched.design_mask & (batched.sequence_tokens != GRNADE_UNKNOWN_TOKEN)
+    return {"input": batched, "target": batched, "loss_normalizer": int(known_design.sum())}
+
+
+def collate_oinvfold(batch: list[Any]) -> dict[str, Any]:
+    r"""Batch one OInvFold polymer graph, normalized by designable nodes."""
+
+    batched = collate_single(batch)
+    return {"input": batched, "target": batched, "loss_normalizer": int(batched.design_mask.sum())}
+
+
 def collate_denoising(batch: list[Any]) -> dict[str, Any]:
     r"""
     Batch-size-1 collate for the diffusion families to DanLing's batch, normalized by resolved atoms.
@@ -108,3 +132,14 @@ def collate_denoising(batch: list[Any]) -> dict[str, Any]:
     pair = {"input": model_input, "target": model_target}
     resolved = resolved_atom_mask(model_target, model_input)
     return {"input": pair, "target": pair, "loss_normalizer": int(resolved.sum())}
+
+
+def collate_odesign(batch: list[Any]) -> dict[str, Any]:
+    r"""Batch one ODesign target, normalized by resolved non-conditioning atoms."""
+
+    from ..modules.diffusion.loss import resolved_atom_mask
+
+    model_input, model_target = collate_single(batch)
+    pair = {"input": model_input, "target": model_target}
+    scored = resolved_atom_mask(model_target, model_input) & ~model_input.fixed_coordinate_mask.bool()
+    return {"input": pair, "target": pair, "loss_normalizer": int(scored.sum())}

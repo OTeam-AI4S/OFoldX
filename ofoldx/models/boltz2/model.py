@@ -3263,6 +3263,7 @@ def _decode_boltz2_fold_result(output: Boltz2ConfidenceOutput, input: Boltz2Inpu
     # atomized-ligand token_site is an ``AtomSite`` -- both are valid ``MetricReference`` values, so the token
     # The metric axis follows layout.token_sites.
     token_axis = layout.token_sites
+    chain_axis = tuple(layout.system.instances)
 
     # Per-token pLDDT (0--100) and resolved probability aligned to the token axis.
     plddt = output.plddt[0, :, :token_count].to(device="cpu", dtype=torch.float32)
@@ -3278,6 +3279,7 @@ def _decode_boltz2_fold_result(output: Boltz2ConfidenceOutput, input: Boltz2Inpu
     iptm = output.iptm[0].float().cpu()
     ligand_iptm = output.ligand_iptm[0].float().cpu()
     protein_iptm = output.protein_iptm[0].float().cpu()
+    chain_pair_iptm = output.pair_chains_iptm[0].float().cpu()
 
     # Interface confidence uses iPTM unless every iPTM value is zero, in which case it falls back to pTM.
     # The confidence score combines that interface term with complex pLDDT normalized back to 0-1.
@@ -3360,6 +3362,11 @@ def _decode_boltz2_fold_result(output: Boltz2ConfidenceOutput, input: Boltz2Inpu
                         row_axis=token_axis,
                         column_axis=token_axis,
                         unit="angstrom",
+                    ),
+                    "chain_pair_iptm": PairMetric(
+                        values=chain_pair_iptm[sample_index].numpy(),
+                        row_axis=chain_axis,
+                        column_axis=chain_axis,
                     ),
                 },
             )

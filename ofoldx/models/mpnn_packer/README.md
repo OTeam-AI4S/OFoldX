@@ -58,12 +58,13 @@ pip install ofoldx
 
 ### Side-Chain Packing
 
-Use the high-level `pack` API:
+Load the concrete packing Pipeline:
 
 ```python
 import ofoldx
 
-output = ofoldx.pack("backbone.cif", model="oteam/mpnn-packer", sequence="MKTAYIAKQR")
+pipeline = ofoldx.pipeline("pack", model="oteam/mpnn-packer")
+output = pipeline.pack("backbone.cif", sequence="MKTAYIAKQR")
 ```
 
 ## Training Details
@@ -80,6 +81,14 @@ iterative coordinate refinement. OFoldX exposes a differentiable
 `forward` over an explicit atom14 state. `encode` and `forward` accept a
 `torch.Generator` for configured training-time coordinate noise; `sample` and
 `pack` advance that same generator before torsion sampling.
+
+## Limitations
+
+The released surface publishes differentiable torsion-mixture and sampling
+math, but no independent aggregate packing-loss callable, so this family has no
+built-in Runner objective. Its raw outputs remain available to custom training
+loops. It rebuilds selected protein side chains; it does not redesign residue
+identities or ligand chemistry.
 
 ## Citation
 

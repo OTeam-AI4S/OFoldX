@@ -4,7 +4,6 @@ Boltz-1 structure-prediction implementation.
 
 from __future__ import annotations
 
-from ...modules.diffusion.loss import denoising_criterion_factory
 from ...pipelines.registry import PIPELINES as _PIPELINES
 from ..registry import MODELS as _MODELS
 from .config import (
@@ -31,8 +30,6 @@ _MODELS.register(
     "boltz1",
     model=Boltz1Model,
     processor=Boltz1Processor,
-    criterion=denoising_criterion_factory,
-    strategy="denoising",
 )
 _PIPELINES.register(
     "boltz1",

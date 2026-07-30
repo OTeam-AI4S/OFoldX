@@ -16,6 +16,7 @@ from .model import (
     GrnadeOutput,
     GrnadeSamplingOutput,
 )
+from .objectives import criterion_factory, sequence_criterion
 from .pipeline import GrnadeDesignResult, GrnadePipeline
 from .processor import GrnadeProcessor
 

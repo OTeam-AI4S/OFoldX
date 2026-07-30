@@ -28,6 +28,7 @@ from ...modules.atom import (
     LocalAtomWindowing,
     TokenToAtomDecoder,
 )
+from ...modules.atom.window import gather_key_windows
 from ...modules.attention import PairBiasedSelfAttention, TriangleAttention, TriangleMultiplication
 from ...modules.backend import LayerNorm
 from ...modules.backend.attention import triangle_attention as dispatch_triangle_attention
@@ -955,9 +956,9 @@ class AlphaFold3CoordinateDenoiser(nn.Module):
             token_hidden=token_hidden,
             atom_query=atom_output.atom_query,
             atom_context=atom_output.atom_context,
-            atom_mask=None,
+            atom_mask=inputs.atom_mask,
             attention_layout="local",
-            num_valid_atoms=inputs.local_geometry.window_info.num_valid_atoms,
+            key_index=inputs.local_geometry.window_info.key_index,
         )
         return self.preconditioner.combine_update(
             inputs.noisy_coords,
@@ -1808,11 +1809,18 @@ def _build_alphafold3_local_geometry(
     """
 
     atom_mask = atom_mask.to(torch.bool)
-    num_valid_atoms = int(atom_mask.sum(-1).amax().item())
-    position_windows = windowing(reference_positions, num_valid_atoms)
+    position_windows = windowing(reference_positions, atom_mask)
 
     query_space_id = torch.where(atom_mask, reference_space_id, 0)
-    query_space_windows = windowing(query_space_id.unsqueeze(-1), num_valid_atoms)
+    num_windows = position_windows.query.shape[-3]
+    query_padding = num_windows * windowing.num_query_atoms - query_space_id.shape[-1]
+    query_space_windows = F.pad(query_space_id.unsqueeze(-1), (0, 0, 0, query_padding))
+    query_space_windows = query_space_windows.reshape(
+        *query_space_id.shape[:-1],
+        num_windows,
+        windowing.num_query_atoms,
+        1,
+    )
 
     # Key-space ids use a dense [token, 24] layout while positions use packed queries.
     token_space_sum = reference_space_id.new_zeros(*reference_space_id.shape[:-1], num_tokens)
@@ -1823,12 +1831,17 @@ def _build_alphafold3_local_geometry(
     dense_space_id = token_space_id.unsqueeze(-1).expand(*token_space_id.shape, 24).flatten(-2)
     atom_count = atom_to_token.shape[-1]
     key_space_id = dense_space_id[..., :atom_count]
-    key_space_windows = windowing(key_space_id.unsqueeze(-1), num_valid_atoms)
+    key_space_windows = gather_key_windows(
+        key_space_id.unsqueeze(-1),
+        windowing.num_query_atoms,
+        windowing.num_key_atoms,
+        position_windows.info.key_index,
+    )
 
     distance_vectors = position_windows.query[..., None, :] - position_windows.key[..., None, :, :]
-    distance_mask = (query_space_windows.query.unsqueeze(-2) == key_space_windows.key.unsqueeze(-3)).to(
+    distance_mask = (query_space_windows.unsqueeze(-2) == key_space_windows.unsqueeze(-3)).to(
         reference_positions.dtype
-    )
+    ) * position_windows.info.attention_mask.unsqueeze(-1)
     return LocalAtomGeometry(
         distance_vectors=distance_vectors,
         distance_mask=distance_mask,

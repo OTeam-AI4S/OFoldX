@@ -110,38 +110,52 @@ class GrnadeProcessor(Processor):
                 raise ValueError("a gRNAde base pair must connect two distinct residues")
             base_pair_indices.append((first_index, second_index))
 
-        coordinates: list[np.ndarray] = []
-        atom_masks: list[np.ndarray] = []
-        for conformation in structures:
-            conformation_instance_id, conformation_sequence = self._resolve_sequence(
-                conformation,
-                instance_id,
+        if use_coordinates:
+            coordinates: list[np.ndarray] = []
+            atom_masks: list[np.ndarray] = []
+            for conformation in structures:
+                conformation_instance_id, conformation_sequence = self._resolve_sequence(
+                    conformation,
+                    instance_id,
+                )
+                if conformation_sequence.components != sequence.components:
+                    raise ValueError("gRNAde conformations must contain the same RNA sequence")
+                conformation_coordinates, conformation_atom_mask = _backbone_coordinates(
+                    conformation,
+                    conformation_instance_id,
+                    conformation_sequence,
+                    filter_by_occupancy=filter_by_occupancy,
+                )
+                coordinates.append(conformation_coordinates)
+                atom_masks.append(conformation_atom_mask)
+            coordinate_tensor = torch.as_tensor(
+                np.stack(coordinates),
+                device=self.device,
+                dtype=self.dtype,
             )
-            if conformation_sequence.components != sequence.components:
-                raise ValueError("gRNAde conformations must contain the same RNA sequence")
-            conformation_coordinates, conformation_atom_mask = _backbone_coordinates(
-                conformation,
-                conformation_instance_id,
-                conformation_sequence,
-                filter_by_occupancy=filter_by_occupancy,
+            atom_mask = torch.as_tensor(
+                np.stack(atom_masks),
+                device=self.device,
+                dtype=torch.bool,
             )
-            coordinates.append(conformation_coordinates)
-            atom_masks.append(conformation_atom_mask)
-
-        coordinate_tensor = torch.as_tensor(
-            np.stack(coordinates),
-            device=self.device,
-            dtype=self.dtype,
-        )
-        atom_mask = torch.as_tensor(
-            np.stack(atom_masks),
-            device=self.device,
-            dtype=torch.bool,
-        )
-        conformation_mask = atom_mask.any(dim=-1).any(dim=-1)
-        if not use_coordinates:
-            coordinate_tensor = torch.full_like(coordinate_tensor, _FILL_VALUE)
-            atom_mask = torch.zeros_like(atom_mask)
+            conformation_mask = atom_mask.any(dim=-1).any(dim=-1)
+        else:
+            coordinate_tensor = torch.full(
+                (1, len(sequence.components), 3, 3),
+                _FILL_VALUE,
+                device=self.device,
+                dtype=self.dtype,
+            )
+            atom_mask = torch.zeros(
+                (1, len(sequence.components), 3),
+                device=self.device,
+                dtype=torch.bool,
+            )
+            conformation_mask = torch.zeros(
+                1,
+                device=self.device,
+                dtype=torch.bool,
+            )
         sequence_tokens = torch.tensor(tokens, device=self.device, dtype=torch.long)
         if base_pair_indices:
             base_pair_index = torch.tensor(

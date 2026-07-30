@@ -23,8 +23,6 @@ _MODELS.register(
     "proteinmpnn",
     model=ProteinMpnnModel,
     processor=ProteinMpnnProcessor,
-    criterion=criterion_factory,
-    strategy="sequence",
 )
 _PIPELINES.register(
     "proteinmpnn",

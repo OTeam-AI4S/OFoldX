@@ -30,6 +30,7 @@ from .model import (
     ODesignSamplingOutput,
     ODesignStructureTarget,
 )
+from .objectives import criterion_factory, weighted_denoising_loss
 from .pipeline import (
     ODesignGrnadeChainPrediction,
     ODesignLigandDesignCandidate,

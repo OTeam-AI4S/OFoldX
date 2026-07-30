@@ -96,6 +96,13 @@ Brownian motion to residue frames, then trains the network to denoise toward
 the true frames with self-conditioning across timesteps. OFoldX exposes the
 differentiable denoiser for training and fine-tuning.
 
+## Limitations
+
+RFdiffusion has no built-in Runner objective: its differentiable denoising pass
+does not by itself reproduce the coupled translation, rotation, timestep, and
+self-conditioning training procedure. The family generates protein backbones,
+not all-atom sequence-complete designs.
+
 ## Citation
 
 ```bibtex

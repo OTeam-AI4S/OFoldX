@@ -12,9 +12,9 @@ complete.
 
 Training and evaluation run through one config-only `ofoldx.runners.Runner`
 (Danling-backed). It resolves the exact registered architecture, builds the Model and a
-config-consistent Processor, and applies the training criterion and batching strategy
-that architecture registers; an architecture is trainable exactly when its registration
-declares a criterion. Training support is not a model-registration requirement.
+config-consistent Processor, and applies the exact built-in objective and batching
+behavior owned by the Runner. Training support is not a model-registration
+requirement.
 
 ## Get Started
 
@@ -59,6 +59,27 @@ from ofoldx import AutoModel, AutoProcessor
 processor = AutoProcessor("oteam/model-name")
 model = AutoModel("oteam/model-name")
 ```
+
+Train a family with a built-in Runner objective from one ordinary configuration:
+
+```python
+from ofoldx.runners import Runner
+
+runner = Runner(
+    {
+        "epochs": 1,
+        "model": {"name": "proteinmpnn"},
+        "data": {"train": {"source": "structures/"}},
+        "optim": {"type": "adamw", "lr": 1e-4},
+        "dataloader": {"batch_size": 1},
+    }
+)
+runner.train()
+runner.close()
+```
+
+Families without a faithful built-in objective remain available through their
+Model and Pipeline APIs; the Runner does not fabricate a loss for them.
 
 Write one registered Model/Processor pair as a standard repository with the sole
 public artifact writer:

@@ -935,9 +935,8 @@ class EvoformerOuterProductMean(PostProjectionOuterProductMean):
             pair_size=pair_size,
             eps=eps,
             backend=backend,
+            projection_bias=True,
         )
-        self.left_projection = nn.Linear(msa_size, hidden_size)
-        self.right_projection = nn.Linear(msa_size, hidden_size)
 
 
 class EvoformerTriangleMultiplication(TriangleMultiplication):
@@ -968,14 +967,9 @@ class EvoformerTriangleMultiplication(TriangleMultiplication):
             pair_size=pair_size,
             hidden_size=hidden_size,
             outgoing=outgoing,
+            projection_bias=True,
             backend=backend,
         )
-        self.left_projection = nn.Linear(pair_size, hidden_size)
-        self.left_gate_projection = nn.Linear(pair_size, hidden_size)
-        self.right_projection = nn.Linear(pair_size, hidden_size)
-        self.right_gate_projection = nn.Linear(pair_size, hidden_size)
-        self.output_projection = nn.Linear(hidden_size, pair_size)
-        self.gate_projection = nn.Linear(pair_size, pair_size)
 
 
 class EvoformerTriangleAttention(TriangleAttention):

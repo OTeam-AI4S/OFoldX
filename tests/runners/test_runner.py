@@ -97,12 +97,11 @@ def test_diffusion_family_trains_config_only(tmp_path: Path) -> None:
         runner.close()
 
 
-# Exact-architecture binding: same-package variants that don't share the training contract, and unrelated
-# architectures, are all rejected -- trainability is not inferred from the family directory.
-@pytest.mark.parametrize("name", ["odesign", "boltz2_affinity", "boltzgen_confidence", "alphafold2"])
-def test_untrainable_architecture_is_rejected(tmp_path: Path, name: str) -> None:
-    with pytest.raises(ValueError, match="not trainable"):
-        Runner(_config(tmp_path, name=name))
+# Runner objectives bind to exact architecture IDs rather than being inferred from
+# a model family.
+def test_architecture_without_runner_objective_is_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="boltz2_affinity.*has no built-in Runner objective"):
+        Runner(_config(tmp_path, name="boltz2_affinity"))
 
 
 def test_selecting_no_model_is_rejected(tmp_path: Path) -> None:
@@ -117,18 +116,6 @@ def test_unsupported_stack_is_rejected(tmp_path: Path) -> None:
         Runner(config)
 
 
-def test_nampnn_criterion_binds_processor_token_scheme(tmp_path: Path) -> None:
-    # The RNA token scheme is a Processor setting; the criterion must score with the same scheme, not a
-    # baked default, or RNA smoothing mass lands on the wrong token span.
-    registration = MODELS.lookup_model("nampnn")
-    model = registration.model(registration.model_config())
-    for scheme in (True, False):
-        processor = registration.processor(registration.processor.config_class(shared_nucleic_tokens=scheme))
-        criterion = MODELS.lookup_model("nampnn").criterion(model, processor)
-        bound = criterion.__closure__[-1].cell_contents  # the captured shared_nucleic_tokens
-        assert bound is scheme
-
-
 def test_denoising_collate_normalizer_is_the_resolved_atom_count(tmp_path: Path) -> None:
     # The batch's loss_normalizer must equal the count the criterion averages over (resolved atoms), so
     # DanLing's normalizer-weighted backward forms a true per-atom mean rather than over-weighting large
@@ -137,7 +124,7 @@ def test_denoising_collate_normalizer_is_the_resolved_atom_count(tmp_path: Path)
     from ofoldx.io import read_structure
 
     item = processor.process_training(read_structure(_write(tmp_path / "chain.pdb")))
-    batch = collate_denoising([item])  # boltz1's wired collate (strategy="denoising"); wiring covered elsewhere
+    batch = collate_denoising([item])
     model_input, model_target = batch["input"]["input"], batch["input"]["target"]
     assert batch["loss_normalizer"] == int(resolved_atom_mask(model_target, model_input).sum())
 
@@ -195,8 +182,7 @@ def test_repository_model_loads_trains_and_rejects_processor_overrides(tmp_path:
 def test_diffusion_survives_ddp_second_step_via_find_unused_parameters(tmp_path: Path) -> None:
     # The single-step test cannot see it: under DDP an un-gradiented parameter crashes on the SECOND step.
     # The Runner sets find_unused_parameters=True, which locates the unused parameters by walking the
-    # forward RETURN VALUE -- possible only because the model returns a ``tensorclass`` (a plain dataclass
-    # return defeats it). So unused modules (here confidence + distogram + sampling-only) need no freezing.
+    # structured forward return. So unused modules (here confidence + distogram + sampling-only) need no freezing.
     # Build with confidence ENABLED so those parameters are genuinely present + unused.
     import torch.distributed as dist
     from tensordict import is_tensorclass

@@ -16,9 +16,7 @@ def test_windowing_shapes_padding_and_mask() -> None:
     assert windows.query.shape == (1, 3, 2, 2)
     assert windows.key.shape == (1, 3, 4, 2)
     assert windows.info.attention_mask.shape == (1, 3, 2, 4)
-    assert windows.info.query_padding == 1
-    assert windows.info.key_padding_left == 1
-    assert windows.info.key_padding_right == 2
+    assert windows.info.key_index is None
 
     # Last query window is short one atom, so it pads with a zero row.
     atoms = tensor[0]
@@ -42,9 +40,44 @@ def test_windowing_shapes_padding_and_mask() -> None:
     assert torch.equal(windows.info.attention_mask[0], expected_mask)
 
 
+def test_windowing_uses_row_specific_atom_masks() -> None:
+    tensor = torch.tensor(
+        [
+            [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+            [10.0, 11.0, 12.0, 13.0, 14.0, 1000.0, 2000.0, 3000.0],
+        ]
+    ).unsqueeze(-1)
+    atom_mask = torch.tensor(
+        [
+            [True, True, True, True, True, True, True, True],
+            [True, True, True, True, True, False, False, False],
+        ]
+    )
+
+    windows = LocalAtomWindowing(num_query_atoms=2, num_key_atoms=4)(tensor, atom_mask)
+
+    key_index = windows.info.key_index
+    assert key_index is not None
+    assert torch.equal(
+        key_index,
+        torch.tensor(
+            [
+                [[0, 1, 2, 3], [1, 2, 3, 4], [3, 4, 5, 6], [4, 5, 6, 7]],
+                [[0, 1, 2, 3], [1, 2, 3, 4], [1, 2, 3, 4], [1, 2, 3, 4]],
+            ]
+        ),
+    )
+    assert torch.equal(windows.key[0, -1, :, 0], tensor[0, 4:8, 0])
+    assert torch.equal(windows.key[1, -1, :, 0], tensor[1, 1:5, 0])
+    assert torch.equal(
+        windows.info.attention_mask[1].any(-1),
+        torch.tensor([[True, True], [True, True], [True, False], [False, False]]),
+    )
+
+
 def test_geometry() -> None:
     # Distinct positions and two reference spaces so neither the displacements nor the same-space mask is true
-    # by construction; out-of-range padded atoms read as zero position / space id 0.
+    # by construction; padded query/key slots are excluded by the window mask.
     builder = LocalAtomGeometryBuilder(num_query_atoms=2, num_key_atoms=4)
     positions = torch.tensor([[[1.0, 0, 0], [0, 2.0, 0], [3.0, 0, 0], [0, 0, 4.0], [5.0, 0, 0]]])
     reference_space_id = torch.tensor([[0, 0, 1, 1, 1]], dtype=torch.long)
@@ -81,9 +114,9 @@ def test_geometry() -> None:
     expected_mask = torch.tensor(
         [
             [
-                [[1, 1, 1, 0], [1, 1, 1, 0]],
+                [[0, 1, 1, 0], [0, 1, 1, 0]],
                 [[0, 1, 1, 1], [0, 1, 1, 1]],
-                [[1, 1, 0, 0], [0, 0, 1, 1]],
+                [[1, 1, 0, 0], [0, 0, 0, 0]],
             ]
         ],
         dtype=torch.float32,
@@ -101,7 +134,7 @@ def test_query_key_windows_match_reference(num_atoms: int, num_query_atoms: int,
     keys = gather_key_windows(tensor, num_query_atoms, num_key_atoms)
 
     num_windows = (num_atoms + num_query_atoms - 1) // num_query_atoms
-    key_padding_left = (num_key_atoms - num_query_atoms) // 2
+    key_offset = (num_key_atoms - num_query_atoms) // 2
     assert tuple(windows.info.attention_mask.shape) == (1, num_windows, num_query_atoms, num_key_atoms)
 
     assert torch.equal(windows.key, keys)
@@ -113,7 +146,7 @@ def test_query_key_windows_match_reference(num_atoms: int, num_query_atoms: int,
             else:
                 assert torch.equal(windows.query[0, window, query], torch.zeros(feature_dim))
             for key in range(num_key_atoms):
-                key_atom = window * num_query_atoms - key_padding_left + key
+                key_atom = window * num_query_atoms - key_offset + key
                 valid = query_atom < num_atoms and 0 <= key_atom < num_atoms
                 assert bool(windows.info.attention_mask[0, window, query, key]) == valid
                 if 0 <= key_atom < num_atoms:
