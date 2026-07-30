@@ -63,6 +63,7 @@ from ...modules.trunk.msa import (
     MsaPairWeightedAveraging,
     OuterProductMean,
 )
+from ...modules.trunk.pairformer import PairformerStack
 from .config import BoltzGenConfidenceConfig, BoltzGenConfig, BoltzGenInverseFoldingConfig
 
 _NUM_BOND_TYPES = 6
@@ -1940,7 +1941,7 @@ class BoltzGenMsaTrunk(nn.Module):
         token_mask: Tensor,
     ) -> Tensor:
         features = [
-            F.one_hot(msa_tokens, num_classes=self.vocab_size).to(pair.dtype),
+            F.one_hot(msa_tokens.long(), num_classes=self.vocab_size).to(pair.dtype),
             has_deletion.unsqueeze(-1).to(pair.dtype),
             deletion_value.unsqueeze(-1).to(pair.dtype),
         ]
@@ -2012,9 +2013,13 @@ class BoltzGenMsaBlock(nn.Module):
         return pair, msa
 
 
-class BoltzGenPairformerStack(nn.Module):
+class BoltzGenPairformerStack(PairformerStack):
     r"""
     Homogeneous stack of BoltzGen Pairformer blocks.
+
+    Runs the same sequential block loop as
+    [`PairformerStack`][ofoldx.modules.trunk.pairformer.PairformerStack]; only the block type
+    differs, so the base is initialised empty and the BoltzGen blocks are installed in its place.
     """
 
     def __init__(
@@ -2031,7 +2036,7 @@ class BoltzGenPairformerStack(nn.Module):
         post_layer_norm: bool = False,
         backend: str = "auto",
     ) -> None:
-        super().__init__()
+        super().__init__(num_blocks=0)
         self.num_blocks = num_blocks
         self.blocks = nn.ModuleList(
             BoltzGenPairformerBlock(
@@ -2048,11 +2053,6 @@ class BoltzGenPairformerStack(nn.Module):
             )
             for _ in range(num_blocks)
         )
-
-    def forward(self, single: Tensor, pair: Tensor, pair_mask: Tensor | None = None) -> tuple[Tensor, Tensor]:
-        for block in self.blocks:
-            single, pair = block(single, pair, pair_mask=pair_mask)
-        return single, pair
 
 
 class BoltzGenPairformerBlock(nn.Module):
@@ -2105,9 +2105,14 @@ class BoltzGenTrianglePairUpdateBlock(BoltzTrianglePairUpdateBlock):
     """
 
 
-class BoltzGenMiniformerMsaTrunk(nn.Module):
+class BoltzGenMiniformerMsaTrunk(BoltzGenMsaTrunk):
     r"""
     MSA-module variant whose pair track uses compact pair-only Miniformer blocks.
+
+    The MSA feature construction and the block loop are those of
+    [`BoltzGenMsaTrunk`][ofoldx.models.boltzgen.model.BoltzGenMsaTrunk]; only the block type
+    differs, so the base is initialised without blocks and the Miniformer blocks are installed
+    in their place.
     """
 
     def __init__(
@@ -2126,58 +2131,28 @@ class BoltzGenMiniformerMsaTrunk(nn.Module):
         expansion: int = 4,
         backend: str = "auto",
     ) -> None:
-        super().__init__()
+        super().__init__(
+            single_size=single_size,
+            msa_size=msa_size,
+            num_blocks=0,
+            vocab_size=vocab_size,
+            use_paired_feature=use_paired_feature,
+        )
         self.num_blocks = num_blocks
-        self.vocab_size = vocab_size
-        self.use_paired_feature = use_paired_feature
-        self.msa_projection = nn.Linear(
-            vocab_size + 2 + int(use_paired_feature),
-            msa_size,
-            bias=False,
-        )
-        self.token_projection = nn.Linear(single_size, msa_size, bias=False)
         self.blocks = nn.ModuleList(
-            [
-                BoltzGenMiniformerMsaBlock(
-                    msa_size=msa_size,
-                    pair_size=pair_size,
-                    outer_product_hidden_size=outer_product_hidden_size,
-                    msa_dropout=msa_dropout,
-                    pair_dropout=pair_dropout,
-                    num_msa_attention_heads=num_msa_attention_heads,
-                    msa_head_dim=msa_head_dim,
-                    expansion=expansion,
-                    backend=backend,
-                )
-                for _ in range(num_blocks)
-            ]
+            BoltzGenMiniformerMsaBlock(
+                msa_size=msa_size,
+                pair_size=pair_size,
+                outer_product_hidden_size=outer_product_hidden_size,
+                msa_dropout=msa_dropout,
+                pair_dropout=pair_dropout,
+                num_msa_attention_heads=num_msa_attention_heads,
+                msa_head_dim=msa_head_dim,
+                expansion=expansion,
+                backend=backend,
+            )
+            for _ in range(num_blocks)
         )
-
-    def forward(
-        self,
-        pair: Tensor,
-        single_inputs: Tensor,
-        *,
-        msa_tokens: Tensor,
-        has_deletion: Tensor,
-        deletion_value: Tensor,
-        is_paired: Tensor,
-        msa_mask: Tensor,
-        token_mask: Tensor,
-    ) -> Tensor:
-        features = [
-            F.one_hot(msa_tokens.long(), num_classes=self.vocab_size).to(pair.dtype),
-            has_deletion.unsqueeze(-1).to(pair.dtype),
-            deletion_value.unsqueeze(-1).to(pair.dtype),
-        ]
-        if self.use_paired_feature:
-            features.append(is_paired.unsqueeze(-1).to(pair.dtype))
-        msa_representation = self.msa_projection(torch.cat(features, dim=-1))
-        msa_representation = msa_representation + self.token_projection(single_inputs).unsqueeze(1)
-        pair_mask = pair_mask_from_token_mask(token_mask)
-        for block in self.blocks:
-            pair, msa_representation = block(pair, msa_representation, pair_mask, msa_mask)
-        return pair
 
 
 class BoltzGenMiniformerMsaBlock(nn.Module):
