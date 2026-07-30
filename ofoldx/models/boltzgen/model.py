@@ -38,8 +38,6 @@ from ...modules.attention import (
     GatedMultiheadAttention,
     PairBiasedSelfAttention,
     PerBlockPairBiasProjection,
-    TriangleAttention,
-    TriangleMultiplication,
 )
 from ...modules.backend import LayerNorm
 from ...modules.contact import BoltzContactConditioning
@@ -61,6 +59,7 @@ from ...modules.transformer import (
 )
 from ...modules.transition import ConditionedTransition, Transition
 from ...modules.trunk.msa import (
+    BoltzTrianglePairUpdateBlock,
     MsaPairWeightedAveraging,
     OuterProductMean,
 )
@@ -2100,61 +2099,10 @@ class BoltzGenPairformerBlock(nn.Module):
         return self.single_post_norm(single), pair
 
 
-class BoltzGenTrianglePairUpdateBlock(nn.Module):
+class BoltzGenTrianglePairUpdateBlock(BoltzTrianglePairUpdateBlock):
     r"""
     BoltzGen pair update with one dropout scalar per pair row or column.
     """
-
-    def __init__(
-        self,
-        pair_size: int = 128,
-        triangle_multiplication_hidden_size: int = 128,
-        triangle_attention_hidden_size: int = 32,
-        num_triangle_attention_heads: int = 4,
-        expansion: int = 4,
-        dropout: float = 0.25,
-        backend: str = "auto",
-    ) -> None:
-        super().__init__()
-        self.triangle_multiplication_outgoing = TriangleMultiplication(
-            pair_size=pair_size,
-            hidden_size=triangle_multiplication_hidden_size,
-            outgoing=True,
-            backend=backend,
-        )
-        self.rowwise_dropout = StructuredDropout(dropout, broadcast_dims=(-2, -1))
-        self.triangle_multiplication_incoming = TriangleMultiplication(
-            pair_size=pair_size,
-            hidden_size=triangle_multiplication_hidden_size,
-            outgoing=False,
-            backend=backend,
-        )
-        self.triangle_attention_starting_node = TriangleAttention(
-            pair_size=pair_size,
-            head_dim=triangle_attention_hidden_size,
-            num_attention_heads=num_triangle_attention_heads,
-            backend=backend,
-        )
-        self.triangle_attention_ending_node = TriangleAttention(
-            pair_size=pair_size,
-            head_dim=triangle_attention_hidden_size,
-            num_attention_heads=num_triangle_attention_heads,
-            backend=backend,
-        )
-        self.columnwise_dropout = StructuredDropout(dropout, broadcast_dims=(-3, -1))
-        self.transition = Transition(pair_size, expansion=expansion, backend=backend)
-
-    def forward(self, pair: Tensor, pair_mask: Tensor | None = None) -> Tensor:
-        pair = pair + self.rowwise_dropout(self.triangle_multiplication_outgoing(pair, pair_mask=pair_mask))
-        pair = pair + self.rowwise_dropout(self.triangle_multiplication_incoming(pair, pair_mask=pair_mask))
-        pair = pair + self.rowwise_dropout(self.triangle_attention_starting_node(pair, pair_mask=pair_mask))
-        end_pair_mask = None if pair_mask is None else pair_mask.transpose(-1, -2)
-        ending_update = self.triangle_attention_ending_node(
-            pair.transpose(-3, -2),
-            pair_mask=end_pair_mask,
-        ).transpose(-3, -2)
-        pair = pair + self.columnwise_dropout(ending_update)
-        return pair + self.transition(pair)
 
 
 class BoltzGenMiniformerMsaTrunk(nn.Module):

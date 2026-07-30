@@ -504,6 +504,71 @@ class TrianglePairUpdateBlock(nn.Module):
         return pair
 
 
+class BoltzTrianglePairUpdateBlock(TrianglePairUpdateBlock):
+    r"""
+    Pair update that shares one dropout scalar per pair row or column.
+
+    The Boltz-derived trunks broadcast the structured dropout mask over different axes than
+    [`TrianglePairUpdateBlock`][ofoldx.modules.trunk.msa.TrianglePairUpdateBlock]: the row
+    branches share one scalar per row, and the ending-node branch is dropped column-wise after
+    it is transposed back rather than before. The residual order and the pair transition are
+    unchanged, so only the dropout structure differs.
+
+    Args:
+        pair_size: Width of the pair representation.
+        triangle_multiplication_hidden_size: Hidden width of each triangle multiplication.
+        triangle_attention_hidden_size: Per-head width of each triangle attention.
+        num_triangle_attention_heads: Number of triangle attention heads.
+        expansion: Expansion factor of the pair transition.
+        dropout: Structured dropout probability.
+        backend: Attention backend selector.
+    """
+
+    def __init__(
+        self,
+        pair_size: int = 128,
+        triangle_multiplication_hidden_size: int = 128,
+        triangle_attention_hidden_size: int = 32,
+        num_triangle_attention_heads: int = 4,
+        expansion: int = 4,
+        dropout: float = 0.25,
+        backend: str = "auto",
+    ) -> None:
+        super().__init__(
+            pair_size=pair_size,
+            triangle_multiplication_hidden_size=triangle_multiplication_hidden_size,
+            triangle_attention_hidden_size=triangle_attention_hidden_size,
+            num_triangle_attention_heads=num_triangle_attention_heads,
+            expansion=expansion,
+            dropout=dropout,
+            backend=backend,
+        )
+        self.rowwise_dropout = StructuredDropout(dropout, broadcast_dims=(-2, -1))
+        self.columnwise_dropout = StructuredDropout(dropout, broadcast_dims=(-3, -1))
+
+    def triangle_update(self, pair: Tensor, pair_mask: Tensor | None = None) -> Tensor:
+        r"""
+        Apply the four triangle residual branches with row- and column-shared dropout.
+
+        Args:
+            pair: Pair representation `[B, N, N, pair_size]`.
+            pair_mask: Optional pair validity mask `[B, N, N]`.
+
+        Returns:
+            Pair representation after outgoing/incoming multiplication and starting/ending attention.
+        """
+
+        pair = pair + self.rowwise_dropout(self.triangle_multiplication_outgoing(pair, pair_mask=pair_mask))
+        pair = pair + self.rowwise_dropout(self.triangle_multiplication_incoming(pair, pair_mask=pair_mask))
+        pair = pair + self.rowwise_dropout(self.triangle_attention_starting_node(pair, pair_mask=pair_mask))
+        end_pair_mask = None if pair_mask is None else pair_mask.transpose(-1, -2)
+        ending_update = self.triangle_attention_ending_node(
+            pair.transpose(-3, -2),
+            pair_mask=end_pair_mask,
+        ).transpose(-3, -2)
+        return pair + self.columnwise_dropout(ending_update)
+
+
 class MsaPairWeightedAveraging(nn.Module):
     r"""
     Pair-conditioned averaging for MSA representations.

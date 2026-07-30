@@ -30,8 +30,6 @@ from ...modules.atom.window import gather_key_windows
 from ...modules.attention import (
     PairBiasedSelfAttention,
     PerBlockPairBiasProjection,
-    TriangleAttention,
-    TriangleMultiplication,
 )
 from ...modules.backend import LayerNorm
 from ...modules.diffusion.conditioning import PairwiseConditioning, condition_single
@@ -53,7 +51,7 @@ from ...modules.potential import (
 )
 from ...modules.transformer import ConditionedTransformerEncoder, TripleProductConditionedTransition
 from ...modules.transition import Transition
-from ...modules.trunk.msa import MsaPairWeightedAveraging, OuterProductMean
+from ...modules.trunk.msa import BoltzTrianglePairUpdateBlock, MsaPairWeightedAveraging, OuterProductMean
 from ...results import FoldPrediction, FoldResult, Metric, PairMetric, Score
 from .config import Boltz1Config
 
@@ -1420,61 +1418,10 @@ class Boltz1TrianglePairUpdateStack(nn.Module):
         return pair
 
 
-class Boltz1TrianglePairUpdateBlock(nn.Module):
+class Boltz1TrianglePairUpdateBlock(BoltzTrianglePairUpdateBlock):
     r"""
     Boltz-1 pair update with one dropout scalar per pair row or column.
     """
-
-    def __init__(
-        self,
-        pair_size: int = 128,
-        triangle_multiplication_hidden_size: int = 128,
-        triangle_attention_hidden_size: int = 32,
-        num_triangle_attention_heads: int = 4,
-        expansion: int = 4,
-        dropout: float = 0.25,
-        backend: str = "auto",
-    ) -> None:
-        super().__init__()
-        self.triangle_multiplication_outgoing = TriangleMultiplication(
-            pair_size=pair_size,
-            hidden_size=triangle_multiplication_hidden_size,
-            outgoing=True,
-            backend=backend,
-        )
-        self.rowwise_dropout = StructuredDropout(dropout, broadcast_dims=(-2, -1))
-        self.triangle_multiplication_incoming = TriangleMultiplication(
-            pair_size=pair_size,
-            hidden_size=triangle_multiplication_hidden_size,
-            outgoing=False,
-            backend=backend,
-        )
-        self.triangle_attention_starting_node = TriangleAttention(
-            pair_size=pair_size,
-            head_dim=triangle_attention_hidden_size,
-            num_attention_heads=num_triangle_attention_heads,
-            backend=backend,
-        )
-        self.triangle_attention_ending_node = TriangleAttention(
-            pair_size=pair_size,
-            head_dim=triangle_attention_hidden_size,
-            num_attention_heads=num_triangle_attention_heads,
-            backend=backend,
-        )
-        self.columnwise_dropout = StructuredDropout(dropout, broadcast_dims=(-3, -1))
-        self.transition = Transition(pair_size, expansion=expansion, backend=backend)
-
-    def forward(self, pair: Tensor, pair_mask: Tensor | None = None) -> Tensor:
-        pair = pair + self.rowwise_dropout(self.triangle_multiplication_outgoing(pair, pair_mask=pair_mask))
-        pair = pair + self.rowwise_dropout(self.triangle_multiplication_incoming(pair, pair_mask=pair_mask))
-        pair = pair + self.rowwise_dropout(self.triangle_attention_starting_node(pair, pair_mask=pair_mask))
-        end_pair_mask = None if pair_mask is None else pair_mask.transpose(-1, -2)
-        ending_update = self.triangle_attention_ending_node(
-            pair.transpose(-3, -2),
-            pair_mask=end_pair_mask,
-        ).transpose(-3, -2)
-        pair = pair + self.columnwise_dropout(ending_update)
-        return pair + self.transition(pair)
 
 
 class Boltz1AtomEncoder(nn.Module):
