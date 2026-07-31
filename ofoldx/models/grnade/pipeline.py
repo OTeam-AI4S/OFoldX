@@ -13,7 +13,7 @@ import torch
 from numpy.typing import NDArray
 
 from ...data.components import get_component
-from ...data.molecular import ComponentReference
+from ...data.molecular import ComponentReference, replace_components
 from ...data.structure import Structure
 from ...io import read_structure
 from ...pipelines import PairedPipeline, resolve_generator
@@ -137,50 +137,62 @@ def _decode_design(
     host_total = total_log_probability.detach().cpu().tolist()
     host_mean = mean_log_probability.detach().cpu().tolist()
     host_design = input.design_mask.detach().cpu().tolist()
+    component_index = input.component_index.detach().cpu().tolist()
+    component_references = tuple(input.structure.system.component_reference(index) for index in component_index)
     designed_scope = frozenset(
         reference
         for reference, selected in zip(
-            input.component_references,
+            component_references,
             host_design,
             strict=True,
         )
         if selected
     )
-    candidates = tuple(
-        DesignCandidate(
-            system=input.structure.system.replace_components(
-                {
-                    reference: get_component(GRNADE_COMPONENT_IDS[int(token)])
-                    for reference, token, selected in zip(
-                        input.component_references,
-                        token_row.tolist(),
-                        host_design,
-                        strict=True,
-                    )
-                    if selected
-                }
-            ),
-            scores={
-                "total_log_probability": Score(
-                    float(host_total[index]),
-                    unit="nat",
-                    preferred="higher",
-                    scope=designed_scope,
-                ),
-                "mean_log_probability": Score(
-                    float(host_mean[index]),
-                    unit="nat/residue",
-                    preferred="higher",
-                    scope=designed_scope,
-                ),
-            },
-        )
-        for index, token_row in enumerate(host_tokens)
+    selected_component_index = [index for index, selected in zip(component_index, host_design, strict=True) if selected]
+    selected_component_index_tensor = torch.tensor(
+        selected_component_index,
+        dtype=torch.long,
+        device=input.structure.system.component_symbol.device,
     )
+    candidates = []
+    for index, token_row in enumerate(host_tokens):
+        replacements = tuple(
+            get_component(GRNADE_COMPONENT_IDS[int(token)])
+            for token, selected in zip(
+                token_row.tolist(),
+                host_design,
+                strict=True,
+            )
+            if selected
+        )
+        system, _, _ = replace_components(
+            input.structure.system,
+            selected_component_index_tensor,
+            replacements,
+        )
+        candidates.append(
+            DesignCandidate(
+                system=system,
+                scores={
+                    "total_log_probability": Score(
+                        float(host_total[index]),
+                        unit="nat",
+                        preferred="higher",
+                        scope=designed_scope,
+                    ),
+                    "mean_log_probability": Score(
+                        float(host_mean[index]),
+                        unit="nat/residue",
+                        preferred="higher",
+                        scope=designed_scope,
+                    ),
+                },
+            )
+        )
     return GrnadeDesignResult(
-        candidates=candidates,
+        candidates=tuple(candidates),
         target=input.structure,
-        component_references=input.component_references,
+        component_references=component_references,
         design_mask=input.design_mask.detach().cpu().numpy(),
         sequence_tokens=host_tokens.numpy(),
         logits=logits.detach().cpu().numpy(),

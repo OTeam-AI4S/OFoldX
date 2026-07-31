@@ -17,13 +17,14 @@ from ...data.components import get_component
 from ...data.evidence import MSA, MSACollection, Template
 from ...data.molecular import (
     AMINO_ACID_THREE_TO_ONE,
+    ENTITY_MOLECULE,
+    ENTITY_PROTEIN,
     AtomSite,
     ComponentReference,
     MolecularSystem,
-    Molecule,
-    PolymerSequence,
+    instance_subgraph,
+    replace_components,
 )
-from ...data.placement import SymbolicAtomSite, SymbolicResidueSite, resolve
 from ...data.structure import Structure
 from ...io.msa import read_msa
 from ...io.structure import read_structure
@@ -56,9 +57,7 @@ from .model import (
     BoltzGenInput,
     BoltzGenInverseFoldingDesignOutput,
     BoltzGenInverseFoldingInput,
-    BoltzGenInverseFoldingLayout,
     BoltzGenInverseFoldingModel,
-    BoltzGenLayout,
     BoltzGenModel,
     BoltzGenPlacements,
     BoltzGenResidueConstraint,
@@ -305,6 +304,10 @@ class BoltzGenDesignResult:
     diversity_selected_indices: tuple[int, ...] = ()
     rank: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.int64))
     quality: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float64))
+
+    @property
+    def best(self) -> BoltzGenDesignCandidate:
+        return self.candidates[self.ranked_indices[0]]
 
     @property
     def ranked_candidates(self) -> tuple[BoltzGenDesignCandidate, ...]:
@@ -741,15 +744,17 @@ class BoltzGenPipeline(CompositePipeline):
             remaining = source_count
             while remaining:
                 current_batch_size = min(diffusion_batch_size, remaining)
-                plan = processor._plan(
+                structure, resolved_conditions, generated_references = processor._plan(
                     canonical_input,
                     placement=placement,
                     total_len=total_len,
                     conditions=condition_values,
                 )
-                canonical_msa = _resolve_msa_reference(msa, plan.system)
+                canonical_msa = _resolve_msa_reference(msa, structure.system)
                 design_input, _ = processor._lower(
-                    plan,
+                    structure,
+                    resolved_conditions,
+                    generated_references,
                     canonical_msa,
                     templates=templates,
                     generator=generator,
@@ -772,16 +777,16 @@ class BoltzGenPipeline(CompositePipeline):
                     noise_scale=noise_scale_value,
                     return_trajectory=return_trajectory,
                 )
-                layout = cast(BoltzGenLayout, design_input.layout)
-                system = layout.system
-                if system is None:
-                    raise ValueError("a design layout must carry a molecular system")
+                system = design_input.system
                 design_references = _design_references(design_input)
                 chain_design = _chain_design_references(system, design_references)
-                binding_sites = _binding_references(condition_values, layout)
+                binding_sites = _binding_references(
+                    resolved_conditions,
+                    system,
+                )
                 sequence_symmetry = _protein_sequence_symmetry(
                     system,
-                    condition_values,
+                    resolved_conditions,
                 )
                 generated.extend(
                     BoltzGenDesignCandidate(
@@ -908,7 +913,7 @@ class BoltzGenPipeline(CompositePipeline):
                 {reference[0] for reference in candidate.chain_design},
             )
             design_references = tuple(
-                reference for reference in candidate.design if reference[0] in design_structure.system.instances
+                reference for reference in candidate.design if reference[0] in _instance_ids(design_structure.system)
             )
             design_input = self.fold_processor(
                 design_structure,
@@ -969,7 +974,7 @@ class BoltzGenPipeline(CompositePipeline):
                 {reference[0] for reference in candidate.chain_design},
             )
             design_references = tuple(
-                reference for reference in candidate.design if reference[0] in design_structure.system.instances
+                reference for reference in candidate.design if reference[0] in _instance_ids(design_structure.system)
             )
             design_only_rmsd = structure_rmsd_metrics(
                 design_structure,
@@ -1375,9 +1380,31 @@ def _select_fold_prediction(predictions: Sequence[FoldPrediction]) -> int:
 
 def _all_component_references(system: MolecularSystem) -> tuple[ComponentReference, ...]:
     return tuple(
-        (instance_id, component_index)
-        for instance_id, entity_id in system.instances.items()
-        for component_index in range(len(system.entities[entity_id].components))
+        system.component_reference(component_index) for component_index in range(system.component_symbol.numel())
+    )
+
+
+def _instance_ids(system: MolecularSystem) -> frozenset[str]:
+    return frozenset(system.instance_id(index) for index in range(system.instance_symbol.numel()))
+
+
+def _atom_component_index(system: MolecularSystem) -> torch.Tensor:
+    return torch.repeat_interleave(
+        torch.arange(
+            system.component_symbol.numel(),
+            device=system.component_atom_ptr.device,
+        ),
+        system.component_atom_ptr[1:] - system.component_atom_ptr[:-1],
+    )
+
+
+def _component_instance_index(system: MolecularSystem) -> torch.Tensor:
+    return torch.repeat_interleave(
+        torch.arange(
+            system.instance_symbol.numel(),
+            device=system.instance_component_ptr.device,
+        ),
+        system.instance_component_ptr[1:] - system.instance_component_ptr[:-1],
     )
 
 
@@ -1389,21 +1416,25 @@ def _chain_design_references(
     Propagate design membership over whole instances and covalently linked instances.
     """
 
-    selected = {reference[0] for reference in design}
-    connections: dict[str, set[str]] = {instance_id: set() for instance_id in system.instances}
-    for bond in system.iter_bonds():
-        source = bond.site_a.instance_id
-        target = bond.site_b.instance_id
+    selected = {system.instance_index(reference[0]) for reference in design}
+    instance_count = system.instance_symbol.numel()
+    connections: dict[int, set[int]] = {instance_index: set() for instance_index in range(instance_count)}
+    atom_component = _atom_component_index(system)
+    component_instance = _component_instance_index(system)
+    edge_instance = component_instance[atom_component[system.edge_index]]
+    for source, target in edge_instance.detach().cpu().T.tolist():
         if source != target:
             connections[source].add(target)
             connections[target].add(source)
     pending = list(selected)
     while pending:
-        instance_id = pending.pop()
-        for connected in connections[instance_id] - selected:
+        instance_index = pending.pop()
+        for connected in connections[instance_index] - selected:
             selected.add(connected)
             pending.append(connected)
-    return tuple(reference for reference in _all_component_references(system) if reference[0] in selected)
+    return tuple(
+        reference for reference in _all_component_references(system) if system.instance_index(reference[0]) in selected
+    )
 
 
 def _target_references(
@@ -1417,15 +1448,14 @@ def _target_references(
 
 def _binding_references(
     conditions: Sequence[BoltzGenSchema],
-    layout: BoltzGenLayout,
+    system: MolecularSystem,
 ) -> tuple[ComponentReference | AtomSite, ...]:
-    system = cast(MolecularSystem, layout.system)
-
     def token_center_reference(
         site: AtomSite,
     ) -> ComponentReference | AtomSite:
-        entity = system.entities[system.instances[site.instance_id]]
-        if isinstance(entity, PolymerSequence):
+        instance_index = system.instance_index(site.instance_id)
+        entity_index = int(system.instance_entity[instance_index])
+        if int(system.entity_type[entity_index]) != ENTITY_MOLECULE:
             return (site.instance_id, site.component_index)
         return site
 
@@ -1434,26 +1464,7 @@ def _binding_references(
         if not isinstance(condition, BoltzGenBinding):
             continue
         for endpoint in condition.binding.residues:
-            if isinstance(endpoint, str):
-                references.extend(layout.placement_map[layout.instance_of[endpoint]][endpoint])
-            elif isinstance(endpoint, SymbolicResidueSite):
-                references.append(resolve(endpoint, layout.placement_map, layout.instance_of))
-            elif isinstance(endpoint, SymbolicAtomSite):
-                reference = resolve(
-                    endpoint.residue,
-                    layout.placement_map,
-                    layout.instance_of,
-                )
-                references.append(
-                    token_center_reference(
-                        AtomSite(
-                            reference[0],
-                            reference[1],
-                            endpoint.atom_id,
-                        )
-                    )
-                )
-            elif isinstance(endpoint, AtomSite):
+            if isinstance(endpoint, AtomSite):
                 references.append(token_center_reference(endpoint))
             else:
                 references.append(cast(ComponentReference, endpoint))
@@ -1464,25 +1475,47 @@ def _component_center_coordinates(
     structure: Structure,
     references: Sequence[ComponentReference | AtomSite],
 ) -> np.ndarray:
-    coordinate_index = {site: index for index, site in enumerate(structure.sites) if structure.coordinate_mask[index]}
-    centers: list[AtomSite] = []
+    system = structure.system
+    atom_symbols = system.atom_symbol.detach().cpu().tolist()
+    component_instance = _component_instance_index(system).detach().cpu().tolist()
+    centers: list[int] = []
     for reference in references:
         if isinstance(reference, AtomSite):
-            centers.append(reference)
+            atom_index = system.atom_index(reference)
+            if bool(structure.coordinate_mask[atom_index]):
+                centers.append(atom_index)
             continue
-        instance_id, component_index = reference
-        sites = tuple(
-            site
-            for site in coordinate_index
-            if site.instance_id == instance_id and site.component_index == component_index
+        component_index = system.component_index(reference)
+        atoms = tuple(
+            atom_index
+            for atom_index in range(
+                int(system.component_atom_ptr[component_index]),
+                int(system.component_atom_ptr[component_index + 1]),
+            )
+            if bool(structure.coordinate_mask[atom_index])
         )
-        entity = structure.system.entities[structure.system.instances[instance_id]]
-        if isinstance(entity, PolymerSequence):
-            by_name = {site.atom_id: site for site in sites}
-            centers.append(by_name.get("CA") or by_name.get("C1'") or sites[0])
+        if not atoms:
+            continue
+        instance_index = component_instance[component_index]
+        entity_index = int(system.instance_entity[instance_index])
+        if int(system.entity_type[entity_index]) != ENTITY_MOLECULE:
+            by_name = {system.symbols[atom_symbols[atom_index]]: atom_index for atom_index in atoms}
+            centers.append(by_name["CA"] if "CA" in by_name else by_name["C1'"] if "C1'" in by_name else atoms[0])
         else:
-            centers.extend(sites)
-    return np.asarray([structure.coordinates[coordinate_index[site]] for site in dict.fromkeys(centers)])
+            centers.extend(atoms)
+    unique = tuple(dict.fromkeys(centers))
+    return (
+        structure.coordinates[
+            torch.tensor(
+                unique,
+                dtype=torch.long,
+                device=structure.coordinates.device,
+            )
+        ]
+        .detach()
+        .cpu()
+        .numpy()
+    )
 
 
 def _binding_site_adherence(
@@ -1502,7 +1535,13 @@ def _designed_sequence(
     system: MolecularSystem,
     design: Sequence[ComponentReference],
 ) -> str:
-    return "".join(AMINO_ACID_THREE_TO_ONE.get(system.component(reference).component_id, "X") for reference in design)
+    return "".join(
+        AMINO_ACID_THREE_TO_ONE.get(
+            system.symbols[int(system.component_symbol[system.component_index(reference)])],
+            "X",
+        )
+        for reference in design
+    )
 
 
 def _designed_chain_analyses(
@@ -1514,16 +1553,19 @@ def _designed_chain_analyses(
     )
     analyses = []
     for instance_id in instance_ids:
-        entity = cast(
-            PolymerSequence,
-            system.entities[system.instances[instance_id]],
-        )
+        instance_index = system.instance_index(instance_id)
+        component_start = int(system.instance_component_ptr[instance_index])
+        component_stop = int(system.instance_component_ptr[instance_index + 1])
         designed_sequence = _designed_sequence(
             system,
             tuple(reference for reference in design if reference[0] == instance_id),
         )
         full_sequence = "".join(
-            AMINO_ACID_THREE_TO_ONE.get(component.component_id, "X") for component in entity.components
+            AMINO_ACID_THREE_TO_ONE.get(
+                system.symbols[int(system.component_symbol[component_index])],
+                "X",
+            )
+            for component_index in range(component_start, component_stop)
         )
         analyses.append(
             BoltzGenDesignedChainAnalysis(
@@ -1544,78 +1586,86 @@ def _design_ca_coordinates(
     structure: Structure,
     design: Sequence[ComponentReference],
 ) -> np.ndarray:
-    coordinate_index = {site: index for index, site in enumerate(structure.sites) if structure.coordinate_mask[index]}
-    return np.stack(
-        [
-            structure.coordinates[coordinate_index[AtomSite(instance_id, component_index, "CA")]]
-            for instance_id, component_index in design
-        ]
-    )
+    indices = [
+        structure.system.atom_index(AtomSite(instance_id, component_index, "CA"))
+        for instance_id, component_index in design
+    ]
+    return structure.coordinates[torch.tensor(indices, device=structure.coordinates.device)].detach().cpu().numpy()
 
 
 def _extract_instances(
     structure: Structure,
     selected: set[str],
 ) -> Structure:
-    instances = {
-        instance_id: entity_id
-        for instance_id, entity_id in structure.system.instances.items()
-        if instance_id in selected
-    }
-    entities = {entity_id: structure.system.entities[entity_id] for entity_id in dict.fromkeys(instances.values())}
-    bonds = frozenset(
-        bond
-        for bond in structure.system.bonds
-        if bond.site_a.instance_id in selected
-        and bond.site_b.instance_id in selected
-        and (bond.stereo_sites is None or all(site.instance_id in selected for site in bond.stereo_sites))
+    instance_mask = torch.tensor(
+        [structure.system.instance_id(index) in selected for index in range(structure.system.instance_symbol.numel())],
+        dtype=torch.bool,
+        device=structure.system.instance_symbol.device,
     )
-    system = MolecularSystem(entities, instances, bonds)
-    indices = [index for index, site in enumerate(structure.sites) if site.instance_id in selected]
-    return Structure(
+    system, component_to_new, atom_to_new = instance_subgraph(
+        structure.system,
+        instance_mask,
+    )
+    retained_atoms = atom_to_new >= 0
+    retained_components = component_to_new >= 0
+    return Structure(  # type: ignore[call-arg]
         system=system,
-        sites=tuple(structure.sites[index] for index in indices),
-        coordinates=structure.coordinates[indices].copy(),
-        coordinate_mask=structure.coordinate_mask[indices].copy(),
-        occupancy=(structure.occupancy[indices].copy() if structure.occupancy is not None else None),
-        b_factor=(structure.b_factor[indices].copy() if structure.b_factor is not None else None),
-        residue_numbers=(
-            {reference: number for reference, number in structure.residue_numbers.items() if reference[0] in selected}
-            if structure.residue_numbers is not None
-            else None
-        ),
+        coordinates=structure.coordinates[retained_atoms],
+        coordinate_mask=structure.coordinate_mask[retained_atoms],
+        occupancy=structure.occupancy[retained_atoms],
+        occupancy_mask=structure.occupancy_mask[retained_atoms],
+        b_factor=structure.b_factor[retained_atoms],
+        b_factor_mask=structure.b_factor_mask[retained_atoms],
+        source_symbols=structure.source_symbols,
+        residue_id=structure.residue_id[retained_components],
+        insertion_code=structure.insertion_code[retained_components],
+        batch_size=[],
     )
 
 
 def _decode_structure(input: BoltzGenInput, coordinates: torch.Tensor) -> Structure:
     r"""
-    Map one design sample's model atoms back onto its canonical heavy-atom sites.
+    Scatter one design sample's real model rows onto the canonical atom axis.
     """
 
-    layout = input.layout
-    if layout is None or layout.system is None:
-        raise ValueError("BoltzGen decoding requires a Processor-populated layout with a system")
-    system = layout.system
-    complete_sites = tuple(site for site, atom in system.iter_atoms() if atom.element != "H")
-    complete_index = {site: index for index, site in enumerate(complete_sites)}
-    output_coordinates = np.zeros((len(complete_sites), 3), dtype=np.float32)
-    coordinate_mask = np.zeros(len(complete_sites), dtype=np.bool_)
-    if coordinates.shape[0] < len(layout.atom_sites):
-        raise ValueError(
-            f"BoltzGen returned {coordinates.shape[0]} atom coordinates for a " f"{len(layout.atom_sites)}-atom layout"
+    system = input.system
+    atom_index = input.atom_index[0].detach().cpu()
+    atom_mask = input.atom_mask[0].detach().cpu().bool()
+    valid = atom_mask & (atom_index >= 0)
+    output_coordinates = (
+        coordinates.detach()
+        .cpu()
+        .new_zeros(
+            system.atom_symbol.numel(),
+            3,
         )
-    model_coordinates = coordinates[: len(layout.atom_sites)].float().cpu().numpy()
-    for site, values in zip(layout.atom_sites, model_coordinates, strict=True):
-        if site is None:
-            continue
-        index = complete_index[site]
-        output_coordinates[index] = values
-        coordinate_mask[index] = True
-    return Structure(
+    )
+    coordinate_mask = torch.zeros(
+        system.atom_symbol.numel(),
+        dtype=torch.bool,
+    )
+    output_coordinates[atom_index[valid]] = coordinates.detach().cpu()[valid]
+    coordinate_mask[atom_index[valid]] = True
+    return Structure(  # type: ignore[call-arg]
         system=system,
-        sites=complete_sites,
         coordinates=output_coordinates,
         coordinate_mask=coordinate_mask,
+        occupancy=output_coordinates.new_zeros(system.atom_symbol.numel()),
+        occupancy_mask=coordinate_mask.new_zeros(system.atom_symbol.numel()),
+        b_factor=output_coordinates.new_zeros(system.atom_symbol.numel()),
+        b_factor_mask=coordinate_mask.new_zeros(system.atom_symbol.numel()),
+        source_symbols=(),
+        residue_id=torch.full(
+            (system.component_symbol.numel(),),
+            -1,
+            dtype=torch.long,
+        ),
+        insertion_code=torch.full(
+            (system.component_symbol.numel(),),
+            -1,
+            dtype=torch.long,
+        ),
+        batch_size=[],
     )
 
 
@@ -1634,9 +1684,9 @@ def _resolve_msa_reference(
     if not isinstance(msa, str | PathLike):
         return msa
     proteins = [
-        entity_id
-        for entity_id, entity in system.entities.items()
-        if isinstance(entity, PolymerSequence) and entity.polymer_type == "protein"
+        system.entity_id(entity_index)
+        for entity_index in range(system.entity_symbol.numel())
+        if int(system.entity_type[entity_index]) == ENTITY_PROTEIN
     ]
     if len(proteins) != 1:
         raise ValueError("an aligned FASTA is unambiguous only for one protein entity; " "pass MSACollection")
@@ -1691,19 +1741,18 @@ def _design_references(
     Return the concrete designed protein residue occurrences.
     """
 
-    layout = cast(BoltzGenLayout, design_input.layout)
     mask = cast(torch.Tensor, design_input.design_mask)
     flags = mask[0].bool().tolist()
     molecule_types = design_input.molecule_type[0].tolist()
     return tuple(
-        reference
-        for reference, flag, molecule_type in zip(
-            layout.output_residues,
+        design_input.system.component_reference(component_index)
+        for component_index, flag, molecule_type in zip(
+            design_input.token_component_index[0].detach().cpu().tolist(),
             flags,
             molecule_types,
             strict=True,
         )
-        if flag and molecule_type == 0 and isinstance(reference, tuple)
+        if flag and molecule_type == 0
     )
 
 
@@ -1730,8 +1779,9 @@ def _is_protein_reference(
     system: MolecularSystem,
     reference: ComponentReference,
 ) -> bool:
-    entity = system.entities[system.instances[reference[0]]]
-    return isinstance(entity, PolymerSequence) and entity.polymer_type == "protein"
+    instance_index = system.instance_index(reference[0])
+    entity_index = int(system.instance_entity[instance_index])
+    return int(system.entity_type[entity_index]) == ENTITY_PROTEIN
 
 
 def _remap_designed_sequence(
@@ -1743,14 +1793,17 @@ def _remap_designed_sequence(
     Write inverse-folding residue identities into one generated backbone.
     """
 
-    layout = cast(BoltzGenInverseFoldingLayout, inverse_folding_input.layout)
     token_ids = inverse_folding_output.tokens[0].long().tolist()
     flags = cast(torch.Tensor, inverse_folding_input.design_mask)[0].bool().tolist()
     designed: dict[ComponentReference, str] = {}
-    for token_index, reference in enumerate(layout.output_residues):
+    for token_index, component_index in enumerate(
+        inverse_folding_input.token_component_index[0].detach().cpu().tolist()
+    ):
         if not flags[token_index]:
             continue
-        designed[cast(ComponentReference, reference)] = _DESIGN_TOKEN_TO_COMPONENT[token_ids[token_index]]
+        designed[inverse_folding_input.system.component_reference(component_index)] = _DESIGN_TOKEN_TO_COMPONENT[
+            token_ids[token_index]
+        ]
     if not designed:
         return backbone
     return _write_designed_structure(backbone, designed)
@@ -1765,82 +1818,119 @@ def _write_designed_structure(
     """
 
     system = backbone.system
-    design_positions = frozenset(designed)
-    new_entities: dict[str, PolymerSequence | Molecule] = {}
-    new_instances: dict[str, str] = {}
-    for instance_id, entity_id in system.instances.items():
-        entity = system.entities[entity_id]
-        if isinstance(entity, PolymerSequence):
-            components = list(entity.components)
-            changed = False
-            for index in range(len(components)):
-                component_id = designed.get((instance_id, index))
-                if component_id is not None:
-                    components[index] = get_component(component_id)
-                    changed = True
-            if changed:
-                new_entity_id = f"{entity_id}__designed_{instance_id}"
-                new_entities[new_entity_id] = PolymerSequence(
-                    entity.polymer_type,
-                    tuple(components),
-                )
-                new_instances[instance_id] = new_entity_id
-                continue
-        new_entities.setdefault(entity_id, entity)
-        new_instances[instance_id] = entity_id
+    component_index = torch.tensor(
+        [system.component_index(reference) for reference in designed],
+        dtype=torch.long,
+        device=system.component_symbol.device,
+    )
+    new_system, old_to_new, _ = replace_components(
+        system,
+        component_index,
+        [get_component(component_id) for component_id in designed.values()],
+    )
+    new_system = _repartition_entities_by_sequence(system, new_system)
 
-    new_system = MolecularSystem(new_entities, new_instances, system.bonds)
-    old_index = {site: index for index, site in enumerate(backbone.sites)}
     backbone_atoms = {"N", "CA", "C", "O"}
-    sites: list[AtomSite] = []
-    coordinates: list[np.ndarray] = []
-    coordinate_mask: list[bool] = []
-    occupancy: list[float] | None = None if backbone.occupancy is None else []
-    b_factor: list[float] | None = None if backbone.b_factor is None else []
-    for site, atom in new_system.iter_atoms():
-        if atom.element == "H":
-            continue
-        reference = (site.instance_id, site.component_index)
-        if reference in design_positions and site.atom_id not in backbone_atoms:
-            coordinate = np.zeros(3, dtype=backbone.coordinates.dtype)
-            present = False
-            source_index = None
-        else:
-            source_index = old_index.get(site)
-            coordinate = (
-                backbone.coordinates[source_index]
-                if source_index is not None
-                else np.zeros(3, dtype=backbone.coordinates.dtype)
-            )
-            present = bool(backbone.coordinate_mask[source_index]) if source_index is not None else False
-        sites.append(site)
-        coordinates.append(np.asarray(coordinate))
-        coordinate_mask.append(present)
-        if occupancy is not None:
-            occupancy.append(
-                float(backbone.occupancy[source_index])
-                if source_index is not None and backbone.occupancy is not None
-                else float("nan")
-            )
-        if b_factor is not None:
-            b_factor.append(
-                float(backbone.b_factor[source_index])
-                if source_index is not None and backbone.b_factor is not None
-                else float("nan")
-            )
+    selected = torch.zeros(
+        system.component_symbol.numel(),
+        dtype=torch.bool,
+        device=system.component_symbol.device,
+    )
+    selected[component_index] = True
+    atom_component = _atom_component_index(system)
+    atom_names = [system.symbols[index] for index in system.atom_symbol.detach().cpu().tolist()]
+    retain = (old_to_new >= 0) & (
+        ~selected[atom_component]
+        | torch.tensor(
+            [name in backbone_atoms for name in atom_names],
+            dtype=torch.bool,
+            device=old_to_new.device,
+        )
+    )
+    atom_count = new_system.atom_symbol.numel()
 
-    return Structure(
+    def transfer(value: torch.Tensor) -> torch.Tensor:
+        output = value.new_zeros((atom_count, *value.shape[1:]))
+        output[old_to_new[retain]] = value[retain]
+        return output
+
+    return Structure(  # type: ignore[call-arg]
         system=new_system,
-        sites=tuple(sites),
-        coordinates=np.asarray(
-            coordinates,
-            dtype=backbone.coordinates.dtype,
-        ).reshape(
-            len(sites),
-            3,
-        ),
-        coordinate_mask=np.asarray(coordinate_mask, dtype=np.bool_),
-        occupancy=(None if occupancy is None else np.asarray(occupancy)),
-        b_factor=(None if b_factor is None else np.asarray(b_factor)),
-        residue_numbers=backbone.residue_numbers,
+        coordinates=transfer(backbone.coordinates),
+        coordinate_mask=transfer(backbone.coordinate_mask),
+        occupancy=transfer(backbone.occupancy),
+        occupancy_mask=transfer(backbone.occupancy_mask),
+        b_factor=transfer(backbone.b_factor),
+        b_factor_mask=transfer(backbone.b_factor_mask),
+        source_symbols=backbone.source_symbols,
+        residue_id=backbone.residue_id,
+        insertion_code=backbone.insertion_code,
+        batch_size=[],
+    )
+
+
+def _repartition_entities_by_sequence(
+    original: MolecularSystem,
+    realized: MolecularSystem,
+) -> MolecularSystem:
+    r"""Split original entity copies only when their realized sequences diverge."""
+
+    symbols = list(realized.symbols)
+    symbol_index = {symbol: index for index, symbol in enumerate(symbols)}
+
+    def intern(symbol: str) -> int:
+        index = symbol_index.get(symbol)
+        if index is None:
+            index = len(symbols)
+            symbols.append(symbol)
+            symbol_index[symbol] = index
+        return index
+
+    def component_ids(system: MolecularSystem, instance: int) -> tuple[str, ...]:
+        start = int(system.instance_component_ptr[instance])
+        stop = int(system.instance_component_ptr[instance + 1])
+        return tuple(system.symbols[int(symbol)] for symbol in system.component_symbol[start:stop].tolist())
+
+    instances_by_entity: list[list[int]] = [[] for _ in range(original.entity_symbol.numel())]
+    for instance, entity in enumerate(original.instance_entity.tolist()):
+        instances_by_entity[entity].append(instance)
+
+    used_ids = {original.symbols[int(symbol)] for symbol in original.entity_symbol.tolist()}
+    entity_symbol: list[int] = []
+    entity_type: list[int] = []
+    entity_molecule_type: list[int] = []
+    instance_entity = torch.empty_like(realized.instance_entity)
+    for entity, instances in enumerate(instances_by_entity):
+        entity_id = original.symbols[int(original.entity_symbol[entity])]
+        original_signature = component_ids(original, instances[0])
+        groups: dict[tuple[str, ...], list[int]] = {}
+        for instance in instances:
+            groups.setdefault(component_ids(realized, instance), []).append(instance)
+        primary = original_signature if original_signature in groups else next(iter(groups))
+        ordered = (
+            primary,
+            *(signature for signature in groups if signature != primary),
+        )
+        for partition, signature in enumerate(ordered):
+            output_id = entity_id
+            if partition:
+                suffix = 2
+                output_id = f"{entity_id}_{suffix}"
+                while output_id in used_ids:
+                    suffix += 1
+                    output_id = f"{entity_id}_{suffix}"
+                used_ids.add(output_id)
+            output_entity = len(entity_symbol)
+            entity_symbol.append(intern(output_id))
+            entity_type.append(int(original.entity_type[entity]))
+            entity_molecule_type.append(int(original.entity_molecule_type[entity]))
+            instance_entity[groups[signature]] = output_entity
+
+    return realized.replace(  # type: ignore[attr-defined]
+        symbols=tuple(symbols),
+        system_entity_ptr=realized.system_entity_ptr.new_tensor([0, len(entity_symbol)]),
+        entity_symbol=realized.entity_symbol.new_tensor(entity_symbol),
+        entity_type=realized.entity_type.new_tensor(entity_type),
+        entity_molecule_type=realized.entity_molecule_type.new_tensor(entity_molecule_type),
+        instance_entity=instance_entity,
     )

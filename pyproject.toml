@@ -69,6 +69,7 @@ urls.repository = "https://github.com/OTeam-AI4S/OFoldX"
 
 [tool.setuptools]
 packages.find.include = [ "ofoldx*" ]
+package-data.ofoldx = [ "py.typed" ]
 
 [tool.setuptools_scm]
 write_to = "ofoldx/_version.py"

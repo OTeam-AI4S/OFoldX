@@ -37,12 +37,21 @@ Pipeline selected by the repository and call its exact interface:
 
 ```python
 import ofoldx
-from ofoldx.data import Structure
+from ofoldx.io import read_structure
 
-structure: Structure = ...  # construct or obtain one canonical Structure
+structure = read_structure("input.cif")
 pipeline = ofoldx.pipeline("design", model="oteam/proteinmpnn")
 result = pipeline.design(structure)
-print(result.candidates[0].system)
+candidate = result.candidates[0]
+system = candidate.system
+for instance in range(system.instance_symbol.numel()):
+    start = int(system.instance_component_ptr[instance])
+    stop = int(system.instance_component_ptr[instance + 1])
+    component_ids = [
+        str(system.symbols[int(symbol)])
+        for symbol in system.component_symbol[start:stop]
+    ]
+    print(system.instance_id(instance), component_ids)
 ```
 
 The same concrete Pipeline exposes that family's complete controls:

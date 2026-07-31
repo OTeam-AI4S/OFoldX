@@ -15,8 +15,8 @@ import torch
 import torch.nn.functional as F
 from tensordict import tensorclass
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
-from ...data.molecular import ComponentReference
 from ...data.structure import Structure
 from ...model import Model
 from .config import GrnadeConfig
@@ -38,22 +38,37 @@ class GrnadeModel(Model):
         config: Model architecture configuration.
 
     Examples:
-        >>> import numpy as np
+        >>> import torch
         >>> from ofoldx.data import AtomSite, MolecularSystem, PolymerSequence, Structure
         >>> from ofoldx.models.grnade import GrnadeConfig, GrnadeModel, GrnadeProcessor
         >>> sequence = PolymerSequence.from_one_letter("AG", polymer_type="rna")
-        >>> system = MolecularSystem({"rna": sequence}, {"A": "rna"})
+        >>> system = MolecularSystem.from_entities({"rna": sequence}, {"A": "rna"})
         >>> sites = tuple(
         ...     AtomSite("A", residue, atom)
         ...     for residue in range(2)
         ...     for atom in ("P", "C4'", "N9")
         ... )
-        >>> coordinates = np.asarray(
+        >>> atom_index = torch.tensor([system.atom_index(site) for site in sites])
+        >>> coordinates = torch.zeros(system.atom_symbol.numel(), 3)
+        >>> coordinates[atom_index] = torch.tensor(
         ...     [[0, 0, 0], [1, 0, 0], [1, 1, 0],
-        ...      [2, 0.5, 0.2], [3, 0.5, 0.2], [3, 1.5, 0.2]],
-        ...     dtype=np.float32,
+        ...      [2, 0.5, 0.2], [3, 0.5, 0.2], [3, 1.5, 0.2]]
         ... )
-        >>> structure = Structure(system, sites, coordinates, np.ones(6, dtype=np.bool_))
+        >>> coordinate_mask = torch.zeros(system.atom_symbol.numel(), dtype=torch.bool)
+        >>> coordinate_mask[atom_index] = True
+        >>> structure = Structure(
+        ...     system=system,
+        ...     coordinates=coordinates,
+        ...     coordinate_mask=coordinate_mask,
+        ...     occupancy=torch.zeros(system.atom_symbol.numel()),
+        ...     occupancy_mask=torch.zeros(system.atom_symbol.numel(), dtype=torch.bool),
+        ...     b_factor=torch.zeros(system.atom_symbol.numel()),
+        ...     b_factor_mask=torch.zeros(system.atom_symbol.numel(), dtype=torch.bool),
+        ...     source_symbols=(),
+        ...     residue_id=torch.full((system.component_symbol.numel(),), -1),
+        ...     insertion_code=torch.full((system.component_symbol.numel(),), -1),
+        ...     batch_size=[],
+        ... )
         >>> graph = GrnadeProcessor()(structure)
         >>> config = GrnadeConfig(
         ...     node_hidden_scalar_size=8, node_hidden_vector_size=2,
@@ -71,6 +86,7 @@ class GrnadeModel(Model):
     def __init__(self, config: GrnadeConfig | None = None) -> None:
         config = GrnadeConfig() if config is None else config
         super().__init__(config)
+        self.gradient_checkpointing = False
         node_input = (config.node_scalar_size, config.node_vector_size)
         node_hidden = (config.node_hidden_scalar_size, config.node_hidden_vector_size)
         edge_input = (config.edge_scalar_size, config.edge_vector_size)
@@ -131,13 +147,24 @@ class GrnadeModel(Model):
         source_token = self.token_embedding(input.sequence_tokens)[source]
         source_token = source_token * (source < destination).unsqueeze(-1)
         edge = (torch.cat((edge[0], source_token), dim=-1), edge[1])
+        checkpointing = self.gradient_checkpointing and self.training and torch.is_grad_enabled()
         for block in self.decoder_blocks:
-            node = block(
-                node,
-                input.edge_index,
-                edge,
-                encoder_node=encoder_node,
-            )
+            if checkpointing:
+                node = checkpoint(
+                    block,
+                    node,
+                    input.edge_index,
+                    edge,
+                    encoder_node=encoder_node,
+                    use_reentrant=False,
+                )
+            else:
+                node = block(
+                    node,
+                    input.edge_index,
+                    edge,
+                    encoder_node=encoder_node,
+                )
         logits = cast(Tensor, self.output_projection(node))
         return GrnadeOutput(logits=logits)
 
@@ -263,8 +290,18 @@ class GrnadeModel(Model):
                 )
             ),
         )
+        checkpointing = self.gradient_checkpointing and self.training and torch.is_grad_enabled()
         for block in self.encoder_blocks:
-            node = block(node, input.edge_index, edge)
+            if checkpointing:
+                node = checkpoint(
+                    block,
+                    node,
+                    input.edge_index,
+                    edge,
+                    use_reentrant=False,
+                )
+            else:
+                node = block(node, input.edge_index, edge)
         return _pool_conformations(
             node,
             edge,
@@ -678,7 +715,7 @@ class GrnadeInput:
             ``(num_residues, num_conformations)``.
         design_mask: Residues whose identities may be replaced.
         structure: Canonical source structure.
-        component_references: Residue axis aligned with all node tensors.
+        component_index: Canonical component indices aligned with all node tensors.
     """
 
     node_scalar_features: Tensor
@@ -690,7 +727,7 @@ class GrnadeInput:
     conformation_mask: Tensor
     design_mask: Tensor
     structure: Structure
-    component_references: tuple[ComponentReference, ...]
+    component_index: Tensor
 
 
 @dataclass(eq=False)

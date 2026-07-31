@@ -12,13 +12,13 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from ...data.evidence import MSA, MSACollection, Template, TemplateAlignment, resolve_msa_bindings
-from ...data.molecular import AtomSite, MolecularSystem, PolymerSequence
+from ...data.molecular import ENTITY_PROTEIN, MolecularSystem, PolymerSequence
 from ...data.structure import Structure
 from ...modules import residue_constants
 from ...modules.mpnn import virtual_beta_carbon
 from ...processor import Processor
 from .config import AlphaFold2ProcessorConfig
-from .model import AlphaFold2InitialGuessInput, AlphaFold2Input, AlphaFold2Layout
+from .model import AlphaFold2InitialGuessInput, AlphaFold2Input
 
 RESIDUE_TYPE_INDEX_BY_COMPONENT = {
     residue_constants.AMINO_ACID_ONE_TO_THREE[letter]: index
@@ -117,26 +117,26 @@ class AlphaFold2Processor(Processor):
 
         topology = input.system if isinstance(input, Structure) else input
         system = topology if isinstance(topology, MolecularSystem) else monomer_system_from_sequences(topology)
-        target, instance_id = protein_monomer(system)
-        target_entity_id = system.instances[instance_id]
+        entity_index, instance_index, component_index = protein_monomer(system)
         if isinstance(msa, MSACollection):
             raise ValueError("AlphaFold 2 monomer accepts an entity-bound MSA, not a multimer MSACollection")
         if msa is not None:
-            ((_value, _target_instance_id, entity),) = resolve_msa_bindings(msa, system)
-            if entity != target:
+            ((_value, target_instance_index, msa_entity_index),) = resolve_msa_bindings(msa, system)
+            if msa_entity_index != entity_index or target_instance_index not in (None, instance_index):
                 raise ValueError("MSA entity disagrees with the AlphaFold 2 target")
         normalized_templates = _normalize_templates(
             templates,
-            target=target,
-            target_entity_id=target_entity_id,
-            target_instance_id=instance_id,
+            system=system,
+            target_entity_index=entity_index,
+            target_instance_index=instance_index,
+            target_length=component_index.numel(),
             max_templates=self.config.max_templates,
         )
         return _prepare_alphafold2_features(
             system,
-            target=target,
-            instance_id=instance_id,
-            target_entity_id=target_entity_id,
+            component_index=component_index,
+            target_entity_index=entity_index,
+            target_instance_index=instance_index,
             msa=msa,
             templates=normalized_templates,
             device=self.device,
@@ -186,69 +186,67 @@ class AlphaFold2InitialGuessProcessor(Processor):
             Concatenated monomer/pTM features in target-then-binder order.
         """
 
-        binder_entity_id = input.system.instances[binder_instance_id]
-        binder = input.system.entities[binder_entity_id]
-        if not isinstance(binder, PolymerSequence) or binder.polymer_type != "protein":
+        system = input.system
+        binder_instance_index = system.instance_index(binder_instance_id)
+        binder_entity_index = int(system.instance_entity[binder_instance_index])
+        if int(system.entity_type[binder_entity_index]) != ENTITY_PROTEIN:
             raise ValueError("AlphaFold 2 initial guess requires a protein binder instance")
-        target_chains = tuple(
-            (instance_id, entity)
-            for instance_id, entity_id in input.system.instances.items()
-            if instance_id != binder_instance_id
-            and isinstance(entity := input.system.entities[entity_id], PolymerSequence)
-            and entity.polymer_type == "protein"
+        target_instance_indices = tuple(
+            instance_index
+            for instance_index, entity_index in enumerate(system.instance_entity.tolist())
+            if instance_index != binder_instance_index and int(system.entity_type[entity_index]) == ENTITY_PROTEIN
         )
-        if not target_chains:
+        if not target_instance_indices:
             raise ValueError("AlphaFold 2 initial guess requires at least one protein target instance")
-        chains = (*target_chains, (binder_instance_id, binder))
-        if any(len(chain) == 0 for _, chain in chains):
-            raise ValueError("AlphaFold 2 initial guess requires nonempty protein chains")
-
-        components = tuple(component for _, chain in chains for component in chain.components)
-        concatenated = PolymerSequence("protein", components)
-        synthetic = MolecularSystem(
-            entities={"complex": concatenated},
-            instances={"complex": "complex"},
+        chain_instance_indices = (*target_instance_indices, binder_instance_index)
+        chain_components = tuple(
+            torch.arange(
+                int(system.instance_component_ptr[instance_index]),
+                int(system.instance_component_ptr[instance_index + 1]),
+                device=system.instance_component_ptr.device,
+            )
+            for instance_index in chain_instance_indices
         )
+        if any(component_index.numel() == 0 for component_index in chain_components):
+            raise ValueError("AlphaFold 2 initial guess requires nonempty protein chains")
+        component_index = torch.cat(chain_components)
         base = _prepare_alphafold2_features(
-            synthetic,
-            target=concatenated,
-            instance_id="complex",
-            target_entity_id="complex",
+            system,
+            component_index=component_index,
+            target_entity_index=int(system.instance_entity[chain_instance_indices[0]]),
+            target_instance_index=chain_instance_indices[0],
             msa=None,
             templates=(),
             device=self.device,
             dtype=self.dtype,
         )
 
-        residue_sites = tuple(
-            (instance_id, component_index) for instance_id, chain in chains for component_index in range(len(chain))
-        )
         residue_indices: list[int] = []
         next_index = 0
-        for _, chain in chains:
-            residue_indices.extend(range(next_index, next_index + len(chain)))
+        for chain_component_index in chain_components:
+            residue_indices.extend(range(next_index, next_index + chain_component_index.numel()))
             next_index = residue_indices[-1] + 50
-        chain_indices = [int(instance_id == binder_instance_id) for instance_id, _ in residue_sites]
+        binder_mask = torch.cat(
+            [
+                torch.full(
+                    (chain_component_index.numel(),),
+                    instance_index == binder_instance_index,
+                    dtype=torch.bool,
+                )
+                for instance_index, chain_component_index in zip(
+                    chain_instance_indices,
+                    chain_components,
+                    strict=True,
+                )
+            ]
+        )
 
-        observed = {site: row for row, site in enumerate(input.sites)}
-        positions = torch.zeros(
-            len(residue_sites),
-            residue_constants.atom_type_num,
-            3,
-            dtype=torch.float32,
-        )
-        atom_mask = torch.zeros(
-            len(residue_sites),
-            residue_constants.atom_type_num,
-            dtype=torch.float32,
-        )
-        for residue_index, (instance_id, component_index) in enumerate(residue_sites):
-            for atom_id, atom_index in residue_constants.atom_order.items():
-                row = observed.get(AtomSite(instance_id, component_index, atom_id))
-                if row is None or not input.coordinate_mask[row]:
-                    continue
-                positions[residue_index, atom_index] = torch.from_numpy(input.coordinates[row].copy())
-                atom_mask[residue_index, atom_index] = 1.0
+        atom37_index = _atom37_indices(system, component_index)
+        safe_atom_index = atom37_index.clamp_min(0)
+        atom_mask = (atom37_index >= 0) & input.coordinate_mask[safe_atom_index]
+        positions = input.coordinates[safe_atom_index].to(dtype=torch.float32)
+        positions = torch.where(atom_mask.unsqueeze(-1), positions, torch.zeros_like(positions))
+        atom_mask = atom_mask.to(torch.float32)
 
         n = residue_constants.atom_order["N"]
         ca = residue_constants.atom_order["CA"]
@@ -265,7 +263,7 @@ class AlphaFold2InitialGuessProcessor(Processor):
         atom_mask[reconstruct_cb, cb] = 1.0
 
         template_residue_type_ids = torch.full(
-            (1, len(residue_sites)),
+            (1, component_index.numel()),
             GAP_RESIDUE_TYPE_INDEX,
             dtype=torch.long,
         )
@@ -273,9 +271,9 @@ class AlphaFold2InitialGuessProcessor(Processor):
         template_atom_mask = atom_mask.clone()
         template_atom_mask[:, 5:] = 0.0
         template_atom_mask = template_atom_mask.unsqueeze(0)
-        torsion = torch.zeros(1, len(residue_sites), 7, 2)
+        torsion = torch.zeros(1, component_index.numel(), 7, 2)
         alternative_torsion = torch.zeros_like(torsion)
-        torsion_mask = torch.zeros(1, len(residue_sites), 7)
+        torsion_mask = torch.zeros(1, component_index.numel(), 7)
 
         values = {field.name: getattr(base, field.name) for field in fields(base)}  # type: ignore[arg-type]
         values.update(
@@ -311,24 +309,15 @@ class AlphaFold2InitialGuessProcessor(Processor):
                 device=self.device,
                 dtype=self.dtype,
             ).unsqueeze(0),
-            layout=AlphaFold2Layout(
-                system=input.system,
-                residue_sites=residue_sites,
-            ),
+            system=system,
+            component_index=component_index.to(device=self.device).unsqueeze(0),
+            atom37_index=atom37_index.to(device=self.device).unsqueeze(0),
             initial_recycling_positions=positions.to(
                 device=self.device,
                 dtype=self.dtype,
             ).unsqueeze(0),
-            chain_index=torch.tensor(
-                chain_indices,
-                dtype=torch.long,
-                device=self.device,
-            ).unsqueeze(0),
-            binder_mask=torch.tensor(
-                [instance_id == binder_instance_id for instance_id, _ in residue_sites],
-                dtype=torch.bool,
-                device=self.device,
-            ).unsqueeze(0),
+            chain_index=binder_mask.to(device=self.device, dtype=torch.long).unsqueeze(0),
+            binder_mask=binder_mask.to(device=self.device).unsqueeze(0),
         )
         return AlphaFold2InitialGuessInput(**values, batch_size=[1])  # type: ignore[call-arg]
 
@@ -344,39 +333,66 @@ def monomer_system_from_sequences(
         named = [("protein", input)]
     else:
         named = [("protein", sequence) for sequence in input]
-    if len(named) != 1 or not isinstance(named[0][1], PolymerSequence):
+    if len(named) != 1:
         raise ValueError("AlphaFold 2 monomer requires exactly one PolymerSequence")
     entity_id, sequence = named[0]
-    return MolecularSystem(
+    return MolecularSystem.from_entities(
         entities={entity_id: sequence},
         instances={entity_id: entity_id},
     )
 
 
-def protein_monomer(system: MolecularSystem) -> tuple[PolymerSequence, str]:
+def protein_monomer(system: MolecularSystem) -> tuple[int, int, Tensor]:
     r"""
-    Return the single protein target and its instance id.
+    Return the single protein entity, instance, and component axes.
     """
 
-    if len(system.instances) != 1 or len(system.entities) != 1:
+    if system.instance_entity.numel() != 1 or system.entity_type.numel() != 1:
         raise ValueError("AlphaFold 2 monomer requires one protein instance")
-    instance_id, entity_id = next(iter(system.instances.items()))
-    entity = system.entities[entity_id]
-    if not isinstance(entity, PolymerSequence) or entity.polymer_type != "protein":
+    instance_index = 0
+    entity_index = int(system.instance_entity[instance_index])
+    if int(system.entity_type[entity_index]) != ENTITY_PROTEIN:
         raise ValueError("AlphaFold 2 monomer requires a protein PolymerSequence")
-    for component in entity.components:
-        component_id = component.component_id
+    component_index = torch.arange(
+        int(system.instance_component_ptr[instance_index]),
+        int(system.instance_component_ptr[instance_index + 1]),
+        device=system.instance_component_ptr.device,
+    )
+    for component_id in _component_ids(system, component_index):
         if component_id not in RESIDUE_TYPE_INDEX_BY_COMPONENT:
             raise ValueError(f"AlphaFold 2 monomer does not support protein component {component_id!r}")
-    return entity, instance_id
+    return entity_index, instance_index, component_index
+
+
+def _component_ids(system: MolecularSystem, component_index: Tensor) -> tuple[str, ...]:
+    return tuple(system.symbols[symbol] for symbol in system.component_symbol[component_index].detach().cpu().tolist())
+
+
+def _atom37_indices(system: MolecularSystem, component_index: Tensor) -> Tensor:
+    indices = torch.full(
+        (component_index.numel(), residue_constants.atom_type_num),
+        -1,
+        dtype=torch.long,
+        device=system.component_atom_ptr.device,
+    )
+    for residue_index, component in enumerate(component_index.detach().cpu().tolist()):
+        start = int(system.component_atom_ptr[component])
+        stop = int(system.component_atom_ptr[component + 1])
+        for atom in range(start, stop):
+            atom_name = system.symbols[int(system.atom_symbol[atom])]
+            atom37 = residue_constants.atom_order.get(atom_name)
+            if atom37 is not None:
+                indices[residue_index, atom37] = atom
+    return indices
 
 
 def _normalize_templates(
     templates: Sequence[Template],
     *,
-    target: PolymerSequence,
-    target_entity_id: str,
-    target_instance_id: str,
+    system: MolecularSystem,
+    target_entity_index: int,
+    target_instance_index: int,
+    target_length: int,
     max_templates: int,
 ) -> tuple[Template, ...]:
     r"""
@@ -387,13 +403,12 @@ def _normalize_templates(
         raise ValueError(f"AlphaFold 2 accepts at most {max_templates} templates")
     normalized: list[Template] = []
     for template in templates:
-        if not isinstance(template, Template):
-            raise TypeError("AlphaFold 2 templates must be explicit Template values with canonical alignments")
         select_template_alignment(
             template,
-            target_length=len(target),
-            target_entity_id=target_entity_id,
-            target_instance_id=target_instance_id,
+            system=system,
+            target_length=target_length,
+            target_entity_index=target_entity_index,
+            target_instance_index=target_instance_index,
         )
         normalized.append(template)
     return tuple(normalized)
@@ -402,9 +417,10 @@ def _normalize_templates(
 def select_template_alignment(
     template: Template,
     *,
+    system: MolecularSystem,
     target_length: int,
-    target_entity_id: str,
-    target_instance_id: str,
+    target_entity_index: int,
+    target_instance_index: int,
 ) -> TemplateAlignment:
     r"""
     Return the one Template alignment that binds to the single AlphaFold 2 target.
@@ -415,11 +431,17 @@ def select_template_alignment(
     the Processor's job: [`TemplateAlignment`][] holds no target sequence.
     """
 
-    matches = [
-        alignment
-        for alignment in template.alignments
-        if alignment.target_entity_id == target_entity_id and alignment.target_instance_id in (None, target_instance_id)
-    ]
+    matches = []
+    for alignment in template.alignments:
+        try:
+            entity_index = system.entity_index(alignment.target_entity_id)
+            instance_index = (
+                None if alignment.target_instance_id is None else system.instance_index(alignment.target_instance_id)
+            )
+        except KeyError:
+            continue
+        if entity_index == target_entity_index and instance_index in (None, target_instance_index):
+            matches.append(alignment)
     if not matches:
         raise ValueError("Template has no alignment for the AlphaFold 2 target")
     if len(matches) != 1:
@@ -433,9 +455,9 @@ def select_template_alignment(
 def _prepare_alphafold2_features(
     system: MolecularSystem,
     *,
-    target: PolymerSequence,
-    instance_id: str,
-    target_entity_id: str,
+    component_index: Tensor,
+    target_entity_index: int,
+    target_instance_index: int,
     msa: MSA | None,
     templates: tuple[Template, ...],
     device: torch.device,
@@ -449,26 +471,30 @@ def _prepare_alphafold2_features(
     and full-pool HHblits profile.
     """
 
+    component_ids = _component_ids(system, component_index)
+    num_residues = len(component_ids)
     residue_type_ids = torch.tensor(
-        [RESIDUE_TYPE_INDEX_BY_COMPONENT[component.component_id] for component in target.components], dtype=torch.long
+        [RESIDUE_TYPE_INDEX_BY_COMPONENT[component_id] for component_id in component_ids],
+        dtype=torch.long,
     )
     token_features = torch.cat(
         [
-            torch.zeros(len(target), 1),
+            torch.zeros(num_residues, 1),
             F.one_hot(residue_type_ids, num_classes=residue_constants.NUM_AMINO_ACID_TYPES + 1),
         ],
         dim=-1,
     ).to(torch.float32)
-    msa_tokens, msa_deletions, msa_profile = _msa_pool_features(target, msa)
+    msa_tokens, msa_deletions, msa_profile = _msa_pool_features(component_ids, msa)
     template_values = _template_features(
         templates,
-        target_length=len(target),
-        target_entity_id=target_entity_id,
-        target_instance_id=instance_id,
+        target_system=system,
+        target_length=num_residues,
+        target_entity_index=target_entity_index,
+        target_instance_index=target_instance_index,
     )
     floating = {
         "token_features": token_features,
-        "sequence_mask": torch.ones(len(target)),
+        "sequence_mask": torch.ones(num_residues),
         "msa_deletions": msa_deletions,
         "msa_profile": msa_profile,
     }
@@ -486,12 +512,11 @@ def _prepare_alphafold2_features(
     template_residue_type_ids = template_values[0]
     return AlphaFold2Input(  # type: ignore[call-arg]
         residue_type_ids=residue_type_ids.to(device=device).unsqueeze(0),
-        residue_index=torch.arange(len(target), device=device).unsqueeze(0),
+        residue_index=torch.arange(num_residues, device=device).unsqueeze(0),
         msa_tokens=msa_tokens.to(device=device).unsqueeze(0),
-        layout=AlphaFold2Layout(
-            system=system,
-            residue_sites=tuple((instance_id, index) for index in range(len(target))),
-        ),
+        system=system,
+        component_index=component_index.to(device=device).unsqueeze(0),
+        atom37_index=_atom37_indices(system, component_index).to(device=device).unsqueeze(0),
         template_residue_type_ids=template_residue_type_ids.to(device=device).unsqueeze(0),
         **placed,
         batch_size=[1],
@@ -499,7 +524,7 @@ def _prepare_alphafold2_features(
 
 
 def _msa_pool_features(
-    target: PolymerSequence,
+    component_ids: tuple[str, ...],
     msa: MSA | None,
 ) -> tuple[Tensor, Tensor, Tensor]:
     r"""
@@ -512,14 +537,15 @@ def _msa_pool_features(
     """
 
     query = torch.tensor(
-        [RESIDUE_TYPE_INDEX_BY_COMPONENT[component.component_id] for component in target.components], dtype=torch.long
+        [RESIDUE_TYPE_INDEX_BY_COMPONENT[component_id] for component_id in component_ids],
+        dtype=torch.long,
     )
     if msa is None:
         tokens = query.unsqueeze(0)
         deletion_counts = torch.zeros_like(tokens, dtype=torch.float32)
     else:
         # The pool is query-width, row 0 is the ungapped query, and column ``i``
-        # addresses ``target.components[i]``. Deletions are per-cell insertion counts.
+        # addresses the i-th target component. Deletions are per-cell insertion counts.
         tokens = torch.tensor(
             [
                 [RESIDUE_TYPE_INDEX_BY_SYMBOL.get(symbol, UNKNOWN_RESIDUE_TYPE_INDEX) for symbol in row]
@@ -536,9 +562,10 @@ def _msa_pool_features(
 def _template_features(
     templates: tuple[Template, ...],
     *,
+    target_system: MolecularSystem,
     target_length: int,
-    target_entity_id: str,
-    target_instance_id: str,
+    target_entity_index: int,
+    target_instance_index: int,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     r"""
     Project aligned template coordinates into atom37 and torsion features.
@@ -560,30 +587,43 @@ def _template_features(
     for template in templates:
         alignment = select_template_alignment(
             template,
+            system=target_system,
             target_length=target_length,
-            target_entity_id=target_entity_id,
-            target_instance_id=target_instance_id,
+            target_entity_index=target_entity_index,
+            target_instance_index=target_instance_index,
         )
         structure = template.structure
-        template_entity_id = structure.system.instances[alignment.template_instance_id]
-        template_entity = structure.system.entities[template_entity_id]
-        if not isinstance(template_entity, PolymerSequence) or template_entity.polymer_type != "protein":
+        template_system = structure.system
+        template_instance_index = template_system.instance_index(alignment.template_instance_id)
+        template_entity_index = int(template_system.instance_entity[template_instance_index])
+        if int(template_system.entity_type[template_entity_index]) != ENTITY_PROTEIN:
             raise ValueError("AlphaFold 2 templates must align a protein instance")
-        sites = {site: index for index, site in enumerate(structure.sites)}
+        template_component_start = int(template_system.instance_component_ptr[template_instance_index])
         residue_type_ids = torch.full((target_length,), GAP_RESIDUE_TYPE_INDEX, dtype=torch.long)
         positions = torch.zeros(target_length, residue_constants.atom_type_num, 3)
         masks = torch.zeros(target_length, residue_constants.atom_type_num)
         for target_index, template_index in alignment.residue_pairs:
-            component_id = template_entity.components[template_index].component_id
+            component = template_component_start + template_index
+            component_id = template_system.symbols[int(template_system.component_symbol[component])]
             residue_type_ids[target_index] = RESIDUE_TYPE_INDEX_BY_COMPONENT.get(
                 component_id, UNKNOWN_RESIDUE_TYPE_INDEX
             )
-            for atom_name, atom_index in residue_constants.atom_order.items():
-                site = AtomSite(alignment.template_instance_id, template_index, atom_name)
-                coordinate_index = sites.get(site)
-                if coordinate_index is None or not structure.coordinate_mask[coordinate_index]:
+            atom_start = int(template_system.component_atom_ptr[component])
+            atom_stop = int(template_system.component_atom_ptr[component + 1])
+            for atom in range(atom_start, atom_stop):
+                atom_index = residue_constants.atom_order.get(
+                    template_system.symbols[int(template_system.atom_symbol[atom])]
+                )
+                if atom_index is None or not bool(structure.coordinate_mask[atom]):
                     continue
-                positions[target_index, atom_index] = torch.from_numpy(structure.coordinates[coordinate_index].copy())
+                positions[target_index, atom_index] = (
+                    structure.coordinates[atom]
+                    .detach()
+                    .to(
+                        device=positions.device,
+                        dtype=positions.dtype,
+                    )
+                )
                 masks[target_index, atom_index] = 1.0
         template_residue_type_ids.append(residue_type_ids)
         template_positions.append(positions)

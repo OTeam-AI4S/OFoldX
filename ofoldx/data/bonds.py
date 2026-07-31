@@ -10,7 +10,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TypeAlias
 
-from .molecular import AtomSite, SystemBond
+from .molecular import (
+    AtomSite,
+    BondDirection,
+    BondKind,
+    SystemBond,
+)
 from .placement import (
     PlacementMap,
     SymbolicAtomSite,
@@ -50,8 +55,9 @@ class SymbolicBond:
     r"""
     A covalent bond with existing or symbolic endpoints.
 
-    Equality and hashing are unordered over `(site, leaving_atoms)` pairs. Bond
-    order, aromaticity, and stereochemistry are preserved by [`resolve`][].
+    Equality and hashing are unordered over ``(site, leaving_atoms)`` pairs for
+    undirected bonds. Directed bonds compare their semantic donor and acceptor
+    endpoints in order. Bond chemistry is preserved by [`resolve`][].
 
     Args:
         site_a: First existing or symbolic bond endpoint.
@@ -68,11 +74,13 @@ class SymbolicBond:
 
     site_a: SymbolicBondSite
     site_b: SymbolicBondSite
-    order: float = 1.0
-    aromatic: bool = False
+    order: float | None = 1.0
+    aromatic: bool | None = False
     stereo: str | None = None
     leaving_a: frozenset[str] = field(default_factory=frozenset)
     leaving_b: frozenset[str] = field(default_factory=frozenset)
+    kind: BondKind = "covalent"
+    direction: BondDirection = "undirected"
 
     def __post_init__(self) -> None:
         if self.site_a == self.site_b:
@@ -91,13 +99,26 @@ class SymbolicBond:
 
     def _identity(self) -> tuple[object, ...]:
         r"""
-        Return the unordered equality and hash key.
+        Return the physical equality and hash key.
         """
 
+        endpoint_a = self.site_a, self.leaving_a
+        endpoint_b = self.site_b, self.leaving_b
+        if self.direction == "undirected":
+            endpoints: object = frozenset((endpoint_a, endpoint_b))
+            direction: object = "undirected"
+        elif self.direction == "a_to_b":
+            endpoints = endpoint_a, endpoint_b
+            direction = "directed"
+        else:
+            endpoints = endpoint_b, endpoint_a
+            direction = "directed"
         return (
-            frozenset(((self.site_a, self.leaving_a), (self.site_b, self.leaving_b))),
+            endpoints,
             self.order,
             self.aromatic,
+            self.kind,
+            direction,
             self.stereo,
         )
 
@@ -131,6 +152,10 @@ class SymbolicBond:
             site_b=resolve_bond_site(self.site_b, placement_map, instance_of),
             order=self.order,
             aromatic=self.aromatic,
+            kind=self.kind,
+            direction=self.direction,
             stereo=self.stereo,
-            origin="user",
+            role="assembly",
+            leaving_a=self.leaving_a,
+            leaving_b=self.leaving_b,
         )

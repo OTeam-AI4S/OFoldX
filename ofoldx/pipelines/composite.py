@@ -15,7 +15,7 @@ import chanfig
 import torch
 from typing_extensions import Self
 
-from ..artifacts import clear_model_subrepositories, save_model
+from ..artifacts import save_model
 from ..hub import (
     PROCESSOR_METADATA,
     ResolvedRepository,
@@ -155,10 +155,6 @@ class CompositePipeline:
             source = self._composite_pair_source(pair)
             plan.append((pair, pair_directory, source))
 
-        clear_model_subrepositories(
-            destination,
-            keep={pair_directory for pair, pair_directory, source in plan if pair.subdirectory},
-        )
         for _pair, pair_directory, source in plan:
             model, processor = source
             save_model(

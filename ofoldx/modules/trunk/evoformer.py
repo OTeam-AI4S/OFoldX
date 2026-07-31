@@ -7,6 +7,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
 from ..attention import GatedMultiheadAttention, TriangleAttention, TriangleMultiplication
 from ..backend import LayerNorm
@@ -56,6 +57,7 @@ class EvoformerStack(nn.Module):
     ) -> None:
         super().__init__()
         self.num_blocks = num_blocks
+        self.gradient_checkpointing = False
         self.blocks = nn.ModuleList(
             [
                 EvoformerBlock(
@@ -91,7 +93,17 @@ class EvoformerStack(nn.Module):
         if pair_mask is None:
             pair_mask = pair.new_ones(pair.shape[:-1])
         for block in self.blocks:
-            msa, pair = block(msa, pair, msa_mask=msa_mask, pair_mask=pair_mask)
+            if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+                msa, pair = checkpoint(
+                    block,
+                    msa,
+                    pair,
+                    msa_mask=msa_mask,
+                    pair_mask=pair_mask,
+                    use_reentrant=False,
+                )
+            else:
+                msa, pair = block(msa, pair, msa_mask=msa_mask, pair_mask=pair_mask)
         return msa, pair
 
 
@@ -119,6 +131,7 @@ class ExtraMsaEvoformerStack(nn.Module):
     ) -> None:
         super().__init__()
         self.num_blocks = num_blocks
+        self.gradient_checkpointing = False
         self.blocks = nn.ModuleList(
             ExtraMsaEvoformerBlock(
                 msa_size=msa_size,
@@ -152,7 +165,17 @@ class ExtraMsaEvoformerStack(nn.Module):
         if pair_mask is None:
             pair_mask = pair.new_ones(pair.shape[:-1])
         for block in self.blocks:
-            msa, pair = block(msa, pair, msa_mask=msa_mask, pair_mask=pair_mask)
+            if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+                msa, pair = checkpoint(
+                    block,
+                    msa,
+                    pair,
+                    msa_mask=msa_mask,
+                    pair_mask=pair_mask,
+                    use_reentrant=False,
+                )
+            else:
+                msa, pair = block(msa, pair, msa_mask=msa_mask, pair_mask=pair_mask)
         return msa, pair
 
 
@@ -180,6 +203,7 @@ class OuterProductFirstEvoformerStack(nn.Module):
     ) -> None:
         super().__init__()
         self.num_blocks = num_blocks
+        self.gradient_checkpointing = False
         self.blocks = nn.ModuleList(
             OuterProductFirstEvoformerBlock(
                 msa_size=msa_size,
@@ -213,7 +237,17 @@ class OuterProductFirstEvoformerStack(nn.Module):
         if pair_mask is None:
             pair_mask = pair.new_ones(pair.shape[:-1])
         for block in self.blocks:
-            msa, pair = block(msa, pair, msa_mask=msa_mask, pair_mask=pair_mask)
+            if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+                msa, pair = checkpoint(
+                    block,
+                    msa,
+                    pair,
+                    msa_mask=msa_mask,
+                    pair_mask=pair_mask,
+                    use_reentrant=False,
+                )
+            else:
+                msa, pair = block(msa, pair, msa_mask=msa_mask, pair_mask=pair_mask)
         return msa, pair
 
 
@@ -241,6 +275,7 @@ class OuterProductFirstExtraMsaEvoformerStack(nn.Module):
     ) -> None:
         super().__init__()
         self.num_blocks = num_blocks
+        self.gradient_checkpointing = False
         self.blocks = nn.ModuleList(
             OuterProductFirstExtraMsaEvoformerBlock(
                 msa_size=msa_size,
@@ -274,7 +309,17 @@ class OuterProductFirstExtraMsaEvoformerStack(nn.Module):
         if pair_mask is None:
             pair_mask = pair.new_ones(pair.shape[:-1])
         for block in self.blocks:
-            msa, pair = block(msa, pair, msa_mask=msa_mask, pair_mask=pair_mask)
+            if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+                msa, pair = checkpoint(
+                    block,
+                    msa,
+                    pair,
+                    msa_mask=msa_mask,
+                    pair_mask=pair_mask,
+                    use_reentrant=False,
+                )
+            else:
+                msa, pair = block(msa, pair, msa_mask=msa_mask, pair_mask=pair_mask)
         return msa, pair
 
 

@@ -4,7 +4,8 @@ Multiple-sequence-alignment trunk blocks.
 
 from __future__ import annotations
 
-from torch import Tensor, nn
+from torch import Tensor, is_grad_enabled, nn
+from torch.utils.checkpoint import checkpoint
 
 from ..attention import TriangleAttention, TriangleMultiplication
 from ..backend import LayerNorm
@@ -63,6 +64,7 @@ class MsaTrunk(nn.Module):
         self.msa_projection = nn.Linear(msa_feature_size, msa_size, bias=False)
         self.token_projection = nn.Linear(token_feature_size, msa_size, bias=False)
         self.num_stages = num_stages
+        self.gradient_checkpointing = False
         self.blocks = nn.ModuleList(
             MsaPairBlock(
                 msa_size=msa_size,
@@ -129,7 +131,17 @@ class MsaTrunk(nn.Module):
         if pair_mask is None and msa_mask is not None:
             pair_mask = pair_mask_from_msa_mask(msa_mask)
         for block in self.blocks:
-            msa, pair = block(msa, pair, msa_mask=msa_mask, pair_mask=pair_mask)
+            if self.gradient_checkpointing and self.training and is_grad_enabled():
+                msa, pair = checkpoint(
+                    block,
+                    msa,
+                    pair,
+                    msa_mask=msa_mask,
+                    pair_mask=pair_mask,
+                    use_reentrant=False,
+                )
+            else:
+                msa, pair = block(msa, pair, msa_mask=msa_mask, pair_mask=pair_mask)
         if self.final_pair_update is not None:
             pair = self.final_pair_update(msa, pair, msa_mask=msa_mask, pair_mask=pair_mask)
         return msa, pair
@@ -376,6 +388,7 @@ class TrianglePairUpdateStack(nn.Module):
     ) -> None:
         super().__init__()
         self.num_blocks = num_blocks
+        self.gradient_checkpointing = False
         self.blocks = nn.ModuleList(
             TrianglePairUpdateBlock(
                 pair_size=pair_size,
@@ -402,7 +415,15 @@ class TrianglePairUpdateStack(nn.Module):
         """
 
         for block in self.blocks:
-            pair = block(pair, pair_mask=pair_mask)
+            if self.gradient_checkpointing and self.training and is_grad_enabled():
+                pair = checkpoint(
+                    block,
+                    pair,
+                    pair_mask=pair_mask,
+                    use_reentrant=False,
+                )
+            else:
+                pair = block(pair, pair_mask=pair_mask)
         return pair
 
 

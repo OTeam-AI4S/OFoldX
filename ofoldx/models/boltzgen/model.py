@@ -5,7 +5,7 @@ BoltzGen structure-design, confidence, and inverse-folding models with typed ten
 from __future__ import annotations
 
 import operator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import partial
 from typing import Literal, cast
 
@@ -13,14 +13,13 @@ import torch
 import torch.nn.functional as F
 from tensordict import tensorclass
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
 from ...data.bonds import SymbolicBond
 from ...data.conditions import Endpoint, Hotspot
-from ...data.molecular import AtomSite, ComponentReference, MolecularSystem
+from ...data.molecular import ComponentReference, MolecularSystem
 from ...data.placement import (
-    PlacementMap,
     PlacementSpec,
-    SymbolicResidueSite,
     validate_placement,
 )
 from ...model import Model
@@ -642,7 +641,7 @@ class BoltzGenModel(_BoltzGenStructureModel):
         and ``A`` is atom count.
 
         Args:
-            input: Inference features and molecular layout.
+            input: Inference features and canonical molecular graph.
             target: Structure-training labels with one or ``S`` conformers.
             num_samples: Number of independent noisy denoising samples per batch item.
             synchronize_noise_levels: Whether all samples of one batch item share
@@ -672,7 +671,7 @@ class BoltzGenModel(_BoltzGenStructureModel):
         trunk = self._run_trunk(input, recycling_steps=recycling_steps)
         conditioning = self._build_denoiser_conditioning(trunk, input)
         batch_size, conformers = target.coordinates.shape[:2]
-        atom_index = target.atom_index.long()
+        atom_index = target.coordinate_atom_index.long()
         valid_atom_index = atom_index >= 0
         safe_atom_index = atom_index.clamp_min(0)
         target_coordinates = target.coordinates.gather(
@@ -1026,28 +1025,31 @@ class BoltzGenInverseFoldingModel(Model):
         config: Model architecture and inference configuration.
 
     Examples:
-        >>> import numpy as np
-        >>> from ofoldx.data import AtomSite, MolecularSystem, PolymerSequence, Structure
+        >>> import torch
+        >>> from ofoldx.data import MolecularSystem, PolymerSequence, Structure
         >>> from ofoldx.models.boltzgen import (
         ...     BoltzGenInverseFoldingConfig,
         ...     BoltzGenInverseFoldingModel,
         ...     BoltzGenInverseFoldingProcessor,
         ... )
         >>> sequence = PolymerSequence.from_one_letter("GG")
-        >>> system = MolecularSystem({"protein": sequence}, {"A": "protein"})
-        >>> sites = tuple(
-        ...     AtomSite("A", residue, atom)
-        ...     for residue in range(2)
-        ...     for atom in ("N", "CA", "C", "O")
+        >>> system = MolecularSystem.from_entities(
+        ...     {"protein": sequence}, {"A": "protein"}
         ... )
+        >>> atom_count = system.atom_symbol.numel()
+        >>> component_count = system.component_symbol.numel()
         >>> structure = Structure(
-        ...     system,
-        ...     sites,
-        ...     np.asarray([
-        ...         [-1., 0., 0.], [0., 0., 0.], [1., 1., 0.], [1., 2., 0.],
-        ...         [2., 1., 0.], [3., 1., 0.], [4., 2., 0.], [4., 3., 0.],
-        ...     ], dtype=np.float32),
-        ...     np.ones(len(sites), dtype=np.bool_),
+        ...     system=system,
+        ...     coordinates=system.reference_coordinates,
+        ...     coordinate_mask=system.reference_coordinate_mask,
+        ...     occupancy=torch.zeros(atom_count),
+        ...     occupancy_mask=torch.zeros(atom_count, dtype=torch.bool),
+        ...     b_factor=torch.zeros(atom_count),
+        ...     b_factor_mask=torch.zeros(atom_count, dtype=torch.bool),
+        ...     source_symbols=(),
+        ...     residue_id=torch.full((component_count,), -1),
+        ...     insertion_code=torch.full((component_count,), -1),
+        ...     batch_size=[],
         ... )
         >>> input = BoltzGenInverseFoldingProcessor()(
         ...     structure,
@@ -1911,6 +1913,7 @@ class BoltzGenMsaTrunk(nn.Module):
         )
         self.token_projection = nn.Linear(single_size, msa_size, bias=False)
         self.num_blocks = num_blocks
+        self.gradient_checkpointing = False
         self.blocks = nn.ModuleList(
             BoltzGenMsaBlock(
                 msa_size=msa_size,
@@ -1951,7 +1954,17 @@ class BoltzGenMsaTrunk(nn.Module):
         msa = msa + self.token_projection(single_inputs).unsqueeze(1)
         pair_mask = pair_mask_from_token_mask(token_mask)
         for block in self.blocks:
-            pair, msa = block(pair, msa, pair_mask, msa_mask)
+            if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+                pair, msa = checkpoint(
+                    block,
+                    pair,
+                    msa,
+                    pair_mask,
+                    msa_mask,
+                    use_reentrant=False,
+                )
+            else:
+                pair, msa = block(pair, msa, pair_mask, msa_mask)
         return pair
 
 
@@ -2037,6 +2050,7 @@ class BoltzGenPairformerStack(PairformerStack):
     ) -> None:
         nn.Module.__init__(self)
         self.num_blocks = num_blocks
+        self.gradient_checkpointing = False
         self.blocks = nn.ModuleList(
             BoltzGenPairformerBlock(
                 single_size=single_size,
@@ -2130,6 +2144,7 @@ class BoltzGenMiniformerMsaTrunk(BoltzGenMsaTrunk):
     ) -> None:
         nn.Module.__init__(self)
         self.num_blocks = num_blocks
+        self.gradient_checkpointing = False
         self.vocab_size = vocab_size
         self.use_paired_feature = use_paired_feature
         self.msa_projection = nn.Linear(
@@ -2228,6 +2243,7 @@ class BoltzGenMiniformerStack(nn.Module):
     ) -> None:
         super().__init__()
         self.num_blocks = num_blocks
+        self.gradient_checkpointing = False
         self.blocks = nn.ModuleList(
             [
                 BoltzGenMiniformerBlock(
@@ -2245,7 +2261,16 @@ class BoltzGenMiniformerStack(nn.Module):
 
     def forward(self, single: Tensor, pair: Tensor, pair_mask: Tensor | None = None) -> tuple[Tensor, Tensor]:
         for block in self.blocks:
-            single, pair = block(single, pair, pair_mask=pair_mask)
+            if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+                single, pair = checkpoint(
+                    block,
+                    single,
+                    pair,
+                    pair_mask=pair_mask,
+                    use_reentrant=False,
+                )
+            else:
+                single, pair = block(single, pair, pair_mask=pair_mask)
         return single, pair
 
 
@@ -3500,6 +3525,7 @@ class BoltzGenInverseFoldingEncoder(nn.Module):
     ) -> None:
         super().__init__()
         self.num_blocks = num_blocks
+        self.gradient_checkpointing = False
         self.num_neighbors = num_neighbors
         self.max_relative_position = max_relative_position
         self.coordinate_noise = coordinate_noise
@@ -3617,7 +3643,16 @@ class BoltzGenInverseFoldingEncoder(nn.Module):
         node = self.node_input_projection(single_inputs[valid_mask])
         edge = self.edge_input_projection(torch.cat([geometry, edge_attr, bond], dim=-1))
         for block in self.blocks:
-            node, edge = block(node, edge, edge_index)
+            if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+                node, edge = checkpoint(
+                    block,
+                    node,
+                    edge,
+                    edge_index,
+                    use_reentrant=False,
+                )
+            else:
+                node, edge = block(node, edge, edge_index)
         return edge_index, valid_mask, node, edge
 
 
@@ -3639,6 +3674,7 @@ class BoltzGenInverseFoldingDecoder(nn.Module):
     ) -> None:
         super().__init__()
         self.num_blocks = num_blocks
+        self.gradient_checkpointing = False
         self.vocab_size = vocab_size
         # Each block's edge state is cat[encoder_edge, neighbour_node + residue_rep] = edge_size + node_size.
         decoder_edge_size = edge_size + node_size
@@ -3678,7 +3714,16 @@ class BoltzGenInverseFoldingDecoder(nn.Module):
         neighbors = torch.cat([edge, node[src] + residue_rep], dim=-1)
 
         for block in self.blocks:
-            node = block(node, neighbors, edge_index)
+            if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+                node = checkpoint(
+                    block,
+                    node,
+                    neighbors,
+                    edge_index,
+                    use_reentrant=False,
+                )
+            else:
+                node = block(node, neighbors, edge_index)
 
         logits = self.residue_type_head(node)
         batch_size, num_tokens = valid_mask.shape
@@ -4679,43 +4724,6 @@ def _scatter_softmax(src: Tensor, index: Tensor, dim_size: int, dim: int = 0) ->
     return exp / (denom + 1e-16)
 
 
-# ---------------------------------------------------------------------------
-# Canonical identity layouts.
-#
-# These are the non-tensor leaves the design/inverse-fold Processors populate and
-# the design Pipeline reads when it decodes tensor rows back into canonical molecular
-# identities; the model graph above deliberately ignores them.
-# ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class BoltzGenLayout:
-    r"""
-    Canonical molecular identities aligned to one ``BoltzGenModel`` tensor layout.
-    """
-
-    system: MolecularSystem | None
-    atom_sites: tuple[AtomSite | None, ...]
-    token_sites: tuple[AtomSite | tuple[str, int], ...]
-    output_residues: tuple[ComponentReference | SymbolicResidueSite, ...]
-    output_instance_ids: tuple[str, ...]
-    placement_map: PlacementMap = field(default_factory=dict)
-    instance_of: dict[str, str] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class BoltzGenInverseFoldingLayout:
-    r"""
-    Canonical molecular identities aligned to one ``BoltzGenInverseFoldingModel`` tensor layout.
-    """
-
-    system: MolecularSystem
-    atom_sites: tuple[AtomSite, ...]
-    token_sites: tuple[AtomSite | tuple[str, int], ...]
-    output_residues: tuple[ComponentReference, ...]
-    output_instance_ids: tuple[str, ...]
-
-
 @dataclass(frozen=True)
 class BoltzGenPlacements:
     r"""
@@ -4871,45 +4879,34 @@ class BoltzGenStructureTarget:
 
     Args:
         coordinates: Complete-assembly target coordinates with shape
-            ``(B, K, T, 3)``.
-        coordinate_mask: Resolved complete-assembly mask with shape ``(B, T)``.
-        atom_index: Current model-atom to truth-pool mapping with shape
-            ``(B, A)`` and ``-1`` padding.
-        chain_span: Half-open truth-pool chain spans with shape ``(B, C, 2)``.
+            ``(B, R, A_system, 3)``.
+        coordinate_mask: Resolved complete-assembly mask with shape
+            ``(B, A_system)``.
+        coordinate_atom_index: Model-row to coordinate-source mapping with shape
+            ``(B, M)`` and ``-1`` padding.
+        chain_span: Half-open canonical-atom chain spans with shape ``(B, C, 2)``.
         chain_equivalence_index: Entity-and-layout equivalence ids with shape
             ``(B, C)``.
         symmetry_atom_index: Current-axis atoms in each local symmetry group
             with shape ``(B, G, W)`` and ``-1`` padding.
         symmetry_permutation: Complete carried permutations with shape
             ``(B, G, P, W)`` and ``-1`` padding.
-        distogram_coordinates: Target token-representative coordinates with
-            shape ``(B, K, N, 3)``.
-        distogram_mask: Valid distogram-token mask with shape ``(B, N)``.
         residue_type: Unmasked target residue distributions with shape
             ``(B, N, V)``.
-        fake_atom_mask: Mask selecting synthetic design atom slots with shape
-            ``(B, A)``.
-        b_factor: Optional token-center B factors with shape ``(B, N)``; NaN
-            denotes a missing individual value.
-        bond_atom_index: Optional inter-residue atom endpoints with shape
-            ``(B, E, 2)``.
-        bond_mask: Optional valid-edge mask with shape ``(B, E)``.
+        b_factor: Canonical atom B factors with shape ``(B, A_system)``.
+        b_factor_mask: Valid B-factor mask with shape ``(B, A_system)``.
     """
 
     coordinates: Tensor
     coordinate_mask: Tensor
-    atom_index: Tensor
+    coordinate_atom_index: Tensor
     chain_span: Tensor
     chain_equivalence_index: Tensor
     symmetry_atom_index: Tensor
     symmetry_permutation: Tensor
-    distogram_coordinates: Tensor
-    distogram_mask: Tensor
     residue_type: Tensor
-    fake_atom_mask: Tensor
-    b_factor: Tensor | None = None
-    bond_atom_index: Tensor | None = None
-    bond_mask: Tensor | None = None
+    b_factor: Tensor
+    b_factor_mask: Tensor
 
 
 @tensorclass
@@ -4918,6 +4915,14 @@ class BoltzGenInput:
     Input tensors consumed by BoltzGen design models.
 
     Args:
+        system: Canonical molecular graph shared by all tensor rows.
+        atom_index: Model-row to canonical-atom identity mapping. Synthetic and
+            padding rows contain ``-1``.
+        token_component_index: Token-row to canonical-component mapping.
+        token_atom_index: Atom-token to canonical-atom mapping; component tokens
+            contain ``-1``.
+        bond_atom_index: Inter-component model-row bond endpoints.
+        bond_mask: Valid inter-component bond mask.
         token_mask: Boolean token validity mask with shape ``(B, N_token)``.
         residue_index: Chain-local residue index used by relative-position features.
         chain_index: Chain ids mapped to contiguous integer indices.
@@ -4966,10 +4971,14 @@ class BoltzGenInput:
         chain_design_mask: Optional token mask selecting the complete covalently
             connected design component. Confidence inputs must provide it.
         ss_type: Optional secondary-structure conditioning ids.
-        layout: Optional molecular identities aligned to token and atom rows. The
-            model graph does not consume it; result decoding requires it.
     """
 
+    system: MolecularSystem
+    atom_index: Tensor
+    token_component_index: Tensor
+    token_atom_index: Tensor
+    bond_atom_index: Tensor
+    bond_mask: Tensor
     token_mask: Tensor
     residue_index: Tensor
     chain_index: Tensor
@@ -5017,18 +5026,21 @@ class BoltzGenInput:
     design_mask: Tensor | None = None
     chain_design_mask: Tensor | None = None
     ss_type: Tensor | None = None
-    # Molecular identities aligned to tensor rows for result decoding.
-    layout: BoltzGenLayout | None = None
 
 
 @tensorclass
 class BoltzGenInverseFoldingInput:
     r"""
-    Tensor and molecular-layout input for BoltzGen inverse folding.
+    Tensor and canonical-graph input for BoltzGen inverse folding.
 
     ``B`` is batch size, ``N`` token count, and ``A`` atom count.
 
     Args:
+        system: Canonical molecular graph shared by all tensor rows.
+        atom_index: Model-row to canonical-atom identity mapping.
+        token_component_index: Token-row to canonical-component mapping.
+        token_atom_index: Atom-token to canonical-atom mapping; component tokens
+            contain ``-1``.
         token_mask: Valid-token mask with shape ``(B, N)``.
         residue_index: Chain-local residue indices with shape ``(B, N)``.
         chain_index: Molecular-instance indices with shape ``(B, N)``.
@@ -5056,9 +5068,12 @@ class BoltzGenInverseFoldingInput:
         aa_constraint_mask: Amino-acid block mask with shape ``(B, N, 20)``.
         symmetric_group: Sequence-symmetry group IDs with shape ``(B, N)``;
             zero means untied.
-        layout: Molecular identities aligned to the token and atom axes.
     """
 
+    system: MolecularSystem
+    atom_index: Tensor
+    token_component_index: Tensor
+    token_atom_index: Tensor
     token_mask: Tensor
     residue_index: Tensor
     chain_index: Tensor
@@ -5083,8 +5098,6 @@ class BoltzGenInverseFoldingInput:
     method_feature: Tensor | None = None
     modified: Tensor | None = None
     cyclic_period: Tensor | None = None
-    # Molecular identities aligned to inverse-folding rows for result decoding.
-    layout: BoltzGenInverseFoldingLayout | None = None
 
 
 @tensorclass

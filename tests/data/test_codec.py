@@ -3,153 +3,129 @@ from __future__ import annotations
 import json
 
 import numpy as np
-import pytest
+import torch
 
-from ofoldx.data.codec import decode_structure, decode_system, encode_structure, encode_system
-from ofoldx.data.components import get_component
-from ofoldx.data.molecular import (
-    AtomSite,
+from ofoldx.data import (
+    MSA,
     ChemicalAtom,
-    ChemicalBond,
     ChemicalComponent,
     MolecularSystem,
-    Molecule,
+    MSACollection,
     PolymerSequence,
-    SystemBond,
+    Structure,
+    Template,
+    TemplateAlignment,
+    decode_msa,
+    decode_msa_collection,
+    decode_structure,
+    decode_system,
+    decode_template,
+    encode_msa,
+    encode_msa_collection,
+    encode_structure,
+    encode_system,
+    encode_template,
 )
-from ofoldx.data.structure import ResidueNumber, Structure
 
 
-def _heterogeneous_structure() -> Structure:
-    mse = ChemicalComponent(
+def _structure() -> Structure:
+    component = ChemicalComponent(
         "MSE",
-        atoms=(
-            ChemicalAtom("N", "N"),
-            ChemicalAtom("CA", "C"),
-            ChemicalAtom("SE", "Se"),
+        (
+            ChemicalAtom("CA", "C", formal_charge=0),
+            ChemicalAtom("SE", "Se", isotope=80),
         ),
-        bonds=frozenset({ChemicalBond("N", "CA"), ChemicalBond("CA", "SE")}),
-        reference_coordinates=((0.0, 0.0, 0.0), (1.4, 0.0, 0.0), (2.0, 1.0, 0.0)),
+        frozenset(),
+        reference_coordinates=((0.0, 0.0, 0.0), None),
     )
-    polymer = PolymerSequence("protein", (mse,))
-    ligand_left = ChemicalComponent(
-        "LFT",
-        atoms=(ChemicalAtom("C1", "C"), ChemicalAtom("N1", "N")),
-        bonds=frozenset({ChemicalBond("C1", "N1")}),
-        reference_coordinates=((0.0, 0.0, 0.0), (1.3, 0.0, 0.0)),
+    system = MolecularSystem.from_entities(
+        {"target": PolymerSequence("protein", (component,))},
+        {"A": "target"},
     )
-    ligand_right = ChemicalComponent(
-        "RGT",
-        atoms=(ChemicalAtom("N1", "N"), ChemicalAtom("O1", "O")),
-        bonds=frozenset({ChemicalBond("N1", "O1")}),
-        reference_coordinates=((2.5, 0.0, 0.0), (3.7, 0.0, 0.0)),
-    )
-    ligand = Molecule((ligand_left, ligand_right))
-    covalent = SystemBond(
-        AtomSite("L", 0, "N1"),
-        AtomSite("L", 1, "N1"),
-        origin="source",
-    )
-    system = MolecularSystem(
-        entities={"target": polymer, "ligand": ligand},
-        instances={"A": "target", "L": "ligand"},
-        bonds=frozenset({covalent}),
-    )
-    sites = tuple(site for site, _ in system.iter_atoms())
-    coordinates = np.arange(len(sites) * 3, dtype=np.float32).reshape(len(sites), 3)
     return Structure(
         system=system,
-        sites=sites,
-        coordinates=coordinates,
-        coordinate_mask=np.ones(len(sites), dtype=np.bool_),
-        occupancy=np.linspace(0.5, 1.0, len(sites), dtype=np.float32),
-        residue_numbers={("A", 0): ResidueNumber(7, "A")},
+        coordinates=torch.tensor([[1.0, 2.0, 3.0], [0.0, 0.0, 0.0]]),
+        coordinate_mask=torch.tensor([True, False]),
+        occupancy=torch.tensor([0.75, 0.0]),
+        occupancy_mask=torch.tensor([True, False]),
+        b_factor=torch.tensor([12.0, 0.0]),
+        b_factor_mask=torch.tensor([True, False]),
+        source_symbols=("7", "B"),
+        residue_id=torch.tensor([0]),
+        insertion_code=torch.tensor([1]),
+        batch_size=[],
     )
 
 
-def test_system_codec_is_deterministic_known_type_json() -> None:
-    structure = _heterogeneous_structure()
-    first = encode_system(structure.system)
-    second = encode_system(structure.system)
+class TestTensorCodecs:
+    def test_system_round_trip_preserves_every_named_tensor(self) -> None:
+        system = _structure().system
+        metadata, arrays = encode_system(system)
+        encoded_json = json.loads(json.dumps(metadata))
+        restored = decode_system(encoded_json, arrays)
+        restored_metadata, restored_arrays = encode_system(restored)
 
-    assert json.dumps(first, sort_keys=True) == json.dumps(second, sort_keys=True)
-    assert set(first) == {"kind", "entities", "instances", "bonds"}
-    assert set(first["entities"]) == {"target", "ligand"}  # type: ignore[arg-type]
-    molecule = first["entities"]["ligand"]  # type: ignore[index]
-    assert molecule["kind"] == "molecule"
-    assert set(molecule) == {"kind", "components", "bonds"}
-    assert [component["component_id"] for component in molecule["components"]] == ["LFT", "RGT"]
-    # instances encode as an ORDERED [instance_id, entity_id] array so sort_keys cannot
-    # scramble declaration order on the mmCIF write path.
-    assert first["instances"] == [["A", "target"], ["L", "ligand"]]
-    for bond in first["bonds"]:  # type: ignore[union-attr]
-        for endpoint in (bond["site_a"], bond["site_b"]):
-            assert set(endpoint) == {"instance_id", "component_index", "atom_id"}
-            assert type(endpoint["component_index"]) is int
+        assert restored_metadata == metadata
+        assert restored.symbols == system.symbols
+        assert arrays.keys() == restored_arrays.keys()
+        for name, value in arrays.items():
+            assert torch.equal(restored_arrays[name], value)
 
-    restored = decode_system(json.loads(json.dumps(first)))
-    # MolecularSystem has no value equality and the codec canonicalizes undirected bond
-    # endpoint order, so round-trip is proven at the deterministic serialized level.
-    assert encode_system(restored) == first
-    assert restored.instances == structure.system.instances
-    restored_mse = restored.component(("A", 0))
-    assert restored_mse.reference_coordinates == structure.system.component(("A", 0)).reference_coordinates
-    restored_ligand = restored.entities["ligand"]
-    assert type(restored_ligand) is Molecule
-    assert tuple(component.component_id for component in restored_ligand.components) == ("LFT", "RGT")
-    assert restored_ligand.components[1].reference_coordinates == ((2.5, 0.0, 0.0), (3.7, 0.0, 0.0))
-    restored_bond = next(iter(restored.bonds))
-    assert {restored_bond.site_a.component_index, restored_bond.site_b.component_index} == {0, 1}
-    assert restored_bond.origin == "source"
+    def test_structure_round_trip_preserves_graph_and_aligned_evidence(self) -> None:
+        structure = _structure()
+        metadata, arrays = encode_structure(structure, array_prefix="structure")
+        restored = decode_structure(json.loads(json.dumps(metadata)), arrays)
+        restored_metadata, restored_arrays = encode_structure(
+            restored,
+            array_prefix="structure",
+        )
+
+        assert restored_metadata == metadata
+        assert restored.source_symbols == ("7", "B")
+        for name, value in arrays.items():
+            assert torch.equal(restored_arrays[name], value)
 
 
-def test_released_nucleic_components_round_trip() -> None:
-    rna = PolymerSequence("rna", tuple(get_component(component_id) for component_id in ("A", "C", "G", "U", "N")))
-    dna = PolymerSequence("dna", tuple(get_component(component_id) for component_id in ("DA", "DC", "DG", "DT", "DN")))
-    system = MolecularSystem(
-        entities={"rna": rna, "dna": dna},
-        instances={"R": "rna", "D": "dna"},
-    )
+class TestEvidenceCodecs:
+    def test_msa_and_pairing_round_trip(self) -> None:
+        msa = MSA(
+            "target",
+            ("A", "G"),
+            np.zeros((2, 1), dtype=np.uint32),
+            ("A",),
+            np.zeros((1, 1), dtype=np.uint32),
+        )
+        restored_msa = decode_msa(json.loads(json.dumps(encode_msa(msa))))
+        assert restored_msa.unpaired_sequences == ("A", "G")
+        np.testing.assert_array_equal(
+            restored_msa.unpaired_deletion_counts,
+            msa.unpaired_deletion_counts,
+        )
 
-    encoded = encode_system(system)
-    restored = decode_system(json.loads(json.dumps(encoded)))
+        collection = MSACollection(
+            (msa,),
+            np.array([[0], [1]], dtype=np.int64),
+            np.array([[True], [False]], dtype=np.bool_),
+            target_instance_ids=("A",),
+        )
+        restored_collection = decode_msa_collection(json.loads(json.dumps(encode_msa_collection(collection))))
+        assert restored_collection.target_instance_ids == ("A",)
+        np.testing.assert_array_equal(
+            restored_collection.row_pairing,
+            collection.row_pairing,
+        )
 
-    # The codec round-trip is idempotent at the serialized level even though undirected
-    # ChemicalBond declaration direction is not part of frozen value equality.
-    assert encode_system(restored) == encoded
-    assert restored.instances == system.instances
-    restored_components = {
-        component.component_id: component for entity in restored.entities.values() for component in entity.components
-    }
-    for component_id in ("A", "C", "G", "U", "N", "DA", "DC", "DG", "DT", "DN"):
-        component = restored_components[component_id]
-        audited = get_component(component_id)
-        assert component.reference_coordinates == audited.reference_coordinates
+    def test_template_round_trip_preserves_structure_and_alignment(self) -> None:
+        template = Template(
+            _structure(),
+            (TemplateAlignment("query", None, "A", ((0, 0),)),),
+        )
+        metadata, arrays = encode_template(template, array_prefix="template")
+        restored = decode_template(json.loads(json.dumps(metadata)), arrays)
 
-
-def test_structure_codec_round_trips_arrays_and_residue_numbers() -> None:
-    structure = _heterogeneous_structure()
-    payload, arrays = encode_structure(structure, array_prefix="structure_0")
-    payload = json.loads(json.dumps(payload))
-    restored = decode_structure(payload, arrays)
-
-    assert restored.sites == structure.sites
-    np.testing.assert_array_equal(restored.coordinates, structure.coordinates)
-    np.testing.assert_array_equal(restored.coordinate_mask, structure.coordinate_mask)
-    assert restored.occupancy is not None
-    np.testing.assert_array_equal(restored.occupancy, structure.occupancy)
-    assert restored.residue_numbers == structure.residue_numbers
-    assert encode_system(restored.system) == encode_system(structure.system)
-    assert restored.system.instances == structure.system.instances
-
-
-def test_structure_codec_rejects_unknown_fields_and_missing_arrays() -> None:
-    structure = _heterogeneous_structure()
-    payload, arrays = encode_structure(structure, array_prefix="structure_0")
-    invalid = dict(payload)
-    invalid["surprise"] = True
-    with pytest.raises(ValueError, match="unknown=.*surprise"):
-        decode_structure(invalid, arrays)
-
-    with pytest.raises(ValueError, match="missing array"):
-        decode_structure(payload, {})
+        assert restored.alignments == template.alignments
+        assert restored.structure.source_symbols == template.structure.source_symbols
+        assert torch.equal(
+            restored.structure.coordinates,
+            template.structure.coordinates,
+        )

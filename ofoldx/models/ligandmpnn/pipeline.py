@@ -12,8 +12,9 @@ import torch
 from torch import Tensor
 from typing_extensions import Self
 
+from ...data import ENTITY_PROTEIN
 from ...data.conditions import AllowedResidueIdentities, TiedResidueIdentities
-from ...data.molecular import ComponentReference, MolecularSystem, PolymerSequence
+from ...data.molecular import ComponentReference, MolecularSystem
 from ...data.structure import Structure
 from ...io import read_structure
 from ...pipelines import PairedPipeline, resolve_generator
@@ -138,7 +139,8 @@ class LigandMpnnPipeline(PairedPipeline[LigandMpnnModel, LigandMpnnProcessor]):
 
         Notes:
             The leading tensor axis enumerates decoding orders, and the residue axis follows
-            ``component_references``. ``seed`` and ``generator`` are mutually exclusive.
+            the processed canonical component indices. ``seed`` and ``generator``
+            are mutually exclusive.
         """
 
         structure = read_structure(input) if isinstance(input, (str, PathLike)) else input
@@ -194,7 +196,8 @@ class LigandMpnnPipeline(PairedPipeline[LigandMpnnModel, LigandMpnnProcessor]):
 
         Notes:
             The leading tensor axis enumerates decoding orders, and the residue axis follows
-            ``component_references``. ``seed`` and ``generator`` are mutually exclusive.
+            the processed canonical component indices. ``seed`` and ``generator``
+            are mutually exclusive.
         """
 
         structure = read_structure(input) if isinstance(input, (str, PathLike)) else input
@@ -249,7 +252,8 @@ class LigandMpnnPipeline(PairedPipeline[LigandMpnnModel, LigandMpnnProcessor]):
         Notes:
             ``logits`` use decoding-order, target-residue, and vocabulary axes;
             ``decoding_ranks`` add a final residue-order axis. Residue axes follow
-            ``component_references``. ``seed`` and ``generator`` are mutually exclusive.
+            the processed canonical component indices. ``seed`` and ``generator``
+            are mutually exclusive.
         """
 
         structure = read_structure(input) if isinstance(input, (str, PathLike)) else input
@@ -303,7 +307,8 @@ class LigandMpnnPipeline(PairedPipeline[LigandMpnnModel, LigandMpnnProcessor]):
         Notes:
             ``logits`` use decoding-order, target-residue, and vocabulary axes;
             ``decoding_ranks`` add a final residue-order axis. Residue axes follow
-            ``component_references``. ``seed`` and ``generator`` are mutually exclusive.
+            the processed canonical component indices. ``seed`` and ``generator``
+            are mutually exclusive.
         """
 
         structure = read_structure(input) if isinstance(input, (str, PathLike)) else input
@@ -446,11 +451,12 @@ class LigandMpnnDesignAndPackPipeline:
         if repack_everything:
             pack_positions: Sequence[ComponentReference] | None = None
         else:
-            references = model_input.component_references
+            component_indices = model_input.component_index[0].detach().cpu().tolist()
+            references = tuple(
+                model_input.structure.system.component_reference(component) for component in component_indices
+            )
             selected = (model_input.residue_mask[0] & model_input.design_positions[0]).tolist()
-            pack_positions = [
-                reference for reference, keep in zip(references, selected) if keep and reference is not None
-            ]
+            pack_positions = [reference for reference, keep in zip(references, selected, strict=True) if keep]
         packs = self.packer.pack_sequences(
             structure,
             sequences=[_candidate_protein_sequences(candidate.system) for candidate in design_result.candidates],
@@ -478,9 +484,17 @@ def _candidate_protein_sequences(
     without a second split.
     """
 
+    instance_entity = system.instance_entity.detach().cpu().tolist()
+    entity_type = system.entity_type.detach().cpu().tolist()
+    instance_symbol = system.instance_symbol.detach().cpu().tolist()
+    component_ptr = system.instance_component_ptr.detach().cpu().tolist()
+    component_symbol = system.component_symbol.detach().cpu().tolist()
     sequences: dict[str, tuple[str, ...]] = {}
-    for instance_id, entity_id in system.instances.items():
-        entity = system.entities[entity_id]
-        if isinstance(entity, PolymerSequence) and entity.polymer_type == "protein":
-            sequences[instance_id] = tuple(component.component_id for component in entity.components)
+    for instance, entity in enumerate(instance_entity):
+        if entity_type[entity] != ENTITY_PROTEIN:
+            continue
+        instance_id = system.symbols[instance_symbol[instance]]
+        sequences[instance_id] = tuple(
+            system.symbols[symbol] for symbol in component_symbol[component_ptr[instance] : component_ptr[instance + 1]]
+        )
     return sequences

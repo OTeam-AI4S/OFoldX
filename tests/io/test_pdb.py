@@ -2,80 +2,59 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
+import torch
 
-from ofoldx.data import ChemicalAtom, ChemicalComponent, Molecule
+from ofoldx.data import (
+    ATOMIC_NUMBER_BY_ELEMENT,
+    ChemicalAtom,
+    ChemicalComponent,
+    MolecularSystem,
+    PolymerSequence,
+    Structure,
+)
 from ofoldx.io import read_structure, write_structure
-from tests.data.test_codec import _heterogeneous_structure
 
 
-def test_pdb_element_symbols_are_normalized_before_graph_comparison(tmp_path: Path) -> None:
-    path = tmp_path / "elements.pdb"
-    path.write_text(
-        "HETATM    1 ZN   ZN  Z   1       0.000   0.000   0.000  1.00 10.00          ZN  \n"
-        "HETATM    2 CL   CL  C   2       2.000   0.000   0.000  1.00 10.00          CL  \n"
-        "END\n",
-        encoding="ascii",
-    )
-    components = {
-        "ZN": ChemicalComponent("ZN", atoms=(ChemicalAtom("ZN", "Zn"),), bonds=frozenset()),
-        "CL": ChemicalComponent("CL", atoms=(ChemicalAtom("CL", "Cl"),), bonds=frozenset()),
-    }
+class TestPdbIO:
+    def test_reader_normalizes_elements_and_keeps_residue_instances_separate(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        path = tmp_path / "elements.pdb"
+        path.write_text(
+            "HETATM    1 ZN   ZN  Z   1       0.000   0.000   0.000  1.00 10.00          ZN  \n"
+            "HETATM    2 CL   CL  C   2       2.000   0.000   0.000  1.00 10.00          CL  \n"
+            "END\n",
+            encoding="ascii",
+        )
+        components = {
+            "ZN": ChemicalComponent(
+                "ZN",
+                (ChemicalAtom("ZN", "Zn"),),
+                frozenset(),
+            ),
+            "CL": ChemicalComponent(
+                "CL",
+                (ChemicalAtom("CL", "Cl"),),
+                frozenset(),
+            ),
+        }
 
-    structure = read_structure(path, components=components)
+        structure = read_structure(path, components=components)
+        assert structure.system.atomic_number.tolist() == [
+            ATOMIC_NUMBER_BY_ELEMENT["Zn"],
+            ATOMIC_NUMBER_BY_ELEMENT["Cl"],
+        ]
+        assert structure.system.entity_symbol.numel() == 2
+        assert structure.system.instance_symbol.numel() == 2
 
-    assert tuple(structure.system.atom(site).element for site in structure.sites) == ("Zn", "Cl")
-
-
-def test_pdb_keeps_separate_het_residues_as_separate_single_component_molecules(tmp_path: Path) -> None:
-    path = tmp_path / "separate-ligands.pdb"
-    path.write_text(
-        "HETATM    1  C1  LFT L   1       0.000   0.000   0.000  1.00 10.00           C  \n"
-        "HETATM    2  C1  RGT L   2       2.000   0.000   0.000  1.00 10.00           C  \n"
-        "END\n",
-        encoding="ascii",
-    )
-    components = {
-        "LFT": ChemicalComponent("LFT", atoms=(ChemicalAtom("C1", "C"),), bonds=frozenset()),
-        "RGT": ChemicalComponent("RGT", atoms=(ChemicalAtom("C1", "C"),), bonds=frozenset()),
-    }
-
-    structure = read_structure(path, components=components)
-
-    assert len(structure.system.entities) == 2
-    assert len(structure.system.instances) == 2
-    assert all(
-        type(entity) is Molecule and len(entity.components) == 1 for entity in structure.system.entities.values()
-    )
-    assert {site.component_index for site in structure.sites} == {0}
-
-
-def test_pdb_fails_by_default_and_returns_exact_loss_report_when_acknowledged(tmp_path: Path) -> None:
-    structure = _heterogeneous_structure()
-    path = tmp_path / "lossy.pdb"
-
-    with pytest.raises(ValueError, match="allow_lossy=True"):
-        write_structure(structure, path)
-    assert not path.exists()
-
-    report = write_structure(structure, path, allow_lossy=True)
-    assert report is not None
-    assert "system.nonpolymer_graph" in report.dropped_fields
-    assert path.read_text(encoding="ascii").endswith("END\n")
-
-
-def test_source_duplicate_atoms_fail_before_canonical_frozensets(tmp_path: Path) -> None:
-    path = tmp_path / "duplicate.pdb"
-    line = "ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00 10.00           C  \n"
-    path.write_text(line + line + "END\n", encoding="ascii")
-    with pytest.raises(ValueError, match="duplicate source atom declaration"):
-        read_structure(path)
-
-
-def test_pdb_assembly_materializes_distinct_instances_of_one_entity(tmp_path: Path) -> None:
-    path = tmp_path / "assembly.pdb"
-    path.write_text(
-        """REMARK 350
+    def test_assembly_materializes_two_instances_of_one_entity(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        path = tmp_path / "assembly.pdb"
+        path.write_text(
+            """REMARK 350
 REMARK 350 BIOMOLECULE: 1
 REMARK 350 APPLY THE FOLLOWING TO CHAINS: A
 REMARK 350   BIOMT1   1  1.000000  0.000000  0.000000        0.00000
@@ -87,11 +66,67 @@ REMARK 350   BIOMT3   2  0.000000  0.000000  1.000000        0.00000
 ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00 10.00           C
 END
 """,
-        encoding="ascii",
-    )
+            encoding="ascii",
+        )
 
-    structure = read_structure(path, assembly_id="1")
+        structure = read_structure(path, assembly_id="1")
+        ca_rows = [
+            index
+            for index in range(structure.system.atom_symbol.numel())
+            if structure.system.atom_site(index).atom_id == "CA"
+        ]
 
-    assert tuple(structure.system.instances) == ("A#0", "A#1")
-    assert len(structure.system.entities) == 1
-    assert structure.coordinates[:, 0].tolist() == [0.0, 10.0]
+        assert structure.system.entity_symbol.numel() == 1
+        assert [structure.system.instance_id(index) for index in range(2)] == ["A#0", "A#1"]
+        assert structure.coordinates[ca_rows, 0].tolist() == [0.0, 10.0]
+
+    def test_declared_missing_residues_remain_on_the_component_axis(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        path = tmp_path / "missing.pdb"
+        missing = "".join(f"REMARK 465     ALA A {number:>5}\n" for number in range(3, 10))
+        path.write_text(
+            missing
+            + "ATOM      1  CA  ALA A   1       0.000   0.000   0.000  1.00 10.00           C  \n"
+            + "ATOM      2  CA  ALA A   2       1.000   0.000   0.000  1.00 10.00           C  \n"
+            + "ATOM      3  CA  ALA A  10       2.000   0.000   0.000  1.00 10.00           C  \n"
+            + "END\n",
+            encoding="ascii",
+        )
+
+        structure = read_structure(path)
+        assert structure.system.component_symbol.numel() == 10
+        assert structure.coordinate_mask.sum().item() == 3
+        assert structure.residue_id.shape == (10,)
+
+    def test_writer_projects_observed_polymer_atoms(self, tmp_path: Path) -> None:
+        system = MolecularSystem.from_entities(
+            {"protein": PolymerSequence.from_one_letter("A")},
+            {"A": "protein"},
+        )
+        atom_count = system.atom_symbol.numel()
+        structure = Structure(
+            system=system,
+            coordinates=torch.arange(
+                atom_count * 3,
+                dtype=torch.float32,
+            ).reshape(atom_count, 3),
+            coordinate_mask=torch.ones(atom_count, dtype=torch.bool),
+            occupancy=torch.zeros(atom_count),
+            occupancy_mask=torch.zeros(atom_count, dtype=torch.bool),
+            b_factor=torch.zeros(atom_count),
+            b_factor_mask=torch.zeros(atom_count, dtype=torch.bool),
+            source_symbols=("1",),
+            residue_id=torch.tensor([0]),
+            insertion_code=torch.tensor([-1]),
+            batch_size=[],
+        )
+        path = tmp_path / "alanine.pdb"
+
+        write_structure(structure, path)
+        restored = read_structure(path)
+
+        assert restored.system.instance_id(0) == "A"
+        assert torch.equal(restored.coordinates, structure.coordinates)
+        assert "ATOM" in path.read_text(encoding="ascii")

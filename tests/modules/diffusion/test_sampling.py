@@ -15,32 +15,36 @@ from ofoldx.modules.diffusion import (
 from ofoldx.modules.embedding.position import generate_relative_position_features
 
 
-def _make_context(batch_size: int = 1) -> CoordinateDenoiseContext:
-    reference_positions = torch.zeros(batch_size, 5, 3)
-    single = torch.zeros(batch_size, 3, 6)
-    pair = torch.zeros(batch_size, 3, 3, 4)
+def _make_context(
+    batch_size: int = 1,
+    *,
+    device: torch.device | str = "cpu",
+) -> CoordinateDenoiseContext:
+    reference_positions = torch.zeros(batch_size, 5, 3, device=device)
+    single = torch.zeros(batch_size, 3, 6, device=device)
+    pair = torch.zeros(batch_size, 3, 3, 4, device=device)
     return CoordinateDenoiseContext(
-        atom_features=torch.zeros(batch_size, 5, 5),
-        atom_to_token=torch.tensor([[0, 0, 1, 2, 2]]).expand(batch_size, -1),
+        atom_features=torch.zeros(batch_size, 5, 5, device=device),
+        atom_to_token=torch.tensor([[0, 0, 1, 2, 2]], device=device).expand(batch_size, -1),
         reference_positions=reference_positions,
-        reference_charges=torch.zeros(batch_size, 5, 1),
-        reference_mask=torch.ones(batch_size, 5, dtype=torch.bool),
-        atom_mask=torch.ones(batch_size, 5, dtype=torch.bool),
-        token_embedding=torch.zeros(batch_size, 3, 8),
+        reference_charges=torch.zeros(batch_size, 5, 1, device=device),
+        reference_mask=torch.ones(batch_size, 5, dtype=torch.bool, device=device),
+        atom_mask=torch.ones(batch_size, 5, dtype=torch.bool, device=device),
+        token_embedding=torch.zeros(batch_size, 3, 8, device=device),
         single=single,
         conditioning_single=single,
         conditioning_pair=pair,
         relative_features=generate_relative_position_features(
-            residue_index=torch.arange(3).expand(batch_size, -1),
-            chain_index=torch.zeros(batch_size, 3, dtype=torch.long),
-            entity_index=torch.zeros(batch_size, 3, dtype=torch.long),
-            symmetry_index=torch.zeros(batch_size, 3, dtype=torch.long),
-            token_index=torch.arange(3).expand(batch_size, -1),
+            residue_index=torch.arange(3, device=device).expand(batch_size, -1),
+            chain_index=torch.zeros(batch_size, 3, dtype=torch.long, device=device),
+            entity_index=torch.zeros(batch_size, 3, dtype=torch.long, device=device),
+            symmetry_index=torch.zeros(batch_size, 3, dtype=torch.long, device=device),
+            token_index=torch.arange(3, device=device).expand(batch_size, -1),
             dtype=torch.float32,
         ),
         local_geometry=LocalAtomGeometryBuilder(num_query_atoms=2, num_key_atoms=4)(
             reference_positions,
-            torch.zeros(batch_size, 5, dtype=torch.long),
+            torch.zeros(batch_size, 5, dtype=torch.long, device=device),
         ),
     )
 
@@ -101,16 +105,32 @@ def test_sample_shapes_fixed_point_and_determinism(context: CoordinateDenoiseCon
 
 
 def test_chunking(context: CoordinateDenoiseContext) -> None:
-    sampler = _make_sampler()
+    sampler = CoordinateEdmSampler(
+        scheduler=EdmScheduler(max_noise_level=1.0, min_noise_level=0.1),
+        churn_rate=0.5,
+        center_random_augmentation=True,
+    )
 
-    # chunked sampling must reproduce the unchunked result bit-for-bit.
-    sampled = torch.arange(1 * 4 * 5 * 3, dtype=torch.float32).reshape(1, 4, 5, 3)
-    unchunked = sampler(_identity, context=context, num_samples=4, num_sampling_steps=1, initial_coords=sampled)
+    # The initial noise, rigid augmentation, and churn paths are all stochastic.
+    # Chunk size is only a denoiser-memory bound, so it cannot change their stream.
+    unchunked = sampler(
+        _zeros,
+        context=context,
+        num_samples=4,
+        num_sampling_steps=2,
+        generator=torch.Generator().manual_seed(11),
+    )
     chunked = sampler(
-        _identity, context=context, num_samples=4, num_sampling_steps=1, sample_chunk_size=2, initial_coords=sampled
+        _zeros,
+        context=context,
+        num_samples=4,
+        num_sampling_steps=2,
+        sample_chunk_size=2,
+        generator=torch.Generator().manual_seed(11),
     )
     assert torch.equal(chunked, unchunked)
 
+    sampler = _make_sampler()
     unsampled = torch.arange(1 * 5 * 3, dtype=torch.float32).reshape(1, 5, 3)
     output = sampler(
         _identity, context=context, num_samples=4, num_sampling_steps=1, sample_chunk_size=2, initial_coords=unsampled
@@ -118,6 +138,26 @@ def test_chunking(context: CoordinateDenoiseContext) -> None:
     assert output.shape == (1, 4, 5, 3)
     assert torch.equal(output[:, 0], unsampled)
     assert torch.equal(output[:, -1], unsampled)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+def test_generator_device_does_not_choose_compute_device() -> None:
+    context = _make_context(device="cuda")
+    output = _make_sampler()(
+        _zeros,
+        context=context,
+        num_samples=2,
+        num_sampling_steps=1,
+        generator=torch.Generator(device="cpu").manual_seed(7),
+    )
+    assert output.is_cuda
+
+    augmented = CoordinateEdmSampler().augment_target(
+        torch.zeros(1, 3, 3),
+        num_samples=1,
+        generator=torch.Generator(device="cuda").manual_seed(7),
+    )
+    assert augmented.device.type == "cpu"
 
 
 def test_unsampled_condition_coords_when_batch_equals_num_samples() -> None:

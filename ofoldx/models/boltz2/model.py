@@ -10,11 +10,11 @@ from dataclasses import dataclass
 from functools import partial
 from typing import NamedTuple, cast
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from tensordict import tensorclass
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
 from ...data.evidence import Template
 from ...data.molecular import AtomSite, ComponentReference, MolecularSystem
@@ -73,7 +73,9 @@ class Boltz2Model(Model):
         >>> from ofoldx.data import MolecularSystem, PolymerSequence
         >>> from ofoldx.models.boltz2 import Boltz2Config, Boltz2Model, Boltz2Processor
         >>> sequence = PolymerSequence.from_one_letter("G")
-        >>> system = MolecularSystem({"protein": sequence}, {"A": "protein"})
+        >>> system = MolecularSystem.from_entities(
+        ...     {"protein": sequence}, {"A": "protein"}
+        ... )
         >>> input = Boltz2Processor()(system)
         >>> config = Boltz2Config(
         ...     {
@@ -651,8 +653,8 @@ class Boltz2Model(Model):
             raise ValueError("num_samples must be positive")
         if input.token_mask.shape[0] != 1:
             raise ValueError("Boltz2Model.fold accepts one molecular system per call")
-        if input.layout is None:
-            raise ValueError("Boltz2Model.fold requires the canonical layout produced by its Processor")
+        if input.system.system_entity_ptr.numel() != 2:
+            raise ValueError("Boltz2Model.fold accepts one molecular system per call")
 
         output = self._fold(
             input,
@@ -1001,7 +1003,7 @@ class Boltz2AffinityModel(Boltz2Model):
         ...         ),
         ...     )
         ... )
-        >>> system = MolecularSystem(
+        >>> system = MolecularSystem.from_entities(
         ...     {"protein": protein, "ligand": ligand},
         ...     {"A": "protein", "L": "ligand"},
         ... )
@@ -1220,10 +1222,10 @@ class Boltz2AffinityModel(Boltz2Model):
                 raise ValueError("num_sampling_steps must be at least 2")
         if input.token_mask.shape[0] != 1:
             raise ValueError("Boltz2AffinityModel.score accepts one molecular system per call")
-        if input.layout is None:
-            raise ValueError("Boltz2AffinityModel.score requires the canonical layout produced by its Processor")
-        if input.layout.affinity_instance_id is None:
-            raise ValueError("Boltz2AffinityModel.score requires one canonical affinity ligand instance")
+        if input.system.system_entity_ptr.numel() != 2:
+            raise ValueError("Boltz2AffinityModel.score accepts one molecular system per call")
+        if input.affinity_token_mask is None:
+            raise ValueError("Boltz2AffinityModel.score requires one affinity ligand")
 
         structure_output, raw_scores = self._score(
             input,
@@ -1237,21 +1239,9 @@ class Boltz2AffinityModel(Boltz2Model):
         )
         selected_index = int(raw_scores["selected_sample_index"][0].item())
         selected_coords = structure_output.coordinates[0, selected_index]
-        layout = input.layout
-        complete_sites = [site for site, atom in layout.system.iter_atoms() if atom.element != "H"]
-        complete_index = {site: index for index, site in enumerate(complete_sites)}
-        coordinates = np.zeros((len(complete_sites), 3), dtype=np.float32)
-        coordinate_mask = np.zeros(len(complete_sites), dtype=np.bool_)
-        model_coords = selected_coords[: len(layout.atom_sites)].float().cpu().numpy()
-        for site, values in zip(layout.atom_sites, model_coords):
-            index = complete_index[site]
-            coordinates[index] = values
-            coordinate_mask[index] = True
-        structure = Structure(
-            system=layout.system,
-            sites=tuple(complete_sites),
-            coordinates=coordinates,
-            coordinate_mask=coordinate_mask,
+        structure = _decode_boltz2_structure(
+            input,
+            selected_coords,
         )
 
         def scalar(name: str) -> float:
@@ -1264,8 +1254,8 @@ class Boltz2AffinityModel(Boltz2Model):
         # atom mask (reconstructable from the affinity ligand scope), and the run provenance / RNG echo. The
         # first-stage per-sample confidence and its ranked selection live on the Pipeline's
         # ``structure_predictions``; this root pass returns only the second-pass ``target`` and the six Scores.
-        ligand_id = cast(Boltz2Layout, input.layout).affinity_instance_id
-        scope = frozenset({cast(str, ligand_id)})
+        ligand_id = _affinity_instance_id(input)
+        scope = frozenset({ligand_id})
         return ScoreResult(
             target=structure,
             scores={
@@ -1770,6 +1760,7 @@ class Boltz2MsaTrunk(nn.Module):
         )
         self.token_projection = nn.Linear(single_size, msa_size, bias=False)
         self.num_blocks = num_blocks
+        self.gradient_checkpointing = False
         self.blocks = nn.ModuleList(
             Boltz2MsaBlock(
                 msa_size=msa_size,
@@ -1805,11 +1796,14 @@ class Boltz2MsaTrunk(nn.Module):
             msa_max_depth = operator.index(msa_max_depth)
             if msa_max_depth < 1:
                 raise ValueError("msa_max_depth must be positive")
+            random_device = msa_tokens.device if generator is None else generator.device
             indices = torch.randperm(
                 msa_tokens.shape[1],
-                device=msa_tokens.device,
+                device=random_device,
                 generator=generator,
-            )[:msa_max_depth]
+            )[
+                :msa_max_depth
+            ].to(msa_tokens.device)
             msa_tokens = msa_tokens[:, indices]
             has_deletion = has_deletion[:, indices]
             deletion_value = deletion_value[:, indices]
@@ -1826,7 +1820,17 @@ class Boltz2MsaTrunk(nn.Module):
         msa = msa + self.token_projection(single_inputs).unsqueeze(1)
         pair_mask = pair_mask_from_token_mask(token_mask)
         for block in self.blocks:
-            pair, msa = block(pair, msa, pair_mask, msa_mask)
+            if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+                pair, msa = checkpoint(
+                    block,
+                    pair,
+                    msa,
+                    pair_mask,
+                    msa_mask,
+                    use_reentrant=False,
+                )
+            else:
+                pair, msa = block(pair, msa, pair_mask, msa_mask)
         return pair
 
 
@@ -1909,6 +1913,7 @@ class Boltz2PairformerStack(nn.Module):
     ) -> None:
         super().__init__()
         self.num_blocks = num_blocks
+        self.gradient_checkpointing = False
         self.blocks = nn.ModuleList(
             Boltz2PairformerBlock(
                 single_size=single_size,
@@ -1927,7 +1932,16 @@ class Boltz2PairformerStack(nn.Module):
 
     def forward(self, single: Tensor, pair: Tensor, pair_mask: Tensor | None = None) -> tuple[Tensor, Tensor]:
         for block in self.blocks:
-            single, pair = block(single, pair, pair_mask=pair_mask)
+            if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+                single, pair = checkpoint(
+                    block,
+                    single,
+                    pair,
+                    pair_mask=pair_mask,
+                    use_reentrant=False,
+                )
+            else:
+                single, pair = block(single, pair, pair_mask=pair_mask)
         return single, pair
 
 
@@ -1993,6 +2007,7 @@ class Boltz2TrianglePairUpdateStack(nn.Module):
     ) -> None:
         super().__init__()
         self.num_blocks = num_blocks
+        self.gradient_checkpointing = False
         self.blocks = nn.ModuleList(
             Boltz2TrianglePairUpdateBlock(
                 pair_size=pair_size,
@@ -2008,7 +2023,15 @@ class Boltz2TrianglePairUpdateStack(nn.Module):
 
     def forward(self, pair: Tensor, pair_mask: Tensor | None = None) -> Tensor:
         for block in self.blocks:
-            pair = block(pair, pair_mask=pair_mask)
+            if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+                pair = checkpoint(
+                    block,
+                    pair,
+                    pair_mask=pair_mask,
+                    use_reentrant=False,
+                )
+            else:
+                pair = block(pair, pair_mask=pair_mask)
         return pair
 
 
@@ -2270,7 +2293,12 @@ class Boltz2CoordinateDiffusion(nn.Module):
     ) -> Tensor:
         log_mean = self.noise_log_mean if log_mean is None else log_mean
         log_std = self.noise_log_std if log_std is None else log_std
-        normal = torch.empty(batch_size, device=device, dtype=dtype).normal_(generator=generator)
+        normal = _draw_normal(
+            (batch_size,),
+            device=device,
+            dtype=dtype,
+            generator=generator,
+        )
         return self.sigma_data * (log_mean + log_std * normal).exp()
 
     def loss_weight(self, sigma: Tensor) -> Tensor:
@@ -2321,7 +2349,12 @@ class Boltz2CoordinateDiffusion(nn.Module):
             translation_scale=augmentation_translation_scale,
             generator=generator,
         )
-        noise = torch.empty_like(augmented_target_coordinates).normal_(generator=generator)
+        noise = _draw_normal(
+            augmented_target_coordinates.shape,
+            device=augmented_target_coordinates.device,
+            dtype=augmented_target_coordinates.dtype,
+            generator=generator,
+        )
         noisy_coordinates = augmented_target_coordinates + noise_level[:, None, None] * noise
         denoised = self.preconditioned_network_forward(
             noisy_coordinates,
@@ -2346,19 +2379,19 @@ class Boltz2CoordinateDiffusion(nn.Module):
         coordinates = coordinates - centroid
         if not coordinate_augmentation:
             return coordinates
+        random_device = coordinates.device if generator is None else generator.device
         rotation = uniform_random_rotation(
             coordinates.shape[0],
+            device=random_device,
+            dtype=coordinates.dtype,
+            generator=generator,
+        ).to(coordinates.device)
+        translation = _draw_normal(
+            (coordinates.shape[0], 1, 3),
             device=coordinates.device,
             dtype=coordinates.dtype,
             generator=generator,
         )
-        translation = torch.empty(
-            coordinates.shape[0],
-            1,
-            3,
-            device=coordinates.device,
-            dtype=coordinates.dtype,
-        ).normal_(generator=generator)
         return torch.einsum("bmd,bds->bms", coordinates, rotation) + translation_scale * translation
 
     def preconditioned_network_forward(
@@ -2448,7 +2481,12 @@ class Boltz2CoordinateDiffusion(nn.Module):
         noise_active = tuple((noise_variances > 0).tolist()) if feynman_kac else ()
 
         def randn() -> Tensor:
-            return torch.randn(shape, device=device, dtype=dtype, generator=generator)
+            return _draw_normal(
+                shape,
+                device=device,
+                dtype=dtype,
+                generator=generator,
+            )
 
         coords = sigmas[0] * randn()
         if feynman_kac:
@@ -2494,13 +2532,15 @@ class Boltz2CoordinateDiffusion(nn.Module):
         denoised = None
         for index in range(len(sigmas) - 1):
             sigma_next = sigmas[index + 1]
+            random_device = device if generator is None else generator.device
             rotation = uniform_random_rotation(
-                expanded_atom_mask.shape[0], device=device, dtype=coords.dtype, generator=generator
-            )
-            translation = torch.randn(
                 expanded_atom_mask.shape[0],
-                1,
-                3,
+                device=random_device,
+                dtype=coords.dtype,
+                generator=generator,
+            ).to(device)
+            translation = _draw_normal(
+                (expanded_atom_mask.shape[0], 1, 3),
                 device=device,
                 dtype=dtype,
                 generator=generator,
@@ -2659,13 +2699,14 @@ class Boltz2CoordinateDiffusion(nn.Module):
                     resample_weights.shape[0],
                     device=device,
                 ).unsqueeze(-1)
+                random_device = resample_weights.device if generator is None else generator.device
                 resample_index = (
                     torch.multinomial(
-                        resample_weights,
+                        resample_weights.to(random_device),
                         sample_count,
                         replacement=True,
                         generator=generator,
-                    )
+                    ).to(device)
                     + offsets
                 ).flatten()
                 coords = coords[resample_index]
@@ -3197,95 +3238,230 @@ class Boltz2ConfidenceOutputHead(nn.Module):
         }
 
 
-def _decode_boltz2_fold_result(output: Boltz2ConfidenceOutput, input: Boltz2Input) -> FoldResult:
+def _draw_normal(
+    size: tuple[int, ...] | torch.Size,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    generator: torch.Generator | None,
+) -> Tensor:
     r"""
-    Decode one raw [`Boltz2ConfidenceOutput`][ofoldx.models.boltz2.model.Boltz2ConfidenceOutput]
-    into a ``FoldResult``.
-
-    Maps model atom order back onto the system's complete heavy-atom sites to build one ``Structure`` per
-    sample, and lifts the confidence head's per-token pLDDT/resolved metrics,
-    token-pair PAE/PDE, and the per-sample complex/design confidence scores onto
-    values aligned to the layout's token axis.
+    Draw standard-normal values from ``generator`` and place them on ``device``.
     """
 
-    layout = cast(Boltz2Layout, input.layout)
-    token_count = len(layout.token_sites)
-    atom_count = len(layout.atom_sites)
+    random_device = device if generator is None else generator.device
+    return torch.randn(
+        size,
+        device=random_device,
+        dtype=dtype,
+        generator=generator,
+    ).to(device)
 
-    complete_sites = [site for site, atom in layout.system.iter_atoms() if atom.element != "H"]
-    complete_index = {site: index for index, site in enumerate(complete_sites)}
-    model_to_complete = np.asarray([complete_index[site] for site in layout.atom_sites], dtype=np.intp)
 
-    coordinates = output.coordinates[0, :, :atom_count].to(device="cpu", dtype=torch.float32).numpy()
-    num_samples = coordinates.shape[0]
-    # Each polymer token_site is already a ``ComponentReference`` (``(instance_id, monomer_index)``) and each
-    # atomized-ligand token_site is an ``AtomSite`` -- both are valid ``MetricReference`` values, so the token
-    # The metric axis follows layout.token_sites.
-    token_axis = layout.token_sites
-    chain_axis = tuple(layout.system.instances)
+def _decode_boltz2_structure(
+    input: Boltz2Input,
+    model_coordinates: Tensor,
+) -> Structure:
+    r"""
+    Scatter model coordinates onto the complete canonical atom axis.
+    """
 
-    # Per-token pLDDT (0--100) and resolved probability aligned to the token axis.
-    plddt = output.plddt[0, :, :token_count].to(device="cpu", dtype=torch.float32)
-    resolved_probability = output.resolved_probability[0, :, :token_count].float().cpu()
+    result_system = input.system.cpu()  # type: ignore[attr-defined]
+    atom_index = input.atom_index[0].detach().cpu().long()
+    valid = input.atom_mask[0].detach().cpu().bool() & (atom_index >= 0)
+    canonical_atom_index = atom_index[valid]
+    complete_atom_count = result_system.atom_symbol.numel()
+    complete_component_count = result_system.component_symbol.numel()
+    coordinates = torch.zeros(
+        complete_atom_count,
+        3,
+        dtype=torch.float32,
+    )
+    coordinate_mask = torch.zeros(
+        complete_atom_count,
+        dtype=torch.bool,
+    )
+    coordinates[canonical_atom_index] = model_coordinates[valid.to(model_coordinates.device)].to(
+        device="cpu", dtype=torch.float32
+    )
+    coordinate_mask[canonical_atom_index] = True
+    return Structure(  # type: ignore[call-arg]
+        system=result_system,
+        coordinates=coordinates,
+        coordinate_mask=coordinate_mask,
+        occupancy=torch.zeros(complete_atom_count),
+        occupancy_mask=torch.zeros(
+            complete_atom_count,
+            dtype=torch.bool,
+        ),
+        b_factor=torch.zeros(complete_atom_count),
+        b_factor_mask=torch.zeros(
+            complete_atom_count,
+            dtype=torch.bool,
+        ),
+        source_symbols=(),
+        residue_id=torch.full(
+            (complete_component_count,),
+            -1,
+            dtype=torch.int64,
+        ),
+        insertion_code=torch.full(
+            (complete_component_count,),
+            -1,
+            dtype=torch.int64,
+        ),
+        batch_size=[],
+    )
 
-    # Expected PAE/PDE in angstrom (half-bin centers over 0-32, matching _boltz2_ptm_scores).
-    pae = output.pae[0, :, :token_count, :token_count].float().cpu()
-    pde = output.pde[0, :, :token_count, :token_count].float().cpu()
 
-    # pTM / ipTM metrics over the flattened sample axis (B == 1); reuse the estimator already used by
-    # _fold/_score.
+def _affinity_instance_id(input: Boltz2Input) -> str:
+    affinity_mask = (
+        cast(
+            Tensor,
+            input.affinity_token_mask,
+        )[0]
+        .detach()
+        .cpu()
+        .bool()
+    )
+    affinity_mask &= input.token_mask[0].detach().cpu().bool()
+    component_index = input.token_component_index[0].detach().cpu().long()[affinity_mask]
+    component_instance = torch.repeat_interleave(
+        torch.arange(input.system.instance_symbol.numel()),
+        (input.system.instance_component_ptr[1:] - input.system.instance_component_ptr[:-1]).detach().cpu(),
+    )
+    instance_index = torch.unique(component_instance[component_index])
+    if instance_index.numel() != 1:
+        raise ValueError("Boltz-2 affinity tokens must identify one ligand instance")
+    return input.system.instance_id(int(instance_index[0]))
+
+
+def _decode_boltz2_fold_result(
+    output: Boltz2ConfidenceOutput,
+    input: Boltz2Input,
+) -> FoldResult:
+    r"""
+    Decode raw Boltz-2 coordinates and confidence on canonical axes.
+    """
+
+    token_valid = input.token_mask[0].detach().cpu().bool()
+    token_selection = token_valid.nonzero(as_tuple=False).flatten()
+    result_system = input.system.cpu()  # type: ignore[attr-defined]
+    token_component_index = input.token_component_index[0].detach().cpu().long()[token_valid]
+    token_atom_index = input.token_atom_index[0].detach().cpu().long()[token_valid]
+    token_axis_values: list[ComponentReference | AtomSite] = []
+    for atom_index, component_index in zip(
+        token_atom_index.tolist(),
+        token_component_index.tolist(),
+    ):
+        if atom_index >= 0:
+            token_axis_values.append(result_system.atom_site(atom_index))
+        else:
+            token_axis_values.append(result_system.component_reference(component_index))
+    token_axis = tuple(token_axis_values)
+    chain_axis = tuple(
+        result_system.instance_id(instance_index) for instance_index in range(result_system.instance_symbol.numel())
+    )
+    num_samples = output.coordinates.shape[1]
+
+    output_token_selection = token_selection.to(output.plddt.device)
+    plddt = output.plddt[0, :, output_token_selection].to(
+        device="cpu",
+        dtype=torch.float32,
+    )
+    resolved_probability = output.resolved_probability[
+        0,
+        :,
+        output_token_selection,
+    ].to(device="cpu", dtype=torch.float32)
+    pae = output.pae[0, :, output_token_selection][
+        :,
+        :,
+        output_token_selection,
+    ].to(device="cpu", dtype=torch.float32)
+    pde = output.pde[0, :, output_token_selection][
+        :,
+        :,
+        output_token_selection,
+    ].to(device="cpu", dtype=torch.float32)
+
     ptm = output.ptm[0].float().cpu()
     iptm = output.iptm[0].float().cpu()
     ligand_iptm = output.ligand_iptm[0].float().cpu()
     protein_iptm = output.protein_iptm[0].float().cpu()
     chain_pair_iptm = output.pair_chains_iptm[0].float().cpu()
-
-    # Interface confidence uses iPTM unless every iPTM value is zero, in which case it falls back to pTM.
-    # The confidence score combines that interface term with complex pLDDT normalized back to 0-1.
     complex_plddt = output.complex_plddt[0].float().cpu()
     complex_iplddt = output.complex_iplddt[0].float().cpu()
     complex_pde = output.complex_pde[0].float().cpu()
     complex_ipde = output.complex_ipde[0].float().cpu()
     interface = ptm if torch.allclose(iptm, torch.zeros_like(iptm)) else iptm
     confidence_score = (4.0 * (complex_plddt / 100.0) + interface) / 5.0
-    has_design = bool(input.design_mask[0].any())
+    has_design = bool(
+        input.design_mask[
+            0,
+            token_selection.to(input.design_mask.device),
+        ].any()
+    )
     design_scores = {
-        "design_to_target_iptm": output.design_to_target_iptm[0].float().cpu(),
-        "design_residue_iptm": output.design_residue_iptm[0].float().cpu(),
+        "design_to_target_iptm": (output.design_to_target_iptm[0].float().cpu()),
+        "design_residue_iptm": (output.design_residue_iptm[0].float().cpu()),
         "design_iptm": output.design_iptm[0].float().cpu(),
         "design_iiptm": output.design_iiptm[0].float().cpu(),
         "target_ptm": output.target_ptm[0].float().cpu(),
         "design_ptm": output.design_ptm[0].float().cpu(),
         "interaction_pae": output.interaction_pae[0].float().cpu(),
-        "min_interaction_pae": output.min_interaction_pae[0].float().cpu(),
-        "min_design_to_target_pae": output.min_design_to_target_pae[0].float().cpu(),
-        "design_ipsae_min": output.design_ipsae_min[0].float().cpu(),
-        "design_to_target_ipsae": output.design_to_target_ipsae[0].float().cpu(),
-        "target_to_design_ipsae": output.target_to_design_ipsae[0].float().cpu(),
+        "min_interaction_pae": (output.min_interaction_pae[0].float().cpu()),
+        "min_design_to_target_pae": (output.min_design_to_target_pae[0].float().cpu()),
+        "design_ipsae_min": (output.design_ipsae_min[0].float().cpu()),
+        "design_to_target_ipsae": (output.design_to_target_ipsae[0].float().cpu()),
+        "target_to_design_ipsae": (output.target_to_design_ipsae[0].float().cpu()),
     }
 
     predictions: list[FoldPrediction] = []
     for sample_index in range(num_samples):
-        complete_coordinates = np.zeros((len(complete_sites), 3), dtype=np.float32)
-        coordinate_mask = np.zeros(len(complete_sites), dtype=np.bool_)
-        complete_coordinates[model_to_complete] = coordinates[sample_index]
-        coordinate_mask[model_to_complete] = True
-        structure = Structure(
-            system=layout.system,
-            sites=tuple(complete_sites),
-            coordinates=complete_coordinates,
-            coordinate_mask=coordinate_mask,
+        structure = _decode_boltz2_structure(
+            input,
+            output.coordinates[0, sample_index],
         )
         scores = {
-            "plddt": Score(float(complex_plddt[sample_index]), preferred="higher"),
-            "ptm": Score(float(ptm[sample_index]), preferred="higher"),
-            "iptm": Score(float(iptm[sample_index]), preferred="higher"),
-            "ligand_iptm": Score(float(ligand_iptm[sample_index]), preferred="higher"),
-            "protein_iptm": Score(float(protein_iptm[sample_index]), preferred="higher"),
-            "confidence_score": Score(float(confidence_score[sample_index]), preferred="higher"),
-            "complex_iplddt": Score(float(complex_iplddt[sample_index]), preferred="higher"),
-            "complex_pde": Score(float(complex_pde[sample_index]), unit="angstrom", preferred="lower"),
-            "complex_ipde": Score(float(complex_ipde[sample_index]), unit="angstrom", preferred="lower"),
+            "plddt": Score(
+                float(complex_plddt[sample_index]),
+                preferred="higher",
+            ),
+            "ptm": Score(
+                float(ptm[sample_index]),
+                preferred="higher",
+            ),
+            "iptm": Score(
+                float(iptm[sample_index]),
+                preferred="higher",
+            ),
+            "ligand_iptm": Score(
+                float(ligand_iptm[sample_index]),
+                preferred="higher",
+            ),
+            "protein_iptm": Score(
+                float(protein_iptm[sample_index]),
+                preferred="higher",
+            ),
+            "confidence_score": Score(
+                float(confidence_score[sample_index]),
+                preferred="higher",
+            ),
+            "complex_iplddt": Score(
+                float(complex_iplddt[sample_index]),
+                preferred="higher",
+            ),
+            "complex_pde": Score(
+                float(complex_pde[sample_index]),
+                unit="angstrom",
+                preferred="lower",
+            ),
+            "complex_ipde": Score(
+                float(complex_ipde[sample_index]),
+                unit="angstrom",
+                preferred="lower",
+            ),
         }
         if has_design:
             for name, values in design_scores.items():
@@ -3300,14 +3476,23 @@ def _decode_boltz2_fold_result(output: Boltz2ConfidenceOutput, input: Boltz2Inpu
                         preferred="lower",
                     )
                 else:
-                    scores[name] = Score(float(values[sample_index]), preferred="higher")
+                    scores[name] = Score(
+                        float(values[sample_index]),
+                        preferred="higher",
+                    )
         predictions.append(
             FoldPrediction(
                 structure=structure,
                 scores=scores,
                 metrics={
-                    "plddt": Metric(values=plddt[sample_index].numpy(), axis=token_axis),
-                    "resolved_probability": Metric(values=resolved_probability[sample_index].numpy(), axis=token_axis),
+                    "plddt": Metric(
+                        values=plddt[sample_index].numpy(),
+                        axis=token_axis,
+                    ),
+                    "resolved_probability": Metric(
+                        values=resolved_probability[sample_index].numpy(),
+                        axis=token_axis,
+                    ),
                 },
                 pair_metrics={
                     "pae": PairMetric(
@@ -3340,7 +3525,13 @@ def _boltz2_expected_angstrom(logits: Tensor) -> Tensor:
 
     num_bins = logits.shape[-1]
     bin_width = 32.0 / num_bins
-    centers = torch.arange(start=0.5 * bin_width, end=32.0, step=bin_width, device=logits.device, dtype=logits.dtype)
+    centers = torch.arange(
+        start=0.5 * bin_width,
+        end=32.0,
+        step=bin_width,
+        device=logits.device,
+        dtype=logits.dtype,
+    )
     return (logits.softmax(dim=-1) * centers).sum(dim=-1)
 
 
@@ -4866,19 +5057,19 @@ def _gather_boltz2_structure_target(
     num_samples: int,
 ) -> tuple[Tensor, Tensor]:
     r"""
-    Gather complete-pool Boltz-2 conformers onto the current padded atom axis.
+    Gather canonical Boltz-2 conformers onto the current padded atom axis.
     """
 
     positions = target.coordinates
     if positions.ndim != 4:
-        raise ValueError("Boltz2StructureTarget.coordinates must have shape (B, K, T, 3)")
+        raise ValueError("Boltz2StructureTarget.coordinates must have shape " "(B, R, A_system, 3)")
     conformers = positions.shape[1]
     if conformers not in (1, num_samples):
         raise ValueError("Boltz-2 target conformer count must be one or num_samples")
     if conformers == 1:
         positions = positions.expand(-1, num_samples, -1, -1)
 
-    atom_index = target.atom_index.long()
+    atom_index = input.atom_index.long()
     safe_index = atom_index.clamp_min(0)
     gathered = positions.gather(
         2,
@@ -4909,7 +5100,7 @@ def _unflatten_sample_axis(tensor: Tensor, batch_size: int, num_samples: int) ->
 # Boltz-2 public values and tensor boundary
 #
 # Family-owned scientific evidence precedes the pure-tensor input, output, and
-# molecular-identity layout.
+# canonical molecular identity.
 # =====================================================================================================
 
 
@@ -4969,18 +5160,6 @@ class Boltz2Template:
     threshold: float | None = None
 
 
-@dataclass(frozen=True)
-class Boltz2Layout:
-    r"""
-    Molecular identities aligned to one Boltz-2 tensor layout.
-    """
-
-    system: MolecularSystem
-    atom_sites: tuple[AtomSite, ...]
-    token_sites: tuple[AtomSite | tuple[str, int], ...]
-    affinity_instance_id: str | None = None
-
-
 @tensorclass
 class Boltz2StructureTarget:
     r"""
@@ -4988,11 +5167,10 @@ class Boltz2StructureTarget:
 
     Args:
         coordinates: Complete-assembly conformers with shape
-            ``(B, K, T, 3)``.
-        coordinate_mask: Resolved complete-assembly mask with shape ``(B, T)``.
-        atom_index: Current atom-to-pool map with shape ``(B, A)`` and
-            ``-1`` padding.
-        chain_span: Half-open pool chain spans with shape ``(B, C, 2)``.
+            ``(B, R, A_system, 3)``.
+        coordinate_mask: Resolved complete-assembly mask with shape
+            ``(B, A_system)``.
+        chain_span: Half-open canonical chain spans with shape ``(B, C, 2)``.
         chain_equivalence_index: Entity-and-layout equivalence ids with
             shape ``(B, C)``.
         symmetry_atom_index: Current-axis atoms in each local symmetry
@@ -5003,7 +5181,6 @@ class Boltz2StructureTarget:
 
     coordinates: Tensor
     coordinate_mask: Tensor
-    atom_index: Tensor
     chain_span: Tensor
     chain_equivalence_index: Tensor
     symmetry_atom_index: Tensor
@@ -5089,7 +5266,13 @@ class Boltz2Input:
         affinity_mw: Optional molecular weight for the selected ligand, used only when affinity MW correction is on.
         affinity_msa_profile: Optional single-sequence profile used by the affinity heads.
         affinity_deletion_mean: Optional deletion mean used by the affinity heads.
-        layout: Molecular identities aligned to the atom and token tensors.
+        system: Canonical molecular system represented by these tensors.
+        atom_index: Canonical atom index for each model atom with shape
+            ``(B, A)`` and ``-1`` padding.
+        token_component_index: Canonical component index for each model token
+            with shape ``(B, N)``.
+        token_atom_index: Canonical atom index for atom-level tokens and ``-1``
+            for component-level tokens, with shape ``(B, N)``.
     """
 
     token_mask: Tensor
@@ -5130,6 +5313,10 @@ class Boltz2Input:
     molecule_type: Tensor
     design_mask: Tensor
     chain_design_mask: Tensor
+    system: MolecularSystem
+    atom_index: Tensor
+    token_component_index: Tensor
+    token_atom_index: Tensor
     frame_atom_index: Tensor | None = None
     method_feature: Tensor | None = None
     modified: Tensor | None = None
@@ -5154,7 +5341,6 @@ class Boltz2Input:
     affinity_mw: Tensor | None = None
     affinity_msa_profile: Tensor | None = None
     affinity_deletion_mean: Tensor | None = None
-    layout: Boltz2Layout | None = None
 
 
 @tensorclass

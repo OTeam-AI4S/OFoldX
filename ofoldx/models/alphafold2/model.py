@@ -15,8 +15,9 @@ import torch
 import torch.nn.functional as F
 from tensordict import tensorclass
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
-from ...data.molecular import AtomSite, MolecularSystem
+from ...data.molecular import MolecularSystem
 from ...data.structure import Structure
 from ...model import Model
 from ...modules import residue_constants
@@ -362,7 +363,7 @@ class AlphaFold2Model(Model):
 
         Notes:
             Predictions follow sample draw order. ``plddt`` and, when present, both ``pae`` axes
-            follow ``input.layout.residue_sites``.
+            follow ``input.component_index``.
 
         Raises:
             ValueError: If ``num_samples`` or ``recycling_steps`` is not positive,
@@ -388,27 +389,13 @@ class AlphaFold2Model(Model):
         Decode one monomer output into a structure and confidence values.
         """
 
-        layout = input.layout
-        complete_sites = [site for site, atom in layout.system.iter_atoms() if atom.element != "H"]
-        complete_index = {site: index for index, site in enumerate(complete_sites)}
-        coordinates: np.ndarray = np.zeros((len(complete_sites), 3), dtype=np.float32)
-        coordinate_mask: np.ndarray = np.zeros(len(complete_sites), dtype=np.bool_)
-        raw_coordinates = output.final_atom_positions[0].float().cpu().numpy()
-        raw_coordinate_mask = output.final_atom_mask[0].bool().cpu().numpy()
-        for residue_index, (instance_id, monomer_index) in enumerate(layout.residue_sites):
-            for atom_name, atom37_index in residue_constants.atom_order.items():
-                site = AtomSite(instance_id, monomer_index, atom_name)
-                target_index = complete_index.get(site)
-                if target_index is None or not raw_coordinate_mask[residue_index, atom37_index]:
-                    continue
-                coordinates[target_index] = raw_coordinates[residue_index, atom37_index]
-                coordinate_mask[target_index] = True
-        structure = Structure(
-            system=layout.system,
-            sites=tuple(complete_sites),
-            coordinates=coordinates,
-            coordinate_mask=coordinate_mask,
+        structure = _decode_atom37_structure(
+            output.final_atom_positions[0],
+            output.final_atom_mask[0],
+            input.system,
+            input.atom37_index[0],
         )
+        residue_axis = _component_axis(input.system, input.component_index[0])
         plddt_logits = output.plddt_logits[0].float()
         plddt_bins = (
             torch.arange(
@@ -421,7 +408,7 @@ class AlphaFold2Model(Model):
         plddt = (100.0 * (plddt_logits.softmax(dim=-1) * plddt_bins).sum(dim=-1)).cpu().numpy()
         pae = None if output.pae_logits is None else _predicted_aligned_error(output.pae_logits[0], self.config)
         scores = {"mean_plddt": Score(float(plddt.mean()), preferred="higher")}
-        metrics = {"plddt": Metric(values=plddt, axis=layout.residue_sites)}
+        metrics = {"plddt": Metric(values=plddt, axis=residue_axis)}
         pair_metrics: dict[str, PairMetric] = {}
         if output.pae_logits is not None and pae is not None:
             scores["ptm"] = Score(
@@ -430,8 +417,8 @@ class AlphaFold2Model(Model):
             )
             pair_metrics["pae"] = PairMetric(
                 values=pae,
-                row_axis=layout.residue_sites,
-                column_axis=layout.residue_sites,
+                row_axis=residue_axis,
+                column_axis=residue_axis,
                 unit="angstrom",
             )
         return FoldPrediction(
@@ -679,7 +666,6 @@ class AlphaFold2InitialGuessModel(AlphaFold2Model):
         config: Initial-guess model architecture and inference configuration.
 
     Examples:
-        >>> import numpy as np
         >>> import torch
         >>> from ofoldx.data import AtomSite, MolecularSystem, PolymerSequence, Structure
         >>> from ofoldx.models.alphafold2 import (
@@ -688,15 +674,26 @@ class AlphaFold2InitialGuessModel(AlphaFold2Model):
         ...     AlphaFold2InitialGuessProcessor,
         ... )
         >>> sequence = PolymerSequence.from_one_letter("A")
-        >>> system = MolecularSystem(
+        >>> system = MolecularSystem.from_entities(
         ...     entities={"protein": sequence},
         ...     instances={"target": "protein", "binder": "protein"},
         ... )
+        >>> coordinates = torch.zeros(system.atom_symbol.numel(), 3)
+        >>> coordinate_mask = torch.zeros(system.atom_symbol.numel(), dtype=torch.bool)
+        >>> ca = system.atom_index(AtomSite("target", 0, "CA"))
+        >>> coordinates[ca], coordinate_mask[ca] = torch.tensor([1.0, 0.0, 0.0]), True
         >>> structure = Structure(
-        ...     system,
-        ...     (AtomSite("target", 0, "CA"),),
-        ...     np.array([[1.0, 0.0, 0.0]], dtype=np.float32),
-        ...     np.ones(1, dtype=np.bool_),
+        ...     system=system,
+        ...     coordinates=coordinates,
+        ...     coordinate_mask=coordinate_mask,
+        ...     occupancy=torch.zeros(system.atom_symbol.numel()),
+        ...     occupancy_mask=torch.zeros(system.atom_symbol.numel(), dtype=torch.bool),
+        ...     b_factor=torch.zeros(system.atom_symbol.numel()),
+        ...     b_factor_mask=torch.zeros(system.atom_symbol.numel(), dtype=torch.bool),
+        ...     source_symbols=(),
+        ...     residue_id=torch.full((system.component_symbol.numel(),), -1, dtype=torch.long),
+        ...     insertion_code=torch.full((system.component_symbol.numel(),), -1, dtype=torch.long),
+        ...     batch_size=[],
         ... )
         >>> config = AlphaFold2InitialGuessConfig({
         ...     "template": {"enabled": False},
@@ -776,7 +773,7 @@ class AlphaFold2InitialGuessModel(AlphaFold2Model):
         binder_scope = frozenset(
             residue
             for residue, selected in zip(
-                initial_guess_input.layout.residue_sites,
+                _component_axis(initial_guess_input.system, initial_guess_input.component_index[0]),
                 binder_mask.cpu().numpy(),
                 strict=True,
             )
@@ -1143,7 +1140,7 @@ class AlphaFold2MultimerModel(Model):
 
         Notes:
             Predictions follow sample draw order. ``plddt`` and both ``pae`` axes follow
-            ``input.layout.residue_sites``.
+            ``input.component_index``.
 
         Raises:
             ValueError: If ``num_samples`` or ``recycling_steps`` is not positive,
@@ -1169,29 +1166,15 @@ class AlphaFold2MultimerModel(Model):
         Decode one multimer output into a structure and confidence values.
         """
 
-        layout = input.layout
         # There is no target assembly against which to permute symmetric copies.
         # Residue labels therefore retain the Processor's concatenation order.
-        complete_sites = [site for site, atom in layout.system.iter_atoms() if atom.element != "H"]
-        complete_index = {site: index for index, site in enumerate(complete_sites)}
-        coordinates: np.ndarray = np.zeros((len(complete_sites), 3), dtype=np.float32)
-        coordinate_mask: np.ndarray = np.zeros(len(complete_sites), dtype=np.bool_)
-        raw_coordinates = output.final_atom_positions[0].float().cpu().numpy()
-        raw_coordinate_mask = output.final_atom_mask[0].bool().cpu().numpy()
-        for residue_index, (instance_id, monomer_index) in enumerate(layout.residue_sites):
-            for atom_name, atom37_index in residue_constants.atom_order.items():
-                site = AtomSite(instance_id, monomer_index, atom_name)
-                target_index = complete_index.get(site)
-                if target_index is None or not raw_coordinate_mask[residue_index, atom37_index]:
-                    continue
-                coordinates[target_index] = raw_coordinates[residue_index, atom37_index]
-                coordinate_mask[target_index] = True
-        structure = Structure(
-            system=layout.system,
-            sites=tuple(complete_sites),
-            coordinates=coordinates,
-            coordinate_mask=coordinate_mask,
+        structure = _decode_atom37_structure(
+            output.final_atom_positions[0],
+            output.final_atom_mask[0],
+            input.system,
+            input.atom37_index[0],
         )
+        residue_axis = _component_axis(input.system, input.component_index[0])
         plddt_logits = output.plddt_logits[0].float()
         plddt_bins = (
             torch.arange(plddt_logits.shape[-1], device=plddt_logits.device, dtype=plddt_logits.dtype) + 0.5
@@ -1214,12 +1197,12 @@ class AlphaFold2MultimerModel(Model):
             "iptm": Score(iptm, preferred="higher"),
             "ranking_score": Score(ranking_score, preferred="higher"),
         }
-        metrics = {"plddt": Metric(values=plddt, axis=layout.residue_sites)}
+        metrics = {"plddt": Metric(values=plddt, axis=residue_axis)}
         pair_metrics = {
             "pae": PairMetric(
                 values=pae,
-                row_axis=layout.residue_sites,
-                column_axis=layout.residue_sites,
+                row_axis=residue_axis,
+                column_axis=residue_axis,
                 unit="angstrom",
             )
         }
@@ -2339,6 +2322,7 @@ class AlphaFold2TemplatePairStack(nn.Module):
     ) -> None:
         super().__init__()
         self.num_blocks = num_blocks
+        self.gradient_checkpointing = False
         self.blocks = nn.ModuleList(
             [
                 AlphaFold2TemplatePairBlock(
@@ -2356,7 +2340,10 @@ class AlphaFold2TemplatePairStack(nn.Module):
 
     def forward(self, pair: Tensor, *, pair_mask: Tensor) -> Tensor:
         for block in self.blocks:
-            pair = block(pair, pair_mask=pair_mask)
+            if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+                pair = checkpoint(block, pair, pair_mask=pair_mask, use_reentrant=False)
+            else:
+                pair = block(pair, pair_mask=pair_mask)
         return pair
 
 
@@ -2440,6 +2427,7 @@ class AlphaFold2MultimerTemplatePairStack(nn.Module):
     ) -> None:
         super().__init__()
         self.num_blocks = num_blocks
+        self.gradient_checkpointing = False
         self.blocks = nn.ModuleList(
             [
                 AlphaFold2MultimerTemplatePairBlock(
@@ -2457,7 +2445,10 @@ class AlphaFold2MultimerTemplatePairStack(nn.Module):
 
     def forward(self, pair: Tensor, *, pair_mask: Tensor) -> Tensor:
         for block in self.blocks:
-            pair = block(pair, pair_mask=pair_mask)
+            if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+                pair = checkpoint(block, pair, pair_mask=pair_mask, use_reentrant=False)
+            else:
+                pair = block(pair, pair_mask=pair_mask)
         return pair
 
 
@@ -4298,14 +4289,42 @@ class AlphaFold2TemplateBatch:
 # ===========================================================================
 
 
-@dataclass(frozen=True)
-class AlphaFold2Layout:
-    r"""
-    Residue identities aligned to one monomer AlphaFold 2 token axis.
-    """
+def _component_axis(
+    system: MolecularSystem,
+    component_index: Tensor,
+) -> tuple[tuple[str, int], ...]:
+    return tuple(system.component_reference(component) for component in component_index.detach().cpu().tolist())
 
-    system: MolecularSystem
-    residue_sites: tuple[tuple[str, int], ...]
+
+def _decode_atom37_structure(
+    atom37_positions: Tensor,
+    atom37_mask: Tensor,
+    system: MolecularSystem,
+    atom37_index: Tensor,
+) -> Structure:
+    system = system.cpu()  # type: ignore[attr-defined]
+    atom37_index = atom37_index.detach().cpu()
+    positions = atom37_positions.detach().to(device="cpu", dtype=torch.float32)
+    mask = atom37_mask.detach().to(device="cpu", dtype=torch.bool) & (atom37_index >= 0)
+    num_atoms = system.atom_symbol.numel()
+    coordinates = torch.zeros(num_atoms, 3, dtype=torch.float32)
+    coordinate_mask = torch.zeros(num_atoms, dtype=torch.bool)
+    coordinates[atom37_index[mask]] = positions[mask]
+    coordinate_mask[atom37_index[mask]] = True
+    num_components = system.component_symbol.numel()
+    return Structure(  # type: ignore[call-arg]
+        system=system,
+        coordinates=coordinates,
+        coordinate_mask=coordinate_mask,
+        occupancy=torch.zeros(num_atoms, dtype=torch.float32),
+        occupancy_mask=torch.zeros(num_atoms, dtype=torch.bool),
+        b_factor=torch.zeros(num_atoms, dtype=torch.float32),
+        b_factor_mask=torch.zeros(num_atoms, dtype=torch.bool),
+        source_symbols=(),
+        residue_id=torch.full((num_components,), -1, dtype=torch.long),
+        insertion_code=torch.full((num_components,), -1, dtype=torch.long),
+        batch_size=[],
+    )
 
 
 @tensorclass
@@ -4336,7 +4355,11 @@ class AlphaFold2Input:
             angles with shape ``(B, T, N, 7, 2)``.
         template_torsion_angles_mask: Template torsion validity mask with shape
             ``(B, T, N, 7)``.
-        layout: Molecular identities aligned to the residue axis.
+        system: Molecular system represented by the tensors.
+        component_index: Canonical component index aligned to residues, with
+            shape ``(B, N)``.
+        atom37_index: Canonical atom index for every atom37 slot, with shape
+            ``(B, N, 37)``; ``-1`` marks an absent atom.
         msa_features: Optional realized clustered-MSA features with shape
             ``(B, M_clustered, N, 49)``.
         msa_mask: Optional clustered-MSA validity mask with shape
@@ -4366,7 +4389,9 @@ class AlphaFold2Input:
     template_torsion_angles_sin_cos: Tensor
     template_alternative_torsion_angles_sin_cos: Tensor
     template_torsion_angles_mask: Tensor
-    layout: AlphaFold2Layout
+    system: MolecularSystem
+    component_index: Tensor
+    atom37_index: Tensor
     msa_features: Tensor | None = None
     msa_mask: Tensor | None = None
     extra_msa_features: Tensor | None = None
@@ -4455,17 +4480,6 @@ class AlphaFold2Output:
     num_recycles: int
 
 
-@dataclass(frozen=True)
-class AlphaFold2MultimerLayout:
-    r"""
-    Residue identities aligned to one AlphaFold-Multimer token axis.
-    """
-
-    system: MolecularSystem
-    residue_sites: tuple[tuple[str, int], ...]
-    chain_boundaries: tuple[tuple[str, int, int], ...]
-
-
 @tensorclass
 class AlphaFold2MultimerInput:
     r"""
@@ -4499,7 +4513,11 @@ class AlphaFold2MultimerInput:
             ``(B, T, N, 4, 4)``.
         template_backbone_frame_mask: Template backbone-frame validity mask with
             shape ``(B, T, N)``.
-        layout: Molecular identities aligned to the residue axis.
+        system: Molecular system represented by the tensors.
+        component_index: Canonical component index aligned to residues, with
+            shape ``(B, N)``.
+        atom37_index: Canonical atom index for every atom37 slot, with shape
+            ``(B, N, 37)``; ``-1`` marks an absent atom.
         msa_features: Optional realized clustered-MSA features with shape
             ``(B, M_clustered, N, 49)``.
         msa_mask: Optional clustered-MSA validity mask with shape
@@ -4532,7 +4550,9 @@ class AlphaFold2MultimerInput:
     template_pseudo_beta_mask: Tensor
     template_backbone_frame: Tensor
     template_backbone_frame_mask: Tensor
-    layout: AlphaFold2MultimerLayout
+    system: MolecularSystem
+    component_index: Tensor
+    atom37_index: Tensor
     msa_features: Tensor | None = None
     msa_mask: Tensor | None = None
     extra_msa_features: Tensor | None = None

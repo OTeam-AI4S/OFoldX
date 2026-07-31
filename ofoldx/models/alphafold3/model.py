@@ -15,10 +15,11 @@ from torch import Tensor, nn
 
 from ...data.molecular import (
     AMINO_ACID_THREE_TO_ONE,
-    AtomSite,
-    ComponentReference,
+    ENTITY_DNA,
+    ENTITY_DNA_RNA_HYBRID,
+    ENTITY_PROTEIN,
+    ENTITY_RNA,
     MolecularSystem,
-    PolymerSequence,
 )
 from ...data.structure import Structure
 from ...model import Model
@@ -497,18 +498,12 @@ class AlphaFold3Model(Model):
             values are in angstroms; pLDDT is on ``0--100``.
 
         Raises:
-            ValueError: If a count is not positive or the input lacks molecular
-                identities required to decode structures.
+            ValueError: If a count is not positive.
         """
 
         num_samples = 5 if num_samples is None else num_samples
         recycling_steps = self._recycling_steps if recycling_steps is None else recycling_steps
         num_sampling_steps = self._num_sampling_steps if num_sampling_steps is None else num_sampling_steps
-        if input.system is None or not input.atom_sites or not input.token_sites:
-            raise ValueError(
-                "fold requires a Processor-built input carrying system, atom_sites, and token_sites; "
-                "bare-tensor inputs can only drive forward/sample"
-            )
 
         return self._decode_fold_result(
             input,
@@ -543,14 +538,22 @@ class AlphaFold3Model(Model):
             generator=generator,
         )
 
-        assert input.system is not None
-        atom_count = len(input.atom_sites)
-        token_count = len(input.token_sites)
-        complete_sites = [site for site, atom in input.system.iter_atoms() if atom.element != "H"]
-        complete_index = {site: index for index, site in enumerate(complete_sites)}
-        model_to_complete = np.asarray([complete_index[site] for site in input.atom_sites], dtype=np.intp)
+        system = input.system.cpu()  # type: ignore[attr-defined]
+        atom_count = int(input.atom_mask[0].sum().item())
+        token_count = int(input.token_mask[0].sum().item())
+        atom_index = input.atom_index[0, :atom_count].detach().cpu().long()
+        token_component_index = input.token_component_index[0, :token_count].detach().cpu().long()
+        token_atom_index = input.token_atom_index[0, :token_count].detach().cpu().long()
+        atom_axis = tuple(system.atom_site(index) for index in atom_index.tolist())
+        token_axis = tuple(
+            system.atom_site(atom) if atom >= 0 else system.component_reference(component)
+            for component, atom in zip(
+                token_component_index.tolist(),
+                token_atom_index.tolist(),
+            )
+        )
 
-        coordinates = output.coordinates[0, :, :atom_count].to(device="cpu", dtype=torch.float32).numpy()
+        coordinates = output.coordinates[0, :, :atom_count].to(device="cpu", dtype=torch.float32)
         atom_plddt = output.plddt[0, :, :atom_count].to(device="cpu", dtype=torch.float32)
         pae_logits = output.pae_logits[0, :, :token_count, :token_count].float().cpu()
         pde_logits = output.pde_logits[0, :, :token_count, :token_count].float().cpu()
@@ -569,9 +572,8 @@ class AlphaFold3Model(Model):
         full_pde = pde.numpy()
         chain_indices = input.chain_index[0, :token_count].cpu().numpy().astype(np.int64)
         frame_mask = input.token_mask[0, :token_count].to(torch.bool).cpu().numpy()
-        instance_ids = tuple(input.system.instances.keys())
         unique_chain = np.unique(chain_indices)
-        chain_axis = tuple(instance_ids[int(index)] for index in unique_chain)
+        chain_axis = tuple(system.instance_id(int(index)) for index in unique_chain)
         multi_chain = unique_chain.shape[0] > 1
 
         pae_single_mask = np.tile(frame_mask[:, None], (1, token_count))
@@ -595,15 +597,24 @@ class AlphaFold3Model(Model):
 
         predictions: list[FoldPrediction] = []
         for sample_index in range(num_samples):
-            complete_coordinates = np.zeros((len(complete_sites), 3), dtype=np.float32)
-            coordinate_mask = np.zeros(len(complete_sites), dtype=np.bool_)
-            complete_coordinates[model_to_complete] = coordinates[sample_index]
-            coordinate_mask[model_to_complete] = True
-            structure = Structure(
-                system=input.system,
-                sites=tuple(complete_sites),
+            num_atoms = system.atom_symbol.numel()
+            complete_coordinates = torch.zeros(num_atoms, 3, dtype=torch.float32)
+            coordinate_mask = torch.zeros(num_atoms, dtype=torch.bool)
+            complete_coordinates[atom_index] = coordinates[sample_index]
+            coordinate_mask[atom_index] = True
+            num_components = system.component_symbol.numel()
+            structure = Structure(  # type: ignore[call-arg]
+                system=system,
                 coordinates=complete_coordinates,
                 coordinate_mask=coordinate_mask,
+                occupancy=torch.zeros(num_atoms, dtype=torch.float32),
+                occupancy_mask=torch.zeros(num_atoms, dtype=torch.bool),
+                b_factor=torch.zeros(num_atoms, dtype=torch.float32),
+                b_factor_mask=torch.zeros(num_atoms, dtype=torch.bool),
+                source_symbols=(),
+                residue_id=torch.full((num_components,), -1, dtype=torch.long),
+                insertion_code=torch.full((num_components,), -1, dtype=torch.long),
+                batch_size=[],
             )
             disorder = alphafold3_fraction_disordered(structure)
             clash = alphafold3_has_clash(structure)
@@ -628,13 +639,13 @@ class AlphaFold3Model(Model):
                         "has_clash": Score(float(clash), preferred="lower"),
                     },
                     metrics={
-                        "plddt": Metric(values=atom_plddt[sample_index].numpy(), axis=input.atom_sites),
+                        "plddt": Metric(values=atom_plddt[sample_index].numpy(), axis=atom_axis),
                         "resolved_probability": Metric(
-                            values=resolved_probability[sample_index].numpy(), axis=input.atom_sites
+                            values=resolved_probability[sample_index].numpy(), axis=atom_axis
                         ),
                         "predicted_distance_error": Metric(
                             values=pde_full_chain[sample_index],
-                            axis=input.token_sites,
+                            axis=token_axis,
                             unit="angstrom",
                         ),
                         "chain_ptm": Metric(values=chain_metrics["iptm_ichain"][sample_index], axis=chain_axis),
@@ -655,20 +666,20 @@ class AlphaFold3Model(Model):
                     pair_metrics={
                         "pae": PairMetric(
                             values=pae[sample_index].numpy(),
-                            row_axis=input.token_sites,
-                            column_axis=input.token_sites,
+                            row_axis=token_axis,
+                            column_axis=token_axis,
                             unit="angstrom",
                         ),
                         "pde": PairMetric(
                             values=pde[sample_index].numpy(),
-                            row_axis=input.token_sites,
-                            column_axis=input.token_sites,
+                            row_axis=token_axis,
+                            column_axis=token_axis,
                             unit="angstrom",
                         ),
                         "contact_probs": PairMetric(
                             values=contact_probability,
-                            row_axis=input.token_sites,
-                            column_axis=input.token_sites,
+                            row_axis=token_axis,
+                            column_axis=token_axis,
                         ),
                         "chain_pair_iptm": PairMetric(
                             values=chain_metrics["chain_pair_iptm"][sample_index],
@@ -1435,6 +1446,7 @@ class AlphaFold3MsaTrunk(MsaTrunk):
         self.msa_projection = nn.Linear(msa_feature_size, msa_size, bias=False)
         self.token_projection = nn.Linear(token_feature_size, msa_size, bias=False)
         self.num_stages = num_stages
+        self.gradient_checkpointing = False
         self.blocks = nn.ModuleList(
             AlphaFold3MsaPairBlock(
                 msa_size=msa_size,
@@ -1590,6 +1602,7 @@ class AlphaFold3PairformerStack(PairformerStack):
     ) -> None:
         nn.Module.__init__(self)
         self.num_blocks = num_blocks
+        self.gradient_checkpointing = False
         self.blocks = nn.ModuleList(
             AlphaFold3PairformerBlock(
                 single_size=single_size,
@@ -2330,7 +2343,7 @@ _MAX_ACCESSIBLE_SURFACE_AREA = {
 _RASA_DISORDER_CUTOFF = 0.581
 _RASA_WINDOW = 25
 
-_POLYMER_TYPES = frozenset({"protein", "rna", "dna", "dna_rna_hybrid"})
+_POLYMER_ENTITY_TYPES = frozenset((ENTITY_PROTEIN, ENTITY_RNA, ENTITY_DNA, ENTITY_DNA_RNA_HYBRID))
 
 
 def alphafold3_ranking_score(ptm: float, iptm: float, fraction_disordered: float, has_clash: bool) -> float:
@@ -2383,13 +2396,13 @@ def alphafold3_fraction_disordered(structure: Structure, rasa_disorder_cutoff: f
 
     rasa: list[float] = []
     sequence_rasa: dict[str, np.ndarray] = {}
-    for instance_id in _protein_instance_ids(structure):
-        chain_sequence = _chain_sequence(structure, instance_id)
+    for instance_index in _protein_instance_indices(structure):
+        chain_sequence = _chain_sequence(structure, instance_index)
         cached = sequence_rasa.get(chain_sequence)
         if cached is not None:
             rasa.extend(cached.tolist())
             continue
-        per_residue = _windowed_solvent_accessible_area(structure, instance_id)
+        per_residue = _windowed_solvent_accessible_area(structure, instance_index)
         sequence_rasa[chain_sequence] = per_residue
         rasa.extend(per_residue.tolist())
 
@@ -2423,7 +2436,7 @@ def alphafold3_has_clash(
         ``True`` if at least one polymer chain overlaps another.
     """
 
-    coordinates, residue_indices, instance_ids = _polymer_atoms(structure)
+    coordinates, residue_indices, instance_indices = _polymer_atoms(structure)
     if coordinates.shape[0] == 0:
         return False
 
@@ -2432,13 +2445,13 @@ def alphafold3_has_clash(
     for atom_index, clashing in enumerate(neighbors):
         for other in clashing:
             if abs(int(residue_indices[atom_index]) - int(residue_indices[other])) > 1 or (
-                instance_ids[atom_index] != instance_ids[other]
+                instance_indices[atom_index] != instance_indices[other]
             ):
                 per_atom_has_clash[atom_index] = True
                 break
 
-    for instance_id in np.unique(instance_ids):
-        mask = instance_ids == instance_id
+    for instance_index in np.unique(instance_indices):
+        mask = instance_indices == instance_index
         num_atoms = int(np.sum(mask))
         if num_atoms == 0:
             continue
@@ -2449,7 +2462,7 @@ def alphafold3_has_clash(
     return False
 
 
-def _windowed_solvent_accessible_area(structure: Structure, instance_id: str) -> np.ndarray:
+def _windowed_solvent_accessible_area(structure: Structure, instance_index: int) -> np.ndarray:
     r"""
     Windowed per-residue rASA for one protein chain (AlphaFold-RSA).
 
@@ -2459,7 +2472,7 @@ def _windowed_solvent_accessible_area(structure: Structure, instance_id: str) ->
     Raises ``RuntimeError`` when the chain has no complete DSSP residues.
     """
 
-    accessible = _dssp_accessible_area(structure, instance_id)
+    accessible = _dssp_accessible_area(structure, instance_index)
     if not accessible:
         raise RuntimeError("DSSP produced no accessible-area rows")
     rasa = []
@@ -2507,7 +2520,7 @@ _DSSP_SURFACE_DOTS = _dssp_surface_dots()
 _DSSP_SURFACE_POINT_WEIGHT = np.float32(4.0 * np.pi / _DSSP_SURFACE_POINT_COUNT)
 
 
-def _dssp_accessible_area(structure: Structure, instance_id: str) -> list[tuple[str, float]]:
+def _dssp_accessible_area(structure: Structure, instance_index: int) -> list[tuple[str, float]]:
     r"""
     Return per-residue ``(residue_name, accessible_area)`` for one protein chain.
 
@@ -2520,24 +2533,35 @@ def _dssp_accessible_area(structure: Structure, instance_id: str) -> list[tuple[
 
     residues: dict[int, tuple[str, dict[str, np.ndarray], list[np.ndarray]]] = {}
     system = structure.system
-    for index, site in enumerate(structure.sites):
-        if site.instance_id != instance_id:
-            continue
-        if not bool(structure.coordinate_mask[index]):
-            continue
-        atom = system.atom(site)
-        if atom.element.upper() == "H":
-            continue
-        component = system.component((instance_id, site.component_index))
-        coordinate = np.asarray(structure.coordinates[index], dtype=np.float32)
-        residue_name, backbone, side_chain = residues.setdefault(
-            site.component_index,
-            (component.component_id, {}, []),
+    component_start = int(system.instance_component_ptr[instance_index])
+    component_stop = int(system.instance_component_ptr[instance_index + 1])
+    component_atom_ptr = system.component_atom_ptr.detach().cpu().tolist()
+    component_symbol = system.component_symbol.detach().cpu().tolist()
+    atom_symbol = system.atom_symbol.detach().cpu().tolist()
+    atomic_number = system.atomic_number.detach().cpu()
+    coordinates = structure.coordinates.detach().to(device="cpu", dtype=torch.float32)
+    coordinate_mask = structure.coordinate_mask.detach().cpu()
+    for component_index in range(component_start, component_stop):
+        residue_name = system.symbols[int(component_symbol[component_index])]
+        backbone: dict[str, np.ndarray] = {}
+        side_chain: list[np.ndarray] = []
+        for atom_index in range(
+            int(component_atom_ptr[component_index]),
+            int(component_atom_ptr[component_index + 1]),
+        ):
+            if not bool(coordinate_mask[atom_index]) or int(atomic_number[atom_index]) == 1:
+                continue
+            atom_name = system.symbols[int(atom_symbol[atom_index])]
+            coordinate = coordinates[atom_index].numpy()
+            if atom_name in _DSSP_ATOM_RADII:
+                backbone[atom_name] = coordinate
+            else:
+                side_chain.append(coordinate)
+        residues[component_index - component_start] = (
+            residue_name,
+            backbone,
+            side_chain,
         )
-        if site.atom_id in _DSSP_ATOM_RADII:
-            backbone[site.atom_id] = coordinate
-        else:
-            side_chain.append(coordinate)
 
     complete_residues = [
         (component_index, residue_name, backbone, side_chain)
@@ -2602,53 +2626,78 @@ def _dssp_accessible_area(structure: Structure, instance_id: str) -> list[tuple[
     return rows
 
 
-def _protein_instance_ids(structure: Structure) -> list[str]:
+def _protein_instance_indices(structure: Structure) -> list[int]:
     r"""
-    Instance ids of protein polymer chains, in system order.
+    Canonical instance indices of protein polymer chains, in system order.
     """
 
     system = structure.system
-    instance_ids: list[str] = []
-    for instance_id, entity_id in system.instances.items():
-        entity = system.entities[entity_id]
-        if isinstance(entity, PolymerSequence) and entity.polymer_type == "protein":
-            instance_ids.append(instance_id)
-    return instance_ids
+    instance_entity = system.instance_entity.detach().cpu().tolist()
+    entity_type = system.entity_type.detach().cpu().tolist()
+    return [
+        instance_index
+        for instance_index, entity_index in enumerate(instance_entity)
+        if int(entity_type[entity_index]) == ENTITY_PROTEIN
+    ]
 
 
-def _chain_sequence(structure: Structure, instance_id: str) -> str:
+def _chain_sequence(structure: Structure, instance_index: int) -> str:
     r"""
     Return the protein sequence used by the cross-chain rASA cache.
     """
 
-    entity = structure.system.entities[structure.system.instances[instance_id]]
-    return "".join(AMINO_ACID_THREE_TO_ONE.get(component.component_id, "X") for component in entity.components)
+    system = structure.system
+    start = int(system.instance_component_ptr[instance_index])
+    stop = int(system.instance_component_ptr[instance_index + 1])
+    return "".join(
+        AMINO_ACID_THREE_TO_ONE.get(
+            system.symbols[int(system.component_symbol[component_index])],
+            "X",
+        )
+        for component_index in range(start, stop)
+    )
 
 
 def _polymer_atoms(structure: Structure) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     r"""
-    Observed polymer atom coordinates, component indices, and instance IDs.
+    Observed polymer atom coordinates, component ordinals, and instance indices.
     """
 
     system = structure.system
-    coordinates: list[np.ndarray] = []
-    residue_indices: list[int] = []
-    instance_ids: list[str] = []
-    for index, site in enumerate(structure.sites):
-        if not bool(structure.coordinate_mask[index]):
-            continue
-        entity = system.entities[system.instances[site.instance_id]]
-        if not isinstance(entity, PolymerSequence) or entity.polymer_type not in _POLYMER_TYPES:
-            continue
-        coordinates.append(np.asarray(structure.coordinates[index], dtype=np.float64))
-        residue_indices.append(site.component_index)
-        instance_ids.append(site.instance_id)
-    if not coordinates:
-        return np.zeros((0, 3), dtype=np.float64), np.zeros(0, dtype=np.int64), np.zeros(0, dtype=object)
+    instance_component_ptr = system.instance_component_ptr.detach().cpu()
+    component_atom_ptr = system.component_atom_ptr.detach().cpu()
+    component_counts = instance_component_ptr[1:] - instance_component_ptr[:-1]
+    atom_counts = component_atom_ptr[1:] - component_atom_ptr[:-1]
+    component_instance = torch.repeat_interleave(
+        torch.arange(system.instance_symbol.numel()),
+        component_counts,
+    )
+    component_local = torch.arange(system.component_symbol.numel()) - torch.repeat_interleave(
+        instance_component_ptr[:-1],
+        component_counts,
+    )
+    atom_component = torch.repeat_interleave(
+        torch.arange(system.component_symbol.numel()),
+        atom_counts,
+    )
+    atom_instance = component_instance[atom_component]
+    atom_entity = system.instance_entity.detach().cpu()[atom_instance]
+    entity_type = system.entity_type.detach().cpu()
+    polymer_entity = torch.tensor(
+        [int(current_entity_type) in _POLYMER_ENTITY_TYPES for current_entity_type in entity_type],
+        dtype=torch.bool,
+    )
+    observed = structure.coordinate_mask.detach().cpu().bool() & polymer_entity[atom_entity]
+    if not bool(observed.any()):
+        return (
+            np.zeros((0, 3), dtype=np.float64),
+            np.zeros(0, dtype=np.int64),
+            np.zeros(0, dtype=np.int64),
+        )
     return (
-        np.stack(coordinates, axis=0),
-        np.asarray(residue_indices, dtype=np.int64),
-        np.asarray(instance_ids, dtype=object),
+        structure.coordinates.detach().to(device="cpu", dtype=torch.float64)[observed].numpy(),
+        component_local[atom_component][observed].numpy(),
+        atom_instance[observed].numpy(),
     )
 
 
@@ -2668,10 +2717,10 @@ def _gather_alphafold3_structure_target(
     input: AlphaFold3Input,
 ) -> tuple[Tensor, Tensor]:
     r"""
-    Gather heavy-atom truth onto the current atom axis.
+    Gather full-system truth onto the current model atom axis.
     """
 
-    atom_index = target.atom_index.long()
+    atom_index = input.atom_index.long()
     valid = atom_index >= 0
     gather_index = atom_index.clamp_min(0)
     coordinates = target.coordinates.gather(
@@ -2760,19 +2809,16 @@ class _AlphaFold3TrunkOutput:
 @tensorclass
 class AlphaFold3StructureTarget:
     r"""
-    Heavy-atom structure truth for AlphaFold 3 training.
+    Full canonical atom-axis structure truth for AlphaFold 3 training.
 
     Args:
-        coordinates: Heavy-atom truth coordinates with shape ``(B, T, 3)`` in
+        coordinates: Full-system atom coordinates with shape ``(B, A_system, 3)`` in
             angstroms.
-        coordinate_mask: Resolved-coordinate mask with shape ``(B, T)``.
-        atom_index: Current model-atom to truth-pool mapping with shape
-            ``(B, A)``; ``-1`` marks padding.
+        coordinate_mask: Resolved-coordinate mask with shape ``(B, A_system)``.
     """
 
     coordinates: Tensor
     coordinate_mask: Tensor
-    atom_index: Tensor
 
 
 @tensorclass
@@ -2781,7 +2827,9 @@ class AlphaFold3Input:
     Tensor and molecular-layout input for AlphaFold 3.
 
     ``B`` is batch size, ``N`` token count, ``A`` atom count, ``M`` MSA depth, and
-    ``T`` template count.
+    ``T`` template count. ``B`` is explicit in the family tensors; the carrier's
+    tensorclass batch size stays empty so the ragged canonical system remains a
+    directly nested, recursively movable tensor graph.
 
     Args:
         token_mask: Valid-token mask with shape ``(B, N)``.
@@ -2807,8 +2855,12 @@ class AlphaFold3Input:
         msa_mask: MSA validity mask with shape ``(B, M, N)``.
         template_features: Optional features for ``T`` structural templates.
         system: Molecular system represented by the tensors.
-        atom_sites: Atom occurrences aligned to the atom axis.
-        token_sites: Molecular occurrences aligned to the token axis.
+        atom_index: Canonical atom index aligned to the model atom axis, with
+            shape ``(B, A)``.
+        token_component_index: Canonical component index aligned to tokens, with
+            shape ``(B, N)``.
+        token_atom_index: Canonical atom index for atom-level tokens, with shape
+            ``(B, N)``; ``-1`` marks a residue/component token.
     """
 
     token_mask: Tensor
@@ -2830,10 +2882,11 @@ class AlphaFold3Input:
     token_bonds: Tensor
     msa_features: Tensor
     msa_mask: Tensor
+    system: MolecularSystem
+    atom_index: Tensor
+    token_component_index: Tensor
+    token_atom_index: Tensor
     template_features: TemplateFeatures | None = None
-    system: MolecularSystem | None = None
-    atom_sites: tuple[AtomSite, ...] = ()
-    token_sites: tuple[AtomSite | ComponentReference, ...] = ()
 
 
 @tensorclass

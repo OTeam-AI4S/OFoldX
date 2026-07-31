@@ -12,7 +12,7 @@ from pathlib import Path
 import torch
 
 from ...data.evidence import MSA, MSACollection, Template
-from ...data.molecular import MolecularSystem, PolymerSequence
+from ...data.molecular import ENTITY_PROTEIN, MolecularSystem
 from ...data.structure import Structure
 from ...io import read_msa, read_structure
 from ...pipelines import CompositePair, CompositePipeline, PairedPipeline, resolve_generator
@@ -378,9 +378,9 @@ def _read_boltz2_msa(
     if not isinstance(msa, str | PathLike):
         return msa
     proteins = [
-        entity_id
-        for entity_id, entity in system.entities.items()
-        if isinstance(entity, PolymerSequence) and entity.polymer_type == "protein"
+        system.entity_id(entity_index)
+        for entity_index in range(system.entity_symbol.numel())
+        if int(system.entity_type[entity_index]) == ENTITY_PROTEIN
     ]
     if len(proteins) != 1:
         raise ValueError("an aligned FASTA is unambiguous only for one protein entity; " "pass MSACollection")

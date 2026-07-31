@@ -5,66 +5,29 @@ Generic PDB codec for canonical [`ofoldx.data.Structure`][] values.
 from __future__ import annotations
 
 import gzip
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
 
 import numpy as np
+import torch
 
-from ..data.components import get_component
-from ..data.molecular import AtomSite, Molecule, PolymerSequence, SystemBond
+from ..data.elements import ATOMIC_NUMBER_BY_ELEMENT
+from ..data.molecular import BOND_ROLE_ENTITY, ENTITY_MOLECULE, AtomSite, SystemBond
 from ..data.structure import Structure
 from .records import (
-    AtomRecord,
-    ParsedStructure,
-    atom_record_residue_key,
-    atom_records_from_array,
-    ordered_output_bonds,
-    reject_duplicate_atom_records,
+    atom_row_residue_key,
+    atom_rows_from_array,
+    reject_duplicate_atom_rows,
     selected_source_sites,
-    source_record_key,
+    source_row_key,
 )
 
 
-@dataclass(frozen=True, slots=True)
-class PdbAtomRecord:
-    r"""
-    One fully materialized PDB output row.
-
-    Args:
-        site: Canonical atom site represented by the row.
-        serial: One-based PDB atom serial.
-        group: `ATOM` or `HETATM` record category.
-        atom_name: PDB atom name.
-        altloc_id: Alternate-location identifier.
-        component_id: PDB residue name.
-        chain_id: One-character PDB chain identifier.
-        residue_id: PDB residue number.
-        insertion_code: PDB insertion code.
-        coordinates: Cartesian coordinates in angstroms.
-        occupancy: Atom occupancy.
-        b_factor: Isotropic B factor.
-        element: Chemical element symbol.
-        charge: Formal charge.
-    """
-
-    site: AtomSite
-    serial: int
-    group: Literal["ATOM", "HETATM"]
-    atom_name: str
-    altloc_id: str
-    component_id: str
-    chain_id: str
-    residue_id: int
-    insertion_code: str
-    coordinates: tuple[float, float, float]
-    occupancy: float
-    b_factor: float
-    element: str
-    charge: int
-
-
-def parse_pdb(path: Path, *, model: int, assembly_id: str | None) -> ParsedStructure:
+def parse_pdb(
+    path: Path,
+    *,
+    model: int,
+    assembly_id: str | None,
+) -> tuple[np.recarray, tuple[str, ...], tuple[tuple[str, str, int, str], ...]]:
     r"""
     Parse one PDB model or assembly into format-neutral atom records.
 
@@ -112,14 +75,54 @@ def parse_pdb(path: Path, *, model: int, assembly_id: str | None) -> ParsedStruc
         raise ValueError(f"PDB does not contain requested model {model}") from error
     except KeyError as error:
         raise ValueError(f"PDB does not contain requested assembly {assembly_id!r}") from error
-    rows = atom_records_from_array(array, format_name="pdb")
-    reject_duplicate_atom_records(rows)
-    return ParsedStructure(
-        format="pdb",
-        rows=rows,
-        canonical_payload=None,
-        pdb_lines=tuple(pdb_file.lines),
-    )
+    rows = atom_rows_from_array(array, format_name="pdb")
+    reject_duplicate_atom_rows(rows)
+    lines = tuple(pdb_file.lines)
+    return rows, lines, _missing_residues(lines, model)
+
+
+def _missing_residues(
+    pdb_lines: tuple[str, ...],
+    model: int,
+) -> tuple[tuple[str, str, int, str], ...]:
+    r"""
+    Read unmodeled polymer residues explicitly declared by ``REMARK 465``.
+
+    PDB author numbering is not a sequence declaration: absent numbers alone do not
+    imply absent residues. This reader therefore considers only fixed-column
+    ``REMARK 465`` data rows and filters model-specific declarations to the selected
+    model.
+    """
+
+    missing: list[tuple[str, str, int, str]] = []
+    for line in pdb_lines:
+        if not line.startswith("REMARK 465"):
+            continue
+        component_id = line[15:18].strip()
+        residue_number = line[21:26].strip()
+        if not component_id or not residue_number:
+            continue
+        try:
+            number = int(residue_number)
+        except ValueError:
+            continue
+        model_text = line[11:14].strip()
+        if model_text:
+            try:
+                declared_model = int(model_text)
+            except ValueError:
+                continue
+            if declared_model != model:
+                continue
+        declaration = (
+            line[19:20].strip(),
+            component_id,
+            number,
+            line[26:27].strip(),
+        )
+        if declaration not in missing:
+            missing.append(declaration)
+    return tuple(missing)
 
 
 def pdb_segment_by_serial(pdb_lines: tuple[str, ...]) -> dict[str, int]:
@@ -152,15 +155,17 @@ def pdb_segment_by_serial(pdb_lines: tuple[str, ...]) -> dict[str, int]:
 
 
 def read_pdb_bonds(
-    parsed: ParsedStructure,
-    selected_rows: tuple[AtomRecord, ...],
+    pdb_lines: tuple[str, ...],
+    source_rows: np.recarray,
+    selected_rows: np.recarray,
     site_by_row_index: dict[int, AtomSite],
 ) -> tuple[SystemBond, ...]:
     r"""
     Decode PDB `CONECT` declarations against selected canonical sites.
 
     Args:
-        parsed: Parsed PDB records and original source lines.
+        pdb_lines: Original PDB source lines.
+        source_rows: All source atom rows before alternate-location selection.
         selected_rows: Atom rows retained for the selected structure.
         site_by_row_index: Canonical atom sites indexed by source row.
 
@@ -169,39 +174,36 @@ def read_pdb_bonds(
 
     Raises:
         ValueError: If atom serials are ambiguous or missing, or a declared bond
-            multiplicity is unsupported.
+            identity is ambiguous.
     """
 
-    conect_lines = [line for line in parsed.pdb_lines if line.startswith("CONECT")]
-    directed_counts: dict[tuple[str, str], int] = {}
+    conect_lines = [line for line in pdb_lines if line.startswith("CONECT")]
+    directed_edges: set[tuple[str, str]] = set()
     for line in conect_lines:
         source_serial = line[6:11].strip()
         if not source_serial:
             continue
         targets = [line[start : start + 5].strip() for start in range(11, len(line), 5)]
         targets = [target for target in targets if target]
-        for target_serial in set(targets):
-            directed_counts[(source_serial, target_serial)] = max(
-                directed_counts.get((source_serial, target_serial), 0), targets.count(target_serial)
-            )
-    source_row_by_serial: dict[tuple[str | None, str], AtomRecord] = {}
-    for row in parsed.rows:
+        directed_edges.update((source_serial, target_serial) for target_serial in targets)
+    source_row_by_serial: dict[tuple[str | None, str], np.record] = {}
+    for row in source_rows:
         if row.serial is None:
             continue
         key = (row.symmetry_id, row.serial)
         previous = source_row_by_serial.get(key)
-        if previous is not None and atom_record_residue_key(previous) != atom_record_residue_key(row):
+        if previous is not None and atom_row_residue_key(previous) != atom_row_residue_key(row):
             raise ValueError(f"PDB atom serial {row.serial!r} is ambiguous")
         source_row_by_serial[key] = row
-    declared_serials = {serial for pair in directed_counts for serial in pair}
+    declared_serials = {serial for pair in directed_edges for serial in pair}
     available_serials = {serial for _, serial in source_row_by_serial}
     missing_serials = declared_serials - available_serials
     if missing_serials:
         raise ValueError(f"PDB CONECT references unknown atom serials: {sorted(missing_serials)!r}")
-    selected_sites = selected_source_sites(selected_rows, site_by_row_index)
+    selected_sites, _ = selected_source_sites(selected_rows, site_by_row_index)
     symmetry_ids = {row.symmetry_id for row in selected_rows}
     bonds: dict[tuple[str | None, frozenset[str]], SystemBond] = {}
-    undirected_serials = {frozenset(pair) for pair in directed_counts if pair[0] != pair[1]}
+    undirected_serials = {frozenset(pair) for pair in directed_edges if pair[0] != pair[1]}
     for symmetry_id in symmetry_ids:
         for serials in undirected_serials:
             if len(serials) != 2:
@@ -211,259 +213,160 @@ def read_pdb_bonds(
             row_b = source_row_by_serial.get((symmetry_id, serial_b))
             if row_a is None or row_b is None:
                 continue
-            site_a = selected_sites.get(source_record_key(row_a))
-            site_b = selected_sites.get(source_record_key(row_b))
+            site_a = selected_sites.get(source_row_key(row_a))
+            site_b = selected_sites.get(source_row_key(row_b))
             if site_a is None or site_b is None or site_a == site_b:
                 continue
-            order = max(
-                directed_counts.get((serial_a, serial_b), 0),
-                directed_counts.get((serial_b, serial_a), 0),
-                1,
-            )
-            if order > 4:
-                raise ValueError(f"unsupported PDB CONECT bond multiplicity {order}")
             bond = SystemBond(
                 site_a,
                 site_b,
-                order=float(order),
-                origin="source",
+                order=None,
+                aromatic=None,
+                role="assembly",
             )
             bonds[(symmetry_id, serials)] = bond
     return tuple(bonds.values())
 
 
-def pdb_loss_fields(
-    structure: Structure,
-    atoms: tuple[PdbAtomRecord, ...],
-    dropped: set[str],
-    rewritten: set[str],
-) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    r"""
-    Return canonical fields dropped or rewritten by PDB output.
+def write_pdb(structure: Structure, path: Path) -> None:
+    r"""Write the observed projection of a Structure as legacy PDB."""
 
-    Args:
-        structure: Source structure being serialized.
-        atoms: Prepared PDB atom rows.
-        dropped: Field tokens already known to be omitted.
-        rewritten: Field tokens already known to be changed.
-
-    Returns:
-        Sorted tuples of dropped and rewritten field tokens.
-    """
-
-    # LossReport covers information represented by Structure and MolecularSystem;
-    # unrepresented source annotations are outside its scope.
     system = structure.system
-    written_sites = {atom.site for atom in atoms}
-    atoms_by_instance: dict[str, list[PdbAtomRecord]] = {}
-    for atom in atoms:
-        atoms_by_instance.setdefault(atom.site.instance_id, []).append(atom)
-    for instance_id, entity_id in system.instances.items():
-        instance_atoms = atoms_by_instance.get(instance_id, [])
-        if not instance_atoms:
-            dropped.add("system.instances")
-            continue
-        entity = system.entities[entity_id]
-        if isinstance(entity, PolymerSequence):
-            observed_components = {atom.site.component_index for atom in instance_atoms}
-            if observed_components != set(range(len(entity))):
-                dropped.add("system.polymer_sequence")
-    if any(bond.site_a not in written_sites or bond.site_b not in written_sites for bond in system.bonds):
-        dropped.add("system.bonds")
-    if any(bond.origin != "source" for bond in system.bonds):
-        rewritten.add("system.bond_origins")
-    if any(isinstance(entity, Molecule) for entity in system.entities.values()):
-        dropped.add("system.nonpolymer_graph")
-    polymer_components = {
-        component.component_id: component
-        for entity in system.entities.values()
-        if isinstance(entity, PolymerSequence)
-        for component in entity.components
-    }
-    for component in polymer_components.values():
-        try:
-            builtin = get_component(component.component_id)
-        except KeyError:
-            dropped.add("system.nonstandard_components")
-            break
-        if builtin != component:
-            dropped.add("system.nonstandard_components")
-            break
-    if any(bond.stereo is not None or bond.aromatic or bond.order not in {1.0, 2.0, 3.0, 4.0} for bond in system.bonds):
-        dropped.add("system.bond_semantics")
-    return tuple(sorted(dropped)), tuple(sorted(rewritten))
+    coordinates = structure.coordinates.detach().cpu()
+    coordinate_mask = structure.coordinate_mask.detach().cpu()
+    occupancy = structure.occupancy.detach().cpu()
+    occupancy_mask = structure.occupancy_mask.detach().cpu()
+    b_factor = structure.b_factor.detach().cpu()
+    b_factor_mask = structure.b_factor_mask.detach().cpu()
+    residue_id = structure.residue_id.detach().cpu()
+    insertion_code = structure.insertion_code.detach().cpu()
+    instance_entity = system.instance_entity.detach().cpu()
+    entity_type = system.entity_type.detach().cpu()
+    instance_component_ptr = system.instance_component_ptr.detach().cpu()
+    component_symbol = system.component_symbol.detach().cpu()
+    component_atom_ptr = system.component_atom_ptr.detach().cpu()
+    atom_symbol = system.atom_symbol.detach().cpu()
+    atomic_numbers = system.atomic_number.detach().cpu()
+    isotopes = system.isotope.detach().cpu()
+    isotopes_known = system.isotope_known.detach().cpu()
+    formal_charges = system.formal_charge.detach().cpu()
+    formal_charges_known = system.formal_charge_known.detach().cpu()
+    edge_index = system.edge_index.detach().cpu()
+    bond_role = system.bond_role.detach().cpu()
+    element_by_number = {number: element for element, number in ATOMIC_NUMBER_BY_ELEMENT.items()}
+    component_count = int(component_symbol.shape[0])
+    atom_count = int(atom_symbol.shape[0])
+    component_instance = [0] * component_count
+    atom_component = [0] * atom_count
+    for instance_index in range(int(system.instance_symbol.shape[0])):
+        component_start = int(instance_component_ptr[instance_index])
+        component_stop = int(instance_component_ptr[instance_index + 1])
+        for component_index in range(component_start, component_stop):
+            component_instance[component_index] = instance_index
+            atom_start = int(component_atom_ptr[component_index])
+            atom_stop = int(component_atom_ptr[component_index + 1])
+            atom_component[atom_start:atom_stop] = [component_index] * (atom_stop - atom_start)
 
-
-def prepare_pdb_atoms(structure: Structure) -> tuple[tuple[PdbAtomRecord, ...], set[str], set[str]]:
-    r"""
-    Materialize PDB rows and collect dropped or rewritten field tokens.
-
-    Args:
-        structure: Structure to lower into PDB atom rows.
-
-    Returns:
-        Prepared atom rows, dropped field tokens, and rewritten field tokens.
-
-    Raises:
-        ValueError: If PDB chain, serial, atom-name, coordinate, occupancy, or B-factor
-            limits cannot represent the structure.
-    """
-
-    # The writer derives source-identity columns and emits one conformer.
-    residue_numbers = structure.residue_numbers or {}
-    dropped: set[str] = set()
-    rewritten: set[str] = set()
+    observed_atom_indices = (
+        torch.nonzero(
+            coordinate_mask,
+            as_tuple=False,
+        )
+        .flatten()
+        .tolist()
+    )
+    observed_instances: list[int] = []
+    seen_instances: set[int] = set()
+    for atom_index in observed_atom_indices:
+        instance_index = component_instance[atom_component[atom_index]]
+        if instance_index not in seen_instances:
+            observed_instances.append(instance_index)
+            seen_instances.add(instance_index)
     alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-    instance_sites: dict[str, list[AtomSite]] = {}
-    for site in structure.sites:
-        instance_sites.setdefault(site.instance_id, []).append(site)
-    if len(instance_sites) > len(alphabet):
-        raise ValueError("PDB supports at most 62 distinct one-character chain IDs")
-    chain_by_instance: dict[str, str] = {}
+    if len(observed_instances) > len(alphabet):
+        raise ValueError("PDB supports at most 62 observed chains")
+    chain_by_instance: dict[int, str] = {}
     used_chains: set[str] = set()
-    for instance_id in instance_sites:
-        preferred = instance_id
-        if len(preferred) == 1 and preferred not in used_chains and preferred.isalnum():
+    for instance_index in observed_instances:
+        preferred = system.instance_id(instance_index)
+        if len(preferred) == 1 and preferred.isalnum() and preferred not in used_chains:
             chain = preferred
         else:
-            chain = next(value for value in alphabet if value not in used_chains)
-            rewritten.add("system.instance_ids")
-        chain_by_instance[instance_id] = chain
+            chain = next(candidate for candidate in alphabet if candidate not in used_chains)
+        chain_by_instance[instance_index] = chain
         used_chains.add(chain)
 
-    atoms: list[PdbAtomRecord] = []
-    names_by_residue: dict[tuple[str, int, str], set[str]] = {}
-    for site_index, site in enumerate(structure.sites):
-        if not bool(structure.coordinate_mask[site_index]):
-            dropped.add("structure.coordinate_mask")
-            if structure.b_factor is not None and not np.isnan(structure.b_factor[site_index]):
-                dropped.add("structure.b_factor")
-            continue
-        if len(atoms) >= 99999:
-            raise ValueError("PDB atom serial limit of 99999 was exceeded")
-        entity = structure.system.entities[structure.system.instances[site.instance_id]]
-        component = structure.system.component((site.instance_id, site.component_index))
-        canonical_component_id = component.component_id
-        canonical_residue_id = site.component_index + 1
-        residue_number = residue_numbers.get((site.instance_id, site.component_index))
-        if isinstance(entity, PolymerSequence):
-            try:
-                get_component(canonical_component_id)
-            except KeyError:
-                group: Literal["ATOM", "HETATM"] = "HETATM"
-            else:
-                group = "ATOM"
-        else:
-            group = "HETATM"
-        component_id = str(canonical_component_id)
-        if len(component_id) > 3:
-            component_id = component_id[:3]
-            rewritten.add("system.component_ids")
-        residue_id = residue_number.number if residue_number is not None else canonical_residue_id
-        residue_id = int(residue_id)
-        if residue_id < -999 or residue_id > 9999:
-            residue_id = canonical_residue_id
-            rewritten.add("structure.author_residue_ids")
-        insertion_code = residue_number.insertion_code if residue_number is not None else ""
-        if len(insertion_code) > 1:
-            insertion_code = insertion_code[0]
-            rewritten.add("structure.insertion_codes")
-        atom_name = site.atom_id
-        if len(atom_name) > 4:
-            atom_name = atom_name[:4]
-            rewritten.add("system.atom_ids")
-        residue_key = (chain_by_instance[site.instance_id], residue_id, insertion_code)
-        used_names = names_by_residue.setdefault(residue_key, set())
-        if atom_name in used_names:
-            raise ValueError(f"PDB atom-name rewrite collides within residue {residue_key!r}: {atom_name!r}")
-        used_names.add(atom_name)
-        altloc_id = ""
-        x, y, z = structure.coordinates[site_index]
-        coordinate = (float(x), float(y), float(z))
-        if any(not np.isfinite(value) or value < -999.999 or value > 9999.999 for value in coordinate):
-            raise ValueError("PDB coordinate field range was exceeded")
-        rounded_coordinate = (
-            round(coordinate[0], 3),
-            round(coordinate[1], 3),
-            round(coordinate[2], 3),
-        )
-        if not np.array_equal(np.asarray(rounded_coordinate, dtype=np.float32), structure.coordinates[site_index]):
-            rewritten.add("structure.coordinates")
-        if structure.occupancy is None or np.isnan(structure.occupancy[site_index]):
-            occupancy = 1.0
-            rewritten.add("structure.occupancy")
-        else:
-            occupancy = float(structure.occupancy[site_index])
-            if not np.isfinite(occupancy) or len(f"{occupancy:6.2f}") > 6:
-                raise ValueError("PDB occupancy field range was exceeded")
-            if np.float32(round(occupancy, 2)) != structure.occupancy[site_index]:
-                rewritten.add("structure.occupancy")
-        if structure.b_factor is None or np.isnan(structure.b_factor[site_index]):
-            b_factor = 0.0
-            rewritten.add("structure.b_factor")
-        else:
-            b_factor = float(structure.b_factor[site_index])
-            if not np.isfinite(b_factor) or len(f"{b_factor:6.2f}") > 6:
-                raise ValueError("PDB B-factor field range was exceeded")
-            if np.float32(round(b_factor, 2)) != structure.b_factor[site_index]:
-                rewritten.add("structure.b_factor")
-        chemical_atom = structure.system.atom(site)
-        charge = chemical_atom.formal_charge or 0
-        if abs(charge) > 9:
-            dropped.add("system.formal_charge")
-            charge = 0
-        atoms.append(
-            PdbAtomRecord(
-                site=site,
-                serial=len(atoms) + 1,
-                group=group,
-                atom_name=atom_name,
-                altloc_id=altloc_id,
-                component_id=component_id,
-                chain_id=chain_by_instance[site.instance_id],
-                residue_id=residue_id,
-                insertion_code=insertion_code,
-                coordinates=rounded_coordinate,
-                occupancy=round(occupancy, 2),
-                b_factor=round(b_factor, 2),
-                element=chemical_atom.element,
-                charge=charge,
-            )
-        )
-    return tuple(atoms), dropped, rewritten
-
-
-def write_pdb(structure: Structure, path: Path, atoms: tuple[PdbAtomRecord, ...]) -> None:
-    r"""
-    Write prepared PDB atom records and representable system bonds.
-
-    Args:
-        structure: Source structure providing the system bond graph.
-        path: Destination PDB path.
-        atoms: Prepared PDB atom rows.
-    """
-
     lines: list[str] = []
-    serial_by_site = {atom.site: atom.serial for atom in atoms}
-    for atom in atoms:
-        x, y, z = atom.coordinates
-        atom_name = _format_pdb_atom_name(atom.atom_name, atom.element)
-        charge = "  " if atom.charge == 0 else f"{abs(atom.charge)}{'+' if atom.charge > 0 else '-'}"
+    serial_by_atom: dict[int, int] = {}
+    used_names: dict[tuple[str, int, str], set[str]] = {}
+    for atom_index in observed_atom_indices:
+        if len(serial_by_atom) >= 99999:
+            raise ValueError("PDB atom serial limit of 99999 was exceeded")
+        component_index = atom_component[atom_index]
+        instance_index = component_instance[component_index]
+        entity_index = int(instance_entity[instance_index])
+        local_component = component_index - int(instance_component_ptr[instance_index])
+        component_id = system.symbols[int(component_symbol[component_index])][:3]
+        atom_id = system.symbols[int(atom_symbol[atom_index])][:4]
+        source_residue = int(residue_id[component_index])
+        if source_residue >= 0:
+            try:
+                number = int(structure.source_symbols[source_residue])
+            except ValueError:
+                number = local_component + 1
+        else:
+            number = local_component + 1
+        if number < -999 or number > 9999:
+            number = local_component + 1
+        source_insertion = int(insertion_code[component_index])
+        code = "" if source_insertion < 0 else structure.source_symbols[source_insertion][:1]
+        residue_key = (chain_by_instance[instance_index], number, code)
+        names = used_names.setdefault(residue_key, set())
+        if atom_id in names:
+            raise ValueError(f"PDB atom-name truncation collides within residue {residue_key!r}: {atom_id!r}")
+        names.add(atom_id)
+
+        xyz = tuple(float(value) for value in coordinates[atom_index])
+        if any(not np.isfinite(value) or value < -999.999 or value > 9999.999 for value in xyz):
+            raise ValueError("PDB coordinate field range was exceeded")
+        atom_occupancy = float(occupancy[atom_index]) if bool(occupancy_mask[atom_index]) else 1.0
+        atom_b_factor = float(b_factor[atom_index]) if bool(b_factor_mask[atom_index]) else 0.0
+        if not np.isfinite(atom_occupancy) or len(f"{atom_occupancy:6.2f}") > 6:
+            raise ValueError("PDB occupancy field range was exceeded")
+        if not np.isfinite(atom_b_factor) or len(f"{atom_b_factor:6.2f}") > 6:
+            raise ValueError("PDB B-factor field range was exceeded")
+        atomic_number = int(atomic_numbers[atom_index])
+        element = element_by_number[atomic_number]
+        if atomic_number == 1 and bool(isotopes_known[atom_index]):
+            if int(isotopes[atom_index]) == 2:
+                element = "D"
+            elif int(isotopes[atom_index]) == 3:
+                element = "T"
+        charge_value = int(formal_charges[atom_index]) if bool(formal_charges_known[atom_index]) else 0
+        if abs(charge_value) > 9:
+            charge_value = 0
+        charge = "  " if charge_value == 0 else f"{abs(charge_value)}{'+' if charge_value > 0 else '-'}"
+        serial = len(serial_by_atom) + 1
+        serial_by_atom[atom_index] = serial
+        group = "HETATM" if int(entity_type[entity_index]) == ENTITY_MOLECULE else "ATOM"
+        atom_name = _format_pdb_atom_name(atom_id, element)
+        x, y, z = xyz
         lines.append(
-            f"{atom.group:<6}{atom.serial:>5} {atom_name}{atom.altloc_id or ' '}{atom.component_id:>3} "
-            f"{atom.chain_id}{atom.residue_id:>4}{atom.insertion_code or ' '}   "
-            f"{x:>8.3f}{y:>8.3f}{z:>8.3f}{atom.occupancy:>6.2f}{atom.b_factor:>6.2f}          "
-            f"{atom.element:>2}{charge:>2}"
+            f"{group:<6}{serial:>5} {atom_name} {component_id:>3} "
+            f"{chain_by_instance[instance_index]}{number:>4}{code or ' '}   "
+            f"{x:>8.3f}{y:>8.3f}{z:>8.3f}{atom_occupancy:>6.2f}{atom_b_factor:>6.2f}          "
+            f"{element:>2}{charge:>2}"
         )
-    for bond in ordered_output_bonds(structure.system):
-        source_serial = serial_by_site.get(bond.site_a)
-        target_serial = serial_by_site.get(bond.site_b)
-        if source_serial is None or target_serial is None:
+
+    for bond_index in range(edge_index.shape[1]):
+        if int(bond_role[bond_index]) < BOND_ROLE_ENTITY:
             continue
-        multiplicity = int(bond.order) if bond.order in {1.0, 2.0, 3.0, 4.0} else 1
-        targets = [target_serial] * multiplicity
-        for start in range(0, len(targets), 4):
-            lines.append(f"CONECT{source_serial:>5}" + "".join(f"{serial:>5}" for serial in targets[start : start + 4]))
+        source_atom = int(edge_index[0, bond_index])
+        target_atom = int(edge_index[1, bond_index])
+        source_serial = serial_by_atom.get(source_atom)
+        target_serial = serial_by_atom.get(target_atom)
+        if source_serial is not None and target_serial is not None:
+            lines.append(f"CONECT{source_serial:>5}{target_serial:>5}")
     lines.append("END")
     path.write_text("\n".join(lines) + "\n", encoding="ascii")
 

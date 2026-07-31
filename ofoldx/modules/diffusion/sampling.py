@@ -232,7 +232,8 @@ class CoordinateEdmSampler(nn.Module):
             context: Static conditioning tensors shared across steps.
             num_samples: Number of samples to draw per batch element.
             num_sampling_steps: Number of reverse-diffusion steps.
-            sample_chunk_size: If set, sample in chunks of this many draws to cap peak memory.
+            sample_chunk_size: Maximum number of candidates denoised together. Random
+                draws still advance over the complete candidate axis.
             initial_coords: Optional starting coordinates with shape
                 ``[..., N_atom, 3]`` or ``[..., num_samples, N_atom, 3]``.
                 Gaussian noise is drawn when omitted.
@@ -287,7 +288,8 @@ class CoordinateEdmSampler(nn.Module):
             context: Static conditioning tensors.
             num_samples: Total number of samples to draw.
             num_sampling_steps: Number of reverse-diffusion steps.
-            sample_chunk_size: Optional chunk size for memory-bounded sampling.
+            sample_chunk_size: Optional maximum number of candidates passed to the
+                denoiser together.
             initial_coords: Optional starting coords.
             condition_coords: Optional fixed coordinates pinned after each step.
             condition_mask: Optional atom mask selecting fixed coordinates.
@@ -315,107 +317,89 @@ class CoordinateEdmSampler(nn.Module):
             max_noise_level=max_noise_level,
         )
 
-        def denoise_chunk(
-            chunk_num_samples: int,
-            chunk_initial_coords: Tensor | None,
-            *,
-            sample_start: int = 0,
-        ) -> Tensor:
-            r"""
-            Run the full reverse-diffusion loop for one chunk of ``chunk_num_samples`` samples.
+        coords = self._initial_coords(
+            context=context,
+            num_samples=num_samples,
+            noise_level=noise_schedule[0],
+            initial_coords=initial_coords,
+            generator=generator,
+        )
+        if condition_mask is not None and condition_coords is not None:
+            coords = self._apply_condition(coords, condition_coords, condition_mask)
 
-            Seeds ``chunk_num_samples`` noisy structures from ``chunk_initial_coords`` (or from the
-            schedule's first noise level), then walks every consecutive ``(sigma_prev, sigma_next)``
-            pair of ``noise_schedule`` applying optional center-random-augmentation and one
-            ``_step`` update.
+        chunk_size = num_samples if sample_chunk_size is None else min(sample_chunk_size, num_samples)
+        num_transitions = noise_schedule.size(0) - 1
+        for step_index, (sigma_prev, sigma_next) in enumerate(zip(noise_schedule[:-1], noise_schedule[1:])):
+            augmentation_transform = None
+            if self.center_random_augmentation:
+                coords, augmentation_transform = self._center_random_augmentation(
+                    coords,
+                    num_samples=1,
+                    atom_mask=context.atom_mask,
+                    generator=generator,
+                )
+                coords = coords.squeeze(dim=-3)
 
-            Args:
-                chunk_num_samples: Number of samples to draw in this chunk.
-                chunk_initial_coords: Optional starting coords for the chunk; seeded from the schedule's
-                    first noise level when ``None``.
+            step_condition_coords = condition_coords
+            if condition_mask is not None and condition_coords is not None:
+                if augmentation_transform is not None:
+                    step_condition_coords = self._apply_augmentation(
+                        condition_coords,
+                        augmentation_transform,
+                        target=coords,
+                    )
+                coords = self._apply_condition(coords, step_condition_coords, condition_mask)
 
-            Returns:
-                Coordinates shaped `[..., chunk_num_samples, N_atom, 3]`.
-            """
-
-            coords = self._initial_coords(
-                context=context,
-                num_samples=chunk_num_samples,
-                noise_level=noise_schedule[0],
-                initial_coords=chunk_initial_coords,
+            # Randomness is drawn for the complete candidate axis before denoiser
+            # chunking.  ``sample_chunk_size`` therefore changes only peak
+            # denoiser memory, never the advancing generator stream.
+            noise = _draw_normal(
+                size=coords.shape,
+                device=coords.device,
+                dtype=coords.dtype,
                 generator=generator,
             )
-            chunk_condition_coords = self._coords_chunk(
-                condition_coords,
-                context=context,
-                num_samples=num_samples,
-                sample_start=sample_start,
-                chunk_num_samples=chunk_num_samples,
-                name="condition_coords",
-            )
-            if condition_mask is not None and chunk_condition_coords is not None:
-                coords = self._apply_condition(coords, chunk_condition_coords, condition_mask)
-            num_transitions = noise_schedule.size(0) - 1
-            for step_index, (sigma_prev, sigma_next) in enumerate(zip(noise_schedule[:-1], noise_schedule[1:])):
-                augmentation_transform = None
-                if self.center_random_augmentation:
-                    coords, augmentation_transform = self._center_random_augmentation(
-                        coords,
-                        num_samples=1,
-                        atom_mask=context.atom_mask,
-                        generator=generator,
-                    )
-                    coords = coords.squeeze(dim=-3)
-                step_condition_coords = chunk_condition_coords
-                if condition_mask is not None and chunk_condition_coords is not None:
-                    if augmentation_transform is not None:
-                        step_condition_coords = self._apply_augmentation(
-                            chunk_condition_coords,
-                            augmentation_transform,
-                            target=coords,
-                        )
-                    coords = self._apply_condition(coords, step_condition_coords, condition_mask)
-                noise = torch.empty_like(coords).normal_(generator=generator)
-                coords = self._step(
+            chunks: list[Tensor] = []
+            for sample_start in range(0, num_samples, chunk_size):
+                chunk_num_samples = min(chunk_size, num_samples - sample_start)
+                sample_end = sample_start + chunk_num_samples
+                chunk_coords = coords[..., sample_start:sample_end, :, :]
+                chunk_noise = noise[..., sample_start:sample_end, :, :]
+                chunk_condition_coords = self._coords_chunk(
+                    step_condition_coords,
+                    context=context,
+                    num_samples=num_samples,
+                    sample_start=sample_start,
+                    chunk_num_samples=chunk_num_samples,
+                    name="condition_coords",
+                )
+                chunk_coords = self._step(
                     denoise,
-                    coords,
+                    chunk_coords,
                     sigma_prev,
                     sigma_next,
                     context=context,
-                    noise=noise,
-                    condition_coords=step_condition_coords,
+                    noise=chunk_noise,
+                    condition_coords=chunk_condition_coords,
                     condition_mask=condition_mask,
                     is_terminal=step_index == num_transitions - 1,
                     churn_rate=churn_rate,
                     step_scale=step_scale,
                 )
-                if condition_mask is not None and step_condition_coords is not None:
-                    coords = self._apply_condition(coords, step_condition_coords, condition_mask)
-                if self.reverse_augmentation and augmentation_transform is not None:
-                    coords = self._reverse_augmentation(coords, augmentation_transform)
                 if condition_mask is not None and chunk_condition_coords is not None:
-                    coords = self._apply_condition(coords, chunk_condition_coords, condition_mask)
-            return coords
+                    chunk_coords = self._apply_condition(
+                        chunk_coords,
+                        chunk_condition_coords,
+                        condition_mask,
+                    )
+                chunks.append(chunk_coords)
+            coords = torch.cat(chunks, dim=-3)
 
-        if sample_chunk_size is None:
-            return denoise_chunk(num_samples, initial_coords, sample_start=0)
-
-        chunks = []
-        num_chunks = num_samples // sample_chunk_size + (num_samples % sample_chunk_size != 0)
-        for i in range(num_chunks):
-            chunk_num_samples = sample_chunk_size if i < num_chunks - 1 else num_samples - i * sample_chunk_size
-            chunk_initial_coords = self._coords_chunk(
-                initial_coords,
-                context=context,
-                num_samples=num_samples,
-                sample_start=i * sample_chunk_size,
-                chunk_num_samples=chunk_num_samples,
-                name="initial_coords",
-            )
-            coords = denoise_chunk(chunk_num_samples, chunk_initial_coords, sample_start=i * sample_chunk_size)
-            chunks.append(coords)
-
-        return torch.cat(chunks, dim=-3)
+            if self.reverse_augmentation and augmentation_transform is not None:
+                coords = self._reverse_augmentation(coords, augmentation_transform)
+            if condition_mask is not None and condition_coords is not None:
+                coords = self._apply_condition(coords, condition_coords, condition_mask)
+        return coords
 
     @staticmethod
     def _initial_coords(
@@ -459,7 +443,12 @@ class CoordinateEdmSampler(nn.Module):
         # torch.compile with dynamic shapes can trace this. Insert the sample axis at -3.
         reference = context.reference_positions
         noise_template = reference.unsqueeze(-3).expand(*context.batch_shape, num_samples, reference.shape[-2], 3)
-        noise = torch.empty_like(noise_template).normal_(generator=generator)
+        noise = _draw_normal(
+            size=noise_template.shape,
+            device=noise_template.device,
+            dtype=noise_template.dtype,
+            generator=generator,
+        )
         return noise_level * noise
 
     @staticmethod
@@ -651,13 +640,18 @@ class CoordinateEdmSampler(nn.Module):
 
         num_augmentations = torch.numel(coords[..., 0, 0])
         batch_size_shape = coords.shape[:-3]
-        rotation = uniform_random_rotation(
-            num_samples=num_augmentations,
-            device=device,
-            dtype=coords.dtype,
-            generator=generator,
-        ).reshape(*batch_size_shape, num_samples, 3, 3)
-        translation = translation_scale * torch.randn(
+        random_device = device if generator is None else generator.device
+        rotation = (
+            uniform_random_rotation(
+                num_samples=num_augmentations,
+                device=random_device,
+                dtype=coords.dtype,
+                generator=generator,
+            )
+            .to(device)
+            .reshape(*batch_size_shape, num_samples, 3, 3)
+        )
+        translation = translation_scale * _draw_normal(
             size=(*batch_size_shape, num_samples, 3),
             generator=generator,
             device=device,
@@ -740,6 +734,26 @@ def _rot_vec_mul(rotation: Tensor, vectors: Tensor) -> Tensor:
         ],
         dim=-1,
     )
+
+
+def _draw_normal(
+    *,
+    size: tuple[int, ...] | torch.Size,
+    device: torch.device,
+    dtype: torch.dtype,
+    generator: torch.Generator | None,
+) -> Tensor:
+    r"""
+    Draw a standard-normal tensor on the generator device, then place it on ``device``.
+    """
+
+    random_device = device if generator is None else generator.device
+    return torch.randn(
+        size,
+        device=random_device,
+        dtype=dtype,
+        generator=generator,
+    ).to(device)
 
 
 def _expand_at_dim(tensor: Tensor, dim: int, size: int) -> Tensor:

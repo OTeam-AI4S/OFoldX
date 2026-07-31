@@ -10,7 +10,7 @@ from pathlib import Path
 import torch
 
 from ...data.evidence import MSA, MSACollection
-from ...data.molecular import MolecularSystem, PolymerSequence
+from ...data.molecular import ENTITY_PROTEIN, MolecularSystem
 from ...data.structure import Structure
 from ...io import read_msa, read_structure
 from ...pipelines import PairedPipeline, resolve_generator
@@ -91,9 +91,9 @@ class Boltz1Pipeline(PairedPipeline[Boltz1Model, Boltz1Processor]):
         if isinstance(msa, str | PathLike):
             system = input.system if isinstance(input, Structure) else input
             proteins = [
-                entity_id
-                for entity_id, entity in system.entities.items()
-                if isinstance(entity, PolymerSequence) and entity.polymer_type == "protein"
+                system.entity_id(entity_index)
+                for entity_index, entity_type in enumerate(system.entity_type.detach().cpu().tolist())
+                if entity_type == ENTITY_PROTEIN
             ]
             if len(proteins) != 1:
                 raise ValueError("an aligned FASTA is unambiguous only for one protein entity; " "pass MSACollection")

@@ -11,9 +11,10 @@ import torch
 import torch.nn.functional as F
 from tensordict import tensorclass
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
 from ...data.components import get_component
-from ...data.molecular import ComponentReference, MolecularSystem
+from ...data.molecular import MolecularSystem, replace_components
 from ...data.structure import Structure
 from ...model import Model
 from ...modules.backend import LayerNorm
@@ -52,37 +53,33 @@ class LigandMpnnModel(Model):
         config: Model architecture and inference configuration.
 
     Examples:
-        >>> import numpy as np
         >>> import torch
         >>> from ofoldx.data import (
-        ...     AtomSite, ChemicalAtom, ChemicalComponent, MolecularSystem,
-        ...     Molecule, PolymerSequence, Structure,
+        ...     MolecularSystem, PolymerSequence, Structure,
         ... )
         >>> from ofoldx.models.ligandmpnn import (
         ...     LigandMpnnConfig, LigandMpnnModel, LigandMpnnProcessor,
         ...     LigandMpnnProcessorConfig,
         ... )
-        >>> sequence = PolymerSequence.from_one_letter("A")
-        >>> ligand = Molecule((ChemicalComponent(
-        ...     "LIG", (ChemicalAtom("C1", "C"),), frozenset(),
-        ...     reference_coordinates=((0.0, 0.0, 0.0),),
-        ... ),))
-        >>> system = MolecularSystem(
-        ...     {"protein": sequence, "ligand": ligand},
-        ...     {"A": "protein", "L": "ligand"},
+        >>> system = MolecularSystem.from_entities(
+        ...     {"protein": PolymerSequence.from_one_letter("A")},
+        ...     {"A": "protein"},
         ... )
-        >>> sites = tuple(
-        ...     [AtomSite("A", 0, atom) for atom in ("N", "CA", "C", "O")]
-        ...     + [AtomSite("L", 0, "C1")]
+        >>> atom_count = system.atom_symbol.numel()
+        >>> component_count = system.component_symbol.numel()
+        >>> structure = Structure(
+        ...     system=system,
+        ...     coordinates=system.reference_coordinates.clone(),
+        ...     coordinate_mask=system.reference_coordinate_mask.clone(),
+        ...     occupancy=torch.zeros(atom_count),
+        ...     occupancy_mask=torch.zeros(atom_count, dtype=torch.bool),
+        ...     b_factor=torch.zeros(atom_count),
+        ...     b_factor_mask=torch.zeros(atom_count, dtype=torch.bool),
+        ...     source_symbols=(),
+        ...     residue_id=torch.full((component_count,), -1, dtype=torch.int64),
+        ...     insertion_code=torch.full((component_count,), -1, dtype=torch.int64),
+        ...     batch_size=[],
         ... )
-        >>> coordinates = np.array(
-        ...     [
-        ...         [-1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [1.0, 0.5, 0.0],
-        ...         [1.0, 1.0, 0.0], [0.0, 3.0, 0.0],
-        ...     ],
-        ...     dtype=np.float32,
-        ... )
-        >>> structure = Structure(system, sites, coordinates, np.ones(len(sites), dtype=np.bool_))
         >>> input = LigandMpnnProcessor(
         ...     LigandMpnnProcessorConfig({"num_context_atoms": 1})
         ... )(structure)
@@ -104,6 +101,7 @@ class LigandMpnnModel(Model):
     def __init__(self, config: LigandMpnnConfig | None = None) -> None:
         config = LigandMpnnConfig() if config is None else config
         super().__init__(config)
+        self.gradient_checkpointing = False
         hidden_size = self.config.hidden_size
         # Cache the one live width as a plain int: the encoder hot path reads it under
         # torch.compile(..., fullgraph=True), where chanfig's Config attribute access does not trace.
@@ -163,7 +161,7 @@ class LigandMpnnModel(Model):
         Reject an execution-batch axis on one-target biological operations.
         """
 
-        if input.backbone_coordinates.shape[0] != 1:
+        if input.backbone_coordinates.shape[0] != 1 or input.structure.system.system_entity_ptr.numel() != 2:
             raise ValueError("this LigandMpnn operation returns one target and therefore accepts one input")
 
     @staticmethod
@@ -189,12 +187,12 @@ class LigandMpnnModel(Model):
             design_positions=repeat(input.design_positions),
             ligand_interface_mask=repeat(input.ligand_interface_mask),
             structure=input.structure,
-            component_references=input.component_references,
+            component_index=repeat(input.component_index),
             tied_group_ids=repeat(input.tied_group_ids),
             tied_weights=repeat(input.tied_weights),
             allowed_token_mask=repeat(input.allowed_token_mask),
             residue_logit_bias=repeat(input.residue_logit_bias),
-            batch_size=[input.backbone_coordinates.shape[0] * count],
+            batch_size=[],
         )
 
     def _probability_result(
@@ -207,9 +205,12 @@ class LigandMpnnModel(Model):
         Wrap aligned per-evaluation logits with the one target's canonical identity.
         """
 
+        component_indices = input.component_index[0].detach().cpu().tolist()
         return MpnnProbabilityResult(
             target=input.structure,
-            component_references=input.component_references,
+            component_references=tuple(
+                input.structure.system.component_reference(component) for component in component_indices
+            ),
             sequence_tokens=input.sequence_tokens[0],
             residue_mask=input.residue_mask[0],
             design_positions=input.design_positions[0],
@@ -318,15 +319,50 @@ class LigandMpnnModel(Model):
         node_states = torch.zeros_like(edges[:, :, 0, :])
         edge_states = self.edge_embedding(edges)
         atom_context = self.atom_context_embedding(atom_features)
+        checkpointing = self.gradient_checkpointing and self.training and torch.is_grad_enabled()
         for block in self.encoder_blocks:
-            node_states, edge_states = block(node_states, edge_states, neighbor_indices, mask, attend_mask)
+            if checkpointing:
+                node_states, edge_states = checkpoint(
+                    block,
+                    node_states,
+                    edge_states,
+                    neighbor_indices,
+                    mask,
+                    attend_mask,
+                    use_reentrant=False,
+                )
+            else:
+                node_states, edge_states = block(node_states, edge_states, neighbor_indices, mask, attend_mask)
         residue_context = self.residue_context_input(node_states)
         atom_pair_mask = atom_mask[:, :, :, None] * atom_mask[:, :, None, :]
         atom_nodes = self.atom_node_embedding(atom_nodes)
         atom_edges = self.atom_edge_embedding(atom_edges)
         for block_index, block in enumerate(self.context_blocks):
-            atom_nodes = self.atom_context_blocks[block_index](atom_nodes, atom_edges, atom_mask, atom_pair_mask)
-            residue_context = block(residue_context, torch.cat((atom_context, atom_nodes), dim=-1), mask, atom_mask)
+            if checkpointing:
+                atom_nodes = checkpoint(
+                    self.atom_context_blocks[block_index],
+                    atom_nodes,
+                    atom_edges,
+                    atom_mask,
+                    atom_pair_mask,
+                    use_reentrant=False,
+                )
+                residue_context = checkpoint(
+                    block,
+                    residue_context,
+                    torch.cat((atom_context, atom_nodes), dim=-1),
+                    mask,
+                    atom_mask,
+                    use_reentrant=False,
+                )
+            else:
+                atom_nodes = self.atom_context_blocks[block_index](atom_nodes, atom_edges, atom_mask, atom_pair_mask)
+                residue_context = block(
+                    residue_context,
+                    torch.cat((atom_context, atom_nodes), dim=-1),
+                    mask,
+                    atom_mask,
+                )
         node_states = node_states + self.context_norm(self.dropout(self.context_output(residue_context)))
         return node_states, edge_states, neighbor_indices, attend_mask
 
@@ -353,9 +389,20 @@ class LigandMpnnModel(Model):
             decoding_ranks, neighbor_indices, mask, neighbor_valid.to(dtype=node_states.dtype)
         )
         forward_context = forward_mask * encoder_context
+        checkpointing = self.gradient_checkpointing and self.training and torch.is_grad_enabled()
         for block in self.decoder_blocks:
             decoder_context = cat_neighbors_nodes(node_states, sequence_edges, neighbor_indices)
-            node_states = block(node_states, backward_mask * decoder_context + forward_context, mask)
+            context = backward_mask * decoder_context + forward_context
+            if checkpointing:
+                node_states = checkpoint(
+                    block,
+                    node_states,
+                    context,
+                    mask,
+                    use_reentrant=False,
+                )
+            else:
+                node_states = block(node_states, context, mask)
         return self.output_projection(node_states)
 
     def _decode_sequence_free_logits(
@@ -1064,7 +1111,7 @@ class LigandMpnnModel(Model):
     @staticmethod
     def _realize_sequence(
         system: MolecularSystem,
-        component_references: tuple[ComponentReference | None, ...],
+        component_indices: list[int],
         sampled_tokens: list[int],
         design_positions: list[bool],
     ) -> MolecularSystem:
@@ -1072,12 +1119,34 @@ class LigandMpnnModel(Model):
         Realize one candidate while preserving entity and bond identity.
         """
 
-        replacements = {
-            reference: get_component(AMINO_ACID_COMPONENT_IDS[int(token)])
-            for reference, token, selected in zip(component_references, sampled_tokens, design_positions)
-            if reference is not None and selected
-        }
-        return system.replace_components(replacements)
+        selected_components = [
+            component
+            for component, selected in zip(
+                component_indices,
+                design_positions,
+                strict=True,
+            )
+            if selected
+        ]
+        replacements = [
+            get_component(AMINO_ACID_COMPONENT_IDS[int(token)])
+            for token, selected in zip(
+                sampled_tokens,
+                design_positions,
+                strict=True,
+            )
+            if selected
+        ]
+        realized, _, _ = replace_components(
+            system,
+            torch.tensor(
+                selected_components,
+                dtype=torch.int64,
+                device=system.component_symbol.device,
+            ),
+            replacements,
+        )
+        return _repartition_design_entities(system, realized)
 
     @torch.inference_mode()
     def design(
@@ -1134,14 +1203,27 @@ class LigandMpnnModel(Model):
             * designed_row
         ).sum(dim=-1) / designed_row.sum(dim=-1)
 
-        references = input.component_references
+        component_indices = input.component_index[0].detach().cpu().tolist()
+        references = tuple(input.structure.system.component_reference(component) for component in component_indices)
         designed_host = designed.detach().cpu().tolist()
         interface_host = interface.detach().cpu().tolist()
         designed_scope = frozenset(
-            reference for reference, selected in zip(references, designed_host) if reference is not None and selected
+            reference
+            for reference, selected in zip(
+                references,
+                designed_host,
+                strict=True,
+            )
+            if selected
         )
         interface_scope = frozenset(
-            reference for reference, selected in zip(references, interface_host) if reference is not None and selected
+            reference
+            for reference, selected in zip(
+                references,
+                interface_host,
+                strict=True,
+            )
+            if selected
         )
         host_sequence_tokens = sampled.sequence_tokens.detach().cpu().tolist()
         designed_confidence_host = designed_confidence.detach().cpu().tolist()
@@ -1152,7 +1234,7 @@ class LigandMpnnModel(Model):
             DesignCandidate(
                 system=self._realize_sequence(
                     input.structure.system,
-                    references,
+                    component_indices,
                     host_sequence_tokens[index],
                     designed_host,
                 ),
@@ -1453,6 +1535,83 @@ def _collapse_tied_order(
     )
 
 
+def _repartition_design_entities(
+    original: MolecularSystem,
+    realized: MolecularSystem,
+) -> MolecularSystem:
+    r"""
+    Partition changed copies by complete output sequence within each input entity.
+    """
+
+    instance_entity = original.instance_entity.detach().cpu().tolist()
+    component_ptr = realized.instance_component_ptr.detach().cpu().tolist()
+    component_symbol = realized.component_symbol.detach().cpu().tolist()
+    original_component_ptr = original.instance_component_ptr.detach().cpu().tolist()
+    original_component_symbol = original.component_symbol.detach().cpu().tolist()
+    entity_ids = [original.entity_id(entity) for entity in range(original.entity_symbol.numel())]
+    used_entity_ids = set(entity_ids)
+    symbols = list(realized.symbols)
+    new_entity_symbols: list[int] = []
+    new_entity_types: list[int] = []
+    new_entity_molecule_types: list[int] = []
+    new_instance_entity = [-1] * len(instance_entity)
+
+    def sequence(
+        pointers: list[int],
+        symbols: list[int],
+        instance: int,
+    ) -> tuple[int, ...]:
+        return tuple(symbols[pointers[instance] : pointers[instance + 1]])
+
+    for entity, entity_id in enumerate(entity_ids):
+        instances = [instance for instance, owner in enumerate(instance_entity) if owner == entity]
+        if not instances:
+            partitions: list[tuple[tuple[int, ...] | None, list[int]]] = [(None, [])]
+        else:
+            grouped: dict[tuple[int, ...], list[int]] = {}
+            for instance in instances:
+                grouped.setdefault(
+                    sequence(component_ptr, component_symbol, instance),
+                    [],
+                ).append(instance)
+            original_sequence = sequence(
+                original_component_ptr,
+                original_component_symbol,
+                instances[0],
+            )
+            primary = original_sequence if original_sequence in grouped else next(iter(grouped))
+            partitions = [(primary, grouped.pop(primary)), *grouped.items()]
+
+        suffix = 2
+        for partition_index, (_, members) in enumerate(partitions):
+            if partition_index == 0:
+                output_id = entity_id
+            else:
+                output_id = f"{entity_id}_{suffix}"
+                while output_id in used_entity_ids:
+                    suffix += 1
+                    output_id = f"{entity_id}_{suffix}"
+                suffix += 1
+                used_entity_ids.add(output_id)
+            if output_id not in symbols:
+                symbols.append(output_id)
+            new_entity = len(new_entity_symbols)
+            new_entity_symbols.append(symbols.index(output_id))
+            new_entity_types.append(int(original.entity_type[entity]))
+            new_entity_molecule_types.append(int(original.entity_molecule_type[entity]))
+            for instance in members:
+                new_instance_entity[instance] = new_entity
+
+    return realized.replace(  # type: ignore[attr-defined]
+        symbols=tuple(symbols),
+        system_entity_ptr=realized.system_entity_ptr.new_tensor([0, len(new_entity_symbols)]),
+        entity_symbol=realized.entity_symbol.new_tensor(new_entity_symbols),
+        entity_type=realized.entity_type.new_tensor(new_entity_types),
+        entity_molecule_type=realized.entity_molecule_type.new_tensor(new_entity_molecule_types),
+        instance_entity=realized.instance_entity.new_tensor(new_instance_entity),
+    )
+
+
 # ---------------------------------------------------------------------------
 # LigandMPNN typed inputs and outputs.
 # ---------------------------------------------------------------------------
@@ -1485,7 +1644,7 @@ class LigandMpnnInput:
         ligand_interface_mask: Residues at the ligand interface with shape
             ``(batch_size, num_residues)``.
         structure: Source structure.
-        component_references: Component occurrences aligned to residue rows.
+        component_index: Canonical component indices aligned to residue rows.
         tied_group_ids: Autoregressive unit ID for each residue row.
         tied_weights: Optional tied-group weights with shape ``(batch_size, num_residues)``.
         allowed_token_mask: Optional token mask with shape
@@ -1507,7 +1666,7 @@ class LigandMpnnInput:
     design_positions: Tensor
     ligand_interface_mask: Tensor
     structure: Structure
-    component_references: tuple[ComponentReference, ...]
+    component_index: Tensor
     tied_group_ids: Tensor
     tied_weights: Tensor | None = None
     allowed_token_mask: Tensor | None = None

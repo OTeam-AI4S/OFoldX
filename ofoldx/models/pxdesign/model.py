@@ -5,16 +5,13 @@ PxDesign coordinate-design model graph.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from tensordict import tensorclass
 from torch import Tensor, nn
 
-from ...data.molecular import AtomSite, MolecularSystem
-from ...data.structure import Structure
+from ...data.molecular import MolecularSystem
 from ...model import Model
 from ...modules.atom import NormalizedKeyAtomToTokenEncoder
 from ...modules.denoiser import CoordinateDenoiser
@@ -195,56 +192,6 @@ class PxDesignModel(Model):
             generator=generator,
         )
         return PxDesignOutput(coordinates, batch_size=[coordinates.shape[0]])  # type: ignore[call-arg]
-
-    @torch.inference_mode()
-    def design(
-        self,
-        input: PxDesignInput,
-        *,
-        num_candidates: int = 1,
-        generator: torch.Generator | None = None,
-        num_sampling_steps: int = 400,
-        sample_chunk_size: int | None = 10,
-    ) -> PxDesignBackboneResult:
-        r"""
-        Generate decoded target-binder backbone candidates.
-
-        Args:
-            input: Processed design input with batch size one.
-            num_candidates: Number of backbone candidates.
-            generator: Random generator used for reference-conformer augmentation and
-                coordinate sampling.
-            num_sampling_steps: Number of EDM sampling steps.
-            sample_chunk_size: Maximum number of candidates denoised together. ``None``
-                processes all candidates together.
-
-        Returns:
-            A [`PxDesignBackboneResult`][] containing ``num_candidates`` structures in
-            sampling order. Structure coordinates are in angstroms.
-        """
-
-        if input.reference_positions.shape[:-2] != (1,):
-            raise ValueError("PxDesignModel.design requires exactly one biological input")
-        output = self.sample(
-            input,
-            num_samples=num_candidates,
-            num_sampling_steps=num_sampling_steps,
-            sample_chunk_size=sample_chunk_size,
-            generator=generator,
-        )
-        candidates = tuple(
-            PxDesignBackboneCandidate(
-                structure=Structure(
-                    system=input.layout.system,
-                    sites=input.layout.sites,
-                    coordinates=output.coordinates[0, index].detach().to(device="cpu", dtype=torch.float32).numpy(),
-                    coordinate_mask=np.ones(len(input.layout.sites), dtype=np.bool_),
-                ),
-            )
-            for index in range(num_candidates)
-        )
-        # This model does not produce candidate-level confidence values.
-        return PxDesignBackboneResult(candidates=candidates)
 
     def encode_condition(
         self,
@@ -438,93 +385,96 @@ class PxDesignSampler(nn.Module):
             device=context.device,
             dtype=context.dtype,
         )
-        chunk_size = num_samples if sample_chunk_size is None else sample_chunk_size
-        chunks: list[Tensor] = []
-        for sample_start in range(0, num_samples, chunk_size):
-            chunk_num_samples = min(chunk_size, num_samples - sample_start)
-            reference = context.reference_positions.to(device=context.device, dtype=context.dtype)
-            noise = torch.randn(
-                *context.batch_shape,
-                chunk_num_samples,
-                reference.shape[-2],
-                3,
-                device=context.device,
-                dtype=context.dtype,
+        chunk_size = num_samples if sample_chunk_size is None else min(sample_chunk_size, num_samples)
+        reference = context.reference_positions.to(device=context.device, dtype=context.dtype)
+        coordinates = noise_schedule[0] * _draw_normal(
+            (*context.batch_shape, num_samples, reference.shape[-2], 3),
+            device=context.device,
+            dtype=context.dtype,
+            generator=generator,
+        )
+        schedule_length = noise_schedule.shape[0]
+
+        for step_index, (sigma_prev, sigma_next) in enumerate(zip(noise_schedule[:-1], noise_schedule[1:])):
+            coordinates = coordinates - coordinates.mean(dim=-2, keepdim=True)
+            batch_shape = coordinates.shape[:-2]
+            random_device = coordinates.device if generator is None else generator.device
+            rotations = (
+                uniform_random_rotation(
+                    math.prod(batch_shape),
+                    device=random_device,
+                    dtype=coordinates.dtype,
+                    generator=generator,
+                )
+                .to(coordinates.device)
+                .reshape(*batch_shape, 3, 3)
+            )
+            translations = _draw_normal(
+                (*batch_shape, 3),
+                device=coordinates.device,
+                dtype=coordinates.dtype,
                 generator=generator,
             )
-            coordinates = noise_schedule[0] * noise
-            schedule_length = noise_schedule.shape[0]
+            coordinates = torch.einsum("...ij,...nj->...ni", rotations, coordinates)
+            coordinates = coordinates + translations.unsqueeze(-2)
 
-            for step_index, (sigma_prev, sigma_next) in enumerate(zip(noise_schedule[:-1], noise_schedule[1:])):
-                coordinates = coordinates - coordinates.mean(dim=-2, keepdim=True)
-                batch_shape = coordinates.shape[:-2]
-                rotations = uniform_random_rotation(
-                    math.prod(batch_shape),
-                    device=coordinates.device,
-                    dtype=coordinates.dtype,
-                    generator=generator,
-                ).reshape(*batch_shape, 3, 3)
-                translations = torch.randn(
-                    *batch_shape,
-                    3,
-                    device=coordinates.device,
-                    dtype=coordinates.dtype,
-                    generator=generator,
-                )
-                coordinates = torch.einsum("...ij,...nj->...ni", rotations, coordinates)
-                coordinates = coordinates + translations.unsqueeze(-2)
+            gamma = torch.where(
+                sigma_next > self.min_churn_noise_level,
+                sigma_next.new_tensor(self.churn_rate),
+                sigma_next.new_zeros(()),
+            )
+            sigma_hat = sigma_prev * (gamma + 1)
+            churn = _draw_normal(
+                coordinates.shape,
+                device=coordinates.device,
+                dtype=coordinates.dtype,
+                generator=generator,
+            )
+            noisy_coordinates = coordinates + (self.noise_scale * torch.sqrt(sigma_hat**2 - sigma_prev**2) * churn)
 
-                gamma = torch.where(
-                    sigma_next > self.min_churn_noise_level,
-                    sigma_next.new_tensor(self.churn_rate),
-                    sigma_next.new_zeros(()),
-                )
-                sigma_hat = sigma_prev * (gamma + 1)
-                churn = torch.randn(
-                    coordinates.shape,
-                    device=coordinates.device,
-                    dtype=coordinates.dtype,
-                    generator=generator,
-                )
-                noisy_coordinates = coordinates + (self.noise_scale * torch.sqrt(sigma_hat**2 - sigma_prev**2) * churn)
+            fraction = step_index / schedule_length
+            minimum = float(self.step_scale_min)
+            maximum = float(self.step_scale_max)
+            if self.step_scale_schedule == "const":
+                step_scale = minimum
+            elif self.step_scale_schedule == "linear":
+                step_scale = minimum + (maximum - minimum) * fraction
+            elif self.step_scale_schedule == "poly":
+                step_scale = minimum + (maximum - minimum) * fraction**2
+            elif self.step_scale_schedule == "cos":
+                step_scale = minimum + 0.5 * (maximum - minimum) * (1 - math.cos(math.pi * fraction))
+            elif self.step_scale_schedule == "piecewise":
+                step_scale = minimum if fraction < 0.5 else maximum
+            elif self.step_scale_schedule == "piecewise_65":
+                step_scale = minimum if fraction < 0.65 else maximum
+            elif self.step_scale_schedule == "piecewise_70":
+                step_scale = minimum if fraction < 0.70 else maximum
+            else:
+                raise ValueError(f"unsupported PxDesign step_scale_schedule: {self.step_scale_schedule!r}")
+
+            chunks: list[Tensor] = []
+            for sample_start in range(0, num_samples, chunk_size):
+                chunk_num_samples = min(chunk_size, num_samples - sample_start)
+                sample_end = sample_start + chunk_num_samples
+                chunk_noisy_coordinates = noisy_coordinates[..., sample_start:sample_end, :, :]
                 leading_shape = noisy_coordinates.shape[:-3]
-                sample_count = noisy_coordinates.shape[-3]
+                sample_count = chunk_noisy_coordinates.shape[-3]
                 noise_level = sigma_hat.reshape((1,) * (len(leading_shape) + 1)).expand(
                     *leading_shape,
                     sample_count,
                 )
                 denoised_coordinates = denoise(
                     context.to_denoising_input(
-                        noisy_coords=noisy_coordinates,
-                        noise_level=noise_level.to(dtype=noisy_coordinates.dtype),
+                        noisy_coords=chunk_noisy_coordinates,
+                        noise_level=noise_level.to(dtype=chunk_noisy_coordinates.dtype),
                     )
                 )
 
-                fraction = step_index / schedule_length
-                minimum = float(self.step_scale_min)
-                maximum = float(self.step_scale_max)
-                if self.step_scale_schedule == "const":
-                    step_scale = minimum
-                elif self.step_scale_schedule == "linear":
-                    step_scale = minimum + (maximum - minimum) * fraction
-                elif self.step_scale_schedule == "poly":
-                    step_scale = minimum + (maximum - minimum) * fraction**2
-                elif self.step_scale_schedule == "cos":
-                    step_scale = minimum + 0.5 * (maximum - minimum) * (1 - math.cos(math.pi * fraction))
-                elif self.step_scale_schedule == "piecewise":
-                    step_scale = minimum if fraction < 0.5 else maximum
-                elif self.step_scale_schedule == "piecewise_65":
-                    step_scale = minimum if fraction < 0.65 else maximum
-                elif self.step_scale_schedule == "piecewise_70":
-                    step_scale = minimum if fraction < 0.70 else maximum
-                else:
-                    raise ValueError(f"unsupported PxDesign step_scale_schedule: {self.step_scale_schedule!r}")
+                derivative = (chunk_noisy_coordinates - denoised_coordinates) / noise_level[..., None, None]
+                chunks.append(chunk_noisy_coordinates + step_scale * (sigma_next - sigma_hat) * derivative)
+            coordinates = torch.cat(chunks, dim=-3)
 
-                derivative = (noisy_coordinates - denoised_coordinates) / noise_level[..., None, None]
-                coordinates = noisy_coordinates + step_scale * (sigma_next - sigma_hat) * derivative
-            chunks.append(coordinates)
-
-        return torch.cat(chunks, dim=-3)
+        return coordinates
 
 
 def _augment_reference_conformers(
@@ -538,51 +488,64 @@ def _augment_reference_conformers(
     positions = input.reference_positions.clone()
     flat_positions = positions.reshape(-1, positions.shape[-2], 3)
     flat_spaces = input.reference_space_id.reshape(-1, input.reference_space_id.shape[-1])
-    for sample_positions, sample_spaces in zip(flat_positions, flat_spaces):
+    active_spaces: list[tuple[int, Tensor]] = []
+    for sample_index, sample_spaces in enumerate(flat_spaces):
         for space_id in torch.unique(sample_spaces):
-            selected = sample_spaces == space_id
-            values = sample_positions[selected]
-            augmentation_dtype = torch.float32 if values.dtype in (torch.float16, torch.bfloat16) else values.dtype
-            values = values.to(augmentation_dtype)
-            values = values - values.mean(dim=0)
-            translation = (
-                2
-                * torch.rand(
-                    3,
-                    device=values.device,
-                    dtype=augmentation_dtype,
-                    generator=generator,
-                )
-                - 1
-            )
-            rotation = uniform_random_rotation(
-                1,
-                device=values.device,
+            active_spaces.append((sample_index, space_id))
+
+    if active_spaces:
+        augmentation_dtype = torch.float32 if positions.dtype in (torch.float16, torch.bfloat16) else positions.dtype
+        random_device = positions.device if generator is None else generator.device
+        translations = (
+            2
+            * torch.rand(
+                len(active_spaces),
+                3,
+                device=random_device,
                 dtype=augmentation_dtype,
                 generator=generator,
-            )[0]
+            ).to(positions.device)
+            - 1
+        )
+        rotations = uniform_random_rotation(
+            len(active_spaces),
+            device=random_device,
+            dtype=augmentation_dtype,
+            generator=generator,
+        ).to(positions.device)
+        for (sample_index, space_id), translation, rotation in zip(active_spaces, translations, rotations):
+            sample_positions = flat_positions[sample_index]
+            selected = flat_spaces[sample_index] == space_id
+            values = sample_positions[selected].to(augmentation_dtype)
+            values = values - values.mean(dim=0)
             augmented = (values + translation) @ rotation.transpose(-1, -2)
             sample_positions[selected] = augmented.to(sample_positions.dtype)
     return input.replace(reference_positions=positions)  # type: ignore[attr-defined]
 
 
+def _draw_normal(
+    size: tuple[int, ...] | torch.Size,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    generator: torch.Generator | None,
+) -> Tensor:
+    r"""
+    Draw standard-normal values from ``generator`` and place them on ``device``.
+    """
+
+    random_device = device if generator is None else generator.device
+    return torch.randn(
+        size,
+        device=random_device,
+        dtype=dtype,
+        generator=generator,
+    ).to(device)
+
+
 # ============================================================================
 # PxDesign tensor inputs and outputs
 # ============================================================================
-@dataclass(frozen=True)
-class PxDesignLayout:
-    r"""
-    Molecular identities aligned to PxDesign token and atom tensors.
-
-    Args:
-        system: Molecular system represented by the tensors.
-        sites: Atom occurrences aligned to the atom axis.
-    """
-
-    system: MolecularSystem
-    sites: tuple[AtomSite, ...]
-
-
 @tensorclass
 class PxDesignInput:
     r"""
@@ -610,9 +573,18 @@ class PxDesignInput:
         hotspot: Per-token hotspot condition with shape ``(B, N, 1)``.
         template_distance_bins: Template distance features aligned to token pairs.
         template_pair_mask: Valid-template-pair mask aligned to token pairs.
-        layout: Molecular identities aligned to the tensor axes.
+        system: Canonical target-binder molecular graph.
+        atom_index: Canonical atom index for each model atom with shape ``(B, A)``.
+        token_component_index: Canonical component index for each token with shape
+            ``(B, N)``.
+        token_atom_index: Canonical atom index for atom tokens and ``-1`` for
+            component tokens, with shape ``(B, N)``.
     """
 
+    system: MolecularSystem
+    atom_index: Tensor
+    token_component_index: Tensor
+    token_atom_index: Tensor
     residue_index: Tensor
     chain_index: Tensor
     entity_index: Tensor
@@ -630,7 +602,6 @@ class PxDesignInput:
     hotspot: Tensor
     template_distance_bins: Tensor
     template_pair_mask: Tensor
-    layout: PxDesignLayout
 
 
 @tensorclass
@@ -644,28 +615,3 @@ class PxDesignOutput:
     """
 
     coordinates: Tensor
-
-
-@dataclass(eq=False)
-class PxDesignBackboneCandidate:
-    r"""
-    One coordinate-bearing target-binder backbone candidate.
-
-    Args:
-        structure: Decoded backbone structure. Unassigned binder residues retain their unknown
-            component identity.
-    """
-
-    structure: Structure
-
-
-@dataclass(eq=False)
-class PxDesignBackboneResult:
-    r"""
-    A generation-ordered collection of PxDesign candidates.
-
-    Args:
-        candidates: Candidates in generation order.
-    """
-
-    candidates: tuple[PxDesignBackboneCandidate, ...]

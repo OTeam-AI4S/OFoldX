@@ -14,15 +14,23 @@ from ...data import (
     ExistingSpan,
     GeneratedSegment,
     PlacementSpec,
-    SymbolicResidueSite,
     validate_placement,
 )
 from ...data.components import get_component
 from ...data.conditions import Hotspot
-from ...data.molecular import AtomSite, ChemicalComponent, MolecularSystem, Molecule, PolymerSequence, SystemBond
+from ...data.molecular import (
+    BOND_ROLE_COMPONENT,
+    ENTITY_MOLECULE,
+    ENTITY_PROTEIN,
+    MolecularSystem,
+    Molecule,
+    PolymerSequence,
+    copy_components,
+    disjoint_union,
+)
 from ...data.structure import Structure
 from ...processor import Processor
-from .model import PxDesignInput, PxDesignLayout
+from .model import PxDesignInput
 
 _RESIDUE_TYPE_INDEX = {
     "ALA": 0,
@@ -63,20 +71,8 @@ _GENERATED_ATOM_IDS = frozenset(atom.atom_id for atom in get_component("GLY").at
 
 class PxDesignProcessor(Processor):
     r"""
-    Convert supported binder-design inputs into `PxDesignInput`.
-
-    Args:
-        device: Device for produced tensors.
-        dtype: Floating-point dtype for produced tensors.
+    Convert one target-binder placement into tensor-native PXDesign input.
     """
-
-    def __init__(
-        self,
-        *,
-        device: torch.device | str | None = None,
-        dtype: torch.dtype | None = None,
-    ) -> None:
-        super().__init__(device=device, dtype=dtype)
 
     def __call__(
         self,
@@ -86,23 +82,17 @@ class PxDesignProcessor(Processor):
         conditions: Sequence[Hotspot] = (),
     ) -> PxDesignInput:
         r"""
-        Build model inputs for one fixed-length target-binder design problem.
+        Materialize one canonical design graph and its model tensors.
 
         Args:
-            input: Optional target system or observed structure.
-            placement: Topology containing complete target spans and one fixed-length
-                generated protein chain.
-            conditions: Target hotspot labels.
+            input: Optional target system or observed target structure.
+            placement: Target groups followed by one fixed-length protein binder.
+            conditions: Existing target components labelled as hotspots.
 
         Returns:
-            A [`PxDesignInput`][] with batch size one and aligned target, binder, token,
-            atom, hotspot, and molecular-layout axes.
+            A tensor-native [`PxDesignInput`][] with explicit model batch dimension
+            one and an empty tensorclass batch size.
         """
-
-        condition_values = tuple(conditions)
-        if any(not isinstance(condition, Hotspot) for condition in condition_values):
-            unsupported = next(condition for condition in condition_values if not isinstance(condition, Hotspot))
-            raise TypeError(f"PXDesign cannot consume {type(unsupported).__name__}")
 
         if isinstance(input, Structure):
             structure: Structure | None = input
@@ -110,581 +100,864 @@ class PxDesignProcessor(Processor):
         else:
             structure = None
             source = input
-        # Canonicalize MSE to MET before tokenization so every feature sees the
-        # standard residue identity.
-        source, structure = _canonicalize_modified_polymers(source, structure)
-        # Placement IDs must be globally unique at construction time.
-        validate_placement(placement)
-        # Each outer key is a declaration group (a chain); each inner key is a globally
-        # unique placement_id. Identity rides the inner key, not a value field: the binder
-        # placement is KEYED by ``generated_id``, while its realized instance is ``chain_0``.
-        generated_items: list[tuple[str, str, GeneratedSegment]] = []
-        for group, placements in placement.items():
-            for placement_id, part in placements.items():
-                if isinstance(part, GeneratedSegment):
-                    generated_items.append((group, placement_id, part))
-        if len(generated_items) != 1:
-            raise ValueError("PxDesign generates exactly one binder chain")
-        generated_group, generated_id, generated = generated_items[0]
-        if generated.polymer_type != "protein":
-            raise ValueError("PxDesign generates protein binders only")
-        if generated.min_length != generated.max_length:
-            raise ValueError("PxDesign requires one fixed binder length")
-        if tuple(placement[generated_group].values()) != (generated,):
-            raise ValueError("the PXDesign binder must be a separate generated chain")
-        if next(reversed(placement)) != generated_group:
-            raise ValueError("PxDesign requires the generated binder after its target chains")
-        existing_chain_values: list[tuple[ExistingSpan, ...]] = []
-        for group, placements in placement.items():
-            if group == generated_group:
-                continue
-            spans: list[ExistingSpan] = []
-            for part in placements.values():
-                if not isinstance(part, ExistingSpan):
-                    raise ValueError(
-                        "every non-binder PXDesign PlacementSpec chain must contain only ExistingSpan values"
-                    )
-                spans.append(part)
-            existing_chain_values.append(tuple(spans))
-        existing_chains = tuple(existing_chain_values)
-        if source is None and existing_chains:
-            raise ValueError("ExistingSpan target chains require molecular input")
-        if structure is None and source is not None:
+
+        target_groups, binder_length = _placement_groups(placement, source)
+        if target_groups and structure is None:
             raise ValueError("PXDesign target conditioning requires observed Structure coordinates")
-        if source is not None:
-            if not existing_chains:
-                raise ValueError("PXDesign target input must be declared by its PlacementSpec")
-            declared_instances = set()
-            for chain in existing_chains:
-                instance_ids = {span.instance_id for span in chain}
-                if len(instance_ids) != 1:
-                    raise ValueError("each PXDesign target chain must crop one source instance")
-                instance_id = next(iter(instance_ids))
-                source_entity = source.entities[source.instances[instance_id]]
-                if not isinstance(source_entity, PolymerSequence):
-                    raise ValueError("PXDesign target PlacementSpec chains must reference polymer instances")
-                for span in chain:
-                    if span.start < 0 or span.start >= span.stop or span.stop > len(source_entity):
-                        raise ValueError(
-                            f"PXDesign target crop [{span.start}, {span.stop}) is outside "
-                            f"source instance {instance_id!r}"
-                        )
-                if instance_id in declared_instances:
-                    raise ValueError("a PXDesign target instance may appear only once in PlacementSpec")
-                declared_instances.add(instance_id)
+        if source is not None and source.system_entity_ptr.numel() != 2:
+            raise ValueError("PXDesign processes one molecular system at a time")
 
-        system, sites, generated_map, selected_residues = _materialize_problem(
-            source,
-            structure,
-            existing_chains,
-            generated,
-            generated_id,
-        )
-        modeled_residues = {
-            (site.instance_id, site.component_index)
-            for site in sites
-            if not isinstance(system.entities[system.instances[site.instance_id]], Molecule)
-        }
-        unsupported_components = set()
-        for instance_id, component_index in modeled_residues:
-            entity = cast(PolymerSequence, system.entities[system.instances[instance_id]])
-            component_id = entity.components[component_index].component_id
-            if component_id not in _RESIDUE_TYPE_INDEX:
-                unsupported_components.add(component_id)
-        if unsupported_components:
-            raise ValueError(
-                "PXDesign modified-polymer lowering canonicalizes MSE to MET (AlphaFold3 SI §2.1) but "
-                "otherwise requires the CCD canonical-parent mapping the package component value does "
-                f"not carry; unsupported components: {sorted(unsupported_components)!r}"
-            )
-        token_sites, token_residues, token_components, representative_sites = _tokens(
+        (
             system,
-            sites,
-            frozenset(generated_map.values()),
+            source_atom_index,
+            source_component_index,
+        ) = _materialize_problem(source, target_groups, binder_length)
+        atom_index = _model_atom_index(
+            system,
+            source_atom_index,
+            structure,
+            source_component_index,
         )
-        site_to_token = {site: token_index for token_index, group in enumerate(token_sites) for site in group}
-        hotspot_residues = _hotspots(
-            condition_values,
-            selected_residues,
-            token_residues,
-        )
+        (
+            token_component_index,
+            token_atom_index,
+            representative_atom_index,
+            atom_to_token,
+            residue_type_features,
+        ) = _tokenize(system, atom_index, source_component_index)
 
+        hotspot = _hotspot_features(
+            tuple(conditions),
+            source,
+            source_component_index,
+            token_component_index,
+        )
         reference_positions, reference_mask, reference_space_id = _reference_features(
             system,
-            sites,
-            frozenset(generated_map.values()),
+            atom_index,
+            source_component_index,
         )
-        atom_features, reference_charges = _atom_features(system, sites, reference_mask)
-        atom_to_token = torch.tensor([site_to_token[site] for site in sites], dtype=torch.int64)
-        token_count = len(token_sites)
-        residue_type_features = torch.zeros(token_count, 36, dtype=torch.float32)
-        generated_residues = frozenset(generated_map.values())
-        for token_index, (residue, component_id) in enumerate(zip(token_residues, token_components)):
-            index = (
-                _GENERATED_RESIDUE_TYPE
-                if residue in generated_residues
-                else _RESIDUE_TYPE_INDEX.get(
-                    component_id,
-                    _RESIDUE_TYPE_INDEX["UNK"],
-                )
-            )
-            residue_type_features[token_index, index] = 1.0
-
-        observed = {} if structure is None else {site: row for row, site in enumerate(structure.sites)}
-        representative_coordinates = torch.zeros(token_count, 3, dtype=torch.float32)
-        representative_mask = torch.zeros(token_count, dtype=torch.bool)
-        for token_index, site in enumerate(representative_sites):
-            if structure is None:
-                continue
-            row = observed.get(site)
-            if row is None or not bool(structure.coordinate_mask[row]):
-                continue
-            coordinates = structure.coordinates[row]
-            representative_coordinates[token_index] = torch.from_numpy(coordinates.copy())
-            representative_mask[token_index] = True
-        template_distance_bins = torch.zeros(token_count, token_count, dtype=torch.int64)
-        template_pair_mask = representative_mask[:, None] & representative_mask[None, :]
-        if bool(representative_mask.any()):
-            rows = torch.nonzero(representative_mask, as_tuple=True)[0]
-            distances = torch.cdist(
-                representative_coordinates.index_select(0, rows),
-                representative_coordinates.index_select(0, rows),
-            )
-            bins = torch.sum(
-                distances.unsqueeze(-1) > torch.linspace(2.0, 22.0, 63),
-                dim=-1,
-            )
-            ii, jj = torch.meshgrid(rows, rows, indexing="ij")
-            template_distance_bins[ii, jj] = bins
-
+        atom_features, reference_charges = _atom_features(
+            system,
+            atom_index,
+            reference_mask,
+        )
+        template_distance_bins, template_pair_mask = _template_features(
+            structure,
+            source_atom_index,
+            representative_atom_index,
+        )
         chain_index, entity_index, symmetry_index, residue_index = _token_indices(
             system,
-            token_sites,
-            token_residues,
+            token_component_index,
         )
+        token_count = token_component_index.numel()
+
         return PxDesignInput(  # type: ignore[call-arg]
+            system=system.to(self.device),
+            atom_index=atom_index.unsqueeze(0).to(self.device),
+            token_component_index=token_component_index.unsqueeze(0).to(self.device),
+            token_atom_index=token_atom_index.unsqueeze(0).to(self.device),
             residue_index=residue_index.unsqueeze(0).to(self.device),
             chain_index=chain_index.unsqueeze(0).to(self.device),
             entity_index=entity_index.unsqueeze(0).to(self.device),
             symmetry_index=symmetry_index.unsqueeze(0).to(self.device),
-            token_index=torch.arange(token_count, dtype=torch.int64, device=self.device).unsqueeze(0),
-            atom_features=atom_features.unsqueeze(0).to(device=self.device, dtype=self.dtype),
-            atom_to_token=atom_to_token.unsqueeze(0).to(self.device),
-            atom_mask=torch.ones(1, len(sites), dtype=torch.bool, device=self.device),
-            reference_positions=reference_positions.unsqueeze(0).to(device=self.device, dtype=self.dtype),
-            reference_space_id=reference_space_id.unsqueeze(0).to(self.device),
-            reference_mask=reference_mask.unsqueeze(0).to(self.device),
-            reference_charges=reference_charges.reshape(1, len(sites), 1).to(
+            token_index=torch.arange(
+                token_count,
+                dtype=torch.int64,
+                device=self.device,
+            ).unsqueeze(0),
+            atom_features=atom_features.unsqueeze(0).to(
                 device=self.device,
                 dtype=self.dtype,
             ),
+            atom_to_token=atom_to_token.unsqueeze(0).to(self.device),
+            atom_mask=torch.ones(
+                1,
+                atom_index.numel(),
+                dtype=torch.bool,
+                device=self.device,
+            ),
+            reference_positions=reference_positions.unsqueeze(0).to(
+                device=self.device,
+                dtype=self.dtype,
+            ),
+            reference_space_id=reference_space_id.unsqueeze(0).to(self.device),
+            reference_mask=reference_mask.unsqueeze(0).to(self.device),
+            reference_charges=reference_charges.reshape(
+                1,
+                atom_index.numel(),
+                1,
+            ).to(device=self.device, dtype=self.dtype),
             residue_type_features=residue_type_features.unsqueeze(0).to(
                 device=self.device,
                 dtype=self.dtype,
             ),
-            plddt=torch.zeros(1, token_count, 1, dtype=self.dtype, device=self.device),
-            hotspot=torch.tensor(
-                [residue in hotspot_residues for residue in token_residues],
+            plddt=torch.zeros(
+                1,
+                token_count,
+                1,
                 dtype=self.dtype,
                 device=self.device,
-            ).reshape(1, token_count, 1),
+            ),
+            hotspot=hotspot.reshape(1, token_count, 1).to(
+                device=self.device,
+                dtype=self.dtype,
+            ),
             template_distance_bins=template_distance_bins.unsqueeze(0).to(self.device),
             template_pair_mask=template_pair_mask.unsqueeze(0).to(self.device),
-            layout=PxDesignLayout(
-                system=system,
-                sites=sites,
-            ),
-            batch_size=[1],
+            batch_size=[],
         )
 
 
-def _canonicalize_modified_polymers(
+def _placement_groups(
+    placement: PlacementSpec,
     source: MolecularSystem | None,
-    structure: Structure | None,
-) -> tuple[MolecularSystem | None, Structure | None]:
+) -> tuple[
+    tuple[tuple[str, dict[str, ExistingSpan], int, tuple[int, ...]], ...],
+    int,
+]:
     r"""
-    Canonicalize MSE residues to MET before tokenization.
-
-    Each ``MSE`` residue becomes ``MET`` and its selenium ``SE`` atom becomes sulfur
-    ``SD``. The heavy-atom graph otherwise matches the wwPDB CCD MET component, so the
-    transformed residue uses the canonical MET component without losing modeled atoms.
-
-    Any *other* modified polymer residue would need the CCD canonical-parent mapping that
-    the package [`ChemicalComponent`][] value does not carry; those are left unchanged
-    here and rejected precisely by the modeled-residue guard in [`PxDesignProcessor.__call__`][].
+    Resolve the family-owned target groups without retaining them in Model input.
     """
 
-    system = structure.system if structure is not None else source
-    if system is None:
-        return source, structure
+    binder_length, target_specs = to_binder(placement)
+    groups = tuple(placement.items())
 
-    met = get_component("MET")
-    new_entities: dict[str, PolymerSequence | Molecule] = {}
-    modified_entities: set[str] = set()
-    for entity_id, entity in system.entities.items():
-        if isinstance(entity, PolymerSequence) and any(
-            component.component_id == "MSE" for component in entity.components
-        ):
-            new_entities[entity_id] = PolymerSequence(
-                entity.polymer_type,
-                tuple(met if component.component_id == "MSE" else component for component in entity.components),
+    targets = []
+    target_source_instances: set[int] = set()
+    for (group, values), (instance_id, crops) in zip(
+        groups[:-1],
+        target_specs,
+        strict=True,
+    ):
+        spans = {placement_id: cast(ExistingSpan, value) for placement_id, value in values.items()}
+        if source is None:
+            raise ValueError("ExistingSpan target groups require molecular input")
+        source_instance = source.instance_index(instance_id)
+        if source_instance in target_source_instances:
+            raise ValueError("one PXDesign source instance cannot define two target groups")
+        target_source_instances.add(source_instance)
+        component_start = int(source.instance_component_ptr[source_instance].item())
+        component_stop = int(source.instance_component_ptr[source_instance + 1].item())
+        component_count = component_stop - component_start
+        selected = sorted({component for start, stop in crops for component in range(start, stop)})
+        if any(start < 0 or start >= stop or stop > component_count for start, stop in crops):
+            raise ValueError(f"PXDesign target group {group!r} has a crop outside its source instance")
+        targets.append(
+            (
+                group,
+                spans,
+                source_instance,
+                tuple(selected),
             )
-            modified_entities.add(entity_id)
-        else:
-            new_entities[entity_id] = entity
-    if not modified_entities:
-        return source, structure
-
-    # ``(instance_id, component_index)`` of every residue rewritten from MSE to MET; only the
-    # selenium ``SE`` occurrence in exactly those residues is renamed to the sulfur ``SD``.
-    modified_residues = {
-        (instance_id, index)
-        for instance_id, entity_id in system.instances.items()
-        if entity_id in modified_entities
-        for index, component in enumerate(system.entities[entity_id].components)
-        if component.component_id == "MSE"
-    }
-
-    def rename(site: AtomSite) -> AtomSite:
-        if site.atom_id == "SE" and (site.instance_id, site.component_index) in modified_residues:
-            return AtomSite(site.instance_id, site.component_index, "SD")
-        return site
-
-    new_bonds = frozenset(
-        SystemBond(
-            rename(bond.site_a),
-            rename(bond.site_b),
-            order=bond.order,
-            aromatic=bond.aromatic,
-            stereo=bond.stereo,
-            stereo_sites=(
-                None if bond.stereo_sites is None else (rename(bond.stereo_sites[0]), rename(bond.stereo_sites[1]))
-            ),
-            origin=bond.origin,
         )
-        for bond in system.bonds
-    )
-    new_system = MolecularSystem(new_entities, dict(system.instances), new_bonds)
-    if structure is None:
-        return new_system, None
-    new_structure = Structure(
-        new_system,
-        tuple(rename(site) for site in structure.sites),
-        structure.coordinates,
-        structure.coordinate_mask,
-        structure.occupancy,
-        structure.b_factor,
-        structure.residue_numbers,
-    )
-    return new_system, new_structure
+
+    return tuple(targets), binder_length
 
 
 def _materialize_problem(
     source: MolecularSystem | None,
-    structure: Structure | None,
-    existing_chains: tuple[tuple[ExistingSpan, ...], ...],
-    generated: GeneratedSegment,
-    generated_id: str,
-) -> tuple[
-    MolecularSystem,
-    tuple[AtomSite, ...],
-    dict[SymbolicResidueSite, tuple[str, int]],
-    frozenset[tuple[str, int]],
-]:
-    explicit_instances = [part.instance_id for chain in existing_chains for part in chain]
-    if source is None:
-        selected_instances: list[tuple[str, str]] = []
-    elif explicit_instances:
-        selected_ids = set(explicit_instances)
-        selected_instances = [
-            (instance_id, source.instances[instance_id]) for instance_id in dict.fromkeys(explicit_instances)
-        ]
-        selected_instances.extend(
-            (instance_id, entity_id)
-            for instance_id, entity_id in source.instances.items()
-            if isinstance(source.entities[entity_id], Molecule) and instance_id not in selected_ids
-        )
-    else:
-        selected_instances = list(source.instances.items())
-
-    selected_instance_ids = {instance_id for instance_id, _ in selected_instances}
-    selected_entity_ids = {entity_id for _, entity_id in selected_instances}
-    entities: dict[str, PolymerSequence | Molecule] = (
-        {} if source is None else {entity_id: source.entities[entity_id] for entity_id in selected_entity_ids}
-    )
-
-    # Generated entity ids remain PXDesign-owned.
-    entity_id = "pxdesign_entity_0"
-    suffix = 1
-    while entity_id in selected_entity_ids:
-        entity_id = f"pxdesign_entity_0_{suffix}"
-        suffix += 1
-    entities[entity_id] = PolymerSequence("protein", (get_component("UNK"),) * generated.max_length)
-
-    # PXDesign realizes one generated binder instance.
-    instance_id = "chain_0"
-    instances = dict(selected_instances)
-    instances[instance_id] = entity_id
-
-    bonds = (
-        frozenset()
-        if source is None
-        else frozenset(
-            bond
-            for bond in source.bonds
-            if bond.site_a.instance_id in selected_instance_ids and bond.site_b.instance_id in selected_instance_ids
-        )
-    )
-    system = MolecularSystem(entities, instances, bonds)
-
-    if existing_chains:
-        selected_residues = frozenset(
-            (part.instance_id, monomer_index)
-            for chain in existing_chains
-            for part in chain
-            for monomer_index in range(part.start, part.stop)
-        )
-    else:
-        selected_residues = frozenset(
-            (instance_id, monomer_index)
-            for instance_id, entity_id in selected_instances
-            if isinstance(entity := system.entities[entity_id], PolymerSequence)
-            for monomer_index in range(len(entity))
-        )
-    if structure is None:
-        observed_residues: frozenset[tuple[str, int]] = frozenset()
-        observed_molecules: frozenset[str] = frozenset()
-    else:
-        molecule_instances = {
-            instance_id
-            for instance_id, entity_id in structure.system.instances.items()
-            if isinstance(structure.system.entities[entity_id], Molecule)
-        }
-        observed_residues = frozenset(
-            (site.instance_id, site.component_index)
-            for site, present in zip(structure.sites, structure.coordinate_mask)
-            if present and site.instance_id not in molecule_instances
-        )
-        observed_molecules = frozenset(
-            site.instance_id
-            for site, present in zip(structure.sites, structure.coordinate_mask)
-            if present and site.instance_id in molecule_instances
-        )
-    # Generated occurrences are ordered by offset; negative offsets resolve through
-    # the occurrence tuple.
-    generated_map = {}
-    for offset in range(generated.max_length):
-        residue = (instance_id, offset)
-        generated_map[SymbolicResidueSite(generated_id, offset)] = residue
-    generated_residues = frozenset(generated_map.values())
-    sites = []
-    for site, atom in system.iter_atoms():
-        if atom.element == "H":
-            continue
-        entity = system.entities[system.instances[site.instance_id]]
-        site_residue = None if isinstance(entity, Molecule) else (site.instance_id, site.component_index)
-        if site_residue in generated_residues:
-            if site.atom_id in _GENERATED_ATOM_IDS:
-                sites.append(site)
-        elif site_residue is not None:
-            if site_residue in selected_residues and site_residue in observed_residues:
-                sites.append(site)
-        elif site.instance_id in observed_molecules:
-            sites.append(site)
-    if not sites:
-        raise ValueError("PXDesign requires at least one modeled atom")
-    return system, tuple(sites), generated_map, selected_residues
-
-
-def _tokens(
-    system: MolecularSystem,
-    sites: tuple[AtomSite, ...],
-    generated_residues: frozenset[tuple[str, int]],
-) -> tuple[
-    tuple[tuple[AtomSite, ...], ...],
-    tuple[tuple[str, int] | None, ...],
-    tuple[str, ...],
-    tuple[AtomSite, ...],
-]:
-    groups: list[tuple[AtomSite, ...]] = []
-    residues: list[tuple[str, int] | None] = []
-    components: list[str] = []
-    representatives: list[AtomSite] = []
-    by_residue: dict[tuple[str, int], list[AtomSite]] = {}
-    for site in sites:
-        if not isinstance(system.entities[system.instances[site.instance_id]], Molecule):
-            by_residue.setdefault((site.instance_id, site.component_index), []).append(site)
-    emitted_residues: set[tuple[str, int]] = set()
-    for site in sites:
-        entity = system.entities[system.instances[site.instance_id]]
-        if isinstance(entity, Molecule):
-            groups.append((site,))
-            residues.append(None)
-            components.append("UNK")
-            representatives.append(site)
-            continue
-        polymer = cast(PolymerSequence, entity)
-        residue = (site.instance_id, site.component_index)
-        if residue in emitted_residues:
-            continue
-        emitted_residues.add(residue)
-        component_id = polymer.components[site.component_index].component_id
-        group = tuple(by_residue[residue])
-        if polymer.polymer_type == "protein":
-            representative_id = "CA" if component_id == "GLY" or residue in generated_residues else "CB"
-        elif component_id in {"DA", "DG", "A", "G"}:
-            representative_id = "C4"
-        elif component_id in {"DC", "DT", "C", "U"}:
-            representative_id = "C2"
-        else:
-            representative_id = "C1'"
-        representative = next(atom_site for atom_site in group if atom_site.atom_id == representative_id)
-        groups.append(group)
-        residues.append(residue)
-        components.append(component_id)
-        representatives.append(representative)
-    return tuple(groups), tuple(residues), tuple(components), tuple(representatives)
-
-
-def _hotspots(
-    conditions: tuple[Hotspot, ...],
-    selected_residues: frozenset[tuple[str, int]],
-    token_residues: tuple[tuple[str, int] | None, ...],
-) -> frozenset[tuple[str, int]]:
+    target_groups: tuple[tuple[str, dict[str, ExistingSpan], int, tuple[int, ...]], ...],
+    binder_length: int,
+) -> tuple[MolecularSystem, Tensor, Tensor]:
     r"""
-    Collect per-token hotspot target residues.
+    Build the sole canonical output-problem graph.
 
-    [`Hotspot`][ofoldx.data.Hotspot] is single-sided and distance-free: ``residues``
-    name the EXISTING target residues to condition on and the generated partner is implicit
-    (the whole binder). Each named residue must be a materialized target
-    ``ComponentReference`` — a ``(instance_id, component_index)`` tuple present in the selected,
-    tokenized target — so a generated-binder endpoint (a bare ``placement_id`` / a
-    [`SymbolicResidueSite`][ofoldx.data.SymbolicResidueSite] /
-    [`SymbolicAtomSite`][ofoldx.data.placement.SymbolicAtomSite]) is rejected because PXDesign
-    hotspots its target, not its binder.
+    The returned source maps are transient Processor evidence. They are consumed
+    while lowering coordinates and never enter [`PxDesignInput`][].
     """
 
-    hotspots: set[tuple[str, int]] = set()
-    token_residue_set = {residue for residue in token_residues if residue is not None}
-    for condition in conditions:
-        if not isinstance(condition, Hotspot):
+    source_instance_ids = (
+        set() if source is None else {source.instance_id(index) for index in range(source.instance_symbol.numel())}
+    )
+    source_entity_ids = (
+        set() if source is None else {source.entity_id(index) for index in range(source.entity_symbol.numel())}
+    )
+    used_instances: set[str] = set()
+    used_entities: set[str] = set()
+    next_instance = 0
+    next_entity = 0
+
+    def instance_id() -> str:
+        nonlocal next_instance
+        while True:
+            value = f"chain_{next_instance}"
+            next_instance += 1
+            if value not in source_instance_ids and value not in used_instances:
+                used_instances.add(value)
+                return value
+
+    def entity_id() -> str:
+        nonlocal next_entity
+        while True:
+            value = f"pxdesign_entity_{next_entity}"
+            next_entity += 1
+            if value not in source_entity_ids and value not in used_entities:
+                used_entities.add(value)
+                return value
+
+    pieces = []
+    source_atom_maps = []
+    source_component_maps = []
+    group_maps = []
+    for group_index, (_, _, source_instance, selected) in enumerate(target_groups):
+        assert source is not None
+        piece, atom_map, component_map = _target_piece(
+            source,
+            source_instance,
+            selected,
+            entity_id(),
+            instance_id(),
+        )
+        pieces.append(piece)
+        source_atom_maps.append(atom_map)
+        source_component_maps.append(component_map)
+        group_maps.append(torch.full_like(atom_map, group_index, dtype=torch.int64))
+
+    binder = MolecularSystem.from_entities(
+        {
+            (entity := entity_id()): PolymerSequence(
+                "protein",
+                (get_component("UNK"),) * binder_length,
+            )
+        },
+        {instance_id(): entity},
+        device=None if source is None else source.atom_symbol.device,
+    )
+    pieces.append(binder)
+    source_atom_maps.append(torch.full_like(binder.atom_symbol, -1, dtype=torch.int64))
+    source_component_maps.append(torch.full_like(binder.component_symbol, -1, dtype=torch.int64))
+    group_maps.append(torch.full_like(binder.atom_symbol, -1, dtype=torch.int64))
+
+    system, component_maps, atom_maps = disjoint_union(pieces)
+    source_atom_index = torch.full_like(
+        system.atom_symbol,
+        -1,
+        dtype=torch.int64,
+    )
+    source_component_index = torch.full_like(
+        system.component_symbol,
+        -1,
+        dtype=torch.int64,
+    )
+    output_group_index = torch.full_like(
+        system.atom_symbol,
+        -1,
+        dtype=torch.int64,
+    )
+    for atom_map, source_map, group_map in zip(
+        atom_maps,
+        source_atom_maps,
+        group_maps,
+        strict=True,
+    ):
+        source_atom_index[atom_map] = source_map
+        output_group_index[atom_map] = group_map
+    for component_map, source_map in zip(
+        component_maps,
+        source_component_maps,
+        strict=True,
+    ):
+        source_component_index[component_map] = source_map
+    if source is not None and target_groups:
+        system = _restore_source_edges(
+            system,
+            source,
+            source_atom_index,
+            output_group_index,
+        )
+    return (
+        system,
+        source_atom_index,
+        source_component_index,
+    )
+
+
+def _target_piece(
+    source: MolecularSystem,
+    source_instance: int,
+    selected_local_components: tuple[int, ...],
+    entity_id: str,
+    instance_id: str,
+) -> tuple[MolecularSystem, Tensor, Tensor]:
+    r"""
+    Copy one target group's selected components without reconstructing objects.
+    """
+
+    device = source.atom_symbol.device
+    source_component_start = int(source.instance_component_ptr[source_instance].item())
+    component_index = torch.tensor(
+        [source_component_start + local for local in selected_local_components],
+        dtype=torch.int64,
+        device=device,
+    )
+    placeholder = MolecularSystem.from_entities(
+        {entity_id: Molecule((get_component("UNK"),) * len(selected_local_components))},
+        {instance_id: entity_id},
+        device=device,
+    )
+    target_component_index = torch.arange(
+        len(selected_local_components),
+        dtype=torch.int64,
+        device=device,
+    )
+    piece, _, source_to_new = copy_components(
+        placeholder,
+        target_component_index,
+        source,
+        component_index,
+    )
+    source_entity = int(source.instance_entity[source_instance].item())
+    piece = piece.replace(  # type: ignore[attr-defined]
+        entity_type=source.entity_type[source_entity : source_entity + 1],
+        entity_molecule_type=source.entity_molecule_type[source_entity : source_entity + 1],
+    )
+
+    symbols = list(piece.symbols)
+
+    def symbol(value: str) -> int:
+        try:
+            return symbols.index(value)
+        except ValueError:
+            symbols.append(value)
+            return len(symbols) - 1
+
+    component_symbol = piece.component_symbol.clone()
+    atom_symbol = piece.atom_symbol.clone()
+    atomic_number = piece.atomic_number.clone()
+    for output_component, source_component in enumerate(component_index.tolist()):
+        component_id = str(source.symbols[int(source.component_symbol[source_component].item())])
+        if component_id != "MSE":
             continue
-        for reference in condition.residues:
-            if not isinstance(reference, tuple):
-                raise ValueError(
-                    "PXDesign hotspot names an existing target residue (ComponentReference); "
-                    f"the generated binder is implicit and cannot be a hotspot: {reference!r}"
-                )
-            residue = cast(tuple[str, int], reference)
-            if residue not in selected_residues or residue not in token_residue_set:
-                raise ValueError(f"PXDesign hotspot residue is absent from the modeled target: {residue!r}")
-            hotspots.add(residue)
-    return frozenset(hotspots)
+        component_symbol[output_component] = symbol("MET")
+        for source_atom in range(
+            int(source.component_atom_ptr[source_component].item()),
+            int(source.component_atom_ptr[source_component + 1].item()),
+        ):
+            atom_id = str(source.symbols[int(source.atom_symbol[source_atom].item())])
+            if atom_id != "SE":
+                continue
+            output_atom = int(source_to_new[source_atom].item())
+            atom_symbol[output_atom] = symbol("SD")
+            atomic_number[output_atom] = 16
+    piece = piece.replace(  # type: ignore[attr-defined]
+        symbols=tuple(symbols),
+        component_symbol=component_symbol,
+        atom_symbol=atom_symbol,
+        atomic_number=atomic_number,
+    )
+
+    source_atom_index = torch.full(
+        (piece.atom_symbol.numel(),),
+        -1,
+        dtype=torch.int64,
+        device=device,
+    )
+    copied_source_atom = torch.nonzero(source_to_new >= 0, as_tuple=True)[0]
+    source_atom_index[source_to_new[copied_source_atom]] = copied_source_atom
+    return piece, source_atom_index, component_index
 
 
-def _component_reference(component: ChemicalComponent) -> dict[str, tuple[float, float, float]]:
-    return {
-        atom.atom_id: coordinate
-        for atom, coordinate in zip(component.atoms, component.reference_coordinates)
-        if coordinate is not None
+def _restore_source_edges(
+    system: MolecularSystem,
+    source: MolecularSystem,
+    source_atom_index: Tensor,
+    output_group_index: Tensor,
+) -> MolecularSystem:
+    r"""
+    Remap every surviving source edge onto its copied target occurrence.
+    """
+
+    source_atom_component = _atom_component(source)
+    source_component_instance = _component_instance(source)
+    source_atom_instance = source_component_instance[source_atom_component]
+    output_by_source_group = {
+        (int(source_atom), int(group)): output_atom
+        for output_atom, (source_atom, group) in enumerate(
+            zip(
+                source_atom_index.tolist(),
+                output_group_index.tolist(),
+                strict=True,
+            )
+        )
+        if source_atom >= 0
     }
+    groups_by_source: dict[int, list[int]] = {}
+    for source_atom, group in output_by_source_group:
+        groups_by_source.setdefault(source_atom, []).append(group)
+
+    edge_rows = []
+    source_edge_rows = []
+    stereo_rows = []
+    directions = []
+    for edge, (source_a, source_b) in enumerate(source.edge_index.transpose(0, 1).tolist()):
+        if int(source.bond_role[edge].item()) == BOND_ROLE_COMPONENT:
+            continue
+        groups_a = groups_by_source.get(source_a, ())
+        groups_b = groups_by_source.get(source_b, ())
+        if int(source_atom_instance[source_a].item()) == int(source_atom_instance[source_b].item()):
+            group_pairs = ((group, group) for group in set(groups_a) & set(groups_b))
+        else:
+            group_pairs = ((group_a, group_b) for group_a in groups_a for group_b in groups_b)
+        for group_a, group_b in group_pairs:
+            output_a = output_by_source_group[(source_a, group_a)]
+            output_b = output_by_source_group[(source_b, group_b)]
+            swapped = output_a > output_b
+            edge_rows.append((output_b, output_a) if swapped else (output_a, output_b))
+            source_edge_rows.append(edge)
+            direction = int(source.bond_direction[edge].item())
+            directions.append(-direction if swapped else direction)
+
+            stereo = []
+            for stereo_atom in source.bond_stereo_index[:, edge].tolist():
+                if stereo_atom < 0:
+                    stereo.append(-1)
+                    continue
+                stereo_instance = int(source_atom_instance[stereo_atom].item())
+                group = group_a if stereo_instance == int(source_atom_instance[source_a].item()) else group_b
+                stereo.append(output_by_source_group.get((stereo_atom, group), -1))
+            stereo_rows.append(tuple(stereo))
+
+    if not edge_rows:
+        return system
+
+    source_rows = torch.tensor(
+        source_edge_rows,
+        dtype=torch.int64,
+        device=source.edge_index.device,
+    )
+    copied_edge_index = torch.tensor(
+        edge_rows,
+        dtype=torch.int64,
+        device=system.edge_index.device,
+    ).transpose(0, 1)
+    copied_stereo_index = torch.tensor(
+        stereo_rows,
+        dtype=torch.int64,
+        device=system.edge_index.device,
+    ).transpose(0, 1)
+    copied_bond_stereo = source.bond_stereo[source_rows].clone()
+    symbols = list(system.symbols)
+    for index, source_symbol in enumerate(copied_bond_stereo.tolist()):
+        if source_symbol < 0:
+            continue
+        value = source.symbols[source_symbol]
+        try:
+            copied_bond_stereo[index] = symbols.index(value)
+        except ValueError:
+            symbols.append(value)
+            copied_bond_stereo[index] = len(symbols) - 1
+        if (copied_stereo_index[:, index] < 0).any():
+            copied_bond_stereo[index] = -1
+
+    edge_index = torch.cat((system.edge_index, copied_edge_index), dim=1)
+    bond_order = torch.cat((system.bond_order, source.bond_order[source_rows]))
+    bond_order_known = torch.cat((system.bond_order_known, source.bond_order_known[source_rows]))
+    bond_aromatic = torch.cat((system.bond_aromatic, source.bond_aromatic[source_rows]))
+    bond_aromatic_known = torch.cat(
+        (
+            system.bond_aromatic_known,
+            source.bond_aromatic_known[source_rows],
+        )
+    )
+    bond_kind = torch.cat((system.bond_kind, source.bond_kind[source_rows]))
+    bond_direction = torch.cat(
+        (
+            system.bond_direction,
+            torch.tensor(
+                directions,
+                dtype=system.bond_direction.dtype,
+                device=system.bond_direction.device,
+            ),
+        )
+    )
+    bond_role = torch.cat((system.bond_role, source.bond_role[source_rows]))
+    bond_stereo = torch.cat((system.bond_stereo, copied_bond_stereo))
+    bond_stereo_index = torch.cat(
+        (system.bond_stereo_index, copied_stereo_index),
+        dim=1,
+    )
+    order = (edge_index[0] * (system.atom_symbol.numel() + 1) + edge_index[1]).argsort()
+    return system.replace(  # type: ignore[attr-defined]
+        symbols=tuple(symbols),
+        edge_index=edge_index[:, order],
+        bond_order=bond_order[order],
+        bond_order_known=bond_order_known[order],
+        bond_aromatic=bond_aromatic[order],
+        bond_aromatic_known=bond_aromatic_known[order],
+        bond_kind=bond_kind[order],
+        bond_direction=bond_direction[order],
+        bond_role=bond_role[order],
+        bond_stereo=bond_stereo[order],
+        bond_stereo_index=bond_stereo_index[:, order],
+    )
+
+
+def _model_atom_index(
+    system: MolecularSystem,
+    source_atom_index: Tensor,
+    structure: Structure | None,
+    source_component_index: Tensor,
+) -> Tensor:
+    atom_component = _atom_component(system)
+    observed_atom = torch.zeros(
+        system.atom_symbol.numel(),
+        dtype=torch.bool,
+        device=system.atom_symbol.device,
+    )
+    if structure is not None:
+        copied = source_atom_index >= 0
+        observed_atom[copied] = structure.coordinate_mask[source_atom_index[copied]]
+
+    atom_names = [system.symbols[int(symbol)] for symbol in system.atom_symbol.tolist()]
+    component_instance = _component_instance(system)
+    component_type = system.entity_type[system.instance_entity[component_instance]]
+    component_ids = [system.symbols[int(symbol)] for symbol in system.component_symbol.tolist()]
+    generated_atom = torch.tensor(
+        [
+            source_component_index[int(component)] < 0 and name in _GENERATED_ATOM_IDS
+            for component, name in zip(
+                atom_component.tolist(),
+                atom_names,
+                strict=True,
+            )
+        ],
+        dtype=torch.bool,
+        device=system.atom_symbol.device,
+    )
+    standard_representative = torch.tensor(
+        [
+            int(component_type[int(component)].item()) != ENTITY_MOLECULE
+            and component_ids[int(component)] in _RESIDUE_TYPE_INDEX
+            and name == ("CA" if int(component_type[int(component)].item()) == ENTITY_PROTEIN else "C1'")
+            for component, name in zip(
+                atom_component.tolist(),
+                atom_names,
+                strict=True,
+            )
+        ],
+        dtype=torch.bool,
+        device=system.atom_symbol.device,
+    )
+    selected = (generated_atom | observed_atom | standard_representative) & (system.atomic_number != 1)
+    atom_index = torch.nonzero(selected, as_tuple=True)[0]
+    if atom_index.numel() == 0:
+        raise ValueError("PXDesign requires at least one modeled atom")
+    return atom_index
+
+
+def _tokenize(
+    system: MolecularSystem,
+    atom_index: Tensor,
+    source_component_index: Tensor,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    atom_component = _atom_component(system)
+    component_instance = _component_instance(system)
+    component_entity = system.instance_entity[component_instance]
+    component_type = system.entity_type[component_entity]
+    model_component = atom_component[atom_index]
+    model_rows_by_component: dict[int, list[int]] = {}
+    for model_atom, component in enumerate(model_component.tolist()):
+        model_rows_by_component.setdefault(component, []).append(model_atom)
+
+    token_components = []
+    token_atoms = []
+    representatives = []
+    token_model_atoms = []
+    residue_feature_indices = []
+    for component in range(system.component_symbol.numel()):
+        model_rows = model_rows_by_component.get(component)
+        if not model_rows:
+            continue
+        component_id = system.symbols[int(system.component_symbol[component].item())]
+        generated = int(source_component_index[component].item()) < 0
+        standard_polymer = int(component_type[component].item()) != ENTITY_MOLECULE and (
+            generated or component_id in _RESIDUE_TYPE_INDEX
+        )
+        representative_id = "CA" if int(component_type[component].item()) == ENTITY_PROTEIN else "C1'"
+        representative = next(
+            (
+                int(atom_index[model_row].item())
+                for model_row in model_rows
+                if system.symbols[int(system.atom_symbol[int(atom_index[model_row].item())].item())]
+                == representative_id
+            ),
+            None,
+        )
+        if standard_polymer:
+            if representative is None:
+                raise ValueError(f"standard polymer component {component_id!r} " f"has no {representative_id} atom")
+            token_components.append(component)
+            token_atoms.append(-1)
+            representatives.append(representative)
+            token_model_atoms.append(model_rows)
+            residue_feature_indices.append(_GENERATED_RESIDUE_TYPE if generated else _RESIDUE_TYPE_INDEX[component_id])
+            continue
+
+        unknown = _unknown_residue_type(int(component_type[component].item()))
+        for model_row in model_rows:
+            canonical_atom = int(atom_index[model_row].item())
+            token_components.append(component)
+            token_atoms.append(canonical_atom)
+            representatives.append(canonical_atom)
+            token_model_atoms.append([model_row])
+            residue_feature_indices.append(unknown)
+
+    token_count = len(token_components)
+    atom_to_token = torch.empty_like(atom_index)
+    for token, model_atoms in enumerate(token_model_atoms):
+        atom_to_token[torch.tensor(model_atoms, device=atom_index.device)] = token
+    residue_type_features = torch.zeros(
+        token_count,
+        36,
+        dtype=torch.float32,
+        device=atom_index.device,
+    )
+    residue_type_features[
+        torch.arange(token_count, device=atom_index.device),
+        torch.tensor(residue_feature_indices, device=atom_index.device),
+    ] = 1
+    return (
+        torch.tensor(
+            token_components,
+            dtype=torch.int64,
+            device=atom_index.device,
+        ),
+        torch.tensor(
+            token_atoms,
+            dtype=torch.int64,
+            device=atom_index.device,
+        ),
+        torch.tensor(
+            representatives,
+            dtype=torch.int64,
+            device=atom_index.device,
+        ),
+        atom_to_token,
+        residue_type_features,
+    )
+
+
+def _unknown_residue_type(entity_type: int) -> int:
+    if entity_type == ENTITY_PROTEIN:
+        return _RESIDUE_TYPE_INDEX["UNK"]
+    # Canonical tensor entity codes are stable: RNA=2, DNA=3, hybrid=4.
+    if entity_type == 2:
+        return _RESIDUE_TYPE_INDEX["N"]
+    if entity_type in (3, 4):
+        return _RESIDUE_TYPE_INDEX["DN"]
+    return _RESIDUE_TYPE_INDEX["UNK"]
+
+
+def _hotspot_features(
+    conditions: tuple[Hotspot, ...],
+    source: MolecularSystem | None,
+    source_component_index: Tensor,
+    token_component_index: Tensor,
+) -> Tensor:
+    selected_source_components = {int(component) for component in source_component_index.tolist() if component >= 0}
+    hotspots: set[int] = set()
+    for condition in conditions:
+        for reference in condition.residues:
+            if source is None or not isinstance(reference, tuple) or len(reference) != 2:
+                raise ValueError("PXDesign hotspots name existing target components")
+            source_component = source.component_index(cast(tuple[str, int], reference))
+            if source_component not in selected_source_components:
+                raise ValueError(f"PXDesign hotspot is absent from the target crop: {reference!r}")
+            hotspots.add(source_component)
+    return torch.tensor(
+        [
+            int(source_component_index[int(component)].item()) in hotspots
+            for component in token_component_index.tolist()
+        ],
+        dtype=torch.float32,
+        device=token_component_index.device,
+    )
 
 
 def _reference_features(
     system: MolecularSystem,
-    sites: tuple[AtomSite, ...],
-    generated_residues: frozenset[tuple[str, int]],
+    atom_index: Tensor,
+    source_component_index: Tensor,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    glycine_coordinates = _component_reference(get_component("GLY"))
-    positions = torch.zeros(len(sites), 3, dtype=torch.float32)
-    mask = torch.zeros(len(sites), dtype=torch.bool)
-    spaces: dict[tuple[str, int | None], int] = {}
-    space_ids: list[int] = []
-    for row, site in enumerate(sites):
-        entity = system.entities[system.instances[site.instance_id]]
-        residue = (site.instance_id, site.component_index)
-        if not isinstance(entity, Molecule) and residue in generated_residues:
-            coordinate = glycine_coordinates.get(site.atom_id)
-        else:
-            coordinate = _component_reference(entity.components[site.component_index]).get(site.atom_id)
-        if coordinate is not None:
-            positions[row] = torch.tensor(coordinate)
-            mask[row] = True
-        space: tuple[str, int | None] = (
-            (site.instance_id, None) if isinstance(entity, Molecule) else (site.instance_id, site.component_index)
+    glycine = get_component("GLY")
+    glycine_coordinates = {
+        atom.atom_id: coordinate
+        for atom, coordinate in zip(
+            glycine.atoms,
+            glycine.reference_coordinates,
+            strict=True,
         )
+        if coordinate is not None
+    }
+    atom_component = _atom_component(system)
+    component_instance = _component_instance(system)
+    positions = system.reference_coordinates[atom_index].clone()
+    mask = system.reference_coordinate_mask[atom_index].clone()
+    spaces: dict[tuple[int, int], int] = {}
+    space_ids = []
+    for model_atom, canonical_atom in enumerate(atom_index.tolist()):
+        component = int(atom_component[canonical_atom].item())
+        instance = int(component_instance[component].item())
+        entity = int(system.instance_entity[instance].item())
+        if int(source_component_index[component].item()) < 0:
+            atom_id = system.symbols[int(system.atom_symbol[canonical_atom].item())]
+            coordinate = glycine_coordinates.get(atom_id)
+            if coordinate is None:
+                mask[model_atom] = False
+            else:
+                positions[model_atom] = positions.new_tensor(coordinate)
+                mask[model_atom] = True
+        space = (instance, -1) if int(system.entity_type[entity].item()) == ENTITY_MOLECULE else (instance, component)
         if space not in spaces:
             spaces[space] = len(spaces)
         space_ids.append(spaces[space])
-    space_id = torch.tensor(space_ids, dtype=torch.int64)
+
+    space_id = torch.tensor(
+        space_ids,
+        dtype=torch.int64,
+        device=atom_index.device,
+    )
     for value in range(len(spaces)):
-        selected = space_id == value
-        positions[selected] -= positions[selected].mean(dim=0)
+        selected = (space_id == value) & mask
+        if selected.any():
+            positions[selected] -= positions[selected].mean(dim=0)
     return positions, mask, space_id
 
 
 def _atom_features(
     system: MolecularSystem,
-    sites: tuple[AtomSite, ...],
+    atom_index: Tensor,
     reference_mask: Tensor,
 ) -> tuple[Tensor, Tensor]:
-    from rdkit.Chem import GetPeriodicTable
-
-    periodic_table = GetPeriodicTable()
-    element = torch.zeros(len(sites), 128)
-    names = torch.zeros(len(sites), 4, 64)
-    charges = torch.zeros(len(sites), dtype=torch.float32)
-    for row, site in enumerate(sites):
-        atom = system.atom(site)
-        element[row, int(periodic_table.GetAtomicNumber(atom.element)) - 1] = 1.0
-        charges[row] = atom.formal_charge
-        if len(site.atom_id) > 4:
-            raise ValueError(f"PXDesign cannot encode atom name longer than four characters: {site.atom_id!r}")
-        for column, character in enumerate(site.atom_id.ljust(4)):
-            index = ord(character) - 32
-            if not 0 <= index < 64:
+    element = torch.zeros(
+        atom_index.numel(),
+        128,
+        device=atom_index.device,
+    )
+    element[
+        torch.arange(atom_index.numel(), device=atom_index.device),
+        system.atomic_number[atom_index].to(torch.int64) - 1,
+    ] = 1
+    names = torch.zeros(
+        atom_index.numel(),
+        4,
+        64,
+        device=atom_index.device,
+    )
+    for row, canonical_atom in enumerate(atom_index.tolist()):
+        atom_id = system.symbols[int(system.atom_symbol[canonical_atom].item())]
+        if len(atom_id) > 4:
+            raise ValueError(f"PXDesign cannot encode atom name longer than four characters: {atom_id!r}")
+        for column, character in enumerate(atom_id.ljust(4)):
+            value = ord(character) - 32
+            if not 0 <= value < 64:
                 raise ValueError(f"PXDesign cannot encode atom-name character {character!r}")
-            names[row, column, index] = 1.0
-    features = torch.cat((reference_mask.float().unsqueeze(-1), element, names.flatten(-2)), dim=-1)
-    return features, charges
+            names[row, column, value] = 1
+    features = torch.cat(
+        (
+            reference_mask.to(torch.float32).unsqueeze(-1),
+            element,
+            names.flatten(-2),
+        ),
+        dim=-1,
+    )
+    return features, system.formal_charge[atom_index].to(torch.float32)
+
+
+def _template_features(
+    structure: Structure | None,
+    source_atom_index: Tensor,
+    representative_atom_index: Tensor,
+) -> tuple[Tensor, Tensor]:
+    token_count = representative_atom_index.numel()
+    positions = torch.zeros(
+        token_count,
+        3,
+        dtype=torch.float32,
+        device=representative_atom_index.device,
+    )
+    mask = torch.zeros(
+        token_count,
+        dtype=torch.bool,
+        device=representative_atom_index.device,
+    )
+    if structure is not None:
+        source_atoms = source_atom_index[representative_atom_index]
+        selected = source_atoms >= 0
+        selected_rows = torch.nonzero(selected, as_tuple=True)[0]
+        selected_source = source_atoms[selected]
+        valid = structure.coordinate_mask[selected_source]
+        valid_rows = selected_rows[valid]
+        valid_source = selected_source[valid]
+        positions[valid_rows] = structure.coordinates[valid_source].to(positions)
+        mask[valid_rows] = True
+
+    bins = torch.zeros(
+        token_count,
+        token_count,
+        dtype=torch.int64,
+        device=positions.device,
+    )
+    pair_mask = mask[:, None] & mask[None, :]
+    rows = torch.nonzero(mask, as_tuple=True)[0]
+    if rows.numel():
+        distances = torch.cdist(
+            positions.index_select(0, rows),
+            positions.index_select(0, rows),
+        )
+        values = torch.sum(
+            distances.unsqueeze(-1)
+            > torch.linspace(
+                2.0,
+                22.0,
+                63,
+                device=positions.device,
+            ),
+            dim=-1,
+        )
+        first, second = torch.meshgrid(rows, rows, indexing="ij")
+        bins[first, second] = values
+    return bins, pair_mask
 
 
 def _token_indices(
     system: MolecularSystem,
-    token_sites: tuple[tuple[AtomSite, ...], ...],
-    token_residues: tuple[tuple[str, int] | None, ...],
+    token_component_index: Tensor,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    chain = {instance_id: index for index, instance_id in enumerate(system.instances)}
-    entity = {value: index for index, value in enumerate(sorted(set(system.instances.values())))}
-    seen: dict[str, int] = {}
-    symmetry: dict[str, int] = {}
-    for instance_id, entity_id in system.instances.items():
-        symmetry[instance_id] = seen.get(entity_id, 0)
-        seen[entity_id] = symmetry[instance_id] + 1
-    chain_values = []
-    entity_values = []
-    symmetry_values = []
-    residue_values = []
-    for group, residue in zip(token_sites, token_residues):
-        instance_id = group[0].instance_id
-        entity_id = system.instances[instance_id]
-        chain_values.append(chain[instance_id])
-        entity_values.append(entity[entity_id])
-        symmetry_values.append(symmetry[instance_id])
-        residue_values.append(0 if residue is None else residue[1])
-    return tuple(
-        torch.tensor(values, dtype=torch.int64)
-        for values in (chain_values, entity_values, symmetry_values, residue_values)
+    component_instance = _component_instance(system)
+    instance = component_instance[token_component_index]
+    entity = system.instance_entity[instance]
+    residue = token_component_index - system.instance_component_ptr[instance]
+    # PXDesign deliberately repartitions every target group into its own entity.
+    symmetry = torch.zeros_like(instance)
+    return instance, entity, symmetry, residue
+
+
+def _atom_component(system: MolecularSystem) -> Tensor:
+    return torch.repeat_interleave(
+        torch.arange(
+            system.component_symbol.numel(),
+            dtype=torch.int64,
+            device=system.atom_symbol.device,
+        ),
+        system.component_atom_ptr[1:] - system.component_atom_ptr[:-1],
     )
 
 
-# PXDesign placement projection. from_binder maps target crops to ExistingSpan
-# groups plus one trailing generated binder; to_binder recovers the binder length
-# and target crops. The projection supports discontinuous target crops even though
-# PxDesignProcessor accepts complete target chains.
+def _component_instance(system: MolecularSystem) -> Tensor:
+    return torch.repeat_interleave(
+        torch.arange(
+            system.instance_symbol.numel(),
+            dtype=torch.int64,
+            device=system.component_symbol.device,
+        ),
+        system.instance_component_ptr[1:] - system.instance_component_ptr[:-1],
+    )
 
-#: One target chain: its source ``instance_id`` and an ordered list of half-open
-#: ``[start, stop)`` crop intervals. Several intervals express a discontinuous crop.
+
+# One target chain: source instance id and ordered half-open crop intervals.
 TargetChain = tuple[str, list[tuple[int, int]]]
 
 _BINDER_LABEL = "binder"
@@ -695,18 +968,11 @@ def from_binder(
     target: Sequence[TargetChain] = (),
 ) -> PlacementSpec:
     r"""
-    Build a placement declaration for target chains and one protein binder.
-
-    Args:
-        binder_length: Exact generated binder length.
-        target: Source instance IDs and half-open component intervals to retain.
-
-    Returns:
-        A placement declaration whose final group is the generated binder.
+    Build target groups followed by one exact protein binder.
     """
 
-    if binder_length < 0:
-        raise ValueError("binder_length must be non-negative")
+    if binder_length <= 0:
+        raise ValueError("binder_length must be positive")
     placement: PlacementSpec = {}
     for instance_id, crops in target:
         crop_intervals = tuple(crops)
@@ -718,66 +984,63 @@ def from_binder(
         for start, stop in crop_intervals:
             if not 0 <= start < stop:
                 raise ValueError(
-                    f"target chain {instance_id!r} crop must be a half-open [start, stop) with "
-                    f"0 <= start < stop; got ({start}, {stop})"
+                    f"target chain {instance_id!r} crop must be a half-open " f"[start, stop); got ({start}, {stop})"
                 )
             placement_id = instance_id if len(crop_intervals) == 1 else f"{instance_id}#{start}_{stop}"
             if placement_id in group:
-                raise ValueError(f"target chain {instance_id!r} has a duplicate crop {(start, stop)!r}")
+                raise ValueError(f"target chain {instance_id!r} has duplicate crop {(start, stop)!r}")
             group[placement_id] = ExistingSpan(instance_id, start, stop)
         placement[instance_id] = group
 
-    existing_ids = {placement_id for chain in placement.values() for placement_id in chain}
+    placement_ids = {placement_id for chain in placement.values() for placement_id in chain}
     binder_label = _BINDER_LABEL
-    while binder_label in placement or binder_label in existing_ids:
+    while binder_label in placement or binder_label in placement_ids:
         binder_label += "_"
-    placement[binder_label] = {binder_label: GeneratedSegment("protein", binder_length, binder_length)}
-
+    placement[binder_label] = {
+        binder_label: GeneratedSegment(
+            "protein",
+            binder_length,
+            binder_length,
+        )
+    }
     return placement
 
 
 def to_binder(placement: PlacementSpec) -> tuple[int, list[TargetChain]]:
     r"""
     Decode a target-and-binder placement declaration.
-
-    Args:
-        placement: Placement declaration whose final group is one fixed-length
-            generated protein binder.
-
-    Returns:
-        The binder length and retained target intervals.
     """
 
     validate_placement(placement)
     groups = list(placement.items())
     if not groups:
         raise ValueError("an empty PlacementSpec declares no binder")
-
     _, binder_placements = groups[-1]
     binder_values = tuple(binder_placements.values())
-    if len(binder_values) != 1 or not isinstance(binder_values[0], GeneratedSegment):
+    if len(binder_values) != 1 or not isinstance(
+        binder_values[0],
+        GeneratedSegment,
+    ):
         raise ValueError("the trailing PlacementSpec group must be exactly one generated binder")
     binder = binder_values[0]
     if binder.polymer_type != "protein":
-        raise ValueError("PXDesign binder must be a protein GeneratedSegment")
-    if binder.min_length != binder.max_length:
-        raise ValueError("PXDesign binder must have one fixed length (min_length == max_length)")
-    binder_length = binder.max_length
+        raise ValueError("PXDesign binder must be protein")
+    if binder.min_length != binder.max_length or binder.max_length <= 0:
+        raise ValueError("PXDesign binder must have one positive fixed length")
 
     targets: list[TargetChain] = []
     for group, placements in groups[:-1]:
         instance_id: str | None = None
-        crops: list[tuple[int, int]] = []
-        for part in placements.values():
-            if not isinstance(part, ExistingSpan):
-                raise ValueError(f"target group {group!r} must contain only ExistingSpan values")
+        crops = []
+        for value in placements.values():
+            if not isinstance(value, ExistingSpan):
+                raise ValueError(f"target group {group!r} must contain ExistingSpan values")
             if instance_id is None:
-                instance_id = part.instance_id
-            elif part.instance_id != instance_id:
+                instance_id = value.instance_id
+            elif value.instance_id != instance_id:
                 raise ValueError(f"target group {group!r} must address one source instance")
-            crops.append((part.start, part.stop))
+            crops.append((value.start, value.stop))
         if instance_id is None:
-            raise ValueError(f"target group {group!r} must contain at least one ExistingSpan")
+            raise ValueError(f"target group {group!r} must contain at least one span")
         targets.append((instance_id, crops))
-
-    return binder_length, targets
+    return binder.max_length, targets

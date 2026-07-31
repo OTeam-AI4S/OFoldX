@@ -11,12 +11,11 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from ...data.molecular import AtomSite, ComponentReference, PolymerSequence
+from ...data.molecular import ENTITY_RNA, ComponentReference
 from ...data.structure import Structure
 from ...processor import Processor
 from .config import GrnadeProcessorConfig
@@ -87,67 +86,77 @@ class GrnadeProcessor(Processor):
         if not structures:
             raise ValueError("gRNAde requires at least one RNA conformation")
         target = structures[0]
-        target_instance_id, sequence = self._resolve_sequence(target, instance_id)
+        _, component_index = self._resolve_sequence(
+            target,
+            instance_id,
+        )
 
-        references: list[ComponentReference] = []
+        component_ids = tuple(
+            target.system.symbols[symbol]
+            for symbol in target.system.component_symbol[component_index].detach().cpu().tolist()
+        )
         tokens: list[int] = []
-        for component_index, component in enumerate(sequence.components):
-            reference = (target_instance_id, component_index)
-            references.append(reference)
-            component_id = "U" if component.component_id in ("T", "DT") else component.component_id
+        for component_id in component_ids:
+            component_id = "U" if component_id in ("T", "DT") else component_id
             tokens.append(GRNADE_TOKEN_BY_COMPONENT.get(component_id, GRNADE_UNKNOWN_TOKEN))
 
-        reference_set = set(references)
-        selected = reference_set if design_positions is None else set(design_positions)
-        if selected - reference_set:
+        component_rows = component_index.detach().cpu().tolist()
+        component_set = set(component_rows)
+        selected = (
+            component_set
+            if design_positions is None
+            else {target.system.component_index(reference) for reference in design_positions}
+        )
+        if selected - component_set:
             raise ValueError("gRNAde design positions must belong to the selected RNA instance")
-        reference_index = {reference: index for index, reference in enumerate(references)}
+        component_row = {component: index for index, component in enumerate(component_rows)}
         base_pair_indices: list[tuple[int, int]] = []
         for first, second in base_pairs:
-            first_index = reference_index[first]
-            second_index = reference_index[second]
+            first_index = component_row[target.system.component_index(first)]
+            second_index = component_row[target.system.component_index(second)]
             if first_index == second_index:
                 raise ValueError("a gRNAde base pair must connect two distinct residues")
             base_pair_indices.append((first_index, second_index))
 
         if use_coordinates:
-            coordinates: list[np.ndarray] = []
-            atom_masks: list[np.ndarray] = []
+            coordinates: list[Tensor] = []
+            atom_masks: list[Tensor] = []
             for conformation in structures:
-                conformation_instance_id, conformation_sequence = self._resolve_sequence(
+                _, conformation_components = self._resolve_sequence(
                     conformation,
                     instance_id,
                 )
-                if conformation_sequence.components != sequence.components:
+                conformation_ids = tuple(
+                    conformation.system.symbols[symbol]
+                    for symbol in conformation.system.component_symbol[conformation_components].detach().cpu().tolist()
+                )
+                if conformation_ids != component_ids:
                     raise ValueError("gRNAde conformations must contain the same RNA sequence")
                 conformation_coordinates, conformation_atom_mask = _backbone_coordinates(
                     conformation,
-                    conformation_instance_id,
-                    conformation_sequence,
+                    conformation_components,
                     filter_by_occupancy=filter_by_occupancy,
                 )
                 coordinates.append(conformation_coordinates)
                 atom_masks.append(conformation_atom_mask)
-            coordinate_tensor = torch.as_tensor(
-                np.stack(coordinates),
+            coordinate_tensor = torch.stack(coordinates).to(
                 device=self.device,
                 dtype=self.dtype,
             )
-            atom_mask = torch.as_tensor(
-                np.stack(atom_masks),
+            atom_mask = torch.stack(atom_masks).to(
                 device=self.device,
                 dtype=torch.bool,
             )
             conformation_mask = atom_mask.any(dim=-1).any(dim=-1)
         else:
             coordinate_tensor = torch.full(
-                (1, len(sequence.components), 3, 3),
+                (1, component_index.numel(), 3, 3),
                 _FILL_VALUE,
                 device=self.device,
                 dtype=self.dtype,
             )
             atom_mask = torch.zeros(
-                (1, len(sequence.components), 3),
+                (1, component_index.numel(), 3),
                 device=self.device,
                 dtype=torch.bool,
             )
@@ -197,69 +206,89 @@ class GrnadeProcessor(Processor):
             sequence_tokens=sequence_tokens,
             conformation_mask=conformation_mask,
             design_mask=torch.tensor(
-                [reference in selected for reference in references],
+                [component in selected for component in component_rows],
                 device=self.device,
                 dtype=torch.bool,
             ),
             structure=target,
-            component_references=tuple(references),
+            component_index=component_index.to(device=self.device),
         )
 
     @staticmethod
     def _resolve_sequence(
         structure: Structure,
         instance_id: str | None,
-    ) -> tuple[str, PolymerSequence]:
-        candidates = tuple(
-            (candidate_id, entity)
-            for candidate_id, entity_id in structure.system.instances.items()
-            if isinstance(entity := structure.system.entities[entity_id], PolymerSequence)
-            and entity.polymer_type == "rna"
-        )
+    ) -> tuple[int, Tensor]:
+        system = structure.system
+        rna_instances = torch.nonzero(
+            system.entity_type[system.instance_entity] == ENTITY_RNA,
+            as_tuple=False,
+        ).flatten()
         if instance_id is None:
-            if len(candidates) != 1:
+            if rna_instances.numel() != 1:
                 raise ValueError("gRNAde requires exactly one RNA instance when instance_id is omitted")
-            return candidates[0]
-        for candidate_id, entity in candidates:
-            if candidate_id == instance_id:
-                return candidate_id, entity
-        raise ValueError(f"{instance_id!r} is not an RNA instance in the input structure")
+            instance_index = int(rna_instances[0])
+        else:
+            instance_index = system.instance_index(instance_id)
+            entity_index = int(system.instance_entity[instance_index])
+            if int(system.entity_type[entity_index]) != ENTITY_RNA:
+                raise ValueError(f"{instance_id!r} is not an RNA instance in the input structure")
+        component_index = torch.arange(
+            int(system.instance_component_ptr[instance_index]),
+            int(system.instance_component_ptr[instance_index + 1]),
+            dtype=torch.long,
+            device=system.instance_component_ptr.device,
+        )
+        return instance_index, component_index
 
 
 def _backbone_coordinates(
     structure: Structure,
-    instance_id: str,
-    sequence: PolymerSequence,
+    component_index: Tensor,
     *,
     filter_by_occupancy: bool,
-) -> tuple[np.ndarray, np.ndarray]:
-    observed = structure.coordinate_mask & np.isfinite(structure.coordinates).all(axis=-1)
-    if filter_by_occupancy and structure.occupancy is not None:
-        observed = observed & (np.isnan(structure.occupancy) | (structure.occupancy > 0))
-    coordinate_index = {site: index for index, site in enumerate(structure.sites)}
+) -> tuple[Tensor, Tensor]:
+    system = structure.system
+    observed = structure.coordinate_mask & torch.isfinite(structure.coordinates).all(dim=-1)
+    if filter_by_occupancy:
+        observed = observed & (~structure.occupancy_mask | (structure.occupancy > 0))
 
-    coordinates: list[np.ndarray] = []
-    atom_masks: list[np.ndarray] = []
-    for component_index, component in enumerate(sequence.components):
+    coordinates: list[Tensor] = []
+    atom_masks: list[Tensor] = []
+    for component in component_index.detach().cpu().tolist():
+        start = int(system.component_atom_ptr[component])
+        stop = int(system.component_atom_ptr[component + 1])
+        atom_rows = range(start, stop)
+        atom_index = {system.symbols[int(system.atom_symbol[atom])]: atom for atom in atom_rows}
+        component_id = system.symbols[int(system.component_symbol[component])]
         atom_ids = (
             "P",
             "C4'",
             _base_nitrogen(
-                component.component_id,
-                frozenset(atom.atom_id for atom in component.atoms),
+                component_id,
+                frozenset(atom_index),
             ),
         )
-        row = np.full((3, 3), _FILL_VALUE, dtype=np.float32)
-        row_mask = np.zeros(3, dtype=np.bool_)
-        for atom_index, atom_id in enumerate(atom_ids):
-            coordinate_position = coordinate_index.get(AtomSite(instance_id, component_index, atom_id))
+        row = torch.full(
+            (3, 3),
+            _FILL_VALUE,
+            dtype=structure.coordinates.dtype,
+            device=structure.coordinates.device,
+        )
+        row_mask = torch.zeros(
+            3,
+            dtype=torch.bool,
+            device=structure.coordinates.device,
+        )
+        for feature_index, atom_id in enumerate(atom_ids):
+            coordinate_position = atom_index.get(atom_id)
             if coordinate_position is None or not bool(observed[coordinate_position]):
                 continue
-            row[atom_index] = structure.coordinates[coordinate_position]
-            row_mask[atom_index] = True
+            row[feature_index] = structure.coordinates[coordinate_position]
+            row_mask[feature_index] = True
         coordinates.append(row)
         atom_masks.append(row_mask)
-    return np.stack(coordinates), np.stack(atom_masks)
+    return torch.stack(coordinates), torch.stack(atom_masks)
 
 
 def _base_nitrogen(

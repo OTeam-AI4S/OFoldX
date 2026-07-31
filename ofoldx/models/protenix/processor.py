@@ -14,22 +14,24 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from ...data import ATOMIC_NUMBER_BY_ELEMENT
-from ...data.components import get_component
+from ...data import water_component_mask
 from ...data.evidence import (
     MSA,
     MSACollection,
     Template,
     TemplateAlignment,
-    msa_binding_map,
-    msa_bindings,
     resolve_msa_bindings,
-    select_msa_binding,
 )
 from ...data.molecular import (
-    HYDROGEN_ELEMENTS,
+    BOND_ROLE_COMPONENT,
+    BOND_ROLE_ENTITY,
+    ENTITY_DNA,
+    ENTITY_DNA_RNA_HYBRID,
+    ENTITY_MOLECULE,
+    ENTITY_PNA,
+    ENTITY_PROTEIN,
+    ENTITY_RNA,
     AtomSite,
-    ChemicalComponent,
     ComponentReference,
     MolecularSystem,
     Molecule,
@@ -96,6 +98,13 @@ _STANDARD = {
     "protein": frozenset(tuple(_RESIDUE_TYPE)[:21]),
     "rna": frozenset(("A", "G", "C", "U", "N")),
     "dna": frozenset(("DA", "DG", "DC", "DT", "DN")),
+}
+_STANDARD_BY_ENTITY_TYPE = {
+    ENTITY_PROTEIN: _STANDARD["protein"],
+    ENTITY_RNA: _STANDARD["rna"],
+    ENTITY_DNA: _STANDARD["dna"],
+    ENTITY_DNA_RNA_HYBRID: _STANDARD["rna"] | _STANDARD["dna"],
+    ENTITY_PNA: frozenset(),
 }
 _METAL_ATOMIC_NUMBERS = frozenset(
     {
@@ -178,6 +187,13 @@ _ESM_CLS_TOKEN = 0
 _ESM_PAD_TOKEN = 1
 _ESM_EOS_TOKEN = 2
 _ESM_UNKNOWN_RESIDUE_TOKEN = 24
+_POLYMER_TYPE = {
+    ENTITY_PROTEIN: "protein",
+    ENTITY_RNA: "rna",
+    ENTITY_DNA: "dna",
+    ENTITY_DNA_RNA_HYBRID: "dna_rna_hybrid",
+    ENTITY_PNA: "pna",
+}
 
 
 class ProtenixProcessor(Processor):
@@ -199,7 +215,9 @@ class ProtenixProcessor(Processor):
         >>> second = ChemicalComponent(
         ...     "L2", (atom,), frozenset(), reference_coordinates=((1.0, 0.0, 0.0),)
         ... )
-        >>> system = MolecularSystem({"ligand": Molecule((first, second))}, {"L": "ligand"})
+        >>> system = MolecularSystem.from_entities(
+        ...     {"ligand": Molecule((first, second))}, {"L": "ligand"}
+        ... )
         >>> config = ProtenixProcessorConfig(augment_reference_positions=False)
         >>> inputs = ProtenixProcessor(config)(system)
         >>> inputs.residue_index.tolist(), inputs.reference_space_id.tolist()
@@ -243,8 +261,8 @@ class ProtenixProcessor(Processor):
 
         Returns:
             Batched token, atom, and MSA tensors. Reference coordinates are in
-            angstroms. Atom-aligned tensors follow ``atom_sites`` and token-aligned
-            tensors follow ``token_sites``.
+            angstroms. ``atom_index`` and ``token_component_index`` bind the
+            family axes to the canonical molecular graph.
         """
 
         return self._lower(
@@ -272,21 +290,22 @@ class ProtenixProcessor(Processor):
         )
         return processed, _structure_target(
             input,
-            processed,
             device=self.device,
             dtype=self.dtype,
         )
 
-    def _validate_msa(
+    def _resolve_msa(
         self,
         msa: MSA | MSACollection | None,
         system: MolecularSystem,
-    ) -> None:
+    ) -> tuple[tuple[MSA, int | None, int], ...]:
         if msa is None:
-            return
-        for _value, _target_instance_id, entity in resolve_msa_bindings(msa, system):
-            if entity.polymer_type != "protein":
+            return ()
+        resolved = resolve_msa_bindings(msa, system)
+        for _value, _target_instance_index, entity_index in resolved:
+            if int(system.entity_type[entity_index]) != ENTITY_PROTEIN:
                 raise ValueError("Protenix accepts supplied MSA evidence only for proteins")
+        return resolved
 
     def _lower(
         self,
@@ -306,7 +325,7 @@ class ProtenixProcessor(Processor):
         atom_contact_values = tuple(atom_contacts)
         token_contact_values = tuple(token_contacts)
         system = molecular_system_from_input(input)
-        self._validate_msa(msa, system)
+        resolved_msa = self._resolve_msa(msa, system)
         # Atom contacts require atom-level tokens. Token contacts and pockets use
         # the tokenization already selected for each residue.
         expanded_residues = _atom_constraint_residues(atom_contact_values, system)
@@ -315,6 +334,7 @@ class ProtenixProcessor(Processor):
             system,
             tokens=tokens,
             msa=msa,
+            msa_bindings=resolved_msa,
             templates=templates,
             atom_contacts=atom_contact_values,
             token_contacts=token_contact_values,
@@ -394,21 +414,22 @@ class ProtenixTemplateProcessor(ProtenixProcessor):
         )
         return processed, _structure_target(
             input,
-            processed,
             device=self.device,
             dtype=self.dtype,
         )
 
-    def _validate_msa(
+    def _resolve_msa(
         self,
         msa: MSA | MSACollection | None,
         system: MolecularSystem,
-    ) -> None:
+    ) -> tuple[tuple[MSA, int | None, int], ...]:
         if msa is None:
-            return
-        for _value, _target_instance_id, entity in resolve_msa_bindings(msa, system):
-            if entity.polymer_type not in {"protein", "rna"}:
+            return ()
+        resolved = resolve_msa_bindings(msa, system)
+        for _value, _target_instance_index, entity_index in resolved:
+            if int(system.entity_type[entity_index]) not in {ENTITY_PROTEIN, ENTITY_RNA}:
                 raise ValueError("template-capable Protenix accepts supplied MSA evidence only for proteins and RNA")
+        return resolved
 
 
 class ProtenixStructureConditionProcessor(ProtenixProcessor):
@@ -478,7 +499,6 @@ class ProtenixStructureConditionProcessor(ProtenixProcessor):
         )
         return processed, _structure_target(
             input,
-            processed,
             device=self.device,
             dtype=self.dtype,
         )
@@ -527,8 +547,8 @@ class ProtenixConstraintProcessor(ProtenixProcessor):
 
         Returns:
             Batched token, atom, MSA, and constraint tensors. Reference
-            coordinates and distance bounds are in angstroms. Atom-aligned tensors
-            follow ``atom_sites``; token-aligned tensors follow ``token_sites``.
+            coordinates and distance bounds are in angstroms. Canonical integer
+            indices bind the atom and token axes to the molecular graph.
         """
 
         return self._lower(
@@ -571,7 +591,6 @@ class ProtenixConstraintProcessor(ProtenixProcessor):
         )
         return processed, _structure_target(
             input,
-            processed,
             device=self.device,
             dtype=self.dtype,
         )
@@ -579,35 +598,17 @@ class ProtenixConstraintProcessor(ProtenixProcessor):
 
 def _structure_target(
     structure: Structure,
-    input: ProtenixInput,
     *,
     device: torch.device,
     dtype: torch.dtype,
 ) -> ProtenixStructureTarget:
     r"""
-    Lower the retained heavy-atom coordinate pool from a Structure.
+    Move full-axis canonical coordinate truth to the model placement.
     """
 
-    coordinate_indices = [
-        index
-        for index, site in enumerate(structure.sites)
-        if site.instance_id in input.system.instances and structure.system.atom(site).element not in HYDROGEN_ELEMENTS
-    ]
-    coordinate_index = {
-        structure.sites[source_index]: target_index for target_index, source_index in enumerate(coordinate_indices)
-    }
-    atom_index = torch.tensor(
-        [coordinate_index.get(site, -1) for site in input.atom_sites],
-        dtype=torch.int64,
-    )
     return ProtenixStructureTarget(  # type: ignore[call-arg]
-        coordinates=torch.from_numpy(structure.coordinates[coordinate_indices].copy())
-        .to(device=device, dtype=dtype)
-        .unsqueeze(0),
-        coordinate_mask=torch.from_numpy(structure.coordinate_mask[coordinate_indices].copy())
-        .to(device=device)
-        .unsqueeze(0),
-        atom_index=atom_index.to(device=device).unsqueeze(0),
+        coordinates=structure.coordinates.to(device=device, dtype=dtype).unsqueeze(0),
+        coordinate_mask=structure.coordinate_mask.to(device=device).unsqueeze(0),
         batch_size=[1],
     )
 
@@ -623,55 +624,29 @@ def molecular_system_from_input(
             structure whose topology supplies the system.
 
     Returns:
-        The normalized molecular system with Protenix-excluded water entities
-        omitted.
+        The canonical molecular system. Protenix-visible axes exclude water
+        during tokenization without creating a second topology.
     """
 
     # A Structure supplied as the primary input contributes only topology. The
     # constraint Processor lowers coordinates only from its explicit substructure argument.
     if isinstance(input, Structure):
-        system = input.system
+        return input.system
     elif isinstance(input, MolecularSystem):
-        system = input
+        return input
     elif isinstance(input, PolymerSequence):
-        system = molecular_system_from_named_sequences((("A", input),))
+        return molecular_system_from_named_sequences((("A", input),))
     elif isinstance(input, Sequence):
         sequence_values = tuple(cast(Sequence[object], input))
         if not sequence_values or not all(isinstance(sequence, PolymerSequence) for sequence in sequence_values):
             raise TypeError("Protenix sequence collections must contain PolymerSequence values")
         polymer_sequences = cast(tuple[PolymerSequence, ...], sequence_values)
-        system = molecular_system_from_named_sequences(
+        return molecular_system_from_named_sequences(
             tuple((f"chain_{index + 1}", sequence) for index, sequence in enumerate(polymer_sequences))
         )
-    else:
-        raise TypeError(
-            "Protenix input must be a PolymerSequence, sequence of PolymerSequence "
-            "values, MolecularSystem, or Structure"
-        )
-
-    # Released Protenix removes deposited HOH and DOD before both training and inference features.
-    water_entities = {
-        entity_id
-        for entity_id, entity in system.entities.items()
-        if isinstance(entity, Molecule)
-        and entity.components
-        and all(component.component_id in {"HOH", "DOD"} for component in entity.components)
-    }
-    if not water_entities:
-        return system
-
-    instances = {
-        instance_id: entity_id for instance_id, entity_id in system.instances.items() if entity_id not in water_entities
-    }
-    entities = {entity_id: entity for entity_id, entity in system.entities.items() if entity_id not in water_entities}
-    bonds = frozenset(
-        bond
-        for bond in system.bonds
-        if bond.site_a.instance_id in instances
-        and bond.site_b.instance_id in instances
-        and (bond.stereo_sites is None or all(site.instance_id in instances for site in bond.stereo_sites))
+    raise TypeError(
+        "Protenix input must be a PolymerSequence, sequence of PolymerSequence " "values, MolecularSystem, or Structure"
     )
-    return MolecularSystem(entities, instances, bonds)
 
 
 def molecular_system_from_named_sequences(
@@ -702,65 +677,105 @@ def molecular_system_from_named_sequences(
         used.add(entity_id)
         entities[entity_id] = sequence
         instances[entity_id] = entity_id
-    return MolecularSystem(entities, instances)
+    return MolecularSystem.from_entities(entities, instances)
 
 
 def _atom_constraint_residues(
     atom_contacts: tuple[ProtenixAtomContact, ...],
     system: MolecularSystem,
-) -> frozenset[ComponentReference]:
+) -> frozenset[int]:
     # Every polymer residue named by an atom contact must lower to per-atom tokens so the two
     # endpoints occupy distinct atom-level tokens. Non-polymer atoms are already per-atom tokens.
-    residues: set[ComponentReference] = set()
+    residues: set[int] = set()
+    atom_component = torch.repeat_interleave(
+        torch.arange(
+            system.component_symbol.numel(),
+            device=system.component_atom_ptr.device,
+        ),
+        system.component_atom_ptr[1:] - system.component_atom_ptr[:-1],
+    )
+    component_instance = torch.repeat_interleave(
+        torch.arange(
+            system.instance_symbol.numel(),
+            device=system.instance_component_ptr.device,
+        ),
+        system.instance_component_ptr[1:] - system.instance_component_ptr[:-1],
+    )
     for contact in atom_contacts:
         for site in (contact.atom_a, contact.atom_b):
-            if not isinstance(system.entities[system.instances[site.instance_id]], Molecule):
-                residues.add((site.instance_id, site.component_index))
+            atom_index = system.atom_index(site)
+            component_index = int(atom_component[atom_index])
+            instance_index = int(component_instance[component_index])
+            entity_index = int(system.instance_entity[instance_index])
+            if int(system.entity_type[entity_index]) != ENTITY_MOLECULE:
+                residues.add(component_index)
     return frozenset(residues)
 
 
-def _is_standard(component: ChemicalComponent, polymer_type: str) -> bool:
-    if component.component_id not in _STANDARD[polymer_type]:
-        return False
-    return component == get_component(component.component_id)
+def _is_standard(system: MolecularSystem, component_index: int, entity_type: int) -> bool:
+    component_id = system.symbols[int(system.component_symbol[component_index])]
+    return component_id in _STANDARD_BY_ENTITY_TYPE.get(
+        entity_type,
+        frozenset(),
+    )
 
 
-def _tokenize(system: MolecularSystem, expanded: frozenset[tuple[str, int]]) -> list[dict[str, object]]:
-    available = {site for site, atom in system.iter_atoms() if atom.element not in HYDROGEN_ELEMENTS}
+def _tokenize(system: MolecularSystem, expanded: frozenset[int]) -> list[dict[str, object]]:
+    instance_components = system.instance_component_ptr.detach().cpu().tolist()
+    component_atoms = system.component_atom_ptr.detach().cpu().tolist()
+    instance_entities = system.instance_entity.detach().cpu().tolist()
+    entity_types = system.entity_type.detach().cpu().tolist()
+    component_symbols = system.component_symbol.detach().cpu().tolist()
+    atom_symbols = system.atom_symbol.detach().cpu().tolist()
+    atomic_numbers = system.atomic_number.detach().cpu().tolist()
+    water_components = water_component_mask(system).detach().cpu().tolist()
     tokens: list[dict[str, object]] = []
-    entity_indices: dict[str, int] = {}
-    entity_copies: dict[str, int] = {}
+    entity_copies: dict[int, int] = {}
     reference_space = 0
+    chain_index = 0
 
-    for chain_index, (instance_id, entity_id) in enumerate(system.instances.items()):
-        entity = system.entities[entity_id]
-        entity_index = entity_indices.setdefault(entity_id, len(entity_indices))
-        symmetry_index = entity_copies.get(entity_id, 0)
-        entity_copies[entity_id] = symmetry_index + 1
-        if isinstance(entity, PolymerSequence):
-            for monomer_index, component in enumerate(entity.components):
-                component_id = component.component_id
-                atom_sites = tuple(
-                    site
-                    for atom in component.atoms
-                    if atom.element not in HYDROGEN_ELEMENTS
-                    and not (component_id in {"N", "DN"} and atom.atom_id == "N")
-                    and (site := AtomSite(instance_id, monomer_index, atom.atom_id)) in available
+    for instance_index, entity_index in enumerate(instance_entities):
+        entity_type = entity_types[entity_index]
+        component_start = instance_components[instance_index]
+        component_stop = instance_components[instance_index + 1]
+        if (
+            entity_type == ENTITY_MOLECULE
+            and component_stop > component_start
+            and all(water_components[component_start:component_stop])
+        ):
+            continue
+
+        symmetry_index = entity_copies.get(entity_index, 0)
+        entity_copies[entity_index] = symmetry_index + 1
+        if entity_type != ENTITY_MOLECULE:
+            polymer_type = _POLYMER_TYPE[entity_type]
+            for component_index in range(component_start, component_stop):
+                monomer_index = component_index - component_start
+                component_id = system.symbols[component_symbols[component_index]]
+                atom_indices = tuple(
+                    atom_index
+                    for atom_index in range(
+                        component_atoms[component_index],
+                        component_atoms[component_index + 1],
+                    )
+                    if atomic_numbers[atom_index] != 1
+                    and not (component_id in {"N", "DN"} and system.symbols[atom_symbols[atom_index]] == "N")
                 )
-                if not atom_sites:
+                if not atom_indices:
                     raise ValueError(
-                        f"Protenix component {component_id!r} at {instance_id}:{monomer_index} "
+                        f"Protenix component {component_id!r} at "
+                        f"{system.instance_id(instance_index)}:{monomer_index} "
                         "has no model-visible heavy atoms"
                     )
-                standard = _is_standard(component, entity.polymer_type)
+                standard = _is_standard(system, component_index, entity_type)
                 groups = (
-                    tuple((site,) for site in atom_sites)
-                    if not standard or (instance_id, monomer_index) in expanded
-                    else (atom_sites,)
+                    tuple((atom_index,) for atom_index in atom_indices)
+                    if not standard or component_index in expanded
+                    else (atom_indices,)
                 )
-                by_name = {site.atom_id: site for site in atom_sites}
-                center_name = "CA" if entity.polymer_type == "protein" else "C1'"
-                if entity.polymer_type == "protein":
+                by_name = {system.symbols[atom_symbols[atom_index]]: atom_index for atom_index in atom_indices}
+                center_name = "CA" if polymer_type == "protein" else "C1'"
+                if polymer_type == "protein":
                     representative_name = "CA" if component_id == "GLY" else "CB"
                 elif component_id in {"A", "G", "DA", "DG"}:
                     representative_name = "C4"
@@ -770,22 +785,29 @@ def _tokenize(system: MolecularSystem, expanded: frozenset[tuple[str, int]]) -> 
                     representative_name = "C1'"
                 for group in groups:
                     atom_token = len(group) == 1 and (not standard or len(groups) > 1)
-                    center_site = group[0] if atom_token else by_name[center_name]
-                    representative_site = group[0] if atom_token else by_name.get(representative_name, center_site)
+                    center_atom = group[0] if atom_token else by_name[center_name]
+                    representative_atom = (
+                        group[0]
+                        if atom_token
+                        else by_name.get(
+                            representative_name,
+                            center_atom,
+                        )
+                    )
                     tokens.append(
                         {
                             "atoms": group,
-                            "site": group[0] if atom_token else (instance_id, monomer_index),
-                            "instance_id": instance_id,
-                            "entity_id": entity_id,
+                            "atom_index": group[0] if atom_token else None,
+                            "component_index": component_index,
+                            "instance_index": instance_index,
+                            "entity_index": entity_index,
                             "monomer_index": monomer_index,
                             "residue_index": monomer_index,
                             "chain_index": chain_index,
-                            "entity_index": entity_index,
                             "symmetry_index": symmetry_index,
                             "residue_type": _RESIDUE_TYPE.get(component_id, _UNKNOWN) if standard else _UNKNOWN,
-                            "center": center_site,
-                            "representative": representative_site,
+                            "center": center_atom,
+                            "representative": representative_atom,
                             "standard": standard,
                             "expanded": standard and len(groups) > 1,
                             "reference_space": reference_space,
@@ -794,31 +816,33 @@ def _tokenize(system: MolecularSystem, expanded: frozenset[tuple[str, int]]) -> 
                 reference_space += 1
         else:
             molecule_has_atoms = False
-            for component_index, component in enumerate(entity.components):
-                atom_sites = tuple(
-                    site
-                    for atom in component.atoms
-                    if atom.element not in HYDROGEN_ELEMENTS
-                    and (site := AtomSite(instance_id, component_index, atom.atom_id)) in available
+            for component_index in range(component_start, component_stop):
+                atom_indices = tuple(
+                    atom_index
+                    for atom_index in range(
+                        component_atoms[component_index],
+                        component_atoms[component_index + 1],
+                    )
+                    if atomic_numbers[atom_index] != 1
                 )
-                if not atom_sites:
+                if not atom_indices:
                     continue
                 molecule_has_atoms = True
-                for site in atom_sites:
+                for atom_index in atom_indices:
                     tokens.append(
                         {
-                            "atoms": (site,),
-                            "site": site,
-                            "instance_id": instance_id,
-                            "entity_id": entity_id,
-                            "monomer_index": None,
-                            "residue_index": component_index,
-                            "chain_index": chain_index,
+                            "atoms": (atom_index,),
+                            "atom_index": atom_index,
+                            "component_index": component_index,
+                            "instance_index": instance_index,
                             "entity_index": entity_index,
+                            "monomer_index": None,
+                            "residue_index": component_index - component_start,
+                            "chain_index": chain_index,
                             "symmetry_index": symmetry_index,
                             "residue_type": _UNKNOWN,
-                            "center": site,
-                            "representative": site,
+                            "center": atom_index,
+                            "representative": atom_index,
                             "standard": False,
                             "expanded": False,
                             "reference_space": reference_space,
@@ -826,7 +850,10 @@ def _tokenize(system: MolecularSystem, expanded: frozenset[tuple[str, int]]) -> 
                     )
                 reference_space += 1
             if not molecule_has_atoms:
-                raise ValueError(f"Protenix molecule {instance_id!r} has no model-visible heavy atoms")
+                raise ValueError(
+                    f"Protenix molecule {system.instance_id(instance_index)!r} " "has no model-visible heavy atoms"
+                )
+        chain_index += 1
     return tokens
 
 
@@ -835,6 +862,7 @@ def _features(
     *,
     tokens: list[dict[str, object]],
     msa: MSA | MSACollection | None,
+    msa_bindings: tuple[tuple[MSA, int | None, int], ...],
     templates: tuple[Template, ...] | None,
     atom_contacts: tuple[ProtenixAtomContact, ...],
     token_contacts: tuple[ProtenixTokenContact, ...],
@@ -849,24 +877,28 @@ def _features(
     device: torch.device,
     dtype: torch.dtype,
 ) -> ProtenixInput:
-    atom_sites = tuple(site for token in tokens for site in cast(tuple[AtomSite, ...], token["atoms"]))
-    site_to_atom = {site: index for index, site in enumerate(atom_sites)}
-    site_to_token = {
-        site: token_index
+    atom_indices = tuple(atom_index for token in tokens for atom_index in cast(tuple[int, ...], token["atoms"]))
+    system_to_model_atom = {atom_index: model_atom_index for model_atom_index, atom_index in enumerate(atom_indices)}
+    system_atom_to_token = {
+        atom_index: token_index
         for token_index, token in enumerate(tokens)
-        for site in cast(tuple[AtomSite, ...], token["atoms"])
+        for atom_index in cast(tuple[int, ...], token["atoms"])
     }
-    atom_to_token = torch.tensor([site_to_token[site] for site in atom_sites], dtype=torch.long)
+    atom_to_token = torch.tensor(
+        [system_atom_to_token[atom_index] for atom_index in atom_indices],
+        dtype=torch.long,
+    )
     reference_positions, reference_mask, reference_charges = _reference_features(
         system,
-        atom_sites,
-        site_to_atom,
+        atom_indices,
         augment=augment_reference_positions,
         generator=generator,
     )
     # Preserve canonical atom IDs; SMILES imports assign element-number IDs during construction.
-    atom_names = tuple(site.atom_id for site in atom_sites)
-    element_indices = torch.tensor([ATOMIC_NUMBER_BY_ELEMENT[system.atom(site).element] - 1 for site in atom_sites])
+    atom_names = tuple(system.symbols[int(system.atom_symbol[atom_index])] for atom_index in atom_indices)
+    element_indices = (
+        system.atomic_number[torch.tensor(atom_indices, device=system.atomic_number.device)].detach().cpu().long() - 1
+    )
     name_indices = torch.tensor(
         [[min(63, max(0, ord(character) - 32)) for character in name.ljust(4)[:4]] for name in atom_names],
         dtype=torch.long,
@@ -875,28 +907,31 @@ def _features(
         (
             reference_mask[:, None].float(),
             F.one_hot(element_indices, num_classes=128).float(),
-            F.one_hot(name_indices, num_classes=64).reshape(len(atom_sites), 256).float(),
+            F.one_hot(name_indices, num_classes=64).reshape(len(atom_indices), 256).float(),
         ),
         dim=-1,
     )
-    atom_token_index = torch.empty(len(atom_sites), dtype=torch.long)
+    component_atoms = system.component_atom_ptr.detach().cpu().tolist()
+    atomic_numbers = system.atomic_number.detach().cpu().tolist()
+    atom_symbols = system.atom_symbol.detach().cpu().tolist()
+    component_symbols = system.component_symbol.detach().cpu().tolist()
+    atom_token_index = torch.empty(len(atom_indices), dtype=torch.long)
     for token in tokens:
-        group = cast(tuple[AtomSite, ...], token["atoms"])
+        group = cast(tuple[int, ...], token["atoms"])
         if cast(bool, token["expanded"]) or not cast(bool, token["standard"]):
-            for site in group:
-                atom_token_index[site_to_atom[site]] = 0
+            for atom_index in group:
+                atom_token_index[system_to_model_atom[atom_index]] = 0
         else:
-            instance_id = cast(str, token["instance_id"])
-            entity = cast(PolymerSequence, system.entities[system.instances[instance_id]])
-            component = entity.components[cast(int, token["monomer_index"])]
-            if component.component_id == "N":
+            component_index = cast(int, token["component_index"])
+            component_id = system.symbols[component_symbols[component_index]]
+            if component_id == "N":
                 heavy_order = {
                     name: index
                     for index, name in enumerate(
                         ("OP3", "P", "OP1", "OP2", "O5'", "C5'", "C4'", "O4'", "C3'", "O3'", "C2'", "O2'", "C1'")
                     )
                 }
-            elif component.component_id == "DN":
+            elif component_id == "DN":
                 heavy_order = {
                     name: index
                     for index, name in enumerate(
@@ -905,15 +940,28 @@ def _features(
                 }
             else:
                 heavy_order = {
-                    atom.atom_id: index
-                    for index, atom in enumerate(
-                        atom for atom in component.atoms if atom.element not in HYDROGEN_ELEMENTS
+                    system.symbols[atom_symbols[atom_index]]: index
+                    for index, atom_index in enumerate(
+                        atom_index
+                        for atom_index in range(
+                            component_atoms[component_index],
+                            component_atoms[component_index + 1],
+                        )
+                        if atomic_numbers[atom_index] != 1
                     )
                 }
-            for site in group:
-                atom_token_index[site_to_atom[site]] = heavy_order[site.atom_id]
+            for atom_index in group:
+                atom_token_index[system_to_model_atom[atom_index]] = heavy_order[
+                    system.symbols[atom_symbols[atom_index]]
+                ]
 
-    _msa_rows, _msa_mask, profile, deletion_mean = _msa_features(msa, tokens, system, max_rows=max_msa_rows)
+    _msa_rows, _msa_mask, profile, deletion_mean = _msa_features(
+        msa,
+        msa_bindings,
+        tokens,
+        system,
+        max_rows=max_msa_rows,
+    )
     residue_type = torch.tensor([cast(int, token["residue_type"]) for token in tokens])
     token_features = torch.cat(
         (
@@ -924,12 +972,19 @@ def _features(
         ),
         dim=-1,
     )
-    deletion_counts = _assembled_deletions(msa, tokens, system, max_rows=max_msa_rows)
+    deletion_counts = _assembled_deletions(
+        msa,
+        msa_bindings,
+        tokens,
+        system,
+        max_rows=max_msa_rows,
+    )
     has_deletion = deletion_counts.clamp(0, 1)
     deletion_value = torch.atan(deletion_counts / 3.0) * (2.0 / math.pi)
     esm_tokens, esm_mask, token_to_esm_residue, token_has_esm = _esm_features(system, tokens)
 
     pocket_feature, token_contact_feature, atom_contact_feature, substructure_feature = _constraint_features(
+        system=system,
         tokens=tokens,
         atom_contacts=atom_contacts,
         token_contacts=token_contacts,
@@ -937,13 +992,15 @@ def _features(
         substructure=substructure,
         substructure_coordinate_noise_scale=substructure_coordinate_noise_scale,
         generator=generator,
-        site_to_token=site_to_token,
+        system_atom_to_token=system_atom_to_token,
     )
-    token_bonds = _token_bonds(system, site_to_token, len(tokens))
+    token_bonds = _token_bonds(system, system_atom_to_token, len(tokens))
     token_to_rep_atom = torch.tensor(
-        [site_to_atom[cast(AtomSite, token["representative"])] for token in tokens], dtype=torch.long
+        [system_to_model_atom[cast(int, token["representative"])] for token in tokens],
+        dtype=torch.long,
     )
     structure_rep_positions, structure_rep_mask = _structure_condition_features(
+        system,
         structure_condition,
         tokens,
     )
@@ -961,9 +1018,15 @@ def _features(
         if tfg_guidance is None
         else _tfg_features(
             system,
-            site_to_atom=site_to_atom,
+            system_to_model_atom=system_to_model_atom,
             atom_chain=torch.tensor(
-                [cast(int, tokens[site_to_token[site]]["chain_index"]) for site in atom_sites],
+                [
+                    cast(
+                        int,
+                        tokens[system_atom_to_token[atom_index]]["chain_index"],
+                    )
+                    for atom_index in atom_indices
+                ],
                 dtype=torch.long,
             ),
             element_index=element_indices,
@@ -975,52 +1038,69 @@ def _features(
     def floating(value: Tensor) -> Tensor:
         return value.to(device=device, dtype=dtype).unsqueeze(0)
 
-    def integer(value: Tensor) -> Tensor:
+    def placed(value: Tensor) -> Tensor:
         return value.to(device=device).unsqueeze(0)
 
     return ProtenixInput(  # type: ignore[call-arg]
-        token_mask=integer(torch.ones(len(tokens), dtype=torch.bool)),
-        residue_index=integer(torch.tensor([cast(int, token["residue_index"]) for token in tokens])),
-        chain_index=integer(torch.tensor([cast(int, token["chain_index"]) for token in tokens])),
-        entity_index=integer(torch.tensor([cast(int, token["entity_index"]) for token in tokens])),
-        symmetry_index=integer(torch.tensor([cast(int, token["symmetry_index"]) for token in tokens])),
-        token_index=integer(torch.arange(len(tokens))),
+        token_mask=placed(torch.ones(len(tokens), dtype=torch.bool)),
+        residue_index=placed(torch.tensor([cast(int, token["residue_index"]) for token in tokens])),
+        chain_index=placed(torch.tensor([cast(int, token["chain_index"]) for token in tokens])),
+        entity_index=placed(torch.tensor([cast(int, token["entity_index"]) for token in tokens])),
+        symmetry_index=placed(torch.tensor([cast(int, token["symmetry_index"]) for token in tokens])),
+        token_index=placed(torch.arange(len(tokens))),
         atom_features=floating(atom_features),
-        atom_to_token=integer(atom_to_token),
-        atom_mask=integer(torch.ones(len(atom_sites), dtype=torch.bool)),
+        atom_to_token=placed(atom_to_token),
+        atom_mask=placed(torch.ones(len(atom_indices), dtype=torch.bool)),
         reference_positions=floating(reference_positions),
-        reference_space_id=integer(
+        reference_space_id=placed(
             torch.tensor(
-                [cast(int, tokens[site_to_token[site]]["reference_space"]) for site in atom_sites],
+                [
+                    cast(
+                        int,
+                        tokens[system_atom_to_token[atom_index]]["reference_space"],
+                    )
+                    for atom_index in atom_indices
+                ],
                 dtype=torch.long,
             )
         ),
-        atom_token_index=integer(atom_token_index),
-        token_to_rep_atom=integer(token_to_rep_atom),
+        atom_token_index=placed(atom_token_index),
+        token_to_rep_atom=placed(token_to_rep_atom),
         token_features=floating(token_features),
-        reference_mask=integer(reference_mask),
+        reference_mask=placed(reference_mask),
         reference_charges=floating(reference_charges[:, None]),
         token_bonds=floating(token_bonds),
-        msa_tokens=integer(_msa_rows),
+        msa_tokens=placed(_msa_rows),
         has_deletion=floating(has_deletion),
         deletion_value=floating(deletion_value),
-        esm_tokens=integer(esm_tokens),
-        esm_mask=integer(esm_mask),
-        token_to_esm_residue=integer(token_to_esm_residue),
-        token_has_esm=integer(token_has_esm),
+        esm_tokens=placed(esm_tokens),
+        esm_mask=placed(esm_mask),
+        token_to_esm_residue=placed(token_to_esm_residue),
+        token_has_esm=placed(token_has_esm),
         pocket=floating(pocket_feature),
         token_contact=floating(token_contact_feature),
         atom_contact=floating(atom_contact_feature),
         substructure=floating(substructure_feature),
         structure_rep_positions=floating(structure_rep_positions),
-        structure_rep_mask=integer(structure_rep_mask),
+        structure_rep_mask=placed(structure_rep_mask),
         template_features=template_features,
         tfg_features=tfg_features,
         tfg_guidance=tfg_guidance,
         system=system,
-        atom_sites=atom_sites,
-        token_sites=tuple(cast(AtomSite | ComponentReference, token["site"]) for token in tokens),
-        batch_size=[1],
+        atom_index=placed(torch.tensor(atom_indices, dtype=torch.long)),
+        token_component_index=placed(
+            torch.tensor(
+                [cast(int, token["component_index"]) for token in tokens],
+                dtype=torch.long,
+            )
+        ),
+        token_atom_index=placed(
+            torch.tensor(
+                [-1 if token["atom_index"] is None else cast(int, token["atom_index"]) for token in tokens],
+                dtype=torch.long,
+            )
+        ),
+        batch_size=[],
     )
 
 
@@ -1045,7 +1125,7 @@ class _ProtenixComponentGeometry:
 def _tfg_features(
     system: MolecularSystem,
     *,
-    site_to_atom: dict[AtomSite, int],
+    system_to_model_atom: dict[int, int],
     atom_chain: Tensor,
     element_index: Tensor,
     device: torch.device,
@@ -1055,12 +1135,22 @@ def _tfg_features(
     Prepare the static molecular geometry used by Protenix TFG.
     """
 
+    component_instance = torch.repeat_interleave(
+        torch.arange(system.instance_symbol.numel(), device=system.instance_symbol.device),
+        system.instance_component_ptr[1:] - system.instance_component_ptr[:-1],
+    )
+    atom_component = torch.repeat_interleave(
+        torch.arange(system.component_symbol.numel(), device=system.component_symbol.device),
+        system.component_atom_ptr[1:] - system.component_atom_ptr[:-1],
+    )
+    atom_instance = component_instance[atom_component].detach().cpu().tolist()
+    edges = system.edge_index.detach().cpu().T.tolist()
     interchain_bonds = [
-        (site_to_atom[bond.site_a], site_to_atom[bond.site_b])
-        for bond in system.iter_bonds()
-        if bond.site_a.instance_id != bond.site_b.instance_id
-        and bond.site_a in site_to_atom
-        and bond.site_b in site_to_atom
+        (system_to_model_atom[first], system_to_model_atom[second])
+        for first, second in edges
+        if first in system_to_model_atom
+        and second in system_to_model_atom
+        and atom_instance[first] != atom_instance[second]
     ]
     pair_index: list[tuple[int, int]] = []
     pair_lower_bound: list[float] = []
@@ -1077,75 +1167,83 @@ def _tfg_features(
     stereo_bond_orientation: list[float] = []
     planar_improper_index: list[tuple[int, int, int, int]] = []
 
-    component_geometry: dict[ChemicalComponent, _ProtenixComponentGeometry] = {}
-    for instance_id, entity_id in system.instances.items():
-        entity = system.entities[entity_id]
-        for component_index, component in enumerate(entity.components):
-            if isinstance(entity, PolymerSequence) and component.component_id in _STANDARD[entity.polymer_type]:
-                continue
-            if any(ATOMIC_NUMBER_BY_ELEMENT[atom.element] in _METAL_ATOMIC_NUMBERS for atom in component.atoms):
-                continue
-            local_to_global: dict[int, int] = {}
-            for local_index, atom in enumerate(component.atoms):
-                site = AtomSite(instance_id, component_index, atom.atom_id)
-                if site in site_to_atom:
-                    local_to_global[local_index] = site_to_atom[site]
-            if len(component.reference_coordinates) != len(component.atoms) or any(
-                component.reference_coordinates[index] is None for index in local_to_global
-            ):
-                raise ValueError(
-                    f"TFG requires reference coordinates for modeled atoms in component {component.component_id!r}"
-                )
-            geometry = component_geometry.get(component)
-            if geometry is None:
-                geometry = _component_geometry(component)
-                component_geometry[component] = geometry
+    component_atoms = system.component_atom_ptr.detach().cpu().tolist()
+    instance_entities = system.instance_entity.detach().cpu().tolist()
+    entity_types = system.entity_type.detach().cpu().tolist()
+    component_instances = component_instance.detach().cpu().tolist()
+    component_symbols = system.component_symbol.detach().cpu().tolist()
+    atomic_numbers = system.atomic_number.detach().cpu().tolist()
+    reference_mask = system.reference_coordinate_mask.detach().cpu().tolist()
+    for component_index, instance_index in enumerate(component_instances):
+        entity_index = instance_entities[instance_index]
+        entity_type = entity_types[entity_index]
+        component_id = system.symbols[component_symbols[component_index]]
+        if _is_standard(system, component_index, entity_type):
+            continue
+        atom_start = component_atoms[component_index]
+        atom_stop = component_atoms[component_index + 1]
+        if any(atomic_number in _METAL_ATOMIC_NUMBERS for atomic_number in atomic_numbers[atom_start:atom_stop]):
+            continue
+        local_to_global = {
+            atom_index - atom_start: system_to_model_atom[atom_index]
+            for atom_index in range(atom_start, atom_stop)
+            if atom_index in system_to_model_atom
+        }
+        if any(not reference_mask[atom_start + index] for index in local_to_global):
+            raise ValueError(f"TFG requires reference coordinates for modeled atoms in " f"component {component_id!r}")
+        geometry = _component_geometry(system, component_index)
 
-            for pair_local_index, lower, upper, is_bond, is_angle in zip(
-                geometry.pair_index,
-                geometry.pair_lower_bound,
-                geometry.pair_upper_bound,
-                geometry.pair_is_bond,
-                geometry.pair_is_angle,
-            ):
-                pair_global_index = _mapped_index(pair_local_index, local_to_global)
-                if pair_global_index is not None:
-                    pair_index.append(cast(tuple[int, int], pair_global_index))
-                    pair_lower_bound.append(lower)
-                    pair_upper_bound.append(upper)
-                    pair_is_bond.append(is_bond)
-                    pair_is_angle.append(is_angle)
-            for torsion_local_index, force_constant, sign in zip(
-                geometry.experimental_torsion_index,
-                geometry.experimental_torsion_force_constant,
-                geometry.experimental_torsion_sign,
-            ):
-                torsion_global_index = _mapped_index(torsion_local_index, local_to_global)
-                if torsion_global_index is not None:
-                    experimental_torsion_index.append(cast(tuple[int, int, int, int], torsion_global_index))
-                    experimental_torsion_force_constant.append(force_constant)
-                    experimental_torsion_sign.append(sign)
-            for linear_local_index in geometry.linear_bond_index:
-                linear_global_index = _mapped_index(linear_local_index, local_to_global)
-                if linear_global_index is not None:
-                    linear_bond_index.append(cast(tuple[int, int, int], linear_global_index))
-            for chiral_local_index, orientation in zip(geometry.chiral_index, geometry.chiral_orientation):
-                chiral_global_index = _mapped_index(chiral_local_index, local_to_global)
-                if chiral_global_index is not None:
-                    chiral_index.append(cast(tuple[int, int, int, int], chiral_global_index))
-                    chiral_orientation.append(orientation)
-            for stereo_local_index, orientation in zip(
-                geometry.stereo_bond_index,
-                geometry.stereo_bond_orientation,
-            ):
-                stereo_global_index = _mapped_index(stereo_local_index, local_to_global)
-                if stereo_global_index is not None:
-                    stereo_bond_index.append(cast(tuple[int, int, int, int], stereo_global_index))
-                    stereo_bond_orientation.append(orientation)
-            for planar_local_index in geometry.planar_improper_index:
-                planar_global_index = _mapped_index(planar_local_index, local_to_global)
-                if planar_global_index is not None:
-                    planar_improper_index.append(cast(tuple[int, int, int, int], planar_global_index))
+        for pair_local_index, lower, upper, is_bond, is_angle in zip(
+            geometry.pair_index,
+            geometry.pair_lower_bound,
+            geometry.pair_upper_bound,
+            geometry.pair_is_bond,
+            geometry.pair_is_angle,
+        ):
+            pair_global_index = _mapped_index(pair_local_index, local_to_global)
+            if pair_global_index is not None:
+                pair_index.append(cast(tuple[int, int], pair_global_index))
+                pair_lower_bound.append(lower)
+                pair_upper_bound.append(upper)
+                pair_is_bond.append(is_bond)
+                pair_is_angle.append(is_angle)
+        for torsion_local_index, force_constant, sign in zip(
+            geometry.experimental_torsion_index,
+            geometry.experimental_torsion_force_constant,
+            geometry.experimental_torsion_sign,
+        ):
+            torsion_global_index = _mapped_index(torsion_local_index, local_to_global)
+            if torsion_global_index is not None:
+                experimental_torsion_index.append(cast(tuple[int, int, int, int], torsion_global_index))
+                experimental_torsion_force_constant.append(force_constant)
+                experimental_torsion_sign.append(sign)
+        for linear_local_index in geometry.linear_bond_index:
+            linear_global_index = _mapped_index(linear_local_index, local_to_global)
+            if linear_global_index is not None:
+                linear_bond_index.append(cast(tuple[int, int, int], linear_global_index))
+        for chiral_local_index, orientation in zip(
+            geometry.chiral_index,
+            geometry.chiral_orientation,
+        ):
+            chiral_global_index = _mapped_index(chiral_local_index, local_to_global)
+            if chiral_global_index is not None:
+                chiral_index.append(cast(tuple[int, int, int, int], chiral_global_index))
+                chiral_orientation.append(orientation)
+        for stereo_local_index, orientation in zip(
+            geometry.stereo_bond_index,
+            geometry.stereo_bond_orientation,
+        ):
+            stereo_global_index = _mapped_index(stereo_local_index, local_to_global)
+            if stereo_global_index is not None:
+                stereo_bond_index.append(cast(tuple[int, int, int, int], stereo_global_index))
+                stereo_bond_orientation.append(orientation)
+        for planar_local_index in geometry.planar_improper_index:
+            planar_global_index = _mapped_index(
+                planar_local_index,
+                local_to_global,
+            )
+            if planar_global_index is not None:
+                planar_improper_index.append(cast(tuple[int, int, int, int], planar_global_index))
 
     return ProtenixTfgFeatures(
         atom_chain=atom_chain.to(device=device),
@@ -1195,7 +1293,10 @@ def _mapped_index(
     return tuple(local_to_global[index] for index in local_index)
 
 
-def _component_geometry(component: ChemicalComponent) -> _ProtenixComponentGeometry:
+def _component_geometry(
+    system: MolecularSystem,
+    component_index: int,
+) -> _ProtenixComponentGeometry:
     r"""
     Extract the released TFG constraints for one non-standard component.
     """
@@ -1207,7 +1308,7 @@ def _component_geometry(component: ChemicalComponent) -> _ProtenixComponentGeome
     from rdkit.Chem.rdDistGeom import GetExperimentalTorsions, GetMoleculeBoundsMatrix
     from rdkit.Chem.rdMolTransforms import GetDihedralRad
 
-    molecule = _rdkit_component(component)
+    molecule = _rdkit_component(system, component_index)
     bounds = GetMoleculeBoundsMatrix(molecule)
     bonds = {tuple(sorted((bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()))) for bond in molecule.GetBonds()}
     neighbors = {
@@ -1367,40 +1468,41 @@ def _component_geometry(component: ChemicalComponent) -> _ProtenixComponentGeome
     )
 
 
-def _rdkit_component(component: ChemicalComponent) -> Mol:
+def _rdkit_component(system: MolecularSystem, component_index: int) -> Mol:
     r"""
-    Materialize one canonical component as an RDKit graph with its reference conformer.
+    Project one canonical component occurrence into RDKit for TFG geometry.
     """
 
     from rdkit import Chem
     from rdkit.Geometry import Point3D
 
-    if component.bonds is None:
-        raise ValueError(f"TFG requires known connectivity for component {component.component_id!r}")
-    if len(component.reference_coordinates) != len(component.atoms):
-        raise ValueError(f"TFG requires aligned reference coordinates for component {component.component_id!r}")
+    component_id = system.symbols[int(system.component_symbol[component_index])]
+    if not bool(system.component_topology_complete[component_index]):
+        raise ValueError(f"TFG requires known connectivity for component {component_id!r}")
+    atom_start = int(system.component_atom_ptr[component_index])
+    atom_stop = int(system.component_atom_ptr[component_index + 1])
+    atom_count = atom_stop - atom_start
 
     editable = Chem.RWMol()
-    atom_index: dict[str, int] = {}
     atom_stereo: dict[int, str] = {}
-    for atom in component.atoms:
-        value = Chem.Atom(atom.element)
-        if atom.isotope is not None:
-            value.SetIsotope(atom.isotope)
-        if atom.formal_charge is not None:
-            value.SetFormalCharge(atom.formal_charge)
-        if atom.radical_electrons is not None:
-            value.SetNumRadicalElectrons(atom.radical_electrons)
-        if atom.explicit_hydrogens is not None:
-            value.SetNumExplicitHs(atom.explicit_hydrogens)
-        if atom.implicit_hydrogens_allowed is not None:
-            value.SetNoImplicit(not atom.implicit_hydrogens_allowed)
-        if atom.aromatic is not None:
-            value.SetIsAromatic(atom.aromatic)
-        index = editable.AddAtom(value)
-        atom_index[atom.atom_id] = index
-        if atom.stereo is not None:
-            atom_stereo[index] = atom.stereo.upper()
+    for atom_index in range(atom_start, atom_stop):
+        value = Chem.Atom(int(system.atomic_number[atom_index]))
+        if bool(system.isotope_known[atom_index]):
+            value.SetIsotope(int(system.isotope[atom_index]))
+        if bool(system.formal_charge_known[atom_index]):
+            value.SetFormalCharge(int(system.formal_charge[atom_index]))
+        if bool(system.radical_electrons_known[atom_index]):
+            value.SetNumRadicalElectrons(int(system.radical_electrons[atom_index]))
+        if bool(system.explicit_hydrogens_known[atom_index]):
+            value.SetNumExplicitHs(int(system.explicit_hydrogens[atom_index]))
+        if bool(system.implicit_hydrogens_allowed_known[atom_index]):
+            value.SetNoImplicit(not bool(system.implicit_hydrogens_allowed[atom_index]))
+        if bool(system.atom_aromatic_known[atom_index]):
+            value.SetIsAromatic(bool(system.atom_aromatic[atom_index]))
+        local_index = editable.AddAtom(value)
+        stereo_index = int(system.atom_stereo[atom_index])
+        if stereo_index >= 0:
+            atom_stereo[local_index] = system.symbols[stereo_index].upper()
 
     bond_types = {
         1.0: Chem.BondType.SINGLE,
@@ -1410,23 +1512,48 @@ def _rdkit_component(component: ChemicalComponent) -> Mol:
         4.0: Chem.BondType.QUADRUPLE,
     }
     bond_stereo: list[tuple[int, str, tuple[int, int] | None]] = []
-    for bond in sorted(component.bonds, key=lambda value: (value.atom_a, value.atom_b)):
-        editable.AddBond(atom_index[bond.atom_a], atom_index[bond.atom_b], bond_types[bond.order])
+    edge_mask = (
+        (system.edge_index[0] >= atom_start)
+        & (system.edge_index[1] < atom_stop)
+        & (system.bond_role == BOND_ROLE_COMPONENT)
+    )
+    edge_rows = edge_mask.nonzero(as_tuple=False).flatten().detach().cpu().tolist()
+    for edge_index in edge_rows:
+        if not bool(system.bond_order_known[edge_index]):
+            raise ValueError(f"TFG requires known bond orders for component {component_id!r}")
+        first = int(system.edge_index[0, edge_index]) - atom_start
+        second = int(system.edge_index[1, edge_index]) - atom_start
+        order = float(system.bond_order[edge_index])
+        editable.AddBond(first, second, bond_types[order])
         rdkit_bond = editable.GetBondWithIdx(editable.GetNumBonds() - 1)
-        rdkit_bond.SetIsAromatic(bond.aromatic)
-        if bond.stereo is not None:
+        if bool(system.bond_aromatic_known[edge_index]):
+            rdkit_bond.SetIsAromatic(bool(system.bond_aromatic[edge_index]))
+        stereo_index = int(system.bond_stereo[edge_index])
+        if stereo_index >= 0:
+            stereo_atoms_tensor = system.bond_stereo_index[:, edge_index]
             stereo_atoms = (
                 None
-                if bond.stereo_atoms is None
-                else (atom_index[bond.stereo_atoms[0]], atom_index[bond.stereo_atoms[1]])
+                if bool((stereo_atoms_tensor < 0).any())
+                else (
+                    int(stereo_atoms_tensor[0]) - atom_start,
+                    int(stereo_atoms_tensor[1]) - atom_start,
+                )
             )
-            bond_stereo.append((rdkit_bond.GetIdx(), bond.stereo, stereo_atoms))
+            bond_stereo.append(
+                (
+                    rdkit_bond.GetIdx(),
+                    system.symbols[stereo_index],
+                    stereo_atoms,
+                )
+            )
 
     molecule = editable.GetMol()
     Chem.SanitizeMol(molecule)
-    conformer = Chem.Conformer(len(component.atoms))
-    for index, coordinate in enumerate(component.reference_coordinates):
-        x, y, z = (0.0, 0.0, 0.0) if coordinate is None else coordinate
+    conformer = Chem.Conformer(atom_count)
+    reference_coordinates = system.reference_coordinates[atom_start:atom_stop].detach().cpu()
+    reference_mask = system.reference_coordinate_mask[atom_start:atom_stop].detach().cpu()
+    for index in range(atom_count):
+        x, y, z = reference_coordinates[index].tolist() if bool(reference_mask[index]) else (0.0, 0.0, 0.0)
         conformer.SetAtomPosition(index, Point3D(x, y, z))
     molecule.AddConformer(conformer, assignId=True)
 
@@ -1490,28 +1617,45 @@ def _esm_features(
     Encode protein entities with the released ESM2 vocabulary and map model tokens to residues.
     """
 
-    protein_entity_ids: list[str] = []
-    seen_entities: set[str] = set()
-    for entity_id in system.instances.values():
-        if entity_id in seen_entities:
+    instance_entities = system.instance_entity.detach().cpu().tolist()
+    entity_types = system.entity_type.detach().cpu().tolist()
+    instance_components = system.instance_component_ptr.detach().cpu().tolist()
+    component_symbols = system.component_symbol.detach().cpu().tolist()
+    protein_entities: list[int] = []
+    seen_entities: set[int] = set()
+    entity_components: dict[int, tuple[int, int]] = {}
+    for instance_index, entity_index in enumerate(instance_entities):
+        if entity_index in seen_entities:
             continue
-        seen_entities.add(entity_id)
-        entity = system.entities[entity_id]
-        if isinstance(entity, PolymerSequence) and entity.polymer_type == "protein":
-            protein_entity_ids.append(entity_id)
-    protein_entities = tuple(cast(PolymerSequence, system.entities[entity_id]) for entity_id in protein_entity_ids)
-    sequence_length = max((len(entity.components) + 2 for entity in protein_entities), default=0)
+        seen_entities.add(entity_index)
+        if entity_types[entity_index] == ENTITY_PROTEIN:
+            protein_entities.append(entity_index)
+            entity_components[entity_index] = (
+                instance_components[instance_index],
+                instance_components[instance_index + 1],
+            )
+    sequence_length = max(
+        (
+            entity_components[entity_index][1] - entity_components[entity_index][0] + 2
+            for entity_index in protein_entities
+        ),
+        default=0,
+    )
     esm_tokens = torch.full(
         (len(protein_entities), sequence_length),
         _ESM_PAD_TOKEN,
         dtype=torch.long,
     )
     esm_mask = torch.zeros_like(esm_tokens, dtype=torch.bool)
-    for sequence_index, entity in enumerate(protein_entities):
+    for sequence_index, entity_index in enumerate(protein_entities):
+        component_start, component_stop = entity_components[entity_index]
         residue_tokens = torch.tensor(
             [
-                _ESM_TOKEN_BY_COMPONENT.get(component.component_id, _ESM_UNKNOWN_RESIDUE_TOKEN)
-                for component in entity.components
+                _ESM_TOKEN_BY_COMPONENT.get(
+                    system.symbols[component_symbols[component_index]],
+                    _ESM_UNKNOWN_RESIDUE_TOKEN,
+                )
+                for component_index in range(component_start, component_stop)
             ],
             dtype=torch.long,
         )
@@ -1521,11 +1665,11 @@ def _esm_features(
         esm_tokens[sequence_index, end] = _ESM_EOS_TOKEN
         esm_mask[sequence_index, : end + 1] = True
 
-    entity_to_sequence = {entity_id: index for index, entity_id in enumerate(protein_entity_ids)}
+    entity_to_sequence = {entity_index: index for index, entity_index in enumerate(protein_entities)}
     token_to_esm_residue = torch.zeros(len(tokens), dtype=torch.long)
     token_has_esm = torch.zeros(len(tokens), dtype=torch.bool)
     for token_index, token in enumerate(tokens):
-        esm_sequence_index = entity_to_sequence.get(cast(str, token["entity_id"]))
+        esm_sequence_index = entity_to_sequence.get(cast(int, token["entity_index"]))
         monomer_index = cast(int | None, token["monomer_index"])
         if esm_sequence_index is None or monomer_index is None:
             continue
@@ -1535,6 +1679,7 @@ def _esm_features(
 
 
 def _structure_condition_features(
+    system: MolecularSystem,
     structure: Structure | None,
     tokens: list[dict[str, object]],
 ) -> tuple[Tensor, Tensor]:
@@ -1547,52 +1692,75 @@ def _structure_condition_features(
     if structure is None:
         return positions, mask
 
-    coordinate_index = {
-        site: index for index, site in enumerate(structure.sites) if bool(structure.coordinate_mask[index])
-    }
     for token_index, token in enumerate(tokens):
-        source_index = coordinate_index.get(cast(AtomSite, token["representative"]))
-        if source_index is not None:
-            positions[token_index] = torch.from_numpy(structure.coordinates[source_index].copy())
+        site = system.atom_site(cast(int, token["representative"]))
+        try:
+            source_index = structure.system.atom_index(site)
+        except KeyError:
+            continue
+        if bool(structure.coordinate_mask[source_index]):
+            positions[token_index] = structure.coordinates[source_index].detach().cpu()
             mask[token_index] = True
     return positions, mask
 
 
 def _reference_features(
     system: MolecularSystem,
-    atom_sites: tuple[AtomSite, ...],
-    site_to_atom: dict[AtomSite, int],
+    atom_indices: tuple[int, ...],
     *,
     augment: bool,
     generator: torch.Generator | None,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    positions = torch.zeros(len(atom_sites), 3)
-    mask = torch.zeros(len(atom_sites), dtype=torch.bool)
-    charges = torch.tensor([system.atom(site).formal_charge for site in atom_sites], dtype=torch.float32)
+    index = torch.tensor(atom_indices, device=system.atom_symbol.device)
+    positions = system.reference_coordinates[index].detach().cpu().clone()
+    mask = system.reference_coordinate_mask[index].detach().cpu().clone()
+    charges = system.formal_charge[index].detach().cpu().float()
     # One reference space per component occurrence, matching the assignment in _tokenize.
-    grouped: dict[ComponentReference, list[AtomSite]] = {}
-    for site in atom_sites:
-        grouped.setdefault((site.instance_id, site.component_index), []).append(site)
+    atom_component = (
+        torch.repeat_interleave(
+            torch.arange(system.component_symbol.numel(), device=system.atom_symbol.device),
+            system.component_atom_ptr[1:] - system.component_atom_ptr[:-1],
+        )
+        .detach()
+        .cpu()
+    )
+    grouped: dict[int, list[int]] = {}
+    for model_atom_index, atom_index in enumerate(atom_indices):
+        grouped.setdefault(int(atom_component[atom_index]), []).append(model_atom_index)
 
-    for component_reference, sites in grouped.items():
-        component = system.component(component_reference)
-        if not any(coordinate is not None for coordinate in component.reference_coordinates):
+    group_indices: list[Tensor] = []
+    component_symbols = system.component_symbol.detach().cpu().tolist()
+    for component_index, model_indices in grouped.items():
+        indices = torch.tensor(model_indices)
+        if not bool(mask[indices].any()):
+            component_id = system.symbols[component_symbols[component_index]]
             raise ValueError(
-                f"Protenix requires explicit reference_coordinates for {component.component_id!r}; "
+                f"Protenix requires explicit reference_coordinates for {component_id!r}; "
                 "the Processor does not generate conformers implicitly"
             )
-        atom_by_name = {atom.atom_id: index for index, atom in enumerate(component.atoms)}
-        for site in sites:
-            global_index = site_to_atom[site]
-            coordinate = component.reference_coordinates[atom_by_name[site.atom_id]]
-            if coordinate is not None:
-                positions[global_index] = torch.tensor(coordinate)
-                mask[global_index] = True
-        indices = torch.tensor([site_to_atom[site] for site in sites])
         positions[indices] -= positions[indices].mean(dim=0)
         if augment:
-            translation = torch.empty(3).uniform_(-1.0, 1.0, generator=generator)
-            rotation = uniform_random_rotation(dtype=positions.dtype, generator=generator)[0]
+            group_indices.append(indices)
+
+    if group_indices:
+        random_device = positions.device if generator is None else generator.device
+        translations = (
+            torch.empty(
+                len(group_indices),
+                3,
+                device=random_device,
+                dtype=positions.dtype,
+            )
+            .uniform_(-1.0, 1.0, generator=generator)
+            .to(positions.device)
+        )
+        rotations = uniform_random_rotation(
+            len(group_indices),
+            device=random_device,
+            dtype=positions.dtype,
+            generator=generator,
+        ).to(positions.device)
+        for indices, translation, rotation in zip(group_indices, translations, rotations):
             positions[indices] = torch.matmul(
                 positions[indices] + translation,
                 rotation.transpose(-1, -2),
@@ -1600,9 +1768,8 @@ def _reference_features(
     return positions, mask, charges
 
 
-def _msa_polymer_type(system: MolecularSystem, entity_id: str) -> str | None:
-    entity = system.entities.get(entity_id)
-    return entity.polymer_type if isinstance(entity, PolymerSequence) else None
+def _msa_polymer_type(system: MolecularSystem, entity_index: int) -> str | None:
+    return _POLYMER_TYPE.get(int(system.entity_type[entity_index]))
 
 
 def _msa_symbol_residue_type(symbol: str, polymer_type: str | None) -> int:
@@ -1616,10 +1783,11 @@ def _msa_symbol_residue_type(symbol: str, polymer_type: str | None) -> int:
 
 def _msa_descriptors(
     msa: MSA | MSACollection | None,
+    resolved_bindings: tuple[tuple[MSA, int | None, int], ...],
     system: MolecularSystem,
     *,
     max_rows: int,
-) -> list[tuple[dict[tuple[str, str | None], tuple[int, bool]], bool]]:
+) -> list[tuple[dict[tuple[int, int | None], tuple[int, bool]], bool]]:
     # Each descriptor maps an entity-broadcast or exact-instance column binding to
     # ``(source_row, is_paired)``. The bool is the query flag.
     if msa is None:
@@ -1627,18 +1795,18 @@ def _msa_descriptors(
     if isinstance(msa, MSA):
         # A bare MSA is the entity's own deep alignment: enumerate its unpaired pool (row 0 is the
         # query), which the single-file reader packs as the full alignment.
-        key = (msa.entity_id, None)
+        _value, target_instance_index, entity_index = resolved_bindings[0]
+        key = (entity_index, target_instance_index)
         return [({key: (row, False)}, row == 0) for row in range(min(len(msa.unpaired_sequences), max_rows))]
 
     row_pairing = msa.row_pairing
     row_is_paired = msa.row_is_paired
-    bindings = msa_bindings(msa)
     plan_rows = int(row_pairing.shape[0])
 
     # RNA contributes only its unpaired pool. Protein paired rows keep the RNA query
     # sequence instead of treating RNA columns as another paired alignment.
     protein_columns = np.asarray(
-        [_msa_polymer_type(system, value.entity_id) == "protein" for value, _target in bindings],
+        [_msa_polymer_type(system, entity_index) == "protein" for _value, _target, entity_index in resolved_bindings],
         dtype=np.bool_,
     )
     protein_paired = np.count_nonzero(
@@ -1655,48 +1823,56 @@ def _msa_descriptors(
     ordered.extend(unpaired[: max_rows - len(ordered)])
     ordered = ordered[:max_rows]
 
-    descriptors: list[tuple[dict[tuple[str, str | None], tuple[int, bool]], bool]] = []
+    descriptors: list[tuple[dict[tuple[int, int | None], tuple[int, bool]], bool]] = []
     for row in ordered:
         if row is None:
             descriptors.append(({}, True))
             continue
-        mapping: dict[tuple[str, str | None], tuple[int, bool]] = {}
-        for column, (value, target_instance_id) in enumerate(bindings):
+        mapping: dict[tuple[int, int | None], tuple[int, bool]] = {}
+        for column, (_value, target_instance_index, entity_index) in enumerate(resolved_bindings):
             source = int(row_pairing[row, column])
             is_paired = bool(row_is_paired[row, column])
-            if source == -1 or (is_paired and _msa_polymer_type(system, value.entity_id) == "rna"):
+            if source == -1 or (is_paired and _msa_polymer_type(system, entity_index) == "rna"):
                 continue
-            mapping[(value.entity_id, target_instance_id)] = (source, is_paired)
+            mapping[(entity_index, target_instance_index)] = (source, is_paired)
         descriptors.append((mapping, False))
     return descriptors
 
 
 def _msa_features(
     msa: MSA | MSACollection | None,
+    resolved_bindings: tuple[tuple[MSA, int | None, int], ...],
     tokens: list[dict[str, object]],
     system: MolecularSystem,
     *,
     max_rows: int,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    bindings = {} if msa is None else msa_binding_map(msa)
-    descriptors = _msa_descriptors(msa, system, max_rows=max_rows)
+    bindings = {
+        (entity_index, target_instance_index): value for value, target_instance_index, entity_index in resolved_bindings
+    }
+    descriptors = _msa_descriptors(
+        msa,
+        resolved_bindings,
+        system,
+        max_rows=max_rows,
+    )
     rows = torch.empty(len(descriptors), len(tokens), dtype=torch.long)
 
     for row_index, (descriptor, query) in enumerate(descriptors):
         for token_index, token in enumerate(tokens):
-            entity_id = cast(str, token["entity_id"])
-            instance_id = cast(str, token["instance_id"])
+            entity_index = cast(int, token["entity_index"])
+            instance_index = cast(int, token["instance_index"])
             monomer_index = cast(int | None, token["monomer_index"])
-            polymer_type = _msa_polymer_type(system, entity_id)
-            selected = select_msa_binding(bindings, entity_id, instance_id)
+            polymer_type = _msa_polymer_type(system, entity_index)
+            key = (entity_index, instance_index) if (entity_index, instance_index) in bindings else (entity_index, None)
+            selected = bindings.get(key)
             if query or selected is None or polymer_type not in {"protein", "rna"}:
                 rows[row_index, token_index] = cast(int, token["residue_type"])
-            elif selected[0] not in descriptor:
+            elif key not in descriptor:
                 rows[row_index, token_index] = cast(int, token["residue_type"]) if polymer_type == "rna" else _GAP
             else:
-                key, value = selected
                 source_row, is_paired = descriptor[key]
-                pool = value.paired_sequences if is_paired else value.unpaired_sequences
+                pool = selected.paired_sequences if is_paired else selected.unpaired_sequences
                 rows[row_index, token_index] = _msa_symbol_residue_type(
                     pool[source_row][cast(int, monomer_index)],
                     polymer_type,
@@ -1705,51 +1881,64 @@ def _msa_features(
     profile = torch.zeros(len(tokens), 32)
     deletion_mean = torch.zeros(len(tokens))
     for token_index, token in enumerate(tokens):
-        entity_id = cast(str, token["entity_id"])
-        instance_id = cast(str, token["instance_id"])
+        entity_index = cast(int, token["entity_index"])
+        instance_index = cast(int, token["instance_index"])
         monomer_index = cast(int | None, token["monomer_index"])
-        polymer_type = _msa_polymer_type(system, entity_id)
-        selected = select_msa_binding(bindings, entity_id, instance_id)
+        polymer_type = _msa_polymer_type(system, entity_index)
+        selected = bindings.get(
+            (entity_index, instance_index),
+            bindings.get((entity_index, None)),
+        )
         if selected is None or polymer_type not in {"protein", "rna"}:
             profile[token_index, cast(int, token["residue_type"])] = 1
             continue
-        _key, value = selected
         # The profile and deletion mean are the entity's own alignment statistics, taken over the full
         # unpaired pool, including the query row.
         column = cast(int, monomer_index)
-        encoded = [_msa_symbol_residue_type(sequence[column], polymer_type) for sequence in value.unpaired_sequences]
+        encoded = [_msa_symbol_residue_type(sequence[column], polymer_type) for sequence in selected.unpaired_sequences]
         profile[token_index] = F.one_hot(torch.tensor(encoded), num_classes=32).float().mean(dim=0)
-        deletion_mean[token_index] = torch.tensor(value.unpaired_deletion_counts[:, column], dtype=torch.float32).mean()
+        deletion_mean[token_index] = torch.tensor(
+            selected.unpaired_deletion_counts[:, column],
+            dtype=torch.float32,
+        ).mean()
     return rows, torch.ones_like(rows, dtype=torch.float32), profile, deletion_mean
 
 
 def _assembled_deletions(
     msa: MSA | MSACollection | None,
+    resolved_bindings: tuple[tuple[MSA, int | None, int], ...],
     tokens: list[dict[str, object]],
     system: MolecularSystem,
     *,
     max_rows: int,
 ) -> Tensor:
-    bindings = {} if msa is None else msa_binding_map(msa)
-    descriptors = _msa_descriptors(msa, system, max_rows=max_rows)
+    bindings = {
+        (entity_index, target_instance_index): value for value, target_instance_index, entity_index in resolved_bindings
+    }
+    descriptors = _msa_descriptors(
+        msa,
+        resolved_bindings,
+        system,
+        max_rows=max_rows,
+    )
     deletions = torch.zeros(len(descriptors), len(tokens))
     for row_index, (descriptor, query) in enumerate(descriptors):
         if query:
             continue
         for token_index, token in enumerate(tokens):
-            entity_id = cast(str, token["entity_id"])
-            instance_id = cast(str, token["instance_id"])
+            entity_index = cast(int, token["entity_index"])
+            instance_index = cast(int, token["instance_index"])
             monomer_index = cast(int | None, token["monomer_index"])
-            selected = select_msa_binding(bindings, entity_id, instance_id)
+            key = (entity_index, instance_index) if (entity_index, instance_index) in bindings else (entity_index, None)
+            selected = bindings.get(key)
             if (
                 selected is None
-                or selected[0] not in descriptor
-                or _msa_polymer_type(system, entity_id) not in {"protein", "rna"}
+                or key not in descriptor
+                or _msa_polymer_type(system, entity_index) not in {"protein", "rna"}
             ):
                 continue
-            key, value = selected
             source_row, is_paired = descriptor[key]
-            pool = value.paired_deletion_counts if is_paired else value.unpaired_deletion_counts
+            pool = selected.paired_deletion_counts if is_paired else selected.unpaired_deletion_counts
             deletions[row_index, token_index] = float(pool[source_row, cast(int, monomer_index)])
     return deletions
 
@@ -1778,28 +1967,49 @@ def _template_features(
     num_distogram_bins: int = 39,
 ) -> ProtenixTemplateFeatures:
     token_count = len(tokens)
-    residue_tokens: dict[tuple[str, int], list[int]] = {}
-    chain_tokens: dict[str, list[int]] = {}
+    residue_tokens: dict[int, list[int]] = {}
+    chain_tokens: dict[int, list[int]] = {}
     for token_index, token in enumerate(tokens):
-        instance_id = cast(str, token["instance_id"])
-        chain_tokens.setdefault(instance_id, []).append(token_index)
+        instance_index = cast(int, token["instance_index"])
+        chain_tokens.setdefault(instance_index, []).append(token_index)
         monomer_index = cast(int | None, token["monomer_index"])
         if monomer_index is not None:
-            residue_tokens.setdefault((instance_id, monomer_index), []).append(token_index)
+            residue_tokens.setdefault(
+                cast(int, token["component_index"]),
+                [],
+            ).append(token_index)
 
-    chain_templates: dict[str, list[tuple[Template, tuple[TemplateAlignment, ...]]]] = {}
-    for instance_id, entity_id in system.instances.items():
-        entity = system.entities[entity_id]
-        if isinstance(entity, PolymerSequence) and entity.polymer_type == "protein":
-            chain_templates[instance_id] = []
+    instance_entities = system.instance_entity.detach().cpu().tolist()
+    chain_templates: dict[
+        int,
+        list[
+            tuple[
+                Template,
+                tuple[tuple[int, tuple[tuple[int, int], ...]], ...],
+            ]
+        ],
+    ] = {
+        instance_index: []
+        for instance_index, entity_index in enumerate(instance_entities)
+        if int(system.entity_type[entity_index]) == ENTITY_PROTEIN
+    }
     for template in templates:
-        alignments_by_chain: dict[str, list[TemplateAlignment]] = {}
+        alignments_by_chain: dict[
+            int,
+            list[tuple[int, tuple[tuple[int, int], ...]]],
+        ] = {}
         for alignment in template.alignments:
-            for instance_id in _template_target_instances(alignment, system):
-                alignments_by_chain.setdefault(instance_id, []).append(alignment)
-        for instance_id, alignments in alignments_by_chain.items():
-            if len(chain_templates[instance_id]) < 4:
-                chain_templates[instance_id].append((template, tuple(alignments)))
+            template_instance_index = template.structure.system.instance_index(alignment.template_instance_id)
+            template_entity_index = int(template.structure.system.instance_entity[template_instance_index])
+            if int(template.structure.system.entity_type[template_entity_index]) != ENTITY_PROTEIN:
+                raise ValueError("Protenix templates must align protein template instances")
+            for instance_index in _template_target_instances(alignment, system):
+                alignments_by_chain.setdefault(instance_index, []).append(
+                    (template_instance_index, alignment.residue_pairs)
+                )
+        for instance_index, alignments in alignments_by_chain.items():
+            if len(chain_templates[instance_index]) < 4:
+                chain_templates[instance_index].append((template, tuple(alignments)))
 
     positions = torch.zeros(4, token_count, 4, 3)
     atom_mask = torch.zeros(4, token_count, 4)
@@ -1807,40 +2017,38 @@ def _template_features(
     # An empty chain contributes one GAP slot; fixed-four padding leaves the remaining slots at residue ID zero.
     residue_type_ids[0] = _GAP
 
-    template_coordinates: dict[int, dict[tuple[str, int, str], tuple[np.ndarray, bool]]] = {}
-    for instance_id, selected_templates in chain_templates.items():
-        target_tokens = chain_tokens[instance_id]
+    target_component_ptr = system.instance_component_ptr.detach().cpu().tolist()
+    for instance_index, selected_templates in chain_templates.items():
+        target_tokens = chain_tokens[instance_index]
         for template_index, (template, template_alignments) in enumerate(selected_templates):
             residue_type_ids[template_index, target_tokens] = _GAP
-            template_key = id(template)
-            coordinates = template_coordinates.get(template_key)
-            if coordinates is None:
-                coordinates = _structure_atom_lookup(template.structure)
-                template_coordinates[template_key] = coordinates
-            for alignment in template_alignments:
-                template_entity_id = template.structure.system.instances[alignment.template_instance_id]
-                template_entity = cast(
-                    PolymerSequence,
-                    template.structure.system.entities[template_entity_id],
-                )
-                if template_entity.polymer_type != "protein":
-                    raise ValueError("Protenix templates must align protein template instances")
-                for target_component, template_component in alignment.residue_pairs:
-                    targets = residue_tokens.get((instance_id, target_component))
+            template_system = template.structure.system
+            template_component_ptr = template_system.instance_component_ptr.detach().cpu().tolist()
+            template_component_symbols = template_system.component_symbol.detach().cpu().tolist()
+            for template_instance_index, residue_pairs in template_alignments:
+                template_entity_index = int(template_system.instance_entity[template_instance_index])
+                for target_component, template_component in residue_pairs:
+                    target_component_index = target_component_ptr[instance_index] + target_component
+                    targets = residue_tokens.get(target_component_index)
                     if targets is None:
                         raise ValueError(
-                            f"template alignment target {instance_id!r}:{target_component} "
+                            f"template alignment target "
+                            f"{system.instance_id(instance_index)!r}:{target_component} "
                             "does not resolve to a token"
                         )
-                    component = template_entity.components[template_component]
+                    template_component_index = template_component_ptr[template_instance_index] + template_component
                     backbone, backbone_mask = _template_residue_backbone(
-                        coordinates,
-                        alignment.template_instance_id,
-                        template_component,
+                        template.structure,
+                        template_component_index,
                     )
+                    component_id = template_system.symbols[template_component_symbols[template_component_index]]
                     residue_type = (
-                        _RESIDUE_TYPE.get(component.component_id, _UNKNOWN)
-                        if _is_standard(component, template_entity.polymer_type)
+                        _RESIDUE_TYPE.get(component_id, _UNKNOWN)
+                        if _is_standard(
+                            template_system,
+                            template_component_index,
+                            int(template_system.entity_type[template_entity_index]),
+                        )
                         else _UNKNOWN
                     )
                     for token_index in targets:
@@ -1872,54 +2080,47 @@ def _template_features(
 def _template_target_instances(
     alignment: TemplateAlignment,
     system: MolecularSystem,
-) -> tuple[str, ...]:
-    entity = system.entities.get(alignment.target_entity_id)
-    if not isinstance(entity, PolymerSequence) or entity.polymer_type != "protein":
+) -> tuple[int, ...]:
+    try:
+        entity_index = system.entity_index(alignment.target_entity_id)
+    except KeyError:
+        raise ValueError(f"template target {alignment.target_entity_id!r} is not a protein entity") from None
+    if int(system.entity_type[entity_index]) != ENTITY_PROTEIN:
         raise ValueError(f"template target {alignment.target_entity_id!r} is not a protein entity")
     if alignment.target_instance_id is None:
         return tuple(
-            instance_id
-            for instance_id, entity_id in system.instances.items()
-            if entity_id == alignment.target_entity_id
+            instance_index
+            for instance_index, actual_entity_index in enumerate(system.instance_entity.detach().cpu().tolist())
+            if actual_entity_index == entity_index
         )
-    actual_entity_id = system.instances.get(alignment.target_instance_id)
-    if actual_entity_id is None:
+    try:
+        instance_index = system.instance_index(alignment.target_instance_id)
+    except KeyError:
         raise ValueError(f"template alignment targets unknown instance {alignment.target_instance_id!r}")
-    if actual_entity_id != alignment.target_entity_id:
+    actual_entity_index = int(system.instance_entity[instance_index])
+    if actual_entity_index != entity_index:
         raise ValueError(
             f"template alignment instance {alignment.target_instance_id!r} belongs to entity "
-            f"{actual_entity_id!r}, not {alignment.target_entity_id!r}"
+            f"{system.entity_id(actual_entity_index)!r}, not {alignment.target_entity_id!r}"
         )
-    return (alignment.target_instance_id,)
-
-
-def _structure_atom_lookup(
-    structure: Structure,
-) -> dict[tuple[str, int, str], tuple[np.ndarray, bool]]:
-    return {
-        (site.instance_id, site.component_index, site.atom_id): (
-            structure.coordinates[index],
-            bool(structure.coordinate_mask[index]),
-        )
-        for index, site in enumerate(structure.sites)
-    }
+    return (instance_index,)
 
 
 def _template_residue_backbone(
-    coordinates: dict[tuple[str, int, str], tuple[np.ndarray, bool]],
-    instance_id: str,
+    structure: Structure,
     component_index: int,
 ) -> tuple[Tensor, Tensor]:
     positions = torch.zeros(4, 3)
     mask = torch.zeros(4)
-    for atom_index, atom_id in enumerate(("N", "CA", "C", "CB")):
-        entry = coordinates.get((instance_id, component_index, atom_id))
-        if entry is None:
-            continue
-        coordinate, present = entry
-        if present:
-            positions[atom_index] = torch.from_numpy(np.asarray(coordinate, dtype=np.float32))
-            mask[atom_index] = 1
+    system = structure.system
+    atom_start = int(system.component_atom_ptr[component_index])
+    atom_stop = int(system.component_atom_ptr[component_index + 1])
+    atoms_by_name = {system.symbols[int(system.atom_symbol[index])]: index for index in range(atom_start, atom_stop)}
+    for row, atom_id in enumerate(("N", "CA", "C", "CB")):
+        atom_index = atoms_by_name.get(atom_id)
+        if atom_index is not None and bool(structure.coordinate_mask[atom_index]):
+            positions[row] = structure.coordinates[atom_index].detach().cpu()
+            mask[row] = 1
     return positions, mask
 
 
@@ -1972,6 +2173,7 @@ def _template_distogram(
 
 def _constraint_features(
     *,
+    system: MolecularSystem,
     tokens: list[dict[str, object]],
     atom_contacts: tuple[ProtenixAtomContact, ...],
     token_contacts: tuple[ProtenixTokenContact, ...],
@@ -1979,7 +2181,7 @@ def _constraint_features(
     substructure: Structure | None,
     substructure_coordinate_noise_scale: float,
     generator: torch.Generator | None,
-    site_to_token: dict[AtomSite, int],
+    system_atom_to_token: dict[int, int],
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     r"""
     Build the four Protenix constraint pair-bias channels.
@@ -2003,19 +2205,22 @@ def _constraint_features(
     token_contact_feature = torch.zeros(count, count, 2)
     atom_contact_feature = torch.zeros(count, count, 2)
     substructure_feature = torch.zeros(count, count, 4)
-    residue_tokens: dict[ComponentReference, list[int]] = {}
-    instance_tokens: dict[str, list[int]] = {}
+    residue_tokens: dict[int, list[int]] = {}
+    instance_tokens: dict[int, list[int]] = {}
     for index, token in enumerate(tokens):
-        instance_id = cast(str, token["instance_id"])
-        instance_tokens.setdefault(instance_id, []).append(index)
+        instance_index = cast(int, token["instance_index"])
+        instance_tokens.setdefault(instance_index, []).append(index)
         monomer_index = cast(int | None, token["monomer_index"])
         if monomer_index is not None:
-            residue_tokens.setdefault((instance_id, monomer_index), []).append(index)
+            residue_tokens.setdefault(
+                cast(int, token["component_index"]),
+                [],
+            ).append(index)
 
     def atom_token(site: AtomSite) -> int:
         try:
-            return site_to_token[site]
-        except KeyError:
+            return system_atom_to_token[system.atom_index(site)]
+        except (KeyError, IndexError):
             raise ValueError(
                 f"Protenix constraint references atom {site!r}, which is not a model-visible token"
             ) from None
@@ -2023,7 +2228,11 @@ def _constraint_features(
     def endpoint_token(endpoint: ComponentReference | AtomSite) -> int:
         if isinstance(endpoint, AtomSite):
             return atom_token(endpoint)
-        candidates = residue_tokens.get(endpoint)
+        try:
+            component_index = system.component_index(endpoint)
+        except (KeyError, IndexError):
+            component_index = -1
+        candidates = residue_tokens.get(component_index)
         if not candidates:
             raise ValueError(
                 f"Protenix token contact references residue {endpoint!r}, which has no model-visible token"
@@ -2040,11 +2249,19 @@ def _constraint_features(
         _write_symmetric(token_contact_feature, first, second, (0.0, token_contact.max_distance))
 
     if pocket is not None:
-        binder_tokens = instance_tokens.get(pocket.binder)
+        try:
+            binder_instance = system.instance_index(pocket.binder)
+        except KeyError:
+            binder_instance = -1
+        binder_tokens = instance_tokens.get(binder_instance)
         if not binder_tokens:
             raise ValueError(f"Protenix pocket binder chain {pocket.binder!r} has no model-visible token")
         for residue in pocket.contact_residues:
-            candidates = residue_tokens.get(residue)
+            try:
+                component_index = system.component_index(residue)
+            except (KeyError, IndexError):
+                component_index = -1
+            candidates = residue_tokens.get(component_index)
             if not candidates:
                 raise ValueError(f"Protenix pocket residue {residue!r} has no model-visible token")
             pocket_token = _draw_token(candidates, generator)
@@ -2052,23 +2269,28 @@ def _constraint_features(
                 pocket_feature[binder_token, pocket_token, 0] = pocket.max_distance
 
     if substructure is not None:
-        coordinate_index = {
-            site: index for index, site in enumerate(substructure.sites) if bool(substructure.coordinate_mask[index])
-        }
         selected_token: list[int] = []
         selected_coordinates: list[Tensor] = []
         for token_index, token in enumerate(tokens):
-            center = cast(AtomSite, token["center"])
-            source_index = coordinate_index.get(center)
-            if source_index is not None:
+            center = cast(int, token["center"])
+            try:
+                source_index = substructure.system.atom_index(system.atom_site(center))
+            except KeyError:
+                continue
+            if bool(substructure.coordinate_mask[source_index]):
                 selected_token.append(token_index)
-                selected_coordinates.append(torch.from_numpy(substructure.coordinates[source_index].copy()))
+                selected_coordinates.append(substructure.coordinates[source_index].detach().cpu())
         if selected_token:
             coordinates = torch.stack(selected_coordinates)
             if substructure_coordinate_noise_scale != 0.0:
-                coordinates = coordinates + substructure_coordinate_noise_scale * torch.empty_like(coordinates).normal_(
-                    generator=generator
-                )
+                random_device = coordinates.device if generator is None else generator.device
+                noise = torch.randn(
+                    coordinates.shape,
+                    device=random_device,
+                    dtype=coordinates.dtype,
+                    generator=generator,
+                ).to(coordinates.device)
+                coordinates = coordinates + substructure_coordinate_noise_scale * noise
             distance = torch.cdist(coordinates, coordinates)
             boundaries = distance.new_tensor((0.0, 4.0, 8.0, 16.0, float("inf")))
             distance_bin = torch.bucketize(distance, boundaries, right=True) - 1
@@ -2088,7 +2310,16 @@ def _constraint_features(
 def _draw_token(candidates: list[int], generator: torch.Generator | None) -> int:
     if len(candidates) == 1:
         return candidates[0]
-    choice = int(torch.randint(0, len(candidates), (1,), generator=generator).item())
+    random_device = torch.device("cpu") if generator is None else generator.device
+    choice = int(
+        torch.randint(
+            0,
+            len(candidates),
+            (1,),
+            device=random_device,
+            generator=generator,
+        ).item()
+    )
     return candidates[choice]
 
 
@@ -2101,28 +2332,54 @@ def _write_symmetric(feature: Tensor, first: int, second: int, value: tuple[floa
     feature[second, first] = channels
 
 
-def _token_bonds(system: MolecularSystem, site_to_token: dict[AtomSite, int], token_count: int) -> Tensor:
+def _token_bonds(
+    system: MolecularSystem,
+    system_atom_to_token: dict[int, int],
+    token_count: int,
+) -> Tensor:
     feature = torch.zeros(token_count, token_count)
-    for bond in system.iter_bonds():
-        first, second = bond.site_a, bond.site_b
-        if first not in site_to_token or second not in site_to_token:
+    component_instance = torch.repeat_interleave(
+        torch.arange(system.instance_symbol.numel(), device=system.instance_symbol.device),
+        system.instance_component_ptr[1:] - system.instance_component_ptr[:-1],
+    )
+    atom_component = torch.repeat_interleave(
+        torch.arange(system.component_symbol.numel(), device=system.component_symbol.device),
+        system.component_atom_ptr[1:] - system.component_atom_ptr[:-1],
+    )
+    component_instances = component_instance.detach().cpu().tolist()
+    atom_components = atom_component.detach().cpu().tolist()
+    instance_entities = system.instance_entity.detach().cpu().tolist()
+    entity_types = system.entity_type.detach().cpu().tolist()
+    edge_rows = system.edge_index.detach().cpu().T.tolist()
+    bond_roles = system.bond_role.detach().cpu().tolist()
+    for edge_index, (first, second) in enumerate(edge_rows):
+        if first not in system_atom_to_token or second not in system_atom_to_token:
             continue
-        overlay = bond.origin not in ("component", "molecule", "polymer_rule")
-        first_entity = system.entities[system.instances[first.instance_id]]
-        second_entity = system.entities[system.instances[second.instance_id]]
-        keep = isinstance(first_entity, Molecule) or isinstance(second_entity, Molecule)
-        if isinstance(first_entity, PolymerSequence) and isinstance(second_entity, PolymerSequence):
-            if first.instance_id == second.instance_id and first.component_index == second.component_index:
-                component = first_entity.components[first.component_index]
-                keep = not _is_standard(component, first_entity.polymer_type)
-            elif overlay and (
-                first.instance_id != second.instance_id or abs(first.component_index - second.component_index) > 1
+        first_component = atom_components[first]
+        second_component = atom_components[second]
+        first_instance = component_instances[first_component]
+        second_instance = component_instances[second_component]
+        first_entity = instance_entities[first_instance]
+        second_entity = instance_entities[second_instance]
+        first_type = entity_types[first_entity]
+        second_type = entity_types[second_entity]
+        keep = first_type == ENTITY_MOLECULE or second_type == ENTITY_MOLECULE
+        if first_type != ENTITY_MOLECULE and second_type != ENTITY_MOLECULE:
+            if first_instance == second_instance and first_component == second_component:
+                keep = not _is_standard(
+                    system,
+                    first_component,
+                    first_type,
+                )
+            elif bond_roles[edge_index] >= BOND_ROLE_ENTITY and (
+                first_instance != second_instance or abs(first_component - second_component) > 1
             ):
                 keep = True
             else:
                 keep = False
         if keep:
-            first_token, second_token = site_to_token[first], site_to_token[second]
+            first_token = system_atom_to_token[first]
+            second_token = system_atom_to_token[second]
             feature[first_token, second_token] = 1
             feature[second_token, first_token] = 1
     return feature

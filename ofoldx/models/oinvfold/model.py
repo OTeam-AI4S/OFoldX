@@ -12,7 +12,6 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 from torch.nn.utils.rnn import pad_sequence
 
-from ...data.molecular import AtomSite, ComponentReference
 from ...data.structure import Structure
 from ...model import Model
 from ...modules.backend import LayerNorm
@@ -68,7 +67,6 @@ class OInvFoldPolymerModel(Model):
     OInvFold inverse folding for protein, DNA, or RNA backbones.
 
     Examples:
-        >>> import numpy as np
         >>> import torch
         >>> from ofoldx.data import AtomSite, MolecularSystem, PolymerSequence, Structure
         >>> from ofoldx.models.oinvfold import (
@@ -77,20 +75,35 @@ class OInvFoldPolymerModel(Model):
         ...     OInvFoldPolymerProcessor,
         ... )
         >>> sequence = PolymerSequence.from_one_letter("AC")
-        >>> system = MolecularSystem({"protein": sequence}, {"A": "protein"})
+        >>> system = MolecularSystem.from_entities({"protein": sequence}, {"A": "protein"})
         >>> sites = tuple(
         ...     AtomSite("A", residue, atom)
         ...     for residue in range(2)
         ...     for atom in ("N", "CA", "C", "O")
         ... )
-        >>> coordinates = np.array(
+        >>> atom_index = torch.tensor([system.atom_index(site) for site in sites])
+        >>> coordinates = torch.zeros(system.atom_symbol.numel(), 3)
+        >>> coordinates[atom_index] = torch.tensor(
         ...     [
         ...         [-1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [1.0, 0.5, 0.0], [1.0, 1.0, 0.0],
         ...         [2.8, 0.0, 0.0], [3.8, 0.0, 0.0], [4.8, 0.5, 0.0], [4.8, 1.0, 0.0],
-        ...     ],
-        ...     dtype=np.float32,
+        ...     ]
         ... )
-        >>> structure = Structure(system, sites, coordinates, np.ones(len(sites), dtype=np.bool_))
+        >>> coordinate_mask = torch.zeros(system.atom_symbol.numel(), dtype=torch.bool)
+        >>> coordinate_mask[atom_index] = True
+        >>> structure = Structure(
+        ...     system=system,
+        ...     coordinates=coordinates,
+        ...     coordinate_mask=coordinate_mask,
+        ...     occupancy=torch.zeros(system.atom_symbol.numel()),
+        ...     occupancy_mask=torch.zeros(system.atom_symbol.numel(), dtype=torch.bool),
+        ...     b_factor=torch.zeros(system.atom_symbol.numel()),
+        ...     b_factor_mask=torch.zeros(system.atom_symbol.numel(), dtype=torch.bool),
+        ...     source_symbols=(),
+        ...     residue_id=torch.full((system.component_symbol.numel(),), -1, dtype=torch.long),
+        ...     insertion_code=torch.full((system.component_symbol.numel(),), -1, dtype=torch.long),
+        ...     batch_size=[],
+        ... )
         >>> input = OInvFoldPolymerProcessor()(structure)
         >>> config = OInvFoldPolymerConfig(
         ...     {"hidden_size": 8, "num_encoder_blocks": 1, "num_virtual_embeddings": 3,
@@ -1047,8 +1060,8 @@ class OInvFoldPolymerInput:
 
     graph: OInvFoldGraph
     structure: Structure
-    component_references: tuple[ComponentReference, ...]
-    coordinate_slots: tuple[tuple[AtomSite, ...], ...]
+    component_index: Tensor
+    coordinate_atom_index: Tensor
     design_mask: Tensor
     chain_index: Tensor
     sequence_tokens: Tensor | None = None

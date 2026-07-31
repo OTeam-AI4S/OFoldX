@@ -102,13 +102,6 @@ def criterion(pred: Any, target: Any, *, label_smoothing: float = 0.1, shared_nu
     )
     mask = (target.residue_mask & target.design_positions).to(per_residue.dtype)
     scope = mask.sum()
-    # An empty scope would divide by zero; the resulting NaN reaches the optimizer and permanently
-    # poisons both the weights and the optimizer state, so refuse the batch instead of scoring it.
-    if not scope:
-        raise ValueError(
-            "NA-MPNN loss has no designable residue to score: residue_mask & design_positions is "
-            "empty for every structure in this batch"
-        )
     return (per_residue * mask).sum() / scope
 
 

@@ -9,7 +9,17 @@ from dataclasses import dataclass
 import numpy as np
 from numpy.typing import NDArray
 
-from .molecular import _STANDARD_COMPONENTS, MolecularSystem, PolymerSequence, one_letter_to_component
+from .molecular import (
+    _STANDARD_COMPONENTS,
+    ENTITY_DNA,
+    ENTITY_DNA_RNA_HYBRID,
+    ENTITY_MOLECULE,
+    ENTITY_PNA,
+    ENTITY_PROTEIN,
+    ENTITY_RNA,
+    MolecularSystem,
+    one_letter_to_component,
+)
 from .structure import Structure
 
 # Component IDs a one-letter alphabet names unambiguously, per polymer chemistry. Used to check an MSA
@@ -17,9 +27,30 @@ from .structure import Structure
 _STANDARD_COMPONENT_IDS: dict[str, frozenset[str]] = {
     polymer_type: frozenset(mapping.values()) for polymer_type, mapping in _STANDARD_COMPONENTS.items()
 }
+_POLYMER_TYPE = {
+    ENTITY_PROTEIN: "protein",
+    ENTITY_RNA: "rna",
+    ENTITY_DNA: "dna",
+    ENTITY_DNA_RNA_HYBRID: "dna_rna_hybrid",
+    ENTITY_PNA: "pna",
+}
 
 
-def _query_conflicts_with_entity(query: str, entity: PolymerSequence) -> int | None:
+def _instance_component_bounds(system: MolecularSystem, instance_index: int) -> tuple[int, int]:
+    pointers = system.instance_component_ptr
+    return int(pointers[instance_index]), int(pointers[instance_index + 1])
+
+
+def _entity_component_bounds(system: MolecularSystem, entity_index: int) -> tuple[int, int]:
+    instance_index = int((system.instance_entity == entity_index).nonzero(as_tuple=False)[0, 0])
+    return _instance_component_bounds(system, instance_index)
+
+
+def _query_conflicts_with_entity(
+    query: str,
+    system: MolecularSystem,
+    entity_index: int,
+) -> int | None:
     r"""
     Locate the first query column whose residue chemistry contradicts the target sequence.
 
@@ -30,15 +61,20 @@ def _query_conflicts_with_entity(query: str, entity: PolymerSequence) -> int | N
     is consistent with the target.
     """
 
-    standard_ids = _STANDARD_COMPONENT_IDS.get(entity.polymer_type)
+    polymer_type = _POLYMER_TYPE.get(int(system.entity_type[entity_index]))
+    if polymer_type is None:
+        return None
+    standard_ids = _STANDARD_COMPONENT_IDS.get(polymer_type)
     if standard_ids is None:
         return None
-    for index, (symbol, component) in enumerate(zip(query, entity.components)):
-        target_id = component.component_id
+    start, stop = _entity_component_bounds(system, entity_index)
+    component_symbols = system.component_symbol[start:stop].detach().cpu().tolist()
+    for index, (symbol, component_symbol) in enumerate(zip(query, component_symbols)):
+        target_id = system.symbols[component_symbol]
         if target_id not in standard_ids:
             continue
         try:
-            query_id = one_letter_to_component(symbol, entity.polymer_type, policy="strict")
+            query_id = one_letter_to_component(symbol, polymer_type, policy="strict")
         except KeyError:
             continue
         if query_id != target_id:
@@ -203,7 +239,7 @@ def msa_bindings(msa: MSA | MSACollection) -> tuple[tuple[MSA, str | None], ...]
 def resolve_msa_bindings(
     msa: MSA | MSACollection,
     system: MolecularSystem,
-) -> tuple[tuple[MSA, str | None, PolymerSequence], ...]:
+) -> tuple[tuple[MSA, int | None, int], ...]:
     r"""
     Resolve MSA entity and instance references against a molecular system.
 
@@ -212,7 +248,7 @@ def resolve_msa_bindings(
         system: Molecular system containing the referenced entities and instances.
 
     Returns:
-        Resolved MSA columns with their optional instance target and polymer entity.
+        Resolved MSA columns with their optional target instance index and entity index.
 
     Raises:
         ValueError: If a referenced entity or instance is invalid, an instance belongs
@@ -220,73 +256,42 @@ def resolve_msa_bindings(
             query row disagrees with the target entity sequence.
     """
 
-    resolved: list[tuple[MSA, str | None, PolymerSequence]] = []
+    resolved: list[tuple[MSA, int | None, int]] = []
     for column, target_instance_id in msa_bindings(msa):
-        entity = system.entities.get(column.entity_id)
-        if not isinstance(entity, PolymerSequence):
+        try:
+            entity_index = system.entity_index(column.entity_id)
+        except KeyError:
+            raise ValueError(f"MSA entity {column.entity_id!r} is not a polymer entity in the input system") from None
+        if int(system.entity_type[entity_index]) == ENTITY_MOLECULE:
             raise ValueError(f"MSA entity {column.entity_id!r} is not a polymer entity in the input system")
+        target_instance_index = None
         if target_instance_id is not None:
-            target_entity_id = system.instances.get(target_instance_id)
-            if target_entity_id is None:
+            try:
+                target_instance_index = system.instance_index(target_instance_id)
+            except KeyError:
                 raise ValueError(f"MSA targets unknown input instance {target_instance_id!r}")
-            if target_entity_id != column.entity_id:
+            target_entity_index = int(system.instance_entity[target_instance_index])
+            if target_entity_index != entity_index:
                 raise ValueError(
                     f"MSA target instance {target_instance_id!r} belongs to entity "
-                    f"{target_entity_id!r}, not {column.entity_id!r}"
+                    f"{system.entity_id(target_entity_index)!r}, not {column.entity_id!r}"
                 )
         query = column.unpaired_sequences[0]
         width = len(query)
-        if width != len(entity):
+        start, stop = _entity_component_bounds(system, entity_index)
+        component_count = stop - start
+        if width != component_count:
             raise ValueError(
-                f"MSA for entity {column.entity_id!r} spans {width} columns but the entity has {len(entity)} components"
+                f"MSA for entity {column.entity_id!r} spans {width} columns "
+                f"but the entity has {component_count} components"
             )
-        conflict = _query_conflicts_with_entity(query, entity)
+        conflict = _query_conflicts_with_entity(query, system, entity_index)
         if conflict is not None:
             raise ValueError(
                 f"MSA query for entity {column.entity_id!r} disagrees with the target sequence at column {conflict}"
             )
-        resolved.append((column, target_instance_id, entity))
+        resolved.append((column, target_instance_index, entity_index))
     return tuple(resolved)
-
-
-def msa_binding_map(msa: MSA | MSACollection) -> dict[tuple[str, str | None], MSA]:
-    r"""
-    Index MSA columns by entity and optional exact instance.
-
-    Args:
-        msa: One MSA or a collection of paired MSA columns.
-
-    Returns:
-        A mapping from `(entity_id, exact_instance_or_none)` to MSA column.
-    """
-
-    return {(column.entity_id, target_instance_id): column for column, target_instance_id in msa_bindings(msa)}
-
-
-def select_msa_binding(
-    bindings: dict[tuple[str, str | None], MSA],
-    entity_id: str,
-    instance_id: str,
-) -> tuple[tuple[str, str | None], MSA] | None:
-    r"""
-    Select an exact-instance MSA column, then fall back to entity broadcast.
-
-    Args:
-        bindings: MSA columns indexed by entity and optional exact instance.
-        entity_id: Entity identifier to match.
-        instance_id: Exact instance identifier to prefer.
-
-    Returns:
-        The selected binding key and MSA column, or `None` when neither binding exists.
-    """
-
-    exact = (entity_id, instance_id)
-    if exact in bindings:
-        return exact, bindings[exact]
-    broadcast = (entity_id, None)
-    if broadcast in bindings:
-        return broadcast, bindings[broadcast]
-    return None
 
 
 @dataclass(frozen=True)
@@ -351,9 +356,11 @@ class Template:
         if not self.alignments:
             raise ValueError("alignments must not be empty")
         for alignment in self.alignments:
-            entity_id = self.structure.system.instances[alignment.template_instance_id]
-            template_entity = self.structure.system.entities[entity_id]
-            if not isinstance(template_entity, PolymerSequence):
+            system = self.structure.system
+            instance_index = system.instance_index(alignment.template_instance_id)
+            entity_index = int(system.instance_entity[instance_index])
+            if int(system.entity_type[entity_index]) == ENTITY_MOLECULE:
                 raise ValueError("template_instance_id must reference a polymer instance")
-            if alignment.residue_pairs[-1][1] >= len(template_entity):
+            start, stop = _instance_component_bounds(system, instance_index)
+            if alignment.residue_pairs[-1][1] >= stop - start:
                 raise ValueError("residue pair template index is outside the template instance")

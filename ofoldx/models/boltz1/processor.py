@@ -11,20 +11,25 @@ from typing import TYPE_CHECKING, cast
 import torch
 from torch import Tensor
 
-from ...data.evidence import MSA, MSACollection, msa_bindings, resolve_msa_bindings
+from ...data.evidence import MSA, MSACollection, resolve_msa_bindings
 from ...data.molecular import (
-    AtomSite,
-    ChemicalComponent,
+    BOND_ROLE_ASSEMBLY,
+    BOND_ROLE_COMPONENT,
+    BOND_ROLE_ENTITY,
+    BOND_ROLE_POLYMER,
+    ENTITY_DNA,
+    ENTITY_DNA_RNA_HYBRID,
+    ENTITY_MOLECULE,
+    ENTITY_PNA,
+    ENTITY_PROTEIN,
+    ENTITY_RNA,
     ComponentReference,
     MolecularSystem,
-    Molecule,
-    PolymerSequence,
 )
 from ...data.structure import Structure
 from ...processor import Processor
 from .model import (
     Boltz1Input,
-    Boltz1Layout,
     Boltz1Pocket,
     Boltz1StructureTarget,
 )
@@ -76,6 +81,13 @@ _STANDARD_COMPONENTS = {
     "rna": frozenset(_RNA_RESIDUE_TYPES),
     "dna": frozenset(_DNA_RESIDUE_TYPES),
 }
+_STANDARD_BY_ENTITY_TYPE = {
+    ENTITY_PROTEIN: _STANDARD_COMPONENTS["protein"],
+    ENTITY_RNA: _STANDARD_COMPONENTS["rna"],
+    ENTITY_DNA: _STANDARD_COMPONENTS["dna"],
+    ENTITY_DNA_RNA_HYBRID: _STANDARD_COMPONENTS["rna"] | _STANDARD_COMPONENTS["dna"],
+    ENTITY_PNA: frozenset(),
+}
 # Boltz parses these polymer components through its canonical residue path and
 # therefore does not emit physical-potential constraints for them. MSE is
 # normalized to MET before that decision.
@@ -84,9 +96,13 @@ _CONSTRAINT_FREE_COMPONENTS = {
     "rna": frozenset(_RNA_RESIDUE_TYPES),
     "dna": frozenset(_DNA_RESIDUE_TYPES),
 }
-_MODEL_HYDROGEN_ELEMENTS = frozenset({"H", "D", "T"})
 _MOLECULE_TYPES = {"protein": 0, "dna": 1, "rna": 2}
 _UNKNOWN_RESIDUE_TYPES = {"protein": 22, "rna": 27, "dna": 32}
+_POLYMER_TYPE = {
+    ENTITY_PROTEIN: "protein",
+    ENTITY_RNA: "rna",
+    ENTITY_DNA: "dna",
+}
 _MSA_GAP = 1
 _STANDARD_LOCAL_SYMMETRY = {
     "ASP": (("OD1", "OD2"), ("OD2", "OD1")),
@@ -194,7 +210,8 @@ class Boltz1Processor(Processor):
 
         Returns:
             Batched token, atom, MSA, and pocket tensors. Reference coordinates
-            are in angstroms; tensor axes align to ``layout``.
+            are in angstroms; canonical integer indices bind the family atom
+            and token axes to ``system``.
         """
 
         if isinstance(input, Structure):
@@ -203,15 +220,17 @@ class Boltz1Processor(Processor):
         else:
             structure = None
             system = input
-        if not system.instances:
+        if system.system_entity_ptr.numel() != 2:
+            raise ValueError("Boltz-1 Processor accepts one canonical molecular system")
+        if not system.instance_symbol.numel():
             raise ValueError("Boltz-1 requires at least one molecular instance")
 
-        if msa is not None:
-            resolve_msa_bindings(msa, system)
+        resolved_msa = () if msa is None else resolve_msa_bindings(msa, system)
         return _prepare_boltz1_features(
             system,
             structure=structure,
             msa=msa,
+            msa_bindings=resolved_msa,
             pocket=pocket,
             device=self.device,
             dtype=self.dtype,
@@ -238,8 +257,7 @@ class Boltz1Processor(Processor):
         )
         return processed, _prepare_boltz1_target(
             input,
-            cast(Boltz1Layout, processed.layout),
-            padded_atom_count=processed.atom_mask.shape[-1],
+            processed.atom_index,
             device=self.device,
             dtype=self.dtype,
         )
@@ -250,146 +268,167 @@ def _prepare_boltz1_features(
     *,
     structure: Structure | None,
     msa: MSA | MSACollection | None,
+    msa_bindings: tuple[tuple[MSA, int | None, int], ...],
     pocket: Boltz1Pocket | None = None,
     device: torch.device,
     dtype: torch.dtype,
     generator: torch.Generator | None = None,
 ) -> Boltz1Input:
     r"""
-    Build the Boltz-1 token, atom, MSA, and identity layout.
+    Build Boltz-1 tensors directly from the canonical molecular graph.
     """
 
-    available_sites = {site for site, atom in system.iter_atoms() if atom.element not in _MODEL_HYDROGEN_ELEMENTS}
-    entity_index_by_id: dict[str, int] = {}
-    instance_count_by_entity: dict[str, int] = {}
+    instance_components = system.instance_component_ptr.detach().cpu().tolist()
+    component_atoms = system.component_atom_ptr.detach().cpu().tolist()
+    instance_entities = system.instance_entity.detach().cpu().tolist()
+    entity_types = system.entity_type.detach().cpu().tolist()
+    component_symbols = system.component_symbol.detach().cpu().tolist()
+    atom_symbols = system.atom_symbol.detach().cpu().tolist()
+    atomic_numbers = system.atomic_number.detach().cpu().tolist()
+    atom_component_index = _atom_component_index(system)
+    atom_components = atom_component_index.detach().cpu().tolist()
+    instance_count_by_entity: dict[int, int] = {}
     tokens: list[dict[str, object]] = []
 
-    for chain_index, (instance_id, entity_id) in enumerate(system.instances.items()):
-        entity = system.entities[entity_id]
-        entity_index = entity_index_by_id.setdefault(entity_id, len(entity_index_by_id))
-        symmetry_index = instance_count_by_entity.get(entity_id, 0)
-        instance_count_by_entity[entity_id] = symmetry_index + 1
-        if isinstance(entity, PolymerSequence):
-            molecule_type = _MOLECULE_TYPES[entity.polymer_type]
-            standards = _STANDARD_COMPONENTS[entity.polymer_type]
-            for monomer_index, component in enumerate(entity.components):
-                component_id = component.component_id
-                atom_sites = tuple(
-                    site
-                    for atom in component.atoms
-                    if atom.element not in _MODEL_HYDROGEN_ELEMENTS
-                    and atom.atom_id not in {"OXT", "OP3"}
-                    and (site := AtomSite(instance_id, monomer_index, atom.atom_id)) in available_sites
+    for instance_index, entity_index in enumerate(instance_entities):
+        entity_type = entity_types[entity_index]
+        symmetry_index = instance_count_by_entity.get(entity_index, 0)
+        instance_count_by_entity[entity_index] = symmetry_index + 1
+        component_start = instance_components[instance_index]
+        component_stop = instance_components[instance_index + 1]
+        if entity_type != ENTITY_MOLECULE:
+            standards = _STANDARD_BY_ENTITY_TYPE.get(entity_type, frozenset())
+            for component_index in range(component_start, component_stop):
+                monomer_index = component_index - component_start
+                component_id = system.symbols[component_symbols[component_index]]
+                atom_indices = tuple(
+                    atom_index
+                    for atom_index in range(
+                        component_atoms[component_index],
+                        component_atoms[component_index + 1],
+                    )
+                    if atomic_numbers[atom_index] != 1
+                    and system.symbols[atom_symbols[atom_index]] not in {"OXT", "OP3"}
                 )
-                if not atom_sites:
+                if not atom_indices:
                     raise ValueError(f"component {component_id!r} has no model-visible heavy atoms")
                 is_standard = component_id in standards
+                polymer_type = _component_polymer_type(
+                    entity_type,
+                    component_id,
+                )
                 common = {
-                    "instance_id": instance_id,
-                    "entity_id": entity_id,
+                    "component_index": component_index,
+                    "instance_index": instance_index,
+                    "entity_index": entity_index,
                     "monomer_index": monomer_index,
                     "residue_index": monomer_index,
-                    "chain_index": chain_index,
-                    "entity_index": entity_index,
+                    "chain_index": instance_index,
                     "symmetry_index": symmetry_index,
-                    "molecule_type": molecule_type,
+                    "molecule_type": (3 if polymer_type is None else _MOLECULE_TYPES[polymer_type]),
                 }
                 if not is_standard:
-                    for site in atom_sites:
+                    residue_type = 22 if polymer_type is None else _UNKNOWN_RESIDUE_TYPES[polymer_type]
+                    for atom_index in atom_indices:
                         tokens.append(
                             {
                                 **common,
-                                "atom_sites": (site,),
-                                "token_site": site,
-                                "residue_type": _UNKNOWN_RESIDUE_TYPES[entity.polymer_type],
-                                "center_site": site,
-                                "distogram_site": site,
-                                "frame_sites": (site, site, site),
+                                "atoms": (atom_index,),
+                                "atom_index": atom_index,
+                                "residue_type": residue_type,
+                                "center": atom_index,
+                                "distogram": atom_index,
+                                "frame": (atom_index, atom_index, atom_index),
                             }
                         )
                     continue
 
-                by_name = {site.atom_id: site for site in atom_sites}
-                center_name = "CA" if entity.polymer_type == "protein" else "C1'"
-                if entity.polymer_type == "protein":
+                by_name = {system.symbols[atom_symbols[atom_index]]: atom_index for atom_index in atom_indices}
+                center_name = "CA" if polymer_type == "protein" else "C1'"
+                if polymer_type == "protein":
                     distogram_name = "CA" if component_id == "GLY" else "CB"
                     frame_names = ("N", "CA", "C")
                 else:
                     distogram_name = "C4" if component_id in {"A", "G", "DA", "DG"} else "C2"
                     frame_names = ("C1'", "C3'", "C4'")
-                center_site = by_name.get(center_name, atom_sites[0])
-                distogram_site = by_name.get(distogram_name, center_site)
+                center = by_name.get(center_name, atom_indices[0])
+                distogram = by_name.get(distogram_name, center)
                 tokens.append(
                     {
                         **common,
-                        "atom_sites": atom_sites,
-                        "token_site": (instance_id, monomer_index),
-                        "residue_type": _residue_type(component_id, entity.polymer_type),
-                        "center_site": center_site,
-                        "distogram_site": distogram_site,
-                        "frame_sites": tuple(by_name.get(name, center_site) for name in frame_names),
+                        "atoms": atom_indices,
+                        "atom_index": None,
+                        "residue_type": _residue_type(
+                            component_id,
+                            cast(str, polymer_type),
+                        ),
+                        "center": center,
+                        "distogram": distogram,
+                        "frame": tuple(by_name.get(name, center) for name in frame_names),
                     }
                 )
         else:
-            atom_sites = tuple(
-                site
-                for component_index, component in enumerate(entity.components)
-                for atom in component.atoms
-                if atom.element not in _MODEL_HYDROGEN_ELEMENTS
-                and (site := AtomSite(instance_id, component_index, atom.atom_id)) in available_sites
+            atom_indices = tuple(
+                atom_index
+                for component_index in range(component_start, component_stop)
+                for atom_index in range(
+                    component_atoms[component_index],
+                    component_atoms[component_index + 1],
+                )
+                if atomic_numbers[atom_index] != 1
             )
-            if not atom_sites:
-                raise ValueError(f"molecule {instance_id!r} has no model-visible heavy atoms")
-            for site in atom_sites:
+            if not atom_indices:
+                raise ValueError(f"molecule {system.instance_id(instance_index)!r} " "has no model-visible heavy atoms")
+            for atom_index in atom_indices:
                 tokens.append(
                     {
-                        "atom_sites": (site,),
-                        "token_site": site,
-                        "instance_id": instance_id,
-                        "entity_id": entity_id,
+                        "atoms": (atom_index,),
+                        "atom_index": atom_index,
+                        "component_index": atom_components[atom_index],
+                        "instance_index": instance_index,
+                        "entity_index": entity_index,
                         "monomer_index": None,
                         "residue_index": 0,
-                        "chain_index": chain_index,
-                        "entity_index": entity_index,
+                        "chain_index": instance_index,
                         "symmetry_index": symmetry_index,
                         "molecule_type": 3,
                         "residue_type": 22,
-                        "center_site": site,
-                        "distogram_site": site,
-                        "frame_sites": (site, site, site),
+                        "center": atom_index,
+                        "distogram": atom_index,
+                        "frame": (atom_index, atom_index, atom_index),
                     }
                 )
 
-    atom_sites = tuple(site for token in tokens for site in cast(tuple[AtomSite, ...], token["atom_sites"]))
-    site_to_atom = {site: index for index, site in enumerate(atom_sites)}
-    site_to_token = {
-        site: token_index
+    atom_indices = tuple(atom_index for token in tokens for atom_index in cast(tuple[int, ...], token["atoms"]))
+    system_to_model_atom = {atom_index: model_atom_index for model_atom_index, atom_index in enumerate(atom_indices)}
+    system_atom_to_token = {
+        atom_index: token_index
         for token_index, token in enumerate(tokens)
-        for site in cast(tuple[AtomSite, ...], token["atom_sites"])
+        for atom_index in cast(tuple[int, ...], token["atoms"])
     }
-    atom_count = len(atom_sites)
+    atom_count = len(atom_indices)
     padded_atom_count = max(32, math.ceil(atom_count / 32) * 32)
-    reference_coordinates = _reference_coordinates(system, atom_sites)
-    reference_space_by_residue: dict[tuple[str, int], int] = {}
-    reference_space_ids = [
-        reference_space_by_residue.setdefault(
-            (site.instance_id, site.component_index),
-            len(reference_space_by_residue),
-        )
-        for site in atom_sites
-    ]
+    reference_coordinates = _reference_coordinates(system, atom_indices)
+    reference_space_ids = (
+        atom_component_index[torch.tensor(atom_indices, device=atom_component_index.device)].detach().cpu()
+    )
     resolved = torch.zeros(atom_count, dtype=torch.bool)
     if structure is not None:
-        coordinate_index = {site: index for index, site in enumerate(structure.sites)}
-        for atom_index, site in enumerate(atom_sites):
-            source_index = coordinate_index.get(site)
-            if source_index is not None and bool(structure.coordinate_mask[source_index]):
-                resolved[atom_index] = True
+        resolved = (
+            structure.coordinate_mask[
+                torch.tensor(
+                    atom_indices,
+                    device=structure.coordinate_mask.device,
+                )
+            ]
+            .detach()
+            .cpu()
+        )
 
     reference_positions = torch.zeros(padded_atom_count, 3)
-    reference_positions[:atom_count] = torch.tensor(reference_coordinates)
+    reference_positions[:atom_count] = reference_coordinates
     reference_space_id = torch.zeros(padded_atom_count, dtype=torch.long)
-    reference_space_id[:atom_count] = torch.tensor(reference_space_ids)
+    reference_space_id[:atom_count] = reference_space_ids
     _augment_reference_positions(
         reference_positions[:atom_count],
         reference_space_id[:atom_count],
@@ -403,21 +442,24 @@ def _prepare_boltz1_features(
     atom_mask = torch.zeros(padded_atom_count, dtype=torch.bool)
     atom_to_token = torch.zeros(padded_atom_count, dtype=torch.long)
     atom_token_index = torch.zeros(padded_atom_count, dtype=torch.long)
-    atom_names = _model_atom_names(system, atom_sites)
-    from rdkit.Chem import GetPeriodicTable
-
-    periodic_table = GetPeriodicTable()
-    for atom_index, (site, atom_name) in enumerate(zip(atom_sites, atom_names)):
-        atom = system.atom(site)
-        atomic_number[atom_index] = periodic_table.GetAtomicNumber(atom.element)
-        reference_charges[atom_index] = atom.formal_charge
-        atom_name_characters[atom_index] = torch.tensor(
+    atom_names = _model_atom_names(system, atom_indices)
+    canonical_atom_index = torch.tensor(
+        atom_indices,
+        device=system.atomic_number.device,
+    )
+    atomic_number[:atom_count] = system.atomic_number[canonical_atom_index].detach().cpu().long()
+    reference_charges[:atom_count] = system.formal_charge[canonical_atom_index].detach().cpu().float()
+    for model_atom_index, (system_atom_index, atom_name) in enumerate(zip(atom_indices, atom_names)):
+        atom_name_characters[model_atom_index] = torch.tensor(
             [ord(character) - 32 if character != " " else 0 for character in atom_name.ljust(4)]
         )
-        atom_mask[atom_index] = True
-        token_index = site_to_token[site]
-        atom_to_token[atom_index] = token_index
-        atom_token_index[atom_index] = cast(tuple[AtomSite, ...], tokens[token_index]["atom_sites"]).index(site)
+        atom_mask[model_atom_index] = True
+        token_index = system_atom_to_token[system_atom_index]
+        atom_to_token[model_atom_index] = token_index
+        atom_token_index[model_atom_index] = cast(
+            tuple[int, ...],
+            tokens[token_index]["atoms"],
+        ).index(system_atom_index)
 
     # Boltz-1 reference-atom features contain positions (3), charge (1), mask (1),
     # element (128), and atom-name characters (4x64=256). The mask channel at index 4
@@ -434,30 +476,35 @@ def _prepare_boltz1_features(
     )
     token_count = len(tokens)
     token_center_atom_index = torch.tensor(
-        [site_to_atom[cast(AtomSite, token["center_site"])] for token in tokens],
+        [system_to_model_atom[cast(int, token["center"])] for token in tokens],
         dtype=torch.long,
     )
     token_distogram_atom_index = torch.tensor(
-        [site_to_atom[cast(AtomSite, token["distogram_site"])] for token in tokens],
+        [system_to_model_atom[cast(int, token["distogram"])] for token in tokens],
         dtype=torch.long,
     )
-    token_bonds = _token_bond_indicator(system, site_to_token, token_count)
-    msa_values = _msa_features(msa, tokens, system)
+    token_bonds = _token_bond_indicator(
+        system,
+        system_atom_to_token,
+        token_count,
+    )
+    msa_values = _msa_features(msa, msa_bindings, tokens, system)
     molecule_types = torch.tensor([cast(int, token["molecule_type"]) for token in tokens])
     residue_types = torch.tensor([cast(int, token["residue_type"]) for token in tokens])
     frame_atom_index = torch.tensor(
         [
-            [site_to_atom[site] for site in cast(tuple[AtomSite, AtomSite, AtomSite], token["frame_sites"])]
+            [system_to_model_atom[atom_index] for atom_index in cast(tuple[int, int, int], token["frame"])]
             for token in tokens
         ],
         dtype=torch.long,
     )
+    cyclic_period_by_instance = _cyclic_periods(system)
     cyclic_period = torch.tensor(
-        [_cyclic_period(system, cast(str, token["instance_id"])) for token in tokens],
+        [cyclic_period_by_instance[cast(int, token["instance_index"])] for token in tokens],
         dtype=torch.float32,
     )
     pocket_feature = _pocket_feature(pocket, tokens, system)
-    steering_features = _steering_features(system, site_to_atom)
+    steering_features = _steering_features(system, system_to_model_atom)
 
     tensor_values: dict[str, Tensor] = {
         "token_mask": torch.ones(token_count, dtype=torch.bool),
@@ -491,60 +538,80 @@ def _prepare_boltz1_features(
     }
     return Boltz1Input(  # type: ignore[call-arg]
         **{name: value.unsqueeze(0) for name, value in placed.items()},
-        layout=Boltz1Layout(
-            system=system,
-            atom_sites=atom_sites,
-            token_sites=tuple(cast(AtomSite | tuple[str, int], token["token_site"]) for token in tokens),
+        system=system,
+        atom_index=torch.cat(
+            (
+                torch.tensor(atom_indices, device=device),
+                torch.full(
+                    (padded_atom_count - atom_count,),
+                    -1,
+                    dtype=torch.long,
+                    device=device,
+                ),
+            )
+        ).unsqueeze(0),
+        token_component_index=torch.tensor(
+            [cast(int, token["component_index"]) for token in tokens],
+            dtype=torch.long,
+            device=device,
+        ).unsqueeze(0),
+        token_atom_index=torch.tensor(
+            [-1 if token["atom_index"] is None else cast(int, token["atom_index"]) for token in tokens],
+            dtype=torch.long,
+            device=device,
+        ).unsqueeze(0),
+        batch_size=[],
+    )
+
+
+def _atom_component_index(system: MolecularSystem) -> Tensor:
+    return torch.repeat_interleave(
+        torch.arange(
+            system.component_symbol.numel(),
+            device=system.component_atom_ptr.device,
         ),
-        batch_size=[1],
+        system.component_atom_ptr[1:] - system.component_atom_ptr[:-1],
     )
 
 
 def _prepare_boltz1_target(
     structure: Structure,
-    layout: Boltz1Layout,
+    atom_index: Tensor,
     *,
-    padded_atom_count: int,
     device: torch.device,
     dtype: torch.dtype,
 ) -> Boltz1StructureTarget:
     r"""
-    Lower complete pre-crop structure truth and its discrete symmetry candidates.
+    Lower full-axis canonical truth and its discrete symmetry candidates.
     """
 
-    atom_sites = layout.atom_sites
-    coordinate_index = {site: index for index, site in enumerate(structure.sites)}
-    source_coordinates = torch.from_numpy(structure.coordinates)
-    coordinates = torch.zeros(
-        len(atom_sites),
-        3,
-        dtype=source_coordinates.dtype,
-    )
-    coordinate_mask = torch.zeros(len(atom_sites), dtype=torch.bool)
-    for atom_index, site in enumerate(atom_sites):
-        source_index = coordinate_index.get(site)
-        if source_index is not None and bool(structure.coordinate_mask[source_index]):
-            coordinates[atom_index] = source_coordinates[source_index]
-            coordinate_mask[atom_index] = True
-
-    atom_index = torch.full(
-        (padded_atom_count,),
-        -1,
-        dtype=torch.long,
-    )
-    atom_index[: len(atom_sites)] = torch.arange(len(atom_sites))
-
-    chain_span = []
-    chain_equivalence = []
-    equivalence_by_layout: dict[tuple[str, tuple[tuple[int, str], ...]], int] = {}
-    chain_start = 0
-    for instance_id, entity_id in structure.system.instances.items():
-        instance_sites = tuple(site for site in atom_sites if site.instance_id == instance_id)
-        chain_end = chain_start + len(instance_sites)
-        chain_span.append((chain_start, chain_end))
+    system = structure.system
+    instance_components = system.instance_component_ptr.detach().cpu().tolist()
+    component_atoms = system.component_atom_ptr.detach().cpu().tolist()
+    instance_entities = system.instance_entity.detach().cpu().tolist()
+    atom_symbols = system.atom_symbol.detach().cpu().tolist()
+    chain_span: list[tuple[int, int]] = []
+    chain_equivalence: list[int] = []
+    equivalence_by_layout: dict[tuple[int, tuple[tuple[int, int], ...]], int] = {}
+    for instance_index, entity_index in enumerate(instance_entities):
+        component_start = instance_components[instance_index]
+        component_stop = instance_components[instance_index + 1]
+        atom_start = component_atoms[component_start]
+        atom_stop = component_atoms[component_stop]
+        chain_span.append((atom_start, atom_stop))
         layout_key = (
-            entity_id,
-            tuple((site.component_index, site.atom_id) for site in instance_sites),
+            entity_index,
+            tuple(
+                (
+                    component_index - component_start,
+                    atom_symbols[system_atom_index],
+                )
+                for component_index in range(component_start, component_stop)
+                for system_atom_index in range(
+                    component_atoms[component_index],
+                    component_atoms[component_index + 1],
+                )
+            ),
         )
         chain_equivalence.append(
             equivalence_by_layout.setdefault(
@@ -552,16 +619,17 @@ def _prepare_boltz1_target(
                 len(equivalence_by_layout),
             )
         )
-        chain_start = chain_end
 
     symmetry_atom_index, symmetry_permutation = _truth_symmetry_features(
-        structure.system,
-        atom_sites,
+        system,
+        tuple(int(value) for value in atom_index[0].detach().cpu().tolist() if value >= 0),
     )
     return Boltz1StructureTarget(  # type: ignore[call-arg]
-        coordinates=coordinates.to(device=device, dtype=dtype).unsqueeze(0),
-        coordinate_mask=coordinate_mask.to(device=device).unsqueeze(0),
-        atom_index=atom_index.to(device=device).unsqueeze(0),
+        coordinates=structure.coordinates.to(
+            device=device,
+            dtype=dtype,
+        ).unsqueeze(0),
+        coordinate_mask=structure.coordinate_mask.to(device=device).unsqueeze(0),
         chain_span=torch.tensor(
             chain_span,
             dtype=torch.long,
@@ -580,41 +648,65 @@ def _prepare_boltz1_target(
 
 def _truth_symmetry_features(
     system: MolecularSystem,
-    atom_sites: tuple[AtomSite, ...],
+    atom_indices: tuple[int, ...],
 ) -> tuple[Tensor, Tensor]:
     r"""
     Build complete local permutations in stable model-occurrence order.
     """
 
-    site_to_atom = {site: index for index, site in enumerate(atom_sites)}
+    system_to_model_atom = {atom_index: model_atom_index for model_atom_index, atom_index in enumerate(atom_indices)}
+    component_instance = (
+        torch.repeat_interleave(
+            torch.arange(
+                system.instance_symbol.numel(),
+                device=system.instance_component_ptr.device,
+            ),
+            system.instance_component_ptr[1:] - system.instance_component_ptr[:-1],
+        )
+        .detach()
+        .cpu()
+        .tolist()
+    )
+    instance_entities = system.instance_entity.detach().cpu().tolist()
+    entity_types = system.entity_type.detach().cpu().tolist()
+    component_symbols = system.component_symbol.detach().cpu().tolist()
+    component_atoms = system.component_atom_ptr.detach().cpu().tolist()
+    atom_symbols = system.atom_symbol.detach().cpu().tolist()
     groups: list[tuple[tuple[int, ...], tuple[tuple[int, ...], ...]]] = []
-    for instance_id, entity_id in system.instances.items():
-        entity = system.entities[entity_id]
-        for component_index, component in enumerate(entity.components):
-            standard = _STANDARD_LOCAL_SYMMETRY.get(component.component_id)
-            if (
-                isinstance(entity, PolymerSequence)
-                and component.component_id in _STANDARD_COMPONENTS[entity.polymer_type]
-            ):
-                if standard is not None:
-                    permutations = tuple(
-                        tuple(site_to_atom[AtomSite(instance_id, component_index, atom_id)] for atom_id in names)
-                        for names in standard
-                        if all(AtomSite(instance_id, component_index, atom_id) in site_to_atom for atom_id in names)
+    for component_index, instance_index in enumerate(component_instance):
+        entity_index = instance_entities[instance_index]
+        entity_type = entity_types[entity_index]
+        component_id = system.symbols[component_symbols[component_index]]
+        standard = _STANDARD_LOCAL_SYMMETRY.get(component_id)
+        if component_id in _STANDARD_BY_ENTITY_TYPE.get(
+            entity_type,
+            frozenset(),
+        ):
+            if standard is not None:
+                by_name = {
+                    system.symbols[atom_symbols[atom_index]]: atom_index
+                    for atom_index in range(
+                        component_atoms[component_index],
+                        component_atoms[component_index + 1],
                     )
-                    if len(permutations) > 1:
-                        groups.append((permutations[0], permutations))
-                continue
+                    if atom_index in system_to_model_atom
+                }
+                permutations = tuple(
+                    tuple(system_to_model_atom[by_name[atom_id]] for atom_id in names)
+                    for names in standard
+                    if all(atom_id in by_name for atom_id in names)
+                )
+                if len(permutations) > 1:
+                    groups.append((permutations[0], permutations))
+            continue
 
-            rdkit_group = _rdkit_symmetry_group(
-                system,
-                instance_id,
-                component_index,
-                component,
-                site_to_atom,
-            )
-            if rdkit_group is not None:
-                groups.append(rdkit_group)
+        rdkit_group = _rdkit_symmetry_group(
+            system,
+            component_index,
+            system_to_model_atom,
+        )
+        if rdkit_group is not None:
+            groups.append(rdkit_group)
 
     if not groups:
         return (
@@ -643,43 +735,51 @@ def _truth_symmetry_features(
 
 def _rdkit_symmetry_group(
     system: MolecularSystem,
-    instance_id: str,
     component_index: int,
-    component: ChemicalComponent,
-    site_to_atom: dict[AtomSite, int],
+    system_to_model_atom: dict[int, int],
 ) -> tuple[tuple[int, ...], tuple[tuple[int, ...], ...]] | None:
     from rdkit import Chem
 
-    atoms = component.atoms
+    if not bool(system.component_topology_complete[component_index]):
+        return None
+    atom_start = int(system.component_atom_ptr[component_index])
+    atom_stop = int(system.component_atom_ptr[component_index + 1])
     visible_local_index = [
-        local_index
-        for local_index, atom in enumerate(atoms)
-        if AtomSite(instance_id, component_index, atom.atom_id) in site_to_atom
+        atom_index - atom_start for atom_index in range(atom_start, atom_stop) if atom_index in system_to_model_atom
     ]
     if len(visible_local_index) < 2:
         return None
 
-    molecule = _canonical_rdkit_molecule(Molecule((component,)))
-    boundary_atom_ids = _component_boundary_atom_ids(
+    edge_indices = (
+        (
+            (system.edge_index[0] >= atom_start)
+            & (system.edge_index[1] < atom_stop)
+            & (system.bond_role == BOND_ROLE_COMPONENT)
+        )
+        .nonzero(as_tuple=False)
+        .flatten()
+        .detach()
+        .cpu()
+        .tolist()
+    )
+    molecule = _canonical_rdkit_molecule(
         system,
-        instance_id,
+        tuple(range(atom_start, atom_stop)),
+        edge_indices,
+    )
+    boundary_atoms = _component_boundary_atoms(
+        system,
         component_index,
     )
-    for boundary_index, atom_id in enumerate(sorted(boundary_atom_ids), start=1):
-        local_index = next(index for index, atom in enumerate(atoms) if atom.atom_id == atom_id)
+    for boundary_index, atom_index in enumerate(
+        sorted(boundary_atoms),
+        start=1,
+    ):
+        local_index = atom_index - atom_start
         molecule.GetAtomWithIdx(local_index).SetIsotope(1000 + boundary_index)
     Chem.AssignStereochemistry(molecule, force=True, cleanIt=True)
 
-    identity = tuple(
-        site_to_atom[
-            AtomSite(
-                instance_id,
-                component_index,
-                atoms[local_index].atom_id,
-            )
-        ]
-        for local_index in visible_local_index
-    )
+    identity = tuple(system_to_model_atom[atom_start + local_index] for local_index in visible_local_index)
     permutations = {identity}
     for match in molecule.GetSubstructMatches(
         molecule,
@@ -690,41 +790,32 @@ def _rdkit_symmetry_group(
         mapped_local_index = tuple(match[index] for index in visible_local_index)
         if set(mapped_local_index) != set(visible_local_index):
             continue
-        permutations.add(
-            tuple(
-                site_to_atom[
-                    AtomSite(
-                        instance_id,
-                        component_index,
-                        atoms[index].atom_id,
-                    )
-                ]
-                for index in mapped_local_index
-            )
-        )
+        permutations.add(tuple(system_to_model_atom[atom_start + index] for index in mapped_local_index))
     if len(permutations) == 1:
         return None
     ordered = (identity, *sorted(permutations - {identity}))
     return identity, ordered
 
 
-def _component_boundary_atom_ids(
+def _component_boundary_atoms(
     system: MolecularSystem,
-    instance_id: str,
     component_index: int,
-) -> set[str]:
-    boundary = set()
-    for bond in system.iter_bonds():
-        for site, other in (
-            (bond.site_a, bond.site_b),
-            (bond.site_b, bond.site_a),
-        ):
-            if (
-                site.instance_id == instance_id
-                and site.component_index == component_index
-                and (other.instance_id != instance_id or other.component_index != component_index)
-            ):
-                boundary.add(site.atom_id)
+) -> set[int]:
+    atom_start = int(system.component_atom_ptr[component_index])
+    atom_stop = int(system.component_atom_ptr[component_index + 1])
+    first_inside = (system.edge_index[0] >= atom_start) & (system.edge_index[0] < atom_stop)
+    second_inside = (system.edge_index[1] >= atom_start) & (system.edge_index[1] < atom_stop)
+    boundary: set[int] = set()
+    for first, second, first_is_inside, second_is_inside in zip(
+        system.edge_index[0].detach().cpu().tolist(),
+        system.edge_index[1].detach().cpu().tolist(),
+        first_inside.detach().cpu().tolist(),
+        second_inside.detach().cpu().tolist(),
+    ):
+        if first_is_inside and not second_is_inside:
+            boundary.add(first)
+        elif second_is_inside and not first_is_inside:
+            boundary.add(second)
     return boundary
 
 
@@ -748,26 +839,34 @@ def _pocket_feature(
             _POCKET_SIZE,
         ).float()
 
-    if pocket.binder not in system.instances:
+    try:
+        binder_instance = system.instance_index(pocket.binder)
+    except KeyError:
         raise ValueError(f"pocket binder instance {pocket.binder!r} is not in the input system")
 
-    def token_reference(token: dict[str, object]) -> ComponentReference:
-        site = token["token_site"]
-        if isinstance(site, AtomSite):
-            return (site.instance_id, site.component_index)
-        return cast(ComponentReference, site)
-
-    pocket_refs = set(pocket.pocket)
-    available = {token_reference(token) for token in tokens}
-    unresolved = pocket_refs - available
+    pocket_components: set[int] = set()
+    unresolved: set[ComponentReference] = set()
+    resolved_references: list[tuple[ComponentReference, int]] = []
+    for reference in pocket.pocket:
+        try:
+            component_index = system.component_index(reference)
+        except (KeyError, IndexError):
+            unresolved.add(reference)
+        else:
+            pocket_components.add(component_index)
+            resolved_references.append((reference, component_index))
+    available = {cast(int, token["component_index"]) for token in tokens}
+    unresolved.update(
+        reference for reference, component_index in resolved_references if component_index not in available
+    )
     if unresolved:
         raise ValueError(f"pocket references do not resolve to any token: {sorted(unresolved)}")
 
     labels = []
     for token in tokens:
-        if token["instance_id"] == pocket.binder:
+        if token["instance_index"] == binder_instance:
             labels.append(_POCKET_BINDER)
-        elif token_reference(token) in pocket_refs:
+        elif token["component_index"] in pocket_components:
             labels.append(_POCKET_POCKET)
         else:
             labels.append(_POCKET_UNSELECTED)
@@ -776,7 +875,7 @@ def _pocket_feature(
 
 def _token_bond_indicator(
     system: MolecularSystem,
-    site_to_token: dict[AtomSite, int],
+    system_atom_to_token: dict[int, int],
     token_count: int,
 ) -> Tensor:
     r"""
@@ -785,36 +884,25 @@ def _token_bond_indicator(
 
     token_bonds = torch.zeros(token_count, token_count)
 
-    def add(site_a: AtomSite, site_b: AtomSite) -> None:
-        token_a = site_to_token.get(site_a)
-        token_b = site_to_token.get(site_b)
+    def add(atom_a: int, atom_b: int) -> None:
+        token_a = system_atom_to_token.get(atom_a)
+        token_b = system_atom_to_token.get(atom_b)
         if token_a is None or token_b is None or token_a == token_b:
             return
         token_bonds[token_a, token_b] = token_bonds[token_b, token_a] = 1
 
-    for instance_id, entity_id in system.instances.items():
-        entity = system.entities[entity_id]
-        for component_index, component in enumerate(entity.components):
-            for component_bond in component.bonds or ():
-                add(
-                    AtomSite(instance_id, component_index, component_bond.atom_a),
-                    AtomSite(instance_id, component_index, component_bond.atom_b),
-                )
-        if not isinstance(entity, Molecule):
+    edge_rows = system.edge_index.detach().cpu().T.tolist()
+    bond_roles = system.bond_role.detach().cpu().tolist()
+    for (atom_a, atom_b), bond_role in zip(edge_rows, bond_roles):
+        if bond_role == BOND_ROLE_POLYMER:
             continue
-        for molecule_bond in entity.bonds:
-            add(
-                AtomSite(instance_id, molecule_bond.component_a, molecule_bond.atom_a),
-                AtomSite(instance_id, molecule_bond.component_b, molecule_bond.atom_b),
-            )
-    for system_bond in system.bonds:
-        add(system_bond.site_a, system_bond.site_b)
+        add(atom_a, atom_b)
     return token_bonds
 
 
 def _steering_features(
     system: MolecularSystem,
-    site_to_atom: dict[AtomSite, int],
+    system_to_model_atom: dict[int, int],
 ) -> dict[str, Tensor]:
     r"""
     Lower molecular geometry, assembly connections, and entity copies for Boltz-1x.
@@ -832,29 +920,78 @@ def _steering_features(
     planar_bonds: list[tuple[int, int, int, int, int, int]] = []
     constraint_scopes: list[tuple[Mol, dict[int, int]]] = []
 
-    for instance_id, entity_id in system.instances.items():
-        entity = system.entities[entity_id]
-        if isinstance(entity, PolymerSequence):
-            for component_index, component in enumerate(entity.components):
-                if component.component_id in _CONSTRAINT_FREE_COMPONENTS[entity.polymer_type]:
+    instance_components = system.instance_component_ptr.detach().cpu().tolist()
+    component_atoms = system.component_atom_ptr.detach().cpu().tolist()
+    instance_entities = system.instance_entity.detach().cpu().tolist()
+    entity_types = system.entity_type.detach().cpu().tolist()
+    component_symbols = system.component_symbol.detach().cpu().tolist()
+    for instance_index, entity_index in enumerate(instance_entities):
+        component_start = instance_components[instance_index]
+        component_stop = instance_components[instance_index + 1]
+        entity_type = entity_types[entity_index]
+        if entity_type != ENTITY_MOLECULE:
+            for component_index in range(component_start, component_stop):
+                component_id = system.symbols[component_symbols[component_index]]
+                polymer_type = _component_polymer_type(
+                    entity_type,
+                    component_id,
+                )
+                if polymer_type is not None and component_id in _CONSTRAINT_FREE_COMPONENTS[polymer_type]:
                     continue
-                rdkit_molecule = _canonical_rdkit_molecule(Molecule((component,)))
+                if not bool(system.component_topology_complete[component_index]):
+                    continue
+                atom_start = component_atoms[component_index]
+                atom_stop = component_atoms[component_index + 1]
+                edge_indices = (
+                    (
+                        (system.edge_index[0] >= atom_start)
+                        & (system.edge_index[1] < atom_stop)
+                        & (system.bond_role == BOND_ROLE_COMPONENT)
+                    )
+                    .nonzero(as_tuple=False)
+                    .flatten()
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+                rdkit_molecule = _canonical_rdkit_molecule(
+                    system,
+                    tuple(range(atom_start, atom_stop)),
+                    edge_indices,
+                )
                 component_atom_index = {
-                    local_index: site_to_atom[site]
-                    for local_index, atom in enumerate(component.atoms)
-                    if (site := AtomSite(instance_id, component_index, atom.atom_id)) in site_to_atom
+                    atom_index - atom_start: system_to_model_atom[atom_index]
+                    for atom_index in range(atom_start, atom_stop)
+                    if atom_index in system_to_model_atom
                 }
                 constraint_scopes.append((rdkit_molecule, component_atom_index))
         else:
-            rdkit_molecule = _canonical_rdkit_molecule(entity)
-            molecule_atom_index: dict[int, int] = {}
-            local_index = 0
-            for component_index, component in enumerate(entity.components):
-                for atom in component.atoms:
-                    site = AtomSite(instance_id, component_index, atom.atom_id)
-                    if site in site_to_atom:
-                        molecule_atom_index[local_index] = site_to_atom[site]
-                    local_index += 1
+            if not bool(system.component_topology_complete[component_start:component_stop].all()):
+                continue
+            atom_start = component_atoms[component_start]
+            atom_stop = component_atoms[component_stop]
+            edge_indices = (
+                (
+                    (system.edge_index[0] >= atom_start)
+                    & (system.edge_index[1] < atom_stop)
+                    & (system.bond_role <= BOND_ROLE_ENTITY)
+                )
+                .nonzero(as_tuple=False)
+                .flatten()
+                .detach()
+                .cpu()
+                .tolist()
+            )
+            rdkit_molecule = _canonical_rdkit_molecule(
+                system,
+                tuple(range(atom_start, atom_stop)),
+                edge_indices,
+            )
+            molecule_atom_index = {
+                atom_index - atom_start: system_to_model_atom[atom_index]
+                for atom_index in range(atom_start, atom_stop)
+                if atom_index in system_to_model_atom
+            }
             constraint_scopes.append((rdkit_molecule, molecule_atom_index))
 
     for rdkit_molecule, atom_index in constraint_scopes:
@@ -881,29 +1018,40 @@ def _steering_features(
         stereo_is_e.extend(scope_stereo_is_e)
         planar_bonds.extend(scope_planar_bonds)
 
-    chain_index = {instance_id: index for index, instance_id in enumerate(system.instances)}
-    connections = [bond for bond in system.bonds if bond.site_a in site_to_atom and bond.site_b in site_to_atom]
-    connections.sort(
-        key=lambda bond: (
-            min(site_to_atom[bond.site_a], site_to_atom[bond.site_b]),
-            max(site_to_atom[bond.site_a], site_to_atom[bond.site_b]),
-            bond.order,
-            bond.aromatic,
-            bond.stereo or "",
-            bond.origin,
-            repr(bond.stereo_sites),
-        )
+    atom_component = _atom_component_index(system)
+    component_instance = torch.repeat_interleave(
+        torch.arange(
+            system.instance_symbol.numel(),
+            device=system.instance_component_ptr.device,
+        ),
+        system.instance_component_ptr[1:] - system.instance_component_ptr[:-1],
     )
-    connected_chains = [
-        (chain_index[bond.site_a.instance_id], chain_index[bond.site_b.instance_id]) for bond in connections
-    ]
-    connected_atoms = [(site_to_atom[bond.site_a], site_to_atom[bond.site_b]) for bond in connections]
+    atom_components = atom_component.detach().cpu().tolist()
+    component_instances = component_instance.detach().cpu().tolist()
+    connections = (system.bond_role == BOND_ROLE_ASSEMBLY).nonzero(as_tuple=False).flatten().detach().cpu().tolist()
+    connection_edges = system.edge_index[:, connections].detach().cpu().T.tolist() if connections else []
+    connected_chains = []
+    connected_atoms = []
+    for first, second in connection_edges:
+        if first not in system_to_model_atom or second not in system_to_model_atom:
+            continue
+        connected_chains.append(
+            (
+                component_instances[atom_components[first]],
+                component_instances[atom_components[second]],
+            )
+        )
+        connected_atoms.append(
+            (
+                system_to_model_atom[first],
+                system_to_model_atom[second],
+            )
+        )
 
-    instances = tuple(system.instances.items())
     symmetric_chains = [
         (first_index, second_index)
-        for first_index, (_first_instance, first_entity) in enumerate(instances)
-        for second_index, (_second_instance, second_entity) in enumerate(instances)
+        for first_index, first_entity in enumerate(instance_entities)
+        for second_index, second_entity in enumerate(instance_entities)
         if first_index < second_index and first_entity == second_entity
     ]
 
@@ -1102,6 +1250,7 @@ def _rdkit_constraint_features(
 
 def _msa_features(
     msa: MSA | MSACollection | None,
+    resolved_bindings: tuple[tuple[MSA, int | None, int], ...],
     tokens: list[dict[str, object]],
     system: MolecularSystem,
 ) -> dict[str, Tensor]:
@@ -1115,8 +1264,7 @@ def _msa_features(
         # a token's monomer index is directly the aligned-row column, and cells are UPPERCASE one-letter
         # symbols (or ``-``). A bare MSA is a single-chain plan over its unpaired pool; a collection replays
         # its dense ``row_pairing`` and ``row_is_paired`` plan across the paired and unpaired pools.
-        bindings = msa_bindings(msa)
-        columns = tuple(value for value, _target_instance_id in bindings)
+        columns = tuple(value for value, _target_instance_index, _entity_index in resolved_bindings)
         if isinstance(msa, MSA):
             plan_rows: list[tuple[tuple[int, int, bool], ...]] = [
                 ((0, row_index, False),) for row_index in range(len(msa.unpaired_sequences))
@@ -1130,7 +1278,13 @@ def _msa_features(
                 )
                 for plan_index in range(msa.row_pairing.shape[0])
             ]
-        polymer_types = tuple(cast(PolymerSequence, system.entities[value.entity_id]).polymer_type for value in columns)
+        polymer_types = tuple(
+            _POLYMER_TYPE.get(
+                int(system.entity_type[entity_index]),
+                "dna",
+            )
+            for _value, _target_instance_index, entity_index in resolved_bindings
+        )
         row_values: list[Tensor] = []
         deletion_values: list[Tensor] = []
         paired_values: list[Tensor] = []
@@ -1144,7 +1298,7 @@ def _msa_features(
             )
             for column_index, source_row, is_paired in selections:
                 value = columns[column_index]
-                target_instance_id = bindings[column_index][1]
+                _value, target_instance_index, entity_index = resolved_bindings[column_index]
                 polymer_type = polymer_types[column_index]
                 aligned = value.paired_sequences[source_row] if is_paired else value.unpaired_sequences[source_row]
                 deletion_source = (value.paired_deletion_counts if is_paired else value.unpaired_deletion_counts)[
@@ -1152,8 +1306,8 @@ def _msa_features(
                 ]
                 for token_index, token in enumerate(tokens):
                     if (
-                        token["entity_id"] != value.entity_id
-                        or (target_instance_id is not None and token["instance_id"] != target_instance_id)
+                        token["entity_index"] != entity_index
+                        or (target_instance_index is not None and token["instance_index"] != target_instance_index)
                         or token["monomer_index"] is None
                     ):
                         continue
@@ -1182,30 +1336,77 @@ def _msa_features(
     }
 
 
-def _reference_coordinates(system: MolecularSystem, sites: tuple[AtomSite, ...]) -> list[tuple[float, float, float]]:
-    generated: dict[str, dict[tuple[int, str], tuple[float, float, float]]] = {}
-    coordinates: list[tuple[float, float, float]] = []
-    for site in sites:
-        entity_id = system.instances[site.instance_id]
-        entity = system.entities[entity_id]
-        component = entity.components[site.component_index]
-        atom_index = next(index for index, atom in enumerate(component.atoms) if atom.atom_id == site.atom_id)
-        coordinate = component.reference_coordinates[atom_index] if component.reference_coordinates else None
-        if coordinate is None and isinstance(entity, Molecule):
-            if entity_id not in generated:
-                generated[entity_id] = _molecule_reference_coordinates(entity)
-            coordinate = generated[entity_id][(site.component_index, site.atom_id)]
-        if coordinate is None:
-            raise ValueError(f"Boltz-1 requires reference coordinates for {site!r}")
-        coordinates.append(coordinate)
+def _reference_coordinates(
+    system: MolecularSystem,
+    atom_indices: tuple[int, ...],
+) -> Tensor:
+    index = torch.tensor(atom_indices, device=system.atom_symbol.device)
+    coordinates = system.reference_coordinates[index].detach().cpu().clone()
+    reference_mask = system.reference_coordinate_mask[index].detach().cpu()
+    if bool(reference_mask.all()):
+        return coordinates
+
+    atom_component = _atom_component_index(system)
+    component_instance = torch.repeat_interleave(
+        torch.arange(
+            system.instance_symbol.numel(),
+            device=system.instance_component_ptr.device,
+        ),
+        system.instance_component_ptr[1:] - system.instance_component_ptr[:-1],
+    )
+    atom_instance = component_instance[atom_component].detach().cpu().tolist()
+    instance_entities = system.instance_entity.detach().cpu().tolist()
+    entity_types = system.entity_type.detach().cpu().tolist()
+    generated: dict[int, dict[int, tuple[float, float, float]]] = {}
+    for model_atom_index, canonical_atom_index in enumerate(atom_indices):
+        if bool(reference_mask[model_atom_index]):
+            continue
+        instance_index = atom_instance[canonical_atom_index]
+        entity_index = instance_entities[instance_index]
+        if entity_types[entity_index] != ENTITY_MOLECULE:
+            raise ValueError("Boltz-1 requires reference coordinates for canonical atom " f"{canonical_atom_index}")
+        if instance_index not in generated:
+            generated[instance_index] = _molecule_reference_coordinates(
+                system,
+                instance_index,
+            )
+        coordinates[model_atom_index] = coordinates.new_tensor(generated[instance_index][canonical_atom_index])
     return coordinates
 
 
-def _molecule_reference_coordinates(molecule: Molecule) -> dict[tuple[int, str], tuple[float, float, float]]:
+def _molecule_reference_coordinates(
+    system: MolecularSystem,
+    instance_index: int,
+) -> dict[int, tuple[float, float, float]]:
     from rdkit import Chem
     from rdkit.Chem import AllChem
 
-    rdkit_molecule = Chem.AddHs(_canonical_rdkit_molecule(molecule))
+    component_start = int(system.instance_component_ptr[instance_index])
+    component_stop = int(system.instance_component_ptr[instance_index + 1])
+    atom_start = int(system.component_atom_ptr[component_start])
+    atom_stop = int(system.component_atom_ptr[component_stop])
+    atom_indices = tuple(range(atom_start, atom_stop))
+    if not bool(system.component_topology_complete[component_start:component_stop].all()):
+        raise ValueError("Boltz-1 cannot generate reference coordinates from unknown " "molecular connectivity")
+    edge_indices = (
+        (
+            (system.edge_index[0] >= atom_start)
+            & (system.edge_index[1] < atom_stop)
+            & (system.bond_role <= BOND_ROLE_ENTITY)
+        )
+        .nonzero(as_tuple=False)
+        .flatten()
+        .detach()
+        .cpu()
+        .tolist()
+    )
+    rdkit_molecule = Chem.AddHs(
+        _canonical_rdkit_molecule(
+            system,
+            atom_indices,
+            edge_indices,
+        )
+    )
     options = AllChem.ETKDGv3()
     options.clearConfs = False
     options.randomSeed = 42
@@ -1215,13 +1416,10 @@ def _molecule_reference_coordinates(molecule: Molecule) -> dict[tuple[int, str],
         conformer_id = AllChem.EmbedMolecule(rdkit_molecule, options)
     AllChem.UFFOptimizeMolecule(rdkit_molecule, confId=conformer_id, maxIters=1000)
     conformer = rdkit_molecule.GetConformer(conformer_id)
-    coordinates: dict[tuple[int, str], tuple[float, float, float]] = {}
-    flat_index = 0
-    for component_index, component in enumerate(molecule.components):
-        for atom in component.atoms:
-            position = conformer.GetAtomPosition(flat_index)
-            coordinates[(component_index, atom.atom_id)] = (position.x, position.y, position.z)
-            flat_index += 1
+    coordinates: dict[int, tuple[float, float, float]] = {}
+    for local_index, atom_index in enumerate(atom_indices):
+        position = conformer.GetAtomPosition(local_index)
+        coordinates[atom_index] = (position.x, position.y, position.z)
     return coordinates
 
 
@@ -1241,53 +1439,73 @@ def _augment_reference_positions(
 
     if not len(space_ids):
         return
-    for space_id in range(int(space_ids.max().item()) + 1):
+    active_space_ids = torch.unique(space_ids[resolved & (space_ids >= 0)], sorted=True)
+    num_active_spaces = active_space_ids.numel()
+    if not num_active_spaces:
+        return
+
+    random_device = positions.device if generator is None else generator.device
+    random_values = torch.randn(
+        num_active_spaces,
+        7,
+        dtype=positions.dtype,
+        device=random_device,
+        generator=generator,
+    ).to(positions.device)
+    quaternions = random_values[:, :4]
+    norm = torch.sqrt((quaternions * quaternions).sum(dim=-1, keepdim=True))
+    quaternions = quaternions / torch.copysign(norm, quaternions[:, :1])
+    real, i, j, k = quaternions.unbind(dim=-1)
+    two = 2.0 / (quaternions * quaternions).sum(dim=-1)
+    rotations = torch.stack(
+        (
+            1 - two * (j * j + k * k),
+            two * (i * j - k * real),
+            two * (i * k + j * real),
+            two * (i * j + k * real),
+            1 - two * (i * i + k * k),
+            two * (j * k - i * real),
+            two * (i * k - j * real),
+            two * (j * k + i * real),
+            1 - two * (i * i + j * j),
+        ),
+        dim=-1,
+    ).reshape(-1, 3, 3)
+    translations = random_values[:, 4:]
+
+    for space_id, rotation, translation in zip(active_space_ids, rotations, translations):
         included = space_ids == space_id
         mask = resolved[included]
-        if not bool(mask.any()):
-            continue
         values = positions[included]
         center = (values * mask[:, None]).sum(dim=0, keepdim=True) / mask.sum()
-        quaternion = torch.randn(
-            4,
-            dtype=values.dtype,
-            device=values.device,
-            generator=generator,
-        )
-        norm = torch.sqrt((quaternion * quaternion).sum())
-        quaternion = quaternion / torch.copysign(norm, quaternion[0])
-        real, i, j, k = quaternion
-        two = 2.0 / (quaternion * quaternion).sum()
-        rotation = torch.stack(
-            (
-                1 - two * (j * j + k * k),
-                two * (i * j - k * real),
-                two * (i * k + j * real),
-                two * (i * j + k * real),
-                1 - two * (i * i + k * k),
-                two * (j * k - i * real),
-                two * (i * k - j * real),
-                two * (j * k + i * real),
-                1 - two * (i * i + j * j),
-            )
-        ).reshape(3, 3)
-        positions[included] = (values - center) @ rotation + torch.randn(
-            1,
-            3,
-            dtype=values.dtype,
-            device=values.device,
-            generator=generator,
-        )
+        positions[included] = (values - center) @ rotation + translation
 
 
-def _model_atom_names(system: MolecularSystem, sites: tuple[AtomSite, ...]) -> list[str]:
+def _model_atom_names(
+    system: MolecularSystem,
+    atom_indices: tuple[int, ...],
+) -> list[str]:
+    from rdkit.Chem import GetPeriodicTable
+
+    atom_component = _atom_component_index(system)
+    component_instance = torch.repeat_interleave(
+        torch.arange(
+            system.instance_symbol.numel(),
+            device=system.instance_component_ptr.device,
+        ),
+        system.instance_component_ptr[1:] - system.instance_component_ptr[:-1],
+    )
+    atom_instance = component_instance[atom_component].detach().cpu().tolist()
+    atom_symbols = system.atom_symbol.detach().cpu().tolist()
+    atomic_numbers = system.atomic_number.detach().cpu().tolist()
+    periodic_table = GetPeriodicTable()
     names: list[str] = []
-    counts: dict[tuple[str, str], int] = {}
-    for site in sites:
-        name = site.atom_id
+    counts: dict[tuple[int, str], int] = {}
+    for atom_index in atom_indices:
+        name = system.symbols[atom_symbols[atom_index]]
         if len(name) > 4 or any(not 32 <= ord(character) < 96 for character in name):
-            element = system.atom(site).element.upper()
-            key = (site.instance_id, element)
+            element = periodic_table.GetElementSymbol(atomic_numbers[atom_index]).upper()
+            key = (atom_instance[atom_index], element)
             counts[key] = counts.get(key, 0) + 1
             name = f"{element}{counts[key]}"
         if len(name) > 4:
@@ -1296,35 +1514,57 @@ def _model_atom_names(system: MolecularSystem, sites: tuple[AtomSite, ...]) -> l
     return names
 
 
-def _canonical_rdkit_molecule(molecule: Molecule) -> Mol:
+def _canonical_rdkit_molecule(
+    system: MolecularSystem,
+    atom_indices: tuple[int, ...],
+    edge_indices: Sequence[int],
+) -> Mol:
     r"""
-    Materialize molecule data as an RDKit graph.
+    Project one family-owned canonical graph scope into RDKit.
     """
 
     from rdkit import Chem
 
     editable = Chem.RWMol()
-    atom_index: dict[tuple[int, str], int] = {}
+    selected_atoms = torch.tensor(
+        atom_indices,
+        device=system.atom_symbol.device,
+    )
+    atomic_numbers = system.atomic_number[selected_atoms].detach().cpu().tolist()
+    isotope = system.isotope[selected_atoms].detach().cpu().tolist()
+    isotope_known = system.isotope_known[selected_atoms].detach().cpu().tolist()
+    formal_charge = system.formal_charge[selected_atoms].detach().cpu().tolist()
+    formal_charge_known = system.formal_charge_known[selected_atoms].detach().cpu().tolist()
+    radical_electrons = system.radical_electrons[selected_atoms].detach().cpu().tolist()
+    radical_electrons_known = system.radical_electrons_known[selected_atoms].detach().cpu().tolist()
+    explicit_hydrogens = system.explicit_hydrogens[selected_atoms].detach().cpu().tolist()
+    explicit_hydrogens_known = system.explicit_hydrogens_known[selected_atoms].detach().cpu().tolist()
+    implicit_hydrogens_allowed = system.implicit_hydrogens_allowed[selected_atoms].detach().cpu().tolist()
+    implicit_hydrogens_allowed_known = system.implicit_hydrogens_allowed_known[selected_atoms].detach().cpu().tolist()
+    atom_aromatic = system.atom_aromatic[selected_atoms].detach().cpu().tolist()
+    atom_aromatic_known = system.atom_aromatic_known[selected_atoms].detach().cpu().tolist()
+    atom_stereo_values = system.atom_stereo[selected_atoms].detach().cpu().tolist()
+    canonical_to_local: dict[int, int] = {}
     atom_stereo: dict[int, str] = {}
-    for component_index, component in enumerate(molecule.components):
-        for atom in component.atoms:
-            rdkit_atom = Chem.Atom(atom.element)
-            if atom.isotope is not None:
-                rdkit_atom.SetIsotope(atom.isotope)
-            if atom.formal_charge is not None:
-                rdkit_atom.SetFormalCharge(atom.formal_charge)
-            if atom.radical_electrons is not None:
-                rdkit_atom.SetNumRadicalElectrons(atom.radical_electrons)
-            if atom.explicit_hydrogens is not None:
-                rdkit_atom.SetNumExplicitHs(atom.explicit_hydrogens)
-            if atom.implicit_hydrogens_allowed is not None:
-                rdkit_atom.SetNoImplicit(not atom.implicit_hydrogens_allowed)
-            if atom.aromatic is not None:
-                rdkit_atom.SetIsAromatic(atom.aromatic)
-            index = editable.AddAtom(rdkit_atom)
-            atom_index[(component_index, atom.atom_id)] = index
-            if atom.stereo is not None:
-                atom_stereo[index] = atom.stereo.upper()
+    for source_index, atom_index in enumerate(atom_indices):
+        rdkit_atom = Chem.Atom(atomic_numbers[source_index])
+        if isotope_known[source_index]:
+            rdkit_atom.SetIsotope(isotope[source_index])
+        if formal_charge_known[source_index]:
+            rdkit_atom.SetFormalCharge(formal_charge[source_index])
+        if radical_electrons_known[source_index]:
+            rdkit_atom.SetNumRadicalElectrons(radical_electrons[source_index])
+        if explicit_hydrogens_known[source_index]:
+            rdkit_atom.SetNumExplicitHs(explicit_hydrogens[source_index])
+        if implicit_hydrogens_allowed_known[source_index]:
+            rdkit_atom.SetNoImplicit(not implicit_hydrogens_allowed[source_index])
+        if atom_aromatic_known[source_index]:
+            rdkit_atom.SetIsAromatic(atom_aromatic[source_index])
+        local_index = editable.AddAtom(rdkit_atom)
+        canonical_to_local[atom_index] = local_index
+        stereo_index = atom_stereo_values[source_index]
+        if stereo_index >= 0:
+            atom_stereo[local_index] = system.symbols[stereo_index].upper()
 
     bond_types = {
         1.0: Chem.BondType.SINGLE,
@@ -1333,62 +1573,47 @@ def _canonical_rdkit_molecule(molecule: Molecule) -> Mol:
         3.0: Chem.BondType.TRIPLE,
         4.0: Chem.BondType.QUADRUPLE,
     }
-    bond_stereo: list[tuple[int, str, tuple[int, int] | None]] = []
-    for component_index, component in enumerate(molecule.components):
-        component_bonds = sorted(
-            component.bonds or (),
-            key=lambda bond: (
-                atom_index[(component_index, bond.atom_a)],
-                atom_index[(component_index, bond.atom_b)],
-            ),
-        )
-        for component_bond in component_bonds:
-            editable.AddBond(
-                atom_index[(component_index, component_bond.atom_a)],
-                atom_index[(component_index, component_bond.atom_b)],
-                bond_types[component_bond.order],
-            )
-            bond_index = editable.GetNumBonds() - 1
-            editable.GetBondWithIdx(bond_index).SetIsAromatic(component_bond.aromatic)
-            if component_bond.stereo is not None:
-                stereo_atoms = (
-                    tuple(atom_index[(component_index, atom_id)] for atom_id in component_bond.stereo_atoms)
-                    if component_bond.stereo_atoms is not None
-                    else None
-                )
-                bond_stereo.append(
-                    (
-                        bond_index,
-                        component_bond.stereo,
-                        cast(tuple[int, int] | None, stereo_atoms),
-                    )
-                )
-    molecule_bonds = sorted(
-        molecule.bonds,
-        key=lambda bond: (
-            atom_index[(bond.component_a, bond.atom_a)],
-            atom_index[(bond.component_b, bond.atom_b)],
-        ),
+    selected_edges = torch.tensor(
+        edge_indices,
+        dtype=torch.long,
+        device=system.edge_index.device,
     )
-    for molecule_bond in molecule_bonds:
+    edge_rows = system.edge_index[:, selected_edges].detach().cpu().T.tolist()
+    bond_order = system.bond_order[selected_edges].detach().cpu().tolist()
+    bond_order_known = system.bond_order_known[selected_edges].detach().cpu().tolist()
+    bond_aromatic = system.bond_aromatic[selected_edges].detach().cpu().tolist()
+    bond_aromatic_known = system.bond_aromatic_known[selected_edges].detach().cpu().tolist()
+    bond_stereo_values = system.bond_stereo[selected_edges].detach().cpu().tolist()
+    bond_stereo_index = system.bond_stereo_index[:, selected_edges].detach().cpu().T.tolist()
+    bond_stereo: list[tuple[int, str, tuple[int, int] | None]] = []
+    for source_index, (first, second) in enumerate(edge_rows):
+        if not bond_order_known[source_index]:
+            raise ValueError("Boltz-1 RDKit geometry requires known bond order")
         editable.AddBond(
-            atom_index[(molecule_bond.component_a, molecule_bond.atom_a)],
-            atom_index[(molecule_bond.component_b, molecule_bond.atom_b)],
-            bond_types[molecule_bond.order],
+            canonical_to_local[first],
+            canonical_to_local[second],
+            bond_types[bond_order[source_index]],
         )
         bond_index = editable.GetNumBonds() - 1
-        editable.GetBondWithIdx(bond_index).SetIsAromatic(molecule_bond.aromatic)
-        if molecule_bond.stereo is not None:
+        rdkit_bond = editable.GetBondWithIdx(bond_index)
+        if bond_aromatic_known[source_index]:
+            rdkit_bond.SetIsAromatic(bond_aromatic[source_index])
+        stereo_index = bond_stereo_values[source_index]
+        if stereo_index >= 0:
+            first_stereo, second_stereo = bond_stereo_index[source_index]
             stereo_atoms = (
-                tuple(atom_index[site] for site in molecule_bond.stereo_atoms)
-                if molecule_bond.stereo_atoms is not None
+                (
+                    canonical_to_local[first_stereo],
+                    canonical_to_local[second_stereo],
+                )
+                if first_stereo >= 0 and second_stereo >= 0
                 else None
             )
             bond_stereo.append(
                 (
                     bond_index,
-                    molecule_bond.stereo,
-                    cast(tuple[int, int] | None, stereo_atoms),
+                    system.symbols[stereo_index],
+                    stereo_atoms,
                 )
             )
 
@@ -1431,16 +1656,45 @@ def _canonical_rdkit_molecule(molecule: Molecule) -> Mol:
     return value
 
 
-def _cyclic_period(system: MolecularSystem, instance_id: str) -> int:
-    entity = system.entities[system.instances[instance_id]]
-    if not isinstance(entity, PolymerSequence) or len(entity) <= 2:
-        return 0
-    for bond in system.bonds:
-        if bond.site_a.instance_id != instance_id or bond.site_b.instance_id != instance_id:
+def _cyclic_periods(system: MolecularSystem) -> list[int]:
+    atom_component = _atom_component_index(system).detach().cpu().tolist()
+    edge_rows = system.edge_index.detach().cpu().T.tolist()
+    instance_components = system.instance_component_ptr.detach().cpu().tolist()
+    instance_entities = system.instance_entity.detach().cpu().tolist()
+    entity_types = system.entity_type.detach().cpu().tolist()
+    periods: list[int] = []
+    for instance_index, entity_index in enumerate(instance_entities):
+        component_start = instance_components[instance_index]
+        component_stop = instance_components[instance_index + 1]
+        component_count = component_stop - component_start
+        if entity_types[entity_index] == ENTITY_MOLECULE or component_count <= 2:
+            periods.append(0)
             continue
-        if {bond.site_a.component_index, bond.site_b.component_index} == {0, len(entity) - 1}:
-            return len(entity)
-    return 0
+        cyclic = any(
+            {
+                atom_component[first],
+                atom_component[second],
+            }
+            == {component_start, component_stop - 1}
+            for first, second in edge_rows
+        )
+        periods.append(component_count if cyclic else 0)
+    return periods
+
+
+def _component_polymer_type(
+    entity_type: int,
+    component_id: str,
+) -> str | None:
+    polymer_type = _POLYMER_TYPE.get(entity_type)
+    if polymer_type is not None:
+        return polymer_type
+    if entity_type == ENTITY_DNA_RNA_HYBRID:
+        if component_id in _STANDARD_COMPONENTS["rna"]:
+            return "rna"
+        if component_id in _STANDARD_COMPONENTS["dna"]:
+            return "dna"
+    return None
 
 
 def _residue_type(component_id: str, polymer_type: str) -> int:

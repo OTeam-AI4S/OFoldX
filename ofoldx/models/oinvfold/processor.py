@@ -15,12 +15,13 @@ from torch.nn import functional as F
 
 from ...data.molecular import (
     AMINO_ACID_THREE_TO_ONE,
+    ENTITY_DNA,
+    ENTITY_MOLECULE,
+    ENTITY_PROTEIN,
+    ENTITY_RNA,
     AtomSite,
-    ChemicalComponent,
     ComponentReference,
-    Molecule,
-    PolymerSequence,
-    is_water_component,
+    water_component_mask,
 )
 from ...data.structure import Structure
 from ...processor import Processor
@@ -114,48 +115,58 @@ class OInvFoldPolymerProcessor(Processor):
             One full-chain OInvFold input.
         """
 
-        instance_id, entity = self._resolve_entity(structure, instance_id)
+        _, component_axis = self._resolve_entity(structure, instance_id)
+        system = structure.system
+        observed = structure.coordinate_mask & torch.isfinite(structure.coordinates).all(dim=-1)
+        if filter_by_occupancy:
+            observed = observed & (~structure.occupancy_mask | (structure.occupancy > 0))
 
-        observed = structure.coordinate_mask
-        if filter_by_occupancy and structure.occupancy is not None:
-            observed = observed & (np.isnan(structure.occupancy) | (structure.occupancy > 0))
-        coordinate_index = {site: index for index, site in enumerate(structure.sites)}
-
-        references: list[ComponentReference] = []
-        coordinate_slots: list[tuple[AtomSite, ...]] = []
-        coordinates: list[np.ndarray] = []
+        component_indices: list[int] = []
+        coordinate_atom_indices: list[tuple[int, ...]] = []
+        coordinates: list[Tensor] = []
         sequence_tokens: list[int | None] = []
-        for component_index, component in enumerate(entity.components):
-            atom_ids = _polymer_atom_ids(self.config.modality, component)
-            sites = tuple(AtomSite(instance_id, component_index, atom_id) for atom_id in atom_ids)
-            indices = tuple(coordinate_index.get(site) for site in sites)
-            if any(index is None for index in indices):
+        for component_index in component_axis.detach().cpu().tolist():
+            component_id = system.symbols[int(system.component_symbol[component_index])]
+            atom_start = int(system.component_atom_ptr[component_index])
+            atom_stop = int(system.component_atom_ptr[component_index + 1])
+            atom_index = {
+                system.symbols[int(system.atom_symbol[index])]: index for index in range(atom_start, atom_stop)
+            }
+            atom_ids = _polymer_atom_ids(
+                self.config.modality,
+                frozenset(atom_index),
+            )
+            if any(atom_id not in atom_index for atom_id in atom_ids):
                 continue
-            exact_indices = tuple(int(index) for index in indices if index is not None)
-            if not all(observed[index] and np.isfinite(structure.coordinates[index]).all() for index in exact_indices):
+            exact_indices = tuple(atom_index[atom_id] for atom_id in atom_ids)
+            index_tensor = torch.tensor(
+                exact_indices,
+                dtype=torch.long,
+                device=structure.coordinates.device,
+            )
+            if not bool(observed[index_tensor].all()):
                 continue
-            references.append((instance_id, component_index))
-            coordinate_slots.append(sites)
-            coordinates.append(structure.coordinates[np.asarray(exact_indices, dtype=np.int64)])
+            component_indices.append(component_index)
+            coordinate_atom_indices.append(exact_indices)
+            coordinates.append(structure.coordinates[index_tensor])
             sequence_tokens.append(
                 _polymer_token(
                     self.config.modality,
-                    component,
+                    component_id,
                 )
             )
 
-        if len(references) < 2:
+        if len(component_indices) < 2:
             raise ValueError("OInvFold polymer inference requires at least two complete coordinate rows")
 
         if design_positions is None:
-            selected = set(references)
+            selected = set(component_indices)
         else:
-            selected = set(design_positions)
-            if selected - set(references):
+            selected = {system.component_index(reference) for reference in design_positions}
+            if selected - set(component_indices):
                 raise ValueError("OInvFold design positions must be complete rows of the selected polymer instance")
 
-        coordinate_tensor = torch.as_tensor(
-            np.stack(coordinates),
+        coordinate_tensor = torch.stack(coordinates).to(
             dtype=torch.float32,
             device=self.device,
         )
@@ -169,15 +180,23 @@ class OInvFoldPolymerProcessor(Processor):
         return OInvFoldPolymerInput(
             graph=graph,
             structure=structure,
-            component_references=tuple(references),
-            coordinate_slots=tuple(coordinate_slots),
+            component_index=torch.tensor(
+                component_indices,
+                dtype=torch.long,
+                device=self.device,
+            ),
+            coordinate_atom_index=torch.tensor(
+                coordinate_atom_indices,
+                dtype=torch.long,
+                device=self.device,
+            ),
             design_mask=torch.tensor(
-                [reference in selected for reference in references],
+                [component_index in selected for component_index in component_indices],
                 dtype=torch.bool,
                 device=self.device,
             ),
             chain_index=torch.zeros(
-                len(references),
+                len(component_indices),
                 dtype=torch.long,
                 device=self.device,
             ),
@@ -196,24 +215,34 @@ class OInvFoldPolymerProcessor(Processor):
         self,
         structure: Structure,
         instance_id: str | None,
-    ) -> tuple[str, PolymerSequence]:
-        candidates: list[tuple[str, PolymerSequence]] = []
-        for candidate, entity_id in structure.system.instances.items():
-            entity = structure.system.entities[entity_id]
-            if isinstance(entity, PolymerSequence) and entity.polymer_type == self.config.modality:
-                candidates.append((candidate, entity))
-
+    ) -> tuple[int, Tensor]:
+        system = structure.system
+        entity_type = {
+            "protein": ENTITY_PROTEIN,
+            "dna": ENTITY_DNA,
+            "rna": ENTITY_RNA,
+        }[self.config.modality]
+        candidates = torch.nonzero(
+            system.entity_type[system.instance_entity] == entity_type,
+            as_tuple=False,
+        ).flatten()
         if instance_id is None:
-            if len(candidates) != 1:
+            if candidates.numel() != 1:
                 raise ValueError(
                     "instance_id is required unless exactly one input instance " f"is {self.config.modality}"
                 )
-            return candidates[0]
-
-        entity = structure.system.entities[structure.system.instances[instance_id]]
-        if not isinstance(entity, PolymerSequence) or entity.polymer_type != self.config.modality:
-            raise ValueError(f"OInvFold {self.config.modality} processor cannot lower instance {instance_id!r}")
-        return instance_id, entity
+            instance_index = int(candidates[0])
+        else:
+            instance_index = system.instance_index(instance_id)
+            if int(system.entity_type[int(system.instance_entity[instance_index])]) != entity_type:
+                raise ValueError(f"OInvFold {self.config.modality} processor cannot lower " f"instance {instance_id!r}")
+        component_index = torch.arange(
+            int(system.instance_component_ptr[instance_index]),
+            int(system.instance_component_ptr[instance_index + 1]),
+            dtype=torch.long,
+            device=system.instance_component_ptr.device,
+        )
+        return instance_index, component_index
 
 
 class OInvFoldLigandProcessor(Processor):
@@ -286,52 +315,60 @@ class OInvFoldLigandProcessor(Processor):
         if atom_sites is None:
             atom_sites = self._default_atom_sites(context)
         sites = tuple(atom_sites)
-        observed = context.coordinate_mask
-        if filter_by_occupancy and context.occupancy is not None:
-            observed = observed & (np.isnan(context.occupancy) | (context.occupancy > 0))
-        coordinate_index = {site: index for index, site in enumerate(context.sites)}
-        indices = tuple(coordinate_index[site] for site in sites)
-        if not all(observed[index] and np.isfinite(context.coordinates[index]).all() for index in indices):
+        indices = torch.tensor(
+            [context.system.atom_index(site) for site in sites],
+            dtype=torch.long,
+            device=context.coordinates.device,
+        )
+        observed = context.coordinate_mask & torch.isfinite(context.coordinates).all(dim=-1)
+        if filter_by_occupancy:
+            observed = observed & (~context.occupancy_mask | (context.occupancy > 0))
+        if not bool(observed[indices].all()):
             raise ValueError("OInvFold ligand atom sites require observed finite coordinates")
         return OInvFoldLigandSlots(
             tuple(f"{site.instance_id}:{site.component_index}:{site.atom_id}" for site in sites),
-            context.coordinates[np.asarray(indices, dtype=np.int64)],
+            context.coordinates[indices].detach().cpu().numpy(),
             context,
         )
 
     @staticmethod
     def _default_atom_sites(context: Structure) -> tuple[AtomSite, ...]:
-        instance_ids = []
-        for instance_id, entity_id in context.system.instances.items():
-            entity = context.system.entities[entity_id]
-            if isinstance(entity, Molecule) and not all(
-                is_water_component(component) for component in entity.components
-            ):
-                instance_ids.append(instance_id)
-        if len(instance_ids) != 1:
+        system = context.system
+        water = water_component_mask(system)
+        instance_indices = []
+        for instance_index, entity_index in enumerate(system.instance_entity.detach().cpu().tolist()):
+            if int(system.entity_type[entity_index]) != ENTITY_MOLECULE:
+                continue
+            start = int(system.instance_component_ptr[instance_index])
+            stop = int(system.instance_component_ptr[instance_index + 1])
+            if not bool(water[start:stop].all()):
+                instance_indices.append(instance_index)
+        if len(instance_indices) != 1:
             raise ValueError(
                 "atom_sites is required unless the context contains exactly one non-water Molecule instance"
             )
-        instance_id = instance_ids[0]
-        return tuple(site for site in context.sites if site.instance_id == instance_id)
+        instance_index = instance_indices[0]
+        component_start = int(system.instance_component_ptr[instance_index])
+        component_stop = int(system.instance_component_ptr[instance_index + 1])
+        atom_start = int(system.component_atom_ptr[component_start])
+        atom_stop = int(system.component_atom_ptr[component_stop])
+        return tuple(system.atom_site(atom_index) for atom_index in range(atom_start, atom_stop))
 
 
 def _polymer_atom_ids(
     modality: str,
-    component: ChemicalComponent,
+    atom_ids: frozenset[str],
 ) -> tuple[str, ...]:
     slots = _POLYMER_ATOM_SLOTS[modality]
     if modality == "protein":
         return slots
-    atoms = component.atoms
-    atom_ids = {atom.atom_id for atom in atoms}
     if "N9" in atom_ids:
         nitrogen = "N9"
     elif "N1" in atom_ids:
         nitrogen = "N1"
     else:
         nitrogen = next(
-            (atom.atom_id for atom in atoms if atom.atom_id.upper().startswith("N")),
+            (atom_id for atom_id in atom_ids if atom_id.upper().startswith("N")),
             "N1",
         )
     return tuple(nitrogen if atom_id == "N" else atom_id for atom_id in slots)
@@ -339,10 +376,10 @@ def _polymer_atom_ids(
 
 def _polymer_token(
     modality: str,
-    component: ChemicalComponent,
+    component_id: str,
 ) -> int | None:
     if modality == "protein":
-        letter = AMINO_ACID_THREE_TO_ONE.get(component.component_id)
+        letter = AMINO_ACID_THREE_TO_ONE.get(component_id)
         return None if letter is None else OINVFOLD_POLYMER_TOKENS.index(letter)
     if modality == "dna":
         return {
@@ -353,7 +390,7 @@ def _polymer_token(
             "DU": 23,
             "DN": 20,
             "DI": 20,
-        }.get(component.component_id)
+        }.get(component_id)
     return {
         "A": 20,
         "C": 21,
@@ -362,7 +399,7 @@ def _polymer_token(
         "U": 24,
         "I": 20,
         "N": 20,
-    }.get(component.component_id)
+    }.get(component_id)
 
 
 def _ligand_local_slots(coordinates: Tensor) -> Tensor:

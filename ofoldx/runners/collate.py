@@ -14,7 +14,10 @@ from __future__ import annotations
 from dataclasses import fields
 from typing import Any
 
+import torch
 from torch import Tensor
+
+from ..data.structure import Structure
 
 
 def nested_collate(batch: list[Any]) -> Any:
@@ -26,15 +29,19 @@ def nested_collate(batch: list[Any]) -> Any:
     (topology-invariant) with no padded rows to contaminate the k-NN or attention. ``NestedTensor`` handles
     multi-axis raggedness natively, so pair fields (ragged on two residue axes) need no special handling and
     ``tied_group_ids`` need no padded-unit extension -- each structure's causal units stay local to it.
+    A tensor-native ``structure`` is one disjoint union, and its aligned nonnegative
+    ``component_index`` values are offset into that union.
     """
 
     from danling import NestedTensor
 
     first = batch[0]
     input_type = type(first)
+    input_fields = fields(first)
+    graph_input = {"structure", "component_index"} <= {field.name for field in input_fields}
 
     merged: dict[str, Any] = {}
-    for field in fields(first):
+    for field in input_fields:
         values = [getattr(item, field.name) for item in batch]
         present = [value is not None for value in values]
         if not any(present):
@@ -42,7 +49,17 @@ def nested_collate(batch: list[Any]) -> Any:
             continue
         if not all(present):
             raise ValueError(f"optional field {field.name!r} must be present on every item or on none")
-        if isinstance(values[0], Tensor):
+        if graph_input and field.name == "structure":
+            merged[field.name] = Structure.batch(values)
+        elif graph_input and field.name == "component_index":
+            component_offset = 0
+            component_indices = []
+            for value, item in zip(values, batch, strict=True):
+                value = value.squeeze(0)
+                component_indices.append(torch.where(value < 0, value, value + component_offset))
+                component_offset += item.structure.system.component_symbol.numel()
+            merged[field.name] = NestedTensor(component_indices)
+        elif isinstance(values[0], Tensor):
             # Each item is ``(1, N_i, ...)`` from the Processor; drop the singleton batch axis so the
             # NestedTensor's leading axis concatenates the structures, ragged on the residue axis.
             merged[field.name] = NestedTensor([value.squeeze(0) for value in values])
@@ -50,7 +67,10 @@ def nested_collate(batch: list[Any]) -> Any:
             # A list (not a tuple) becomes a batched NonTensorStack so ``input[i]`` selects item ``i``'s
             # metadata; a tuple would be one shared blob that does not track the batch axis.
             merged[field.name] = [element for value in values for element in value]
-    return input_type(**merged, batch_size=[len(batch)])
+    return input_type(
+        **merged,
+        batch_size=[] if graph_input else [len(batch)],
+    )
 
 
 def collate_single(batch: list[Any]) -> Any:
@@ -66,7 +86,10 @@ def collate_single(batch: list[Any]) -> Any:
 def _design_count(batched: Any) -> int:
     r"""Count designable residues -- the unit the sequence-recovery criteria average over."""
 
-    return int((batched.residue_mask & batched.design_positions).sum())
+    count = int((batched.residue_mask & batched.design_positions).sum())
+    if count == 0:
+        raise ValueError("the batch has no designable residue to score")
+    return count
 
 
 def collate_sequence(batch: list[Any]) -> dict[str, Any]:
@@ -129,9 +152,12 @@ def collate_denoising(batch: list[Any]) -> dict[str, Any]:
     from ..modules.diffusion.loss import resolved_atom_mask
 
     model_input, model_target = collate_single(batch)
-    pair = {"input": model_input, "target": model_target}
     resolved = resolved_atom_mask(model_target, model_input)
-    return {"input": pair, "target": pair, "loss_normalizer": int(resolved.sum())}
+    count = int(resolved.sum())
+    if count == 0:
+        raise ValueError("the batch has no resolved atom to score")
+    pair = {"input": model_input, "target": model_target}
+    return {"input": pair, "target": pair, "loss_normalizer": count}
 
 
 def collate_odesign(batch: list[Any]) -> dict[str, Any]:

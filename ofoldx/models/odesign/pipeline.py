@@ -13,19 +13,22 @@ from typing import Literal, cast
 import numpy as np
 import torch
 
-from ...data import ATOMIC_NUMBER_BY_ELEMENT
 from ...data.bonds import SymbolicBond
 from ...data.components import get_component
 from ...data.conditions import Hotspot
 from ...data.evidence import MSA, MSACollection
 from ...data.molecular import (
     AMINO_ACID_THREE_TO_ONE,
-    HYDROGEN_ELEMENTS,
+    ENTITY_DNA,
+    ENTITY_MOLECULE,
+    ENTITY_PROTEIN,
+    ENTITY_RNA,
     AtomSite,
     ComponentReference,
     MolecularSystem,
-    PolymerSequence,
-    is_water_component,
+    copy_components,
+    replace_components,
+    water_component_mask,
 )
 from ...data.structure import Structure
 from ...io.msa import read_msa
@@ -45,12 +48,9 @@ from ..proteinmpnn import ProteinMpnnPipeline
 from .model import (
     ODesignGeneratedAtoms,
     ODesignInput,
-    ODesignLigandBackbone,
     ODesignLigandInput,
     ODesignModel,
     ODesignPlacements,
-    ODesignProvisionalAtomSlot,
-    ODesignReferenceCoordinates,
 )
 from .processor import ODesignLigandProcessor, ODesignProcessor
 
@@ -187,21 +187,38 @@ class ODesignPolymerDesignResult:
 
 
 @dataclass(eq=False)
+class ODesignLigandBackbone:
+    r"""
+    Decoded ODesign ligand backbone before identities and bonds are resolved.
+
+    Args:
+        context: Predicted coordinates over the canonical context system.
+        coordinates: Ordered provisional coordinates with shape ``(L, 3)``.
+        token_bond_type_logits: Generated-slot pair logits with shape
+            ``(L, L, D_b)``.
+        bonds: Unresolved generated chemical connectivity.
+    """
+
+    context: Structure | None
+    coordinates: np.ndarray
+    token_bond_type_logits: np.ndarray
+    bonds: None = None
+
+
+@dataclass(eq=False)
 class ODesignLigandDesignCandidate:
     r"""
     One provisional ligand atom assignment without fabricated connectivity.
 
     Args:
         context: Canonical context with its ODesign-predicted coordinates.
-        context_token_sites: Context groups on the leading bond-logit axes.
-        slots: Caller-owned provisional atom identities.
-        coordinates: Coordinates aligned with ``slots``.
-        elements: OInvFold element labels aligned with ``slots``.
+        coordinates: Ordered provisional coordinates.
+        elements: OInvFold element labels aligned with the same rows.
         per_atom_probabilities: Selected temperature-view probabilities.
-        logits: Raw OInvFold logits aligned with ``slots``.
+        logits: Raw OInvFold logits aligned with ``coordinates``.
         log_probabilities: Raw OInvFold log probabilities.
         probabilities: Full temperature-view probabilities.
-        token_bond_type_logits: Full ODesign context-and-slot bond logits.
+        token_bond_type_logits: Generated-slot pair bond logits.
         scores: Total and mean raw element log probabilities.
         bonds: Explicitly unresolved generated chemical connectivity.
         seed_index: Zero-based ODesign seed index.
@@ -210,8 +227,6 @@ class ODesignLigandDesignCandidate:
     """
 
     context: Structure | None
-    context_token_sites: tuple[tuple[AtomSite, ...], ...]
-    slots: tuple[ODesignProvisionalAtomSlot, ...]
     coordinates: np.ndarray
     elements: tuple[str, ...]
     per_atom_probabilities: np.ndarray
@@ -313,7 +328,10 @@ class ODesignProteinPipeline(CompositePipeline):
         seeds: Sequence[int] | None = None,
         seed: int | None = None,
         generator: torch.Generator | None = None,
-        conditions: Sequence[Hotspot | SymbolicBond | ODesignReferenceCoordinates] = (),
+        hotspots: Sequence[Hotspot] = (),
+        cyclic_bonds: Sequence[SymbolicBond] = (),
+        fixed_atoms: Sequence[AtomSite] = (),
+        constraint_atoms: Sequence[AtomSite] = (),
         recycling_steps: int | None = None,
         num_sampling_steps: int = 200,
         partial_diffusion_snr: float | None = None,
@@ -332,31 +350,33 @@ class ODesignProteinPipeline(CompositePipeline):
             seed,
             generator,
         )
-        model_input = _build_polymer_input(
-            self.processor,
-            input,
-            placement,
-            msa,
-            conditions,
-        )
+        canonical_input = _resolve_structure(input)
+        msa_value = _resolve_msa(msa, _input_system(canonical_input))
 
         candidates: list[ODesignPolymerDesignCandidate] = []
         for seed_index, backbone_seed in enumerate(seed_list):
             stream = resolve_generator(
                 backbone_seed,
                 None,
-                device=model_input.reference_positions.device,
+                device=_model_device(self.model),
             )
-            realized_input = self.processor.realize_ranges(
-                model_input,
+            realized_input = self.processor(
+                canonical_input,
+                placement=placement,
+                msa=msa_value,
+                hotspots=hotspots,
+                cyclic_bonds=cyclic_bonds,
+                fixed_atoms=fixed_atoms,
+                constraint_atoms=constraint_atoms,
                 generator=stream,
             )
             design_chains = tuple(chain for chain in _generated_polymer_chains(realized_input) if chain[1] == "protein")
             if not design_chains:
                 raise ValueError("ODesign protein design requires at least one generated protein position")
-            backbones = self.model.design(
+            backbones = _sample_polymer_backbones(
+                self.model,
                 realized_input,
-                num_candidates=num_backbones,
+                num_backbones=num_backbones,
                 generator=stream,
                 recycling_steps=recycling_steps,
                 num_sampling_steps=num_sampling_steps,
@@ -555,7 +575,10 @@ class ODesignOInvFoldProteinPipeline(CompositePipeline):
         seeds: Sequence[int] | None = None,
         seed: int | None = None,
         generator: torch.Generator | None = None,
-        conditions: Sequence[Hotspot | SymbolicBond | ODesignReferenceCoordinates] = (),
+        hotspots: Sequence[Hotspot] = (),
+        cyclic_bonds: Sequence[SymbolicBond] = (),
+        fixed_atoms: Sequence[AtomSite] = (),
+        constraint_atoms: Sequence[AtomSite] = (),
         recycling_steps: int | None = None,
         num_sampling_steps: int = 200,
         partial_diffusion_snr: float | None = None,
@@ -577,31 +600,33 @@ class ODesignOInvFoldProteinPipeline(CompositePipeline):
             seed,
             generator,
         )
-        model_input = _build_polymer_input(
-            self.processor,
-            input,
-            placement,
-            msa,
-            conditions,
-        )
+        canonical_input = _resolve_structure(input)
+        msa_value = _resolve_msa(msa, _input_system(canonical_input))
 
         candidates: list[ODesignPolymerDesignCandidate] = []
         for seed_index, backbone_seed in enumerate(seed_list):
             stream = resolve_generator(
                 backbone_seed,
                 None,
-                device=model_input.reference_positions.device,
+                device=_model_device(self.model),
             )
-            realized_input = self.processor.realize_ranges(
-                model_input,
+            realized_input = self.processor(
+                canonical_input,
+                placement=placement,
+                msa=msa_value,
+                hotspots=hotspots,
+                cyclic_bonds=cyclic_bonds,
+                fixed_atoms=fixed_atoms,
+                constraint_atoms=constraint_atoms,
                 generator=stream,
             )
             design_chains = tuple(chain for chain in _generated_polymer_chains(realized_input) if chain[1] == "protein")
             if not design_chains:
                 raise ValueError("ODesign protein design requires at least one generated protein position")
-            backbones = self.model.design(
+            backbones = _sample_polymer_backbones(
+                self.model,
                 realized_input,
-                num_candidates=num_backbones,
+                num_backbones=num_backbones,
                 generator=stream,
                 recycling_steps=recycling_steps,
                 num_sampling_steps=num_sampling_steps,
@@ -739,7 +764,10 @@ class ODesignNucleicAcidPipeline(CompositePipeline):
         seeds: Sequence[int] | None = None,
         seed: int | None = None,
         generator: torch.Generator | None = None,
-        conditions: Sequence[Hotspot | SymbolicBond | ODesignReferenceCoordinates] = (),
+        hotspots: Sequence[Hotspot] = (),
+        cyclic_bonds: Sequence[SymbolicBond] = (),
+        fixed_atoms: Sequence[AtomSite] = (),
+        constraint_atoms: Sequence[AtomSite] = (),
         recycling_steps: int | None = None,
         num_sampling_steps: int = 200,
         partial_diffusion_snr: float | None = None,
@@ -763,23 +791,24 @@ class ODesignNucleicAcidPipeline(CompositePipeline):
             seed,
             generator,
         )
-        model_input = _build_polymer_input(
-            self.processor,
-            input,
-            placement,
-            msa,
-            conditions,
-        )
+        canonical_input = _resolve_structure(input)
+        msa_value = _resolve_msa(msa, _input_system(canonical_input))
 
         candidates: list[ODesignPolymerDesignCandidate] = []
         for seed_index, backbone_seed in enumerate(seed_list):
             stream = resolve_generator(
                 backbone_seed,
                 None,
-                device=model_input.reference_positions.device,
+                device=_model_device(self.model),
             )
-            realized_input = self.processor.realize_ranges(
-                model_input,
+            realized_input = self.processor(
+                canonical_input,
+                placement=placement,
+                msa=msa_value,
+                hotspots=hotspots,
+                cyclic_bonds=cyclic_bonds,
+                fixed_atoms=fixed_atoms,
+                constraint_atoms=constraint_atoms,
                 generator=stream,
             )
             design_chains = tuple(
@@ -792,9 +821,10 @@ class ODesignNucleicAcidPipeline(CompositePipeline):
                     "greedy DNA OInvFold decoding returns one sequence; "
                     "set use_beam=True for num_sequences greater than one"
                 )
-            backbones = self.model.design(
+            backbones = _sample_polymer_backbones(
+                self.model,
                 realized_input,
-                num_candidates=num_backbones,
+                num_backbones=num_backbones,
                 generator=stream,
                 recycling_steps=recycling_steps,
                 num_sampling_steps=num_sampling_steps,
@@ -967,7 +997,10 @@ class ODesignOInvFoldRnaPipeline(CompositePipeline):
         seeds: Sequence[int] | None = None,
         seed: int | None = None,
         generator: torch.Generator | None = None,
-        conditions: Sequence[Hotspot | SymbolicBond | ODesignReferenceCoordinates] = (),
+        hotspots: Sequence[Hotspot] = (),
+        cyclic_bonds: Sequence[SymbolicBond] = (),
+        fixed_atoms: Sequence[AtomSite] = (),
+        constraint_atoms: Sequence[AtomSite] = (),
         recycling_steps: int | None = None,
         num_sampling_steps: int = 200,
         partial_diffusion_snr: float | None = None,
@@ -986,23 +1019,24 @@ class ODesignOInvFoldRnaPipeline(CompositePipeline):
             seed,
             generator,
         )
-        model_input = _build_polymer_input(
-            self.processor,
-            input,
-            placement,
-            msa,
-            conditions,
-        )
+        canonical_input = _resolve_structure(input)
+        msa_value = _resolve_msa(msa, _input_system(canonical_input))
 
         candidates: list[ODesignPolymerDesignCandidate] = []
         for seed_index, backbone_seed in enumerate(seed_list):
             stream = resolve_generator(
                 backbone_seed,
                 None,
-                device=model_input.reference_positions.device,
+                device=_model_device(self.model),
             )
-            realized_input = self.processor.realize_ranges(
-                model_input,
+            realized_input = self.processor(
+                canonical_input,
+                placement=placement,
+                msa=msa_value,
+                hotspots=hotspots,
+                cyclic_bonds=cyclic_bonds,
+                fixed_atoms=fixed_atoms,
+                constraint_atoms=constraint_atoms,
                 generator=stream,
             )
             generated_chains = _generated_polymer_chains(realized_input)
@@ -1011,9 +1045,10 @@ class ODesignOInvFoldRnaPipeline(CompositePipeline):
                 raise ValueError("ODesign OInvFold RNA design requires at least one generated RNA position")
             if len(design_chains) != len(generated_chains):
                 raise ValueError("ODesignOInvFoldRnaPipeline accepts only generated RNA chains")
-            backbones = self.model.design(
+            backbones = _sample_polymer_backbones(
+                self.model,
                 realized_input,
-                num_candidates=num_backbones,
+                num_backbones=num_backbones,
                 generator=stream,
                 recycling_steps=recycling_steps,
                 num_sampling_steps=num_sampling_steps,
@@ -1131,7 +1166,9 @@ class ODesignLigandPipeline(CompositePipeline):
         seeds: Sequence[int] | None = None,
         seed: int | None = None,
         generator: torch.Generator | None = None,
-        conditions: Sequence[Hotspot | ODesignReferenceCoordinates] = (),
+        hotspots: Sequence[Hotspot] = (),
+        fixed_atoms: Sequence[AtomSite] = (),
+        constraint_atoms: Sequence[AtomSite] = (),
         recycling_steps: int | None = None,
         num_sampling_steps: int = 200,
         partial_diffusion_snr: float | None = None,
@@ -1139,8 +1176,8 @@ class ODesignLigandPipeline(CompositePipeline):
         r"""
         Generate provisional ligand slots and assign their element categories.
 
-        The result retains ODesign's full bond logits, but generated connectivity
-        remains unresolved.
+        The result retains generated-slot pair bond logits, but generated
+        connectivity remains unresolved.
         """
 
         seed_list = _resolve_seeds(
@@ -1152,37 +1189,45 @@ class ODesignLigandPipeline(CompositePipeline):
             seed,
             generator,
         )
-        model_input = _build_ligand_input(
-            self.processor,
-            input,
-            generated_atoms,
-            msa,
-            conditions,
-        )
+        canonical_input = _resolve_structure(input)
+        msa_value = _resolve_msa(msa, _input_system(canonical_input))
 
         candidates: list[ODesignLigandDesignCandidate] = []
         for seed_index, backbone_seed in enumerate(seed_list):
             stream = resolve_generator(
                 backbone_seed,
                 None,
-                device=model_input.reference_positions.device,
+                device=_model_device(self.model),
             )
-            realized_input = self.processor.realize_atoms(
-                model_input,
+            realized_input = self.processor(
+                canonical_input,
+                generated_atoms=generated_atoms,
+                msa=msa_value,
+                hotspots=hotspots,
+                fixed_atoms=fixed_atoms,
+                constraint_atoms=constraint_atoms,
                 generator=stream,
             )
-            backbones = self.model.design_ligand(
+            output = self.model.sample(
                 realized_input,
-                num_candidates=num_backbones,
+                num_samples=num_backbones,
                 generator=stream,
                 recycling_steps=recycling_steps,
                 num_sampling_steps=num_sampling_steps,
+                num_model_seeds=1,
                 partial_diffusion_snr=partial_diffusion_snr,
+            )
+            backbones = tuple(
+                _ligand_backbone_from_coordinates(
+                    output.coordinates[0, 0, index],
+                    output.token_bond_type_logits[0, 0],
+                    realized_input,
+                )
+                for index in range(num_backbones)
             )
 
             for backbone_index, backbone in enumerate(backbones):
-                slot_ids = tuple(str(index) for index in range(len(backbone.slots)))
-                slot_by_id = dict(zip(slot_ids, backbone.slots, strict=True))
+                slot_ids = tuple(str(index) for index in range(backbone.coordinates.shape[0]))
                 result = self.element_designer.design(
                     OInvFoldLigandSlots(
                         slot_ids=slot_ids,
@@ -1197,7 +1242,6 @@ class ODesignLigandPipeline(CompositePipeline):
                     _ligand_candidate(
                         backbone,
                         result,
-                        slot_by_id,
                         sequence_index,
                         seed_index,
                         backbone_index,
@@ -1248,39 +1292,149 @@ def _resolve_seeds(
     return tuple(int(value) for value in drawn.tolist())
 
 
-def _build_polymer_input(
-    processor: ODesignProcessor,
-    input: MolecularSystem | Structure | str | PathLike[str] | None,
-    placement: ODesignPlacements | None,
-    msa: MSA | MSACollection | str | PathLike[str] | None,
-    conditions: Sequence[Hotspot | SymbolicBond | ODesignReferenceCoordinates],
-) -> ODesignInput:
-    canonical_input = _resolve_structure(input)
-    plan = processor._plan(canonical_input, placement, conditions)
-    return processor._lower(plan, _resolve_msa(msa, plan.system))
-
-
-def _build_ligand_input(
-    processor: ODesignLigandProcessor,
-    input: MolecularSystem | Structure | str | PathLike[str] | None,
-    generated_atoms: ODesignGeneratedAtoms,
-    msa: MSA | MSACollection | str | PathLike[str] | None,
-    conditions: Sequence[Hotspot | ODesignReferenceCoordinates],
-) -> ODesignLigandInput:
-    canonical_input = _resolve_structure(input)
-    plan = processor._plan(canonical_input, generated_atoms, conditions)
-    return processor._lower(
-        plan,
-        _resolve_msa(msa, plan.context_system),
-    )
-
-
 def _resolve_structure(
     input: MolecularSystem | Structure | str | PathLike[str] | None,
 ) -> MolecularSystem | Structure | None:
     if isinstance(input, (str, PathLike)):
         return read_structure(Path(input).expanduser())
     return input
+
+
+def _input_system(
+    input: MolecularSystem | Structure | None,
+) -> MolecularSystem | None:
+    return input.system if isinstance(input, Structure) else input
+
+
+def _model_device(model: ODesignModel) -> torch.device:
+    return next(model.parameters()).device
+
+
+def _sample_polymer_backbones(
+    model: ODesignModel,
+    input: ODesignInput,
+    *,
+    num_backbones: int,
+    generator: torch.Generator | None,
+    recycling_steps: int | None,
+    num_sampling_steps: int,
+    partial_diffusion_snr: float | None,
+) -> tuple[Structure, ...]:
+    output = model.sample(
+        input,
+        num_samples=num_backbones,
+        recycling_steps=recycling_steps,
+        num_sampling_steps=num_sampling_steps,
+        num_model_seeds=1,
+        partial_diffusion_snr=partial_diffusion_snr,
+        generator=generator,
+    )
+    return tuple(
+        _structure_from_atom_coordinates(
+            output.coordinates[0, 0, index],
+            input,
+        )
+        for index in range(num_backbones)
+    )
+
+
+def _structure_from_atom_coordinates(
+    coordinates: torch.Tensor,
+    input: ODesignInput,
+) -> Structure:
+    system = input.system.cpu()  # type: ignore[attr-defined]
+    atom_index = input.atom_index[0].detach().cpu().long()
+    valid = input.atom_mask[0].detach().cpu().bool() & (atom_index >= 0)
+    canonical_atom_index = atom_index[valid]
+    atom_count = system.atom_symbol.numel()
+    component_count = system.component_symbol.numel()
+    complete = torch.zeros(atom_count, 3, dtype=torch.float32)
+    coordinate_mask = torch.zeros(atom_count, dtype=torch.bool)
+    complete[canonical_atom_index] = coordinates[valid.to(coordinates.device)].to(device="cpu", dtype=torch.float32)
+    coordinate_mask[canonical_atom_index] = True
+    return Structure(  # type: ignore[call-arg]
+        system=system,
+        coordinates=complete,
+        coordinate_mask=coordinate_mask,
+        occupancy=torch.zeros(atom_count),
+        occupancy_mask=torch.zeros(atom_count, dtype=torch.bool),
+        b_factor=torch.zeros(atom_count),
+        b_factor_mask=torch.zeros(atom_count, dtype=torch.bool),
+        source_symbols=(),
+        residue_id=torch.full(
+            (component_count,),
+            -1,
+            dtype=torch.int64,
+        ),
+        insertion_code=torch.full(
+            (component_count,),
+            -1,
+            dtype=torch.int64,
+        ),
+        batch_size=[],
+    )
+
+
+def _ligand_backbone_from_coordinates(
+    coordinates: torch.Tensor,
+    token_bond_type_logits: torch.Tensor,
+    input: ODesignLigandInput,
+) -> ODesignLigandBackbone:
+    context = _structure_from_ligand_context(coordinates, input)
+    slot_mask = input.atom_mask[0].bool() & (input.atom_index[0] < 0)
+    generated_token_mask = input.token_mask[0].bool() & (input.token_component_index[0] < 0)
+    slot_coordinates = coordinates[slot_mask].detach().to(device="cpu", dtype=torch.float32).contiguous().numpy()
+    bond_logits = (
+        token_bond_type_logits[generated_token_mask][:, generated_token_mask]
+        .detach()
+        .to(device="cpu", dtype=torch.float32)
+        .contiguous()
+        .numpy()
+    )
+    return ODesignLigandBackbone(
+        context=context,
+        coordinates=slot_coordinates,
+        token_bond_type_logits=bond_logits,
+    )
+
+
+def _structure_from_ligand_context(
+    coordinates: torch.Tensor,
+    input: ODesignLigandInput,
+) -> Structure | None:
+    atom_index = input.atom_index[0].detach().cpu().long()
+    valid = input.atom_mask[0].detach().cpu().bool() & (atom_index >= 0)
+    if not bool(valid.any()):
+        return None
+    system = input.system.cpu()  # type: ignore[attr-defined]
+    canonical_atom_index = atom_index[valid]
+    atom_count = system.atom_symbol.numel()
+    component_count = system.component_symbol.numel()
+    complete = torch.zeros(atom_count, 3, dtype=torch.float32)
+    coordinate_mask = torch.zeros(atom_count, dtype=torch.bool)
+    complete[canonical_atom_index] = coordinates[valid.to(coordinates.device)].to(device="cpu", dtype=torch.float32)
+    coordinate_mask[canonical_atom_index] = True
+    return Structure(  # type: ignore[call-arg]
+        system=system,
+        coordinates=complete,
+        coordinate_mask=coordinate_mask,
+        occupancy=torch.zeros(atom_count),
+        occupancy_mask=torch.zeros(atom_count, dtype=torch.bool),
+        b_factor=torch.zeros(atom_count),
+        b_factor_mask=torch.zeros(atom_count, dtype=torch.bool),
+        source_symbols=(),
+        residue_id=torch.full(
+            (component_count,),
+            -1,
+            dtype=torch.int64,
+        ),
+        insertion_code=torch.full(
+            (component_count,),
+            -1,
+            dtype=torch.int64,
+        ),
+        batch_size=[],
+    )
 
 
 def _resolve_msa(
@@ -1292,7 +1446,9 @@ def _resolve_msa(
     if system is None:
         raise ValueError("an MSA path requires canonical polymer context")
     polymer_entity_ids = tuple(
-        entity_id for entity_id, entity in system.entities.items() if isinstance(entity, PolymerSequence)
+        system.entity_id(entity)
+        for entity in range(system.entity_symbol.numel())
+        if int(system.entity_type[entity]) != ENTITY_MOLECULE
     )
     if len(polymer_entity_ids) != 1:
         raise ValueError("an MSA path is unambiguous only for a single-polymer system; " "pass MSACollection")
@@ -1312,32 +1468,35 @@ def _generated_polymer_chains(
     ],
     ...,
 ]:
-    generated = {
-        reference
-        for placements in input.layout.placement_map.values()
-        for occurrences in placements.values()
-        for reference in occurrences
-    }
-    has_placement = input.layout.placement is not None
     chains = []
-    for instance_id, entity_id in input.layout.system.instances.items():
-        entity = input.layout.system.entities[entity_id]
-        if not isinstance(entity, PolymerSequence):
+    system = input.system
+    modality_by_type = {
+        ENTITY_PROTEIN: "protein",
+        ENTITY_DNA: "dna",
+        ENTITY_RNA: "rna",
+    }
+    for instance in range(system.instance_symbol.numel()):
+        entity = int(system.instance_entity[instance])
+        modality = modality_by_type.get(int(system.entity_type[entity]))
+        if modality is None:
             continue
-        if entity.polymer_type not in ("protein", "dna", "rna"):
-            continue
+        start = int(system.instance_component_ptr[instance])
+        stop = int(system.instance_component_ptr[instance + 1])
         positions = tuple(
-            (instance_id, component_index)
-            for component_index in range(len(entity))
-            if not has_placement or (instance_id, component_index) in generated
+            (
+                system.instance_id(instance),
+                component - start,
+            )
+            for component in range(start, stop)
+            if bool(input.design_component_mask[component])
         )
         if positions:
             chains.append(
                 (
-                    instance_id,
+                    system.instance_id(instance),
                     cast(
                         Literal["protein", "dna", "rna"],
-                        entity.polymer_type,
+                        modality,
                     ),
                     positions,
                 )
@@ -1349,19 +1508,17 @@ def _protein_backbone_for_inverse_folding(
     structure: Structure,
     positions: tuple[ComponentReference, ...],
 ) -> Structure:
-    replacements = {reference: get_component("GLY") for reference in positions}
-    system = structure.system.replace_components(replacements)
-    rows = [index for index, site in enumerate(structure.sites) if _contains_site(system, site)]
-    indices = np.asarray(rows, dtype=np.int64)
-    return Structure(
-        system=system,
-        sites=tuple(structure.sites[index] for index in rows),
-        coordinates=structure.coordinates[indices],
-        coordinate_mask=structure.coordinate_mask[indices],
-        occupancy=(None if structure.occupancy is None else structure.occupancy[indices]),
-        b_factor=(None if structure.b_factor is None else structure.b_factor[indices]),
-        residue_numbers=structure.residue_numbers,
+    component_index = torch.tensor(
+        [structure.system.component_index(reference) for reference in positions],
+        dtype=torch.int64,
+        device=structure.system.component_symbol.device,
     )
+    system, old_to_new, _ = replace_components(
+        structure.system,
+        component_index,
+        [get_component("GLY")] * len(positions),
+    )
+    return _remap_structure(structure, system, old_to_new)
 
 
 _NUCLEIC_ACID_IDENTITIES = {
@@ -1382,40 +1539,28 @@ def _nucleic_acid_backbone_for_inverse_folding(
     modality: Literal["dna", "rna"],
 ) -> Structure:
     component_id, base_anchor_atom_id = _NUCLEIC_ACID_IDENTITIES[modality, "A"]
-    replacements = {reference: get_component(component_id) for reference in positions}
-    system = structure.system.replace_components(replacements)
-    selected = set(positions)
-    sites = tuple(
-        (
+    component_index = torch.tensor(
+        [structure.system.component_index(reference) for reference in positions],
+        dtype=torch.int64,
+        device=structure.system.component_symbol.device,
+    )
+    system, old_to_new, _ = replace_components(
+        structure.system,
+        component_index,
+        [get_component(component_id)] * len(positions),
+    )
+    output = _remap_structure(structure, system, old_to_new)
+    for reference in positions:
+        source_atom = structure.system.atom_index(AtomSite(reference[0], reference[1], "N"))
+        target_atom = system.atom_index(
             AtomSite(
-                site.instance_id,
-                site.component_index,
-                base_anchor_atom_id if site.atom_id == "N" else site.atom_id,
+                reference[0],
+                reference[1],
+                base_anchor_atom_id,
             )
-            if (site.instance_id, site.component_index) in selected
-            else site
         )
-        for site in structure.sites
-    )
-    rows = [index for index, site in enumerate(sites) if _contains_site(system, site)]
-    indices = np.asarray(rows, dtype=np.int64)
-    return Structure(
-        system=system,
-        sites=tuple(sites[index] for index in rows),
-        coordinates=structure.coordinates[indices],
-        coordinate_mask=structure.coordinate_mask[indices],
-        occupancy=(None if structure.occupancy is None else structure.occupancy[indices]),
-        b_factor=(None if structure.b_factor is None else structure.b_factor[indices]),
-        residue_numbers=structure.residue_numbers,
-    )
-
-
-def _contains_site(system: MolecularSystem, site: AtomSite) -> bool:
-    try:
-        system.atom(site)
-    except KeyError:
-        return False
-    return True
+        _copy_atom_fields(output, target_atom, structure, source_atom)
+    return output
 
 
 def _has_ligand_atom_context(
@@ -1423,39 +1568,48 @@ def _has_ligand_atom_context(
     *,
     filter_by_occupancy: bool,
 ) -> bool:
-    observed = structure.coordinate_mask & np.isfinite(structure.coordinates).all(axis=-1)
-    if filter_by_occupancy and structure.occupancy is not None:
-        observed = observed & (np.isnan(structure.occupancy) | (structure.occupancy > 0))
-    for index, site in enumerate(structure.sites):
-        if not bool(observed[index]):
-            continue
-        entity = structure.system.entities[structure.system.instances[site.instance_id]]
-        if isinstance(entity, PolymerSequence) and entity.polymer_type == "protein":
-            continue
-        component = entity.components[site.component_index]
-        if is_water_component(component):
-            continue
-        element = structure.system.atom(site).element
-        if element not in HYDROGEN_ELEMENTS and element in ATOMIC_NUMBER_BY_ELEMENT:
-            return True
-    return False
+    system = structure.system
+    atom_component = torch.repeat_interleave(
+        torch.arange(
+            system.component_symbol.numel(),
+            dtype=torch.int64,
+            device=system.atom_symbol.device,
+        ),
+        system.component_atom_ptr[1:] - system.component_atom_ptr[:-1],
+    )
+    component_instance = torch.repeat_interleave(
+        torch.arange(
+            system.instance_symbol.numel(),
+            dtype=torch.int64,
+            device=system.atom_symbol.device,
+        ),
+        system.instance_component_ptr[1:] - system.instance_component_ptr[:-1],
+    )
+    entity_type = system.entity_type[system.instance_entity[component_instance[atom_component]]]
+    observed = structure.coordinate_mask & torch.isfinite(structure.coordinates).all(-1)
+    if filter_by_occupancy:
+        observed &= ~structure.occupancy_mask | (structure.occupancy > 0)
+    ligand = (
+        observed
+        & (entity_type != ENTITY_PROTEIN)
+        & ~water_component_mask(system)[atom_component]
+        & (system.atomic_number > 1)
+    )
+    return bool(ligand.any())
 
 
 def _structure_with_system(
     structure: Structure,
     system: MolecularSystem,
 ) -> Structure:
-    rows = [index for index, site in enumerate(structure.sites) if _contains_site(system, site)]
-    indices = np.asarray(rows, dtype=np.int64)
-    return Structure(
-        system=system,
-        sites=tuple(structure.sites[index] for index in rows),
-        coordinates=structure.coordinates[indices],
-        coordinate_mask=structure.coordinate_mask[indices],
-        occupancy=None if structure.occupancy is None else structure.occupancy[indices],
-        b_factor=None if structure.b_factor is None else structure.b_factor[indices],
-        residue_numbers=structure.residue_numbers,
-    )
+    output = _empty_structure(system, structure)
+    for source_atom in range(structure.system.atom_symbol.numel()):
+        try:
+            target_atom = system.atom_index(structure.system.atom_site(source_atom))
+        except KeyError:
+            continue
+        _copy_atom_fields(output, target_atom, structure, source_atom)
+    return output
 
 
 def _protein_sequence(
@@ -1463,7 +1617,11 @@ def _protein_sequence(
     positions: tuple[ComponentReference, ...],
 ) -> str:
     return "".join(
-        AMINO_ACID_THREE_TO_ONE.get(system.component(reference).component_id, "X") for reference in positions
+        AMINO_ACID_THREE_TO_ONE.get(
+            system.symbols[int(system.component_symbol[system.component_index(reference)])],
+            "X",
+        )
+        for reference in positions
     )
 
 
@@ -1471,8 +1629,9 @@ def _instance_component_references(
     system: MolecularSystem,
     instance_id: str,
 ) -> tuple[ComponentReference, ...]:
-    entity = system.entities[system.instances[instance_id]]
-    return tuple((instance_id, component_index) for component_index in range(len(entity.components)))
+    instance = system.instance_index(instance_id)
+    count = int(system.instance_component_ptr[instance + 1] - system.instance_component_ptr[instance])
+    return tuple((instance_id, component) for component in range(count))
 
 
 def _rna_structure_with_system(
@@ -1481,27 +1640,27 @@ def _rna_structure_with_system(
     positions: tuple[ComponentReference, ...],
 ) -> Structure:
     selected = set(positions)
-    sites = []
-    for site in structure.sites:
+    output = _empty_structure(system, structure)
+    for source_atom in range(structure.system.atom_symbol.numel()):
+        site = structure.system.atom_site(source_atom)
         reference = (site.instance_id, site.component_index)
-        if reference not in selected:
-            sites.append(site)
+        atom_id = site.atom_id
+        if reference in selected and atom_id in ("N", "N1", "N9"):
+            component = system.component_index(reference)
+            symbol = system.symbols[int(system.component_symbol[component])]
+            _, atom_id = _NUCLEIC_ACID_IDENTITIES["rna", symbol]
+        try:
+            target_atom = system.atom_index(
+                AtomSite(
+                    site.instance_id,
+                    site.component_index,
+                    atom_id,
+                )
+            )
+        except KeyError:
             continue
-        symbol = system.component(reference).component_id
-        _, base_anchor_atom_id = _NUCLEIC_ACID_IDENTITIES["rna", symbol]
-        atom_id = base_anchor_atom_id if site.atom_id in ("N", "N1", "N9") else site.atom_id
-        sites.append(AtomSite(site.instance_id, site.component_index, atom_id))
-    rows = [index for index, site in enumerate(sites) if _contains_site(system, site)]
-    indices = np.asarray(rows, dtype=np.int64)
-    return Structure(
-        system=system,
-        sites=tuple(sites[index] for index in rows),
-        coordinates=structure.coordinates[indices],
-        coordinate_mask=structure.coordinate_mask[indices],
-        occupancy=None if structure.occupancy is None else structure.occupancy[indices],
-        b_factor=None if structure.b_factor is None else structure.b_factor[indices],
-        residue_numbers=structure.residue_numbers,
-    )
+        _copy_atom_fields(output, target_atom, structure, source_atom)
+    return output
 
 
 def _polymer_chain_prediction(
@@ -1562,7 +1721,10 @@ def _grnade_chain_prediction(
         component_references=result.component_references,
         design_mask=result.design_mask,
         sequence="".join(
-            candidate.system.component(reference).component_id for reference in result.component_references
+            candidate.system.symbols[
+                int(candidate.system.component_symbol[candidate.system.component_index(reference)])
+            ]
+            for reference in result.component_references
         ),
         sequence_tokens=result.sequence_tokens[sequence_index],
         logits=result.logits[sequence_index],
@@ -1621,76 +1783,44 @@ def _combine_polymer_structures(
         ...,
     ],
 ) -> Structure:
-    selected = {reference for positions, _ in selections for reference in positions}
-    replacements = {
-        reference: candidate.system.component(reference)
-        for positions, candidate in selections
-        for reference in positions
-    }
-    system = backbone.system.replace_components(replacements)
-
-    sites: list[AtomSite] = []
-    coordinates: list[np.ndarray] = []
-    coordinate_mask: list[np.bool_] = []
-    occupancy: list[np.generic] | None = None if backbone.occupancy is None else []
-    b_factor: list[np.generic] | None = None if backbone.b_factor is None else []
-
-    for index, site in enumerate(backbone.sites):
-        if (site.instance_id, site.component_index) in selected:
-            continue
-        sites.append(site)
-        coordinates.append(backbone.coordinates[index])
-        coordinate_mask.append(backbone.coordinate_mask[index])
-        if occupancy is not None and backbone.occupancy is not None:
-            occupancy.append(backbone.occupancy[index])
-        if b_factor is not None and backbone.b_factor is not None:
-            b_factor.append(backbone.b_factor[index])
-
+    output = backbone
     for positions, candidate in selections:
-        selected_positions = set(positions)
-        for index, site in enumerate(candidate.sites):
-            if (site.instance_id, site.component_index) not in selected_positions:
-                continue
-            sites.append(site)
-            coordinates.append(candidate.coordinates[index])
-            coordinate_mask.append(candidate.coordinate_mask[index])
-            if occupancy is not None:
-                occupancy.append(np.nan if candidate.occupancy is None else candidate.occupancy[index])
-            if b_factor is not None:
-                b_factor.append(np.nan if candidate.b_factor is None else candidate.b_factor[index])
-
-    return Structure(
-        system=system,
-        sites=tuple(sites),
-        coordinates=np.asarray(
-            coordinates,
-            dtype=backbone.coordinates.dtype,
-        ),
-        coordinate_mask=np.asarray(coordinate_mask, dtype=np.bool_),
-        occupancy=(
-            None
-            if occupancy is None
-            else np.asarray(
-                occupancy,
-                dtype=cast(np.ndarray, backbone.occupancy).dtype,
+        target_component = torch.tensor(
+            [output.system.component_index(reference) for reference in positions],
+            dtype=torch.int64,
+            device=output.system.component_symbol.device,
+        )
+        source_component = torch.tensor(
+            [candidate.system.component_index(reference) for reference in positions],
+            dtype=torch.int64,
+            device=candidate.system.component_symbol.device,
+        )
+        system, old_to_new, source_to_new = copy_components(
+            output.system,
+            target_component,
+            candidate.system,
+            source_component,
+        )
+        combined = _remap_structure(output, system, old_to_new)
+        valid = source_to_new >= 0
+        for source_atom, target_atom in zip(
+            valid.nonzero(as_tuple=False).flatten().tolist(),
+            source_to_new[valid].detach().cpu().tolist(),
+            strict=True,
+        ):
+            _copy_atom_fields(
+                combined,
+                target_atom,
+                candidate,
+                source_atom,
             )
-        ),
-        b_factor=(
-            None
-            if b_factor is None
-            else np.asarray(
-                b_factor,
-                dtype=cast(np.ndarray, backbone.b_factor).dtype,
-            )
-        ),
-        residue_numbers=backbone.residue_numbers,
-    )
+        output = combined
+    return output
 
 
 def _ligand_candidate(
     backbone: ODesignLigandBackbone,
     result: OInvFoldLigandResult,
-    slot_by_id: dict[str, ODesignProvisionalAtomSlot],
     sequence_index: int,
     seed_index: int,
     backbone_index: int,
@@ -1698,8 +1828,6 @@ def _ligand_candidate(
     candidate = result.candidates[sequence_index]
     return ODesignLigandDesignCandidate(
         context=candidate.context,
-        context_token_sites=backbone.context_token_sites,
-        slots=tuple(slot_by_id[slot_id] for slot_id in candidate.slot_ids),
         coordinates=candidate.coordinates,
         elements=candidate.elements,
         per_atom_probabilities=candidate.per_atom_probabilities,
@@ -1723,3 +1851,84 @@ def _ligand_candidate(
         backbone_index=backbone_index,
         sequence_index=sequence_index,
     )
+
+
+def _empty_structure(
+    system: MolecularSystem,
+    source: Structure,
+) -> Structure:
+    atom_count = system.atom_symbol.numel()
+    component_count = system.component_symbol.numel()
+    return Structure(  # type: ignore[call-arg]
+        system=system,
+        coordinates=torch.zeros(
+            atom_count,
+            3,
+            dtype=source.coordinates.dtype,
+            device=system.atom_symbol.device,
+        ),
+        coordinate_mask=torch.zeros(
+            atom_count,
+            dtype=torch.bool,
+            device=system.atom_symbol.device,
+        ),
+        occupancy=torch.zeros(
+            atom_count,
+            dtype=source.occupancy.dtype,
+            device=system.atom_symbol.device,
+        ),
+        occupancy_mask=torch.zeros(
+            atom_count,
+            dtype=torch.bool,
+            device=system.atom_symbol.device,
+        ),
+        b_factor=torch.zeros(
+            atom_count,
+            dtype=source.b_factor.dtype,
+            device=system.atom_symbol.device,
+        ),
+        b_factor_mask=torch.zeros(
+            atom_count,
+            dtype=torch.bool,
+            device=system.atom_symbol.device,
+        ),
+        source_symbols=source.source_symbols,
+        residue_id=source.residue_id[:component_count].clone(),
+        insertion_code=source.insertion_code[:component_count].clone(),
+        batch_size=[],
+    )
+
+
+def _copy_atom_fields(
+    target: Structure,
+    target_atom: int,
+    source: Structure,
+    source_atom: int,
+) -> None:
+    target.coordinates[target_atom] = source.coordinates[source_atom]
+    target.coordinate_mask[target_atom] = source.coordinate_mask[source_atom]
+    target.occupancy[target_atom] = source.occupancy[source_atom]
+    target.occupancy_mask[target_atom] = source.occupancy_mask[source_atom]
+    target.b_factor[target_atom] = source.b_factor[source_atom]
+    target.b_factor_mask[target_atom] = source.b_factor_mask[source_atom]
+
+
+def _remap_structure(
+    source: Structure,
+    system: MolecularSystem,
+    old_to_new: torch.Tensor,
+) -> Structure:
+    output = _empty_structure(system, source)
+    valid = old_to_new >= 0
+    for source_atom, target_atom in zip(
+        valid.nonzero(as_tuple=False).flatten().tolist(),
+        old_to_new[valid].detach().cpu().tolist(),
+        strict=True,
+    ):
+        _copy_atom_fields(
+            output,
+            target_atom,
+            source,
+            source_atom,
+        )
+    return output

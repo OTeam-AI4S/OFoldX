@@ -6,13 +6,25 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 
-import numpy as np
 import torch
 from torch import Tensor
 
 from ...data.components import get_component
 from ...data.conditions import AllowedResidueIdentities, TiedResidueIdentities
-from ...data.molecular import AtomSite, ComponentReference, MolecularSystem, PolymerSequence
+from ...data.molecular import (
+    BOND_ROLE_COMPONENT,
+    BOND_ROLE_POLYMER,
+    ENTITY_DNA,
+    ENTITY_DNA_RNA_HYBRID,
+    ENTITY_MOLECULE,
+    ENTITY_PROTEIN,
+    ENTITY_RNA,
+    ChemicalComponent,
+    ComponentReference,
+    MolecularSystem,
+    one_letter_to_component,
+    replace_components,
+)
 from ...data.structure import Structure
 from ...processor import Processor
 from .config import NaMpnnProcessorConfig
@@ -24,6 +36,7 @@ from .model import (
     NA_MPNN_RNA_SHARED_GENERATABLE_TOKEN_IDS,
     NA_MPNN_TOKEN_BY_COMPONENT,
     NaMpnnInput,
+    _repartition_entities_by_sequence,
 )
 
 _VOCAB_SIZE = 33
@@ -46,9 +59,10 @@ _SHARED_NUCLEIC_TOKENS = {
     "U": NA_MPNN_TOKEN_BY_COMPONENT["DT"],
 }
 _POLYMER_TYPE_INDEX = {"protein": 0, "dna": 1, "rna": 2}
+_POLYMER_TYPE_NAME = ("protein", "dna", "rna")
 
 # One aligned lowered residue row.
-_Row = tuple[ComponentReference, str, str, int, int, np.ndarray, tuple[bool, ...], bool]
+_Row = tuple[int, str, int, int, int, Tensor, Tensor, bool]
 
 
 class NaMpnnProcessor(Processor):
@@ -130,14 +144,20 @@ class NaMpnnProcessor(Processor):
     # ------------------------------------------------------------------
     # Shared lowering.
     # ------------------------------------------------------------------
-    def _polymer_type(self, entity: PolymerSequence, component_id: str) -> str:
-        if entity.polymer_type in ("protein", "dna", "rna"):
-            return entity.polymer_type
-        if component_id in _DNA_COMPONENTS:
-            return "dna"
-        if component_id in _RNA_COMPONENTS:
-            return "rna"
-        raise ValueError(f"NA-MPNN cannot consume polymer type {entity.polymer_type!r}")
+    @staticmethod
+    def _polymer_type(entity_type: int, component_id: str) -> int:
+        if entity_type == ENTITY_PROTEIN:
+            return _POLYMER_TYPE_INDEX["protein"]
+        if entity_type == ENTITY_DNA:
+            return _POLYMER_TYPE_INDEX["dna"]
+        if entity_type == ENTITY_RNA:
+            return _POLYMER_TYPE_INDEX["rna"]
+        if entity_type == ENTITY_DNA_RNA_HYBRID:
+            if component_id in _DNA_COMPONENTS:
+                return _POLYMER_TYPE_INDEX["dna"]
+            if component_id in _RNA_COMPONENTS:
+                return _POLYMER_TYPE_INDEX["rna"]
+        raise ValueError("NA-MPNN cannot classify this polymer occurrence as protein, DNA, or RNA")
 
     def _lower_rows(self, structure: Structure) -> list[_Row]:
         r"""
@@ -145,62 +165,140 @@ class NaMpnnProcessor(Processor):
         """
 
         system = structure.system
-        site_index = {site: index for index, site in enumerate(structure.sites)}
-        occupancy = structure.occupancy
-        residue_numbers = structure.residue_numbers
-
-        raw: list[tuple[ComponentReference, str, str, int]] = []
-        coordinates: list[np.ndarray] = []
-        atom_masks: list[tuple[bool, ...]] = []
-        valids: list[bool] = []
+        component_indices: list[int] = []
+        component_ids: list[str] = []
+        polymer_types: list[int] = []
+        chain_indices: list[int] = []
         source_numbers: list[int] = []
         chain_index = 0
-        for instance_id, entity_id in system.instances.items():
-            entity = system.entities[entity_id]
-            if not isinstance(entity, PolymerSequence):
+        component_ptr = system.instance_component_ptr.detach().cpu().tolist()
+        instance_entities = system.instance_entity.detach().cpu().tolist()
+        entity_types = system.entity_type.detach().cpu().tolist()
+        component_symbols = system.component_symbol.detach().cpu().tolist()
+        residue_ids = structure.residue_id.detach().cpu().tolist()
+        for instance, entity in enumerate(instance_entities):
+            entity_type = entity_types[entity]
+            if entity_type == ENTITY_MOLECULE:
                 continue
-            for component_index, component in enumerate(entity.components):
-                reference = (instance_id, component_index)
-                polymer_type = self._polymer_type(entity, component.component_id)
-                row_coordinates: list[np.ndarray] = []
-                row_mask: list[bool] = []
-                for atom_name in NA_MPNN_ATOM_NAMES:
-                    index = site_index.get(AtomSite(instance_id, component_index, atom_name))
-                    present = (
-                        index is not None
-                        and bool(structure.coordinate_mask[index])
-                        and (occupancy is None or bool(np.isnan(occupancy[index])) or float(occupancy[index]) > 0.0)
-                    )
-                    row_mask.append(present)
-                    row_coordinates.append(structure.coordinates[index] if present else np.zeros(3, dtype=np.float32))
-                valid = all(row_mask[NA_MPNN_ATOM_NAMES.index(name)] for name in _REQUIRED_ATOMS[polymer_type])
-                raw.append((reference, component.component_id, polymer_type, chain_index))
-                coordinates.append(np.stack(row_coordinates))
-                atom_masks.append(tuple(row_mask))
-                valids.append(valid)
-                if residue_numbers is not None and reference in residue_numbers:
-                    source_numbers.append(residue_numbers[reference].number)
+            start = component_ptr[instance]
+            stop = component_ptr[instance + 1]
+            for component in range(start, stop):
+                component_id = system.symbols[component_symbols[component]]
+                polymer_type = self._polymer_type(entity_type, component_id)
+                component_indices.append(component)
+                component_ids.append(component_id)
+                polymer_types.append(polymer_type)
+                chain_indices.append(chain_index)
+                source_id = residue_ids[component]
+                if source_id >= 0:
+                    source_numbers.append(int(structure.source_symbols[source_id]))
                 else:
-                    source_numbers.append(component_index)
+                    source_numbers.append(component - start)
             chain_index += 1
 
+        if not component_indices:
+            raise ValueError("NA-MPNN requires at least one protein, DNA, or RNA residue")
+
+        device = system.component_symbol.device
+        component_index_tensor = torch.tensor(
+            component_indices,
+            dtype=torch.int64,
+            device=device,
+        )
+        length = component_index_tensor.numel()
+        atom_coordinates = structure.coordinates.new_zeros((length, len(NA_MPNN_ATOM_NAMES), 3))
+        atom_mask = torch.zeros(
+            (length, len(NA_MPNN_ATOM_NAMES)),
+            dtype=torch.bool,
+            device=structure.coordinate_mask.device,
+        )
+        atom_component = torch.repeat_interleave(
+            torch.arange(
+                system.component_symbol.numel(),
+                dtype=torch.int64,
+                device=device,
+            ),
+            system.component_atom_ptr[1:] - system.component_atom_ptr[:-1],
+        )
+        row_by_component = torch.full(
+            (system.component_symbol.numel(),),
+            -1,
+            dtype=torch.int64,
+            device=device,
+        )
+        row_by_component[component_index_tensor] = torch.arange(
+            length,
+            dtype=torch.int64,
+            device=device,
+        )
+        symbol_index = {symbol: index for index, symbol in enumerate(system.symbols)}
+        slot_by_symbol = torch.full(
+            (len(system.symbols),),
+            -1,
+            dtype=torch.int64,
+            device=system.atom_symbol.device,
+        )
+        for slot, atom_name in enumerate(NA_MPNN_ATOM_NAMES):
+            symbol = symbol_index.get(atom_name)
+            if symbol is not None:
+                slot_by_symbol[symbol] = slot
+        atom_row = row_by_component[atom_component]
+        atom_slot = slot_by_symbol[system.atom_symbol]
+        retained = torch.nonzero(
+            (atom_row >= 0) & (atom_slot >= 0),
+            as_tuple=False,
+        ).flatten()
+        retained_row = atom_row[retained]
+        retained_slot = atom_slot[retained]
+        observed = structure.coordinate_mask & (~structure.occupancy_mask | (structure.occupancy > 0))
+        retained_observed = observed[retained]
+        atom_coordinates[retained_row, retained_slot] = torch.where(
+            retained_observed[:, None],
+            structure.coordinates[retained],
+            0,
+        )
+        atom_mask[retained_row, retained_slot] = retained_observed
+
+        required_slots = {
+            polymer_type: torch.tensor(
+                [NA_MPNN_ATOM_NAMES.index(name) for name in required],
+                dtype=torch.int64,
+                device=device,
+            )
+            for polymer_type, required in _REQUIRED_ATOMS.items()
+        }
+        polymer_type_tensor = torch.tensor(
+            polymer_types,
+            dtype=torch.int64,
+            device=device,
+        )
+        valid_tensor = torch.zeros(length, dtype=torch.bool, device=device)
+        for polymer_name, polymer_type in _POLYMER_TYPE_INDEX.items():
+            selected_type = polymer_type_tensor == polymer_type
+            valid_tensor[selected_type] = atom_mask[selected_type][:, required_slots[polymer_name]].all(dim=-1)
+        valids = valid_tensor.detach().cpu().tolist()
         residue_index = self._renumber(source_numbers)
-        rows: list[_Row] = []
-        for position, (reference, component_id, polymer_type, chain) in enumerate(raw):
-            rows.append(
-                (
-                    reference,
-                    component_id,
-                    polymer_type,
-                    chain,
-                    residue_index[position],
-                    coordinates[position],
-                    atom_masks[position],
-                    valids[position],
+        rows = [
+            (
+                component,
+                component_id,
+                polymer_type,
+                chain,
+                residue_index[position],
+                atom_coordinates[position],
+                atom_mask[position],
+                valids[position],
+            )
+            for position, (component, component_id, polymer_type, chain) in enumerate(
+                zip(
+                    component_indices,
+                    component_ids,
+                    polymer_types,
+                    chain_indices,
+                    strict=True,
                 )
             )
-        if not rows:
-            raise ValueError("NA-MPNN requires at least one protein, DNA, or RNA residue")
+        ]
         if not any(row[7] for row in rows):
             raise ValueError("NA-MPNN requires at least one residue with a complete polymer backbone")
         return rows
@@ -221,16 +319,17 @@ class NaMpnnProcessor(Processor):
             previous = source
         return renumbered
 
-    def _component_token(self, component_id: str, polymer_type: str) -> int:
-        if polymer_type == "rna" and self.config.shared_nucleic_tokens:
+    def _component_token(self, component_id: str, polymer_type: int) -> int:
+        polymer_name = _POLYMER_TYPE_NAME[polymer_type]
+        if polymer_name == "rna" and self.config.shared_nucleic_tokens:
             return _SHARED_NUCLEIC_TOKENS.get(component_id, NA_MPNN_TOKEN_BY_COMPONENT["DX"])
-        unknown = {"protein": "UNK", "dna": "DX", "rna": "RX"}[polymer_type]
+        unknown = {"protein": "UNK", "dna": "DX", "rna": "RX"}[polymer_name]
         return NA_MPNN_TOKEN_BY_COMPONENT.get(component_id, NA_MPNN_TOKEN_BY_COMPONENT[unknown])
 
-    def _generatable_tokens(self, polymer_type: str) -> tuple[int, ...]:
-        if polymer_type == "protein":
+    def _generatable_tokens(self, polymer_type: int) -> tuple[int, ...]:
+        if polymer_type == _POLYMER_TYPE_INDEX["protein"]:
             return NA_MPNN_PROTEIN_GENERATABLE_TOKEN_IDS
-        if polymer_type == "dna":
+        if polymer_type == _POLYMER_TYPE_INDEX["dna"]:
             return NA_MPNN_DNA_GENERATABLE_TOKEN_IDS
         return (
             NA_MPNN_RNA_SHARED_GENERATABLE_TOKEN_IDS
@@ -253,34 +352,41 @@ class NaMpnnProcessor(Processor):
         residue_logit_bias: Tensor | None,
         allowed_token_mask: Tensor | None,
         pair_logit_bias: Tensor | None,
-        conditions: tuple[AllowedResidueIdentities | TiedResidueIdentities, ...],
     ) -> NaMpnnInput:
-        coordinates = np.stack([row[5] for row in rows])
         return NaMpnnInput(  # type: ignore[call-arg]
-            atom_coordinates=torch.as_tensor(coordinates, device=self.device, dtype=self.dtype).unsqueeze(0),
-            atom_mask=self._tensor([list(row[6]) for row in rows], torch.bool),
+            atom_coordinates=torch.stack([row[5] for row in rows])
+            .to(device=self.device, dtype=self.dtype)
+            .unsqueeze(0),
+            atom_mask=torch.stack([row[6] for row in rows]).to(device=self.device).unsqueeze(0),
             sequence_tokens=self._tensor(sequence_tokens, torch.int64),
             residue_mask=self._tensor([row[7] for row in rows], torch.bool),
             residue_index=self._tensor([row[4] for row in rows], torch.int64),
             chain_index=self._tensor([row[3] for row in rows], torch.int64),
             polymer_type_index=self._tensor(
-                [_POLYMER_TYPE_INDEX[row[2]] if row[7] else 3 for row in rows],
+                [row[2] if row[7] else 3 for row in rows],
                 torch.int64,
             ),
-            protein_mask=self._tensor([row[2] == "protein" and row[7] for row in rows], torch.bool),
-            dna_mask=self._tensor([row[2] == "dna" and row[7] for row in rows], torch.bool),
-            rna_mask=self._tensor([row[2] == "rna" and row[7] for row in rows], torch.bool),
+            protein_mask=self._tensor(
+                [row[2] == _POLYMER_TYPE_INDEX["protein"] and row[7] for row in rows],
+                torch.bool,
+            ),
+            dna_mask=self._tensor(
+                [row[2] == _POLYMER_TYPE_INDEX["dna"] and row[7] for row in rows],
+                torch.bool,
+            ),
+            rna_mask=self._tensor(
+                [row[2] == _POLYMER_TYPE_INDEX["rna"] and row[7] for row in rows],
+                torch.bool,
+            ),
             design_positions=self._tensor(design_positions, torch.bool),
             tied_group_ids=self._tensor(tied_group_ids, torch.int64),
-            structures=(structure,),
-            component_references=(tuple(row[0] for row in rows),),
-            polymer_types=(tuple(row[2] for row in rows),),
-            conditions=(conditions,),
+            structure=structure,
+            component_index=self._tensor([row[0] for row in rows], torch.int64),
             tied_weights=tied_weights,
             residue_logit_bias=residue_logit_bias,
             allowed_token_mask=allowed_token_mask,
             pair_logit_bias=pair_logit_bias,
-            batch_size=[1],
+            batch_size=[],
         )
 
     # ------------------------------------------------------------------
@@ -301,16 +407,23 @@ class NaMpnnProcessor(Processor):
             (
                 self._component_token(row[1], row[2])
                 if row[7]
-                else NA_MPNN_TOKEN_BY_COMPONENT[{"protein": "UNK", "dna": "DX", "rna": "RX"}[row[2]]]
+                else NA_MPNN_TOKEN_BY_COMPONENT[
+                    {"protein": "UNK", "dna": "DX", "rna": "RX"}[_POLYMER_TYPE_NAME[row[2]]]
+                ]
             )
             for row in rows
         ]
-        selected = None if design_positions is None else set(design_positions)
+        selected = (
+            None
+            if design_positions is None
+            else {structure.system.component_index(reference) for reference in design_positions}
+        )
         if selected is not None:
-            references = {row[0] for row in rows}
-            missing = selected - references
+            components = {row[0] for row in rows}
+            missing = selected - components
             if missing:
-                raise ValueError(f"NA-MPNN positions are not polymer residues: {sorted(missing)!r}")
+                references = [structure.system.component_reference(component) for component in missing]
+                raise ValueError(f"NA-MPNN positions are not polymer residues: {references!r}")
         lowered_design_positions = [bool(row[7] and (selected is None or row[0] in selected)) for row in rows]
         tied_group_ids = list(range(len(rows)))
         return self._base_input(
@@ -323,7 +436,6 @@ class NaMpnnProcessor(Processor):
             residue_logit_bias=None,
             allowed_token_mask=None,
             pair_logit_bias=None,
-            conditions=(),
         )
 
     def _resolve_score_target(
@@ -336,68 +448,136 @@ class NaMpnnProcessor(Processor):
         """
 
         system = structure.system
-        polymer_instances: list[tuple[str, PolymerSequence]] = []
-        for instance_id, entity_id in system.instances.items():
-            entity = system.entities[entity_id]
-            if isinstance(entity, PolymerSequence):
-                polymer_instances.append((instance_id, entity))
+        if system.system_entity_ptr.numel() != 2:
+            raise ValueError("an NA-MPNN sequence target must contain one molecular system")
+        instance_entities = system.instance_entity.detach().cpu().tolist()
+        entity_types = system.entity_type.detach().cpu().tolist()
+        component_ptr = system.instance_component_ptr.detach().cpu().tolist()
+        component_symbols = system.component_symbol.detach().cpu().tolist()
+        polymer_instances = [
+            instance
+            for instance, entity in enumerate(instance_entities)
+            if entity_types[entity] in (ENTITY_PROTEIN, ENTITY_DNA, ENTITY_RNA, ENTITY_DNA_RNA_HYBRID)
+        ]
         if isinstance(sequence, str):
             if len(polymer_instances) != 1:
                 raise ValueError("a bare NA-MPNN sequence requires exactly one polymer instance")
-            sequence = {polymer_instances[0][0]: sequence}
+            sequence = {system.instance_id(polymer_instances[0]): sequence}
 
-        target_components = {instance_id: entity.components for instance_id, entity in polymer_instances}
+        requested_by_instance: dict[int, tuple[ChemicalComponent, ...]] = {}
         for instance_id, value in sequence.items():
-            entity = system.entities[system.instances[instance_id]]
-            if not isinstance(entity, PolymerSequence):
+            instance = system.instance_index(instance_id)
+            entity = instance_entities[instance]
+            entity_type = entity_types[entity]
+            if entity_type not in (
+                ENTITY_PROTEIN,
+                ENTITY_DNA,
+                ENTITY_RNA,
+                ENTITY_DNA_RNA_HYBRID,
+            ):
                 raise ValueError(f"NA-MPNN sequence instance {instance_id!r} is not a polymer")
+            start = component_ptr[instance]
+            stop = component_ptr[instance + 1]
             if isinstance(value, str):
-                requested = PolymerSequence.from_one_letter(value, polymer_type=entity.polymer_type).components
+                polymer_type = {
+                    ENTITY_PROTEIN: "protein",
+                    ENTITY_DNA: "dna",
+                    ENTITY_RNA: "rna",
+                }.get(entity_type)
+                if polymer_type is None:
+                    raise ValueError("a DNA/RNA hybrid requires explicit component occurrences")
+                requested_components = []
+                for index, symbol in enumerate(value):
+                    try:
+                        component_id = one_letter_to_component(
+                            symbol,
+                            polymer_type,
+                            policy="strict",
+                        )
+                    except KeyError:
+                        raise ValueError(
+                            f"unsupported or ambiguous {polymer_type} one-letter " f"symbol {symbol!r} at index {index}"
+                        ) from None
+                    requested_components.append(get_component(component_id))
+                requested = tuple(requested_components)
             else:
                 requested = tuple(get_component(component_id) for component_id in value)
-            if len(requested) != len(entity):
+            if len(requested) != stop - start:
                 raise ValueError(
                     f"NA-MPNN sequence for instance {instance_id!r} has length "
-                    f"{len(requested)}, expected {len(entity)}"
+                    f"{len(requested)}, expected {stop - start}"
                 )
-            target_components[instance_id] = tuple(
-                original if original.component_id == replacement.component_id else replacement
-                for original, replacement in zip(entity.components, requested)
-            )
+            requested_by_instance[instance] = requested
 
-        changed_references = {
-            (instance_id, component_index)
-            for instance_id, entity in polymer_instances
-            for component_index, (original, target) in enumerate(zip(entity.components, target_components[instance_id]))
-            if original.component_id != target.component_id
-        }
-        if not changed_references:
+        changed_components = []
+        replacements = []
+        for instance, requested in requested_by_instance.items():
+            start = component_ptr[instance]
+            for component, replacement in zip(
+                range(start, component_ptr[instance + 1]),
+                requested,
+                strict=True,
+            ):
+                if system.symbols[component_symbols[component]] != replacement.component_id:
+                    changed_components.append(component)
+                    replacements.append(replacement)
+        if not changed_components:
             return structure
 
-        replacements = {reference: target_components[reference[0]][reference[1]] for reference in changed_references}
-        replacement_atom_ids = {
-            reference: frozenset(atom.atom_id for atom in component.atoms)
-            for reference, component in replacements.items()
-        }
-        system = system.replace_components(replacements)
-        indices: list[int] = []
-        for index, site in enumerate(structure.sites):
-            reference = (site.instance_id, site.component_index)
-            if reference in changed_references and (
-                site.atom_id not in NA_MPNN_ATOM_NAMES or site.atom_id not in replacement_atom_ids[reference]
-            ):
-                continue
-            system.atom(site)
-            indices.append(index)
-        index_array = np.asarray(indices, dtype=np.int64)
-        return Structure(
+        realized, old_to_new, _ = replace_components(
             system,
-            tuple(structure.sites[index] for index in indices),
-            structure.coordinates[index_array],
-            structure.coordinate_mask[index_array],
-            None if structure.occupancy is None else structure.occupancy[index_array],
-            None if structure.b_factor is None else structure.b_factor[index_array],
-            structure.residue_numbers,
+            torch.tensor(
+                changed_components,
+                dtype=torch.int64,
+                device=system.component_symbol.device,
+            ),
+            replacements,
+        )
+        realized = _repartition_entities_by_sequence(system, realized)
+
+        atom_count = realized.atom_symbol.numel()
+        coordinates = structure.coordinates.new_zeros(atom_count, 3)
+        coordinate_mask = structure.coordinate_mask.new_zeros(atom_count)
+        occupancy = structure.occupancy.new_zeros(atom_count)
+        occupancy_mask = structure.occupancy_mask.new_zeros(atom_count)
+        b_factor = structure.b_factor.new_zeros(atom_count)
+        b_factor_mask = structure.b_factor_mask.new_zeros(atom_count)
+        atom_component = torch.repeat_interleave(
+            torch.arange(
+                system.component_symbol.numel(),
+                dtype=torch.int64,
+                device=system.atom_symbol.device,
+            ),
+            system.component_atom_ptr[1:] - system.component_atom_ptr[:-1],
+        )
+        changed_mask = torch.zeros_like(system.component_symbol, dtype=torch.bool)
+        changed_mask[changed_components] = True
+        consumed_symbols = {index for index, symbol in enumerate(system.symbols) if symbol in NA_MPNN_ATOM_NAMES}
+        consumed_atom = torch.tensor(
+            [symbol in consumed_symbols for symbol in system.atom_symbol.detach().cpu().tolist()],
+            dtype=torch.bool,
+            device=system.atom_symbol.device,
+        )
+        retained = (old_to_new >= 0) & (~changed_mask[atom_component] | consumed_atom)
+        destination = old_to_new[retained]
+        coordinates[destination] = structure.coordinates[retained]
+        coordinate_mask[destination] = structure.coordinate_mask[retained]
+        occupancy[destination] = structure.occupancy[retained]
+        occupancy_mask[destination] = structure.occupancy_mask[retained]
+        b_factor[destination] = structure.b_factor[retained]
+        b_factor_mask[destination] = structure.b_factor_mask[retained]
+        return Structure(  # type: ignore[call-arg]
+            system=realized,
+            coordinates=coordinates,
+            coordinate_mask=coordinate_mask,
+            occupancy=occupancy,
+            occupancy_mask=occupancy_mask,
+            b_factor=b_factor,
+            b_factor_mask=b_factor_mask,
+            source_symbols=structure.source_symbols,
+            residue_id=structure.residue_id,
+            insertion_code=structure.insertion_code,
+            batch_size=[],
         )
 
     # ------------------------------------------------------------------
@@ -422,22 +602,31 @@ class NaMpnnProcessor(Processor):
 
         system = structure.system
         length = len(rows)
-        index_by_reference = {row[0]: index for index, row in enumerate(rows)}
+        index_by_component = {row[0]: index for index, row in enumerate(rows)}
+
+        def row_index(reference: ComponentReference) -> int:
+            return index_by_component[system.component_index(reference)]
+
         sequence_tokens = [
             (
                 self._component_token(row[1], row[2])
                 if row[7]
-                else NA_MPNN_TOKEN_BY_COMPONENT[{"protein": "UNK", "dna": "DX", "rna": "RX"}[row[2]]]
+                else NA_MPNN_TOKEN_BY_COMPONENT[
+                    {"protein": "UNK", "dna": "DX", "rna": "RX"}[_POLYMER_TYPE_NAME[row[2]]]
+                ]
             )
             for row in rows
         ]
 
         bonded = self._bonded_rows(system)
-        selected = None if design_positions is None else set(design_positions)
+        selected = (
+            None if design_positions is None else {system.component_index(reference) for reference in design_positions}
+        )
         if selected is not None:
-            for reference in selected:
-                if reference not in index_by_reference:
-                    raise ValueError(f"NA-MPNN position {reference!r} is not a polymer residue")
+            missing = selected - index_by_component.keys()
+            if missing:
+                references = [system.component_reference(component) for component in missing]
+                raise ValueError(f"NA-MPNN positions are not polymer residues: {references!r}")
         lowered_design_positions = [
             bool(row[7] and row[0] not in bonded and (selected is None or row[0] in selected)) for row in rows
         ]
@@ -456,31 +645,50 @@ class NaMpnnProcessor(Processor):
                 parent[second] = first
 
         # Same-entity shared instances tie identical monomers across copies.
-        entity_monomer_rows: dict[str, list[list[int]]] = {}
+        component_instance = torch.repeat_interleave(
+            torch.arange(
+                system.instance_symbol.numel(),
+                dtype=torch.int64,
+                device=system.component_symbol.device,
+            ),
+            system.instance_component_ptr[1:] - system.instance_component_ptr[:-1],
+        )
+        component_instances = component_instance.detach().cpu().tolist()
+        instance_entities = system.instance_entity.detach().cpu().tolist()
+        component_ptr = system.instance_component_ptr.detach().cpu().tolist()
+        entity_monomer_rows: dict[int, dict[int, list[int]]] = {}
         for index, row in enumerate(rows):
-            entity_id = system.instances[row[0][0]]
-            entity = system.entities[entity_id]
-            entity_monomer_rows.setdefault(entity_id, [[] for _ in entity.components])[row[0][1]].append(index)
+            instance = component_instances[row[0]]
+            entity = instance_entities[instance]
+            monomer = row[0] - component_ptr[instance]
+            entity_monomer_rows.setdefault(entity, {}).setdefault(
+                monomer,
+                [],
+            ).append(index)
         for monomer_rows in entity_monomer_rows.values():
-            for members in monomer_rows:
+            for members in monomer_rows.values():
                 for member in members[1:]:
                     union(members[0], member)
 
         # Exact identity ties may not cross polymer types; token symmetry may.
         for group in symmetry_groups:
-            members = [index_by_reference[reference] for reference in group]
+            members = [row_index(reference) for reference in group]
             for member in members[1:]:
                 union(members[0], member)
         restrictions: list[set[str] | None] = [None] * length
         for condition in conditions:
             if isinstance(condition, TiedResidueIdentities):
                 for group in condition.groups:
-                    members = [index_by_reference[reference] for reference in group]
+                    members = [row_index(reference) for reference in group]
+                    if len({rows[member][2] for member in members}) != 1:
+                        raise ValueError(
+                            "NA-MPNN cannot tie exact residue identities across " "different polymer types"
+                        )
                     for member in members[1:]:
                         union(members[0], member)
             elif isinstance(condition, AllowedResidueIdentities):
                 for target in condition.positions:
-                    index = index_by_reference[target]
+                    index = row_index(target)
                     allowed = set(condition.component_ids)
                     current = restrictions[index]
                     restrictions[index] = allowed if current is None else current & allowed
@@ -501,14 +709,6 @@ class NaMpnnProcessor(Processor):
             }
             if len(fixed_identities) > 1:
                 raise ValueError("NA-MPNN cannot tie residues fixed to different identities")
-            polymer_types = {rows[index][2] for index in members}
-            exact_tie = any(
-                isinstance(condition, TiedResidueIdentities)
-                and any(index_by_reference[reference] in members for group in condition.groups for reference in group)
-                for condition in conditions
-            )
-            if exact_tie and len(polymer_types) != 1:
-                raise ValueError("NA-MPNN cannot tie exact residue identities across different polymer types")
             # A tie shares one decoding position, so allowed identities intersect in token space:
             # token-symmetric nucleic identities (A/DA, ...) stay equivalent across a DNA/RNA tie
             # instead of being rejected as different component IDs.
@@ -524,7 +724,7 @@ class NaMpnnProcessor(Processor):
                     row = rows[index]
                     supported = {
                         component_id
-                        for component_id in _GENERATED_COMPONENTS[row[2]]
+                        for component_id in _GENERATED_COMPONENTS[_POLYMER_TYPE_NAME[row[2]]]
                         if self._component_token(component_id, row[2]) in allowed_tokens
                     }
                     if not supported:
@@ -539,8 +739,18 @@ class NaMpnnProcessor(Processor):
 
         tied_group_ids = self._dense_ids([find(index) for index in range(length)])
 
-        tied_weight_tensor = self._tied_weights_tensor(rows, index_by_reference, groups, tied_weights)
-        residue_bias_tensor = self._residue_bias_tensor(index_by_reference, residue_logit_bias)
+        tied_weight_tensor = self._tied_weights_tensor(
+            rows,
+            system,
+            index_by_component,
+            groups,
+            tied_weights,
+        )
+        residue_bias_tensor = self._residue_bias_tensor(
+            system,
+            index_by_component,
+            residue_logit_bias,
+        )
         pair_logit_bias = self._pair_logit_bias(rows, pair_bias)
 
         return self._base_input(
@@ -553,17 +763,27 @@ class NaMpnnProcessor(Processor):
             residue_logit_bias=residue_bias_tensor,
             allowed_token_mask=allowed_token_mask,
             pair_logit_bias=pair_logit_bias,
-            conditions=conditions,
         )
 
-    def _bonded_rows(self, system: MolecularSystem) -> set[ComponentReference]:
-        bonded: set[ComponentReference] = set()
-        for bond in system.bonds:
-            for site in (bond.site_a, bond.site_b):
-                entity = system.entities[system.instances[site.instance_id]]
-                if isinstance(entity, PolymerSequence):
-                    bonded.add((site.instance_id, site.component_index))
-        return bonded
+    @staticmethod
+    def _bonded_rows(system: MolecularSystem) -> set[int]:
+        r"""
+        Return polymer occurrences participating in noncanonical external bonds.
+        """
+
+        external = (system.bond_role != BOND_ROLE_COMPONENT) & (system.bond_role != BOND_ROLE_POLYMER)
+        atoms = system.edge_index[:, external].reshape(-1)
+        if not atoms.numel():
+            return set()
+        atom_component = torch.repeat_interleave(
+            torch.arange(
+                system.component_symbol.numel(),
+                dtype=torch.int64,
+                device=system.atom_symbol.device,
+            ),
+            system.component_atom_ptr[1:] - system.component_atom_ptr[:-1],
+        )
+        return set(atom_component[atoms].detach().cpu().tolist())
 
     def _allowed_token_mask(self, rows: list[_Row], global_omit_tokens: tuple[str, ...]) -> Tensor:
         omit_tokens: set[int] = set()
@@ -591,7 +811,8 @@ class NaMpnnProcessor(Processor):
     def _tied_weights_tensor(
         self,
         rows: list[_Row],
-        index_by_reference: dict[ComponentReference, int],
+        system: MolecularSystem,
+        index_by_component: dict[int, int],
         groups: dict[int, list[int]],
         tied_weights: Mapping[ComponentReference, float] | None,
     ) -> Tensor | None:
@@ -600,7 +821,7 @@ class NaMpnnProcessor(Processor):
         grouped = {index for members in groups.values() if len(members) > 1 for index in members}
         values = torch.ones(1, len(rows), device=self.device, dtype=self.dtype)
         for reference, weight in tied_weights.items():
-            index = index_by_reference[reference]
+            index = index_by_component[system.component_index(reference)]
             if index not in grouped:
                 raise ValueError("NA-MPNN tied weights require a tied or symmetric residue")
             values[0, index] = float(weight)
@@ -608,17 +829,27 @@ class NaMpnnProcessor(Processor):
 
     def _residue_bias_tensor(
         self,
-        index_by_reference: dict[ComponentReference, int],
+        system: MolecularSystem,
+        index_by_component: dict[int, int],
         residue_logit_bias: Mapping[ComponentReference, Tensor] | None,
     ) -> Tensor | None:
         if not residue_logit_bias:
             return None
-        values = torch.zeros(1, len(index_by_reference), _VOCAB_SIZE, device=self.device, dtype=self.dtype)
+        values = torch.zeros(
+            1,
+            len(index_by_component),
+            _VOCAB_SIZE,
+            device=self.device,
+            dtype=self.dtype,
+        )
         for reference, value in residue_logit_bias.items():
             converted = value.to(device=self.device, dtype=self.dtype)
             if converted.shape != (_VOCAB_SIZE,):
                 raise ValueError("NA-MPNN residue logit bias must have shape (33,)")
-            values[0, index_by_reference[reference]] = converted
+            values[
+                0,
+                index_by_component[system.component_index(reference)],
+            ] = converted
         return values
 
     def _pair_logit_bias(self, rows: list[_Row], pair_bias: Tensor | None) -> Tensor | None:

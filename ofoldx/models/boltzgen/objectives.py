@@ -116,7 +116,7 @@ def confidence_loss(
         predicted_coordinates,
         target.coordinates[:, 0],
         target.coordinate_mask,
-        target.atom_index,
+        target.coordinate_atom_index,
         target.chain_span,
         target.chain_equivalence_index,
         target.symmetry_atom_index,
@@ -577,13 +577,13 @@ def diffusion_loss(
         + nucleotide_loss_weight * atom_is_nucleotide.to(output.coordinates)
         + ligand_loss_weight * atom_is_ligand.to(output.coordinates)
     )
-    target_atom_index = target.atom_index.long()
-    valid_target_atom = target_atom_index >= 0
+    coordinate_atom_index = target.coordinate_atom_index.long()
+    valid_coordinate_atom = coordinate_atom_index >= 0
     resolved = target.coordinate_mask.gather(
         1,
-        target_atom_index.clamp_min(0),
+        coordinate_atom_index.clamp_min(0),
     ).bool()
-    resolved = resolved & valid_target_atom & input.atom_mask.bool()
+    resolved = resolved & valid_coordinate_atom & input.atom_mask.bool()
     alignment_weight = type_weight * resolved.to(type_weight)
 
     augmented_target_coordinates = output.augmented_target_coordinates.masked_fill(
@@ -603,11 +603,8 @@ def diffusion_loss(
             alignment_weight[:, None, :],
         )
 
-    fake_weight = (
-        1.0
-        - target.fake_atom_mask.to(output.coordinates)
-        + target.fake_atom_mask.to(output.coordinates) * fake_atom_weight
-    )
+    synthetic_atom = input.atom_mask.bool() & (input.atom_index < 0) & (target.coordinate_atom_index >= 0)
+    fake_weight = 1.0 - synthetic_atom.to(output.coordinates) + synthetic_atom.to(output.coordinates) * fake_atom_weight
     residue_class_weight = output.coordinates.new_tensor(_RESIDUE_TYPE_WEIGHTS)
     token_residue_weight = target.residue_type.to(output.coordinates) @ residue_class_weight
     atom_residue_weight = token_residue_weight.gather(1, atom_to_token)
@@ -635,12 +632,21 @@ def diffusion_loss(
     else:
         smooth_lddt = torch.zeros_like(mse)
 
-    if add_bond_loss and target.bond_atom_index is not None and target.bond_mask is not None:
+    if add_bond_loss:
+        bond_atom_index = input.bond_atom_index.long()
+        valid_bond_atom = bond_atom_index >= 0
+        safe_bond_atom_index = bond_atom_index.clamp_min(0)
+        bond_mask = (
+            input.bond_mask.bool()
+            & valid_bond_atom.all(dim=-1)
+            & resolved.gather(1, safe_bond_atom_index[..., 0])
+            & resolved.gather(1, safe_bond_atom_index[..., 1])
+        )
         bonds = bond_loss(
             output.coordinates,
             aligned_target,
-            target.bond_atom_index,
-            target.bond_mask,
+            safe_bond_atom_index,
+            bond_mask,
         )
     else:
         bonds = torch.zeros_like(mse)

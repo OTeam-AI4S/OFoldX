@@ -18,6 +18,7 @@ from ...data.molecular import (
     AtomSite,
     ChemicalComponent,
     ComponentReference,
+    replace_components,
 )
 from ...data.structure import Structure
 from ...pipelines import PairedPipeline
@@ -158,9 +159,13 @@ class OInvFoldPolymerPipeline(PairedPipeline[OInvFoldPolymerModel, OInvFoldPolym
         )
         probability_view = torch.softmax(output.logits / temperature, dim=-1)
         candidates = tuple(self._candidate(model_input, log_probabilities, tokens) for tokens in token_sequences)
+        component_references = tuple(
+            model_input.structure.system.component_reference(component_index)
+            for component_index in model_input.component_index.detach().cpu().tolist()
+        )
         return OInvFoldPolymerResult(
             target=input,
-            component_references=model_input.component_references,
+            component_references=component_references,
             design_mask=model_input.design_mask.detach().cpu().numpy(),
             logits=_numpy(output.logits),
             log_probabilities=_numpy(log_probabilities),
@@ -336,66 +341,116 @@ def _realize_polymer_structure(
     tokens: tuple[int, ...],
     modality: Literal["protein", "dna", "rna"],
 ) -> Structure:
-    replacements = {
-        reference: _component_for_token(token, modality)
-        for reference, token, design in zip(
-            input.component_references,
-            tokens,
-            input.design_mask.tolist(),
-            strict=True,
-        )
-        if design
-    }
-    changed = {
-        reference
-        for reference, component in replacements.items()
-        if input.structure.system.component(reference).component_id != component.component_id
-    }
-    if not changed:
+    source = input.structure
+    source_system = source.system
+    component_indices = input.component_index.detach().cpu().tolist()
+    design_mask = input.design_mask.detach().cpu().tolist()
+    changed_rows: list[int] = []
+    changed_components: list[int] = []
+    replacements: list[ChemicalComponent] = []
+    for row, (component_index, token, design) in enumerate(zip(component_indices, tokens, design_mask, strict=True)):
+        if not design:
+            continue
+        replacement = _component_for_token(token, modality)
+        changed_rows.append(row)
+        changed_components.append(component_index)
+        replacements.append(replacement)
+    if not changed_rows:
         return input.structure
 
-    system = input.structure.system.replace_components(replacements)
-    source_index = {site: index for index, site in enumerate(input.structure.sites)}
-    sites = [site for site in input.structure.sites if (site.instance_id, site.component_index) not in changed]
-    source_rows = [
-        index
-        for index, site in enumerate(input.structure.sites)
-        if (site.instance_id, site.component_index) not in changed
-    ]
-    coordinates = [input.structure.coordinates[index] for index in source_rows]
-    coordinate_mask = [input.structure.coordinate_mask[index] for index in source_rows]
-    occupancy = (
-        None if input.structure.occupancy is None else [input.structure.occupancy[index] for index in source_rows]
+    system, old_to_new, replacement_to_new = replace_components(
+        source_system,
+        torch.tensor(
+            changed_components,
+            dtype=torch.long,
+            device=source_system.component_symbol.device,
+        ),
+        tuple(replacements),
     )
-    b_factor = None if input.structure.b_factor is None else [input.structure.b_factor[index] for index in source_rows]
+    atom_count = system.atom_symbol.numel()
+    coordinates = torch.zeros(
+        atom_count,
+        3,
+        dtype=source.coordinates.dtype,
+        device=source.coordinates.device,
+    )
+    coordinate_mask = torch.zeros(
+        atom_count,
+        dtype=torch.bool,
+        device=source.coordinate_mask.device,
+    )
+    occupancy = torch.zeros(
+        atom_count,
+        dtype=source.occupancy.dtype,
+        device=source.occupancy.device,
+    )
+    occupancy_mask = torch.zeros(
+        atom_count,
+        dtype=torch.bool,
+        device=source.occupancy_mask.device,
+    )
+    b_factor = torch.zeros(
+        atom_count,
+        dtype=source.b_factor.dtype,
+        device=source.b_factor.device,
+    )
+    b_factor_mask = torch.zeros(
+        atom_count,
+        dtype=torch.bool,
+        device=source.b_factor_mask.device,
+    )
+    retained = old_to_new >= 0
+    retained_target = old_to_new[retained]
+    coordinates[retained_target] = source.coordinates[retained]
+    coordinate_mask[retained_target] = source.coordinate_mask[retained]
+    occupancy[retained_target] = source.occupancy[retained]
+    occupancy_mask[retained_target] = source.occupancy_mask[retained]
+    b_factor[retained_target] = source.b_factor[retained]
+    b_factor_mask[retained_target] = source.b_factor_mask[retained]
 
-    for reference, old_slots in zip(
-        input.component_references,
-        input.coordinate_slots,
+    replacement_offset = 0
+    coordinate_atom_index = input.coordinate_atom_index.detach().cpu()
+    for row, replacement in zip(
+        changed_rows,
+        replacements,
         strict=True,
     ):
-        if reference not in changed:
-            continue
-        component = replacements[reference]
-        new_atom_ids = _polymer_atom_ids(modality, component)
-        for old_site, atom_id in zip(old_slots, new_atom_ids, strict=True):
-            index = source_index[old_site]
-            sites.append(AtomSite(reference[0], reference[1], atom_id))
-            coordinates.append(input.structure.coordinates[index])
-            coordinate_mask.append(input.structure.coordinate_mask[index])
-            if occupancy is not None and input.structure.occupancy is not None:
-                occupancy.append(input.structure.occupancy[index])
-            if b_factor is not None and input.structure.b_factor is not None:
-                b_factor.append(input.structure.b_factor[index])
+        replacement_atom_index = {
+            atom.atom_id: replacement_offset + index for index, atom in enumerate(replacement.atoms)
+        }
+        new_atom_ids = _polymer_atom_ids(
+            modality,
+            frozenset(replacement_atom_index),
+        )
+        old_atoms = coordinate_atom_index[row]
+        for old_atom, atom_id in zip(
+            old_atoms.tolist(),
+            new_atom_ids,
+            strict=True,
+        ):
+            new_atom = int(replacement_to_new[replacement_atom_index[atom_id]])
+            if new_atom < 0:
+                continue
+            coordinates[new_atom] = source.coordinates[old_atom]
+            coordinate_mask[new_atom] = source.coordinate_mask[old_atom]
+            occupancy[new_atom] = source.occupancy[old_atom]
+            occupancy_mask[new_atom] = source.occupancy_mask[old_atom]
+            b_factor[new_atom] = source.b_factor[old_atom]
+            b_factor_mask[new_atom] = source.b_factor_mask[old_atom]
+        replacement_offset += len(replacement.atoms)
 
-    return Structure(
-        system,
-        tuple(sites),
-        np.asarray(coordinates, dtype=input.structure.coordinates.dtype),
-        np.asarray(coordinate_mask, dtype=np.bool_),
-        None if occupancy is None else np.asarray(occupancy),
-        None if b_factor is None else np.asarray(b_factor),
-        input.structure.residue_numbers,
+    return Structure(  # type: ignore[call-arg]
+        system=system,
+        coordinates=coordinates,
+        coordinate_mask=coordinate_mask,
+        occupancy=occupancy,
+        occupancy_mask=occupancy_mask,
+        b_factor=b_factor,
+        b_factor_mask=b_factor_mask,
+        source_symbols=source.source_symbols,
+        residue_id=source.residue_id,
+        insertion_code=source.insertion_code,
+        batch_size=[],
     )
 
 

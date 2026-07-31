@@ -9,7 +9,6 @@ import operator
 from dataclasses import dataclass
 from typing import Any, Callable, Literal, cast, overload
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from tensordict import tensorclass
@@ -17,11 +16,10 @@ from torch import Tensor, nn
 from transformers import EsmConfig, EsmModel
 
 from ...data.molecular import (
-    HYDROGEN_ELEMENTS,
+    ENTITY_MOLECULE,
     AtomSite,
     ComponentReference,
     MolecularSystem,
-    PolymerSequence,
 )
 from ...data.structure import Structure
 from ...model import Model
@@ -410,17 +408,18 @@ class ProtenixModel(Model):
             generator=generator,
         )
         noise_count = batch_size if synchronize_noise_levels else batch_size * num_samples
-        normal = torch.empty(
-            noise_count,
+        normal = _draw_normal(
+            (noise_count,),
             device=augmented_target_coordinates.device,
             dtype=augmented_target_coordinates.dtype,
-        ).normal_(generator=generator)
+            generator=generator,
+        )
         noise_level = (
             self.coordinate_denoiser.preconditioner.sigma_data * (noise_log_mean + noise_log_std * normal).exp()
         )
         if synchronize_noise_levels:
             noise_level = noise_level.repeat_interleave(num_samples)
-        coordinate_noise = torch.empty_like(augmented_target_coordinates).normal_(generator=generator)
+        coordinate_noise = _draw_normal_like(augmented_target_coordinates, generator)
         noisy_coordinates = augmented_target_coordinates + noise_level[:, None, None] * coordinate_noise
         augmented_target_coordinates = augmented_target_coordinates.reshape(
             batch_size,
@@ -628,8 +627,8 @@ class ProtenixModel(Model):
         Returns:
             One generation-ordered prediction per sample. Structure, PAE, PDE, and
             gPDE values are in angstroms; pLDDT is on the ``0--100`` scale. Atom
-            metrics follow ``input.atom_sites`` and token-pair metrics follow
-            ``input.token_sites``.
+            and token metric axes are reversed from the canonical indices carried
+            by ``input``.
 
         Raises:
             ValueError: If a sampling or guidance iteration count is invalid,
@@ -650,16 +649,28 @@ class ProtenixModel(Model):
         num_samples = output.coordinates.shape[-3]
         reference_positions = input.reference_positions
 
-        atom_count = len(input.atom_sites)
-        token_count = len(input.token_sites)
-        complete_sites = [site for site, atom in input.system.iter_atoms() if atom.element not in HYDROGEN_ELEMENTS]
-        complete_index = {site: index for index, site in enumerate(complete_sites)}
-        model_to_complete = np.asarray(
-            [complete_index[site] for site in input.atom_sites],
-            dtype=np.intp,
-        )
+        atom_count = int(input.atom_mask[0].sum().item())
+        token_count = int(input.token_mask[0].sum().item())
+        canonical_atom_index = input.atom_index[0, :atom_count].detach().cpu().long()
+        canonical_token_component = input.token_component_index[0, :token_count].detach().cpu().long()
+        canonical_token_atom = input.token_atom_index[0, :token_count].detach().cpu().long()
+        result_system = input.system.cpu()  # type: ignore[attr-defined]
+        atom_axis = tuple(result_system.atom_site(int(index)) for index in canonical_atom_index)
+        token_axis_values: list[ComponentReference | AtomSite] = []
+        for atom_index, component_index in zip(
+            canonical_token_atom.tolist(),
+            canonical_token_component.tolist(),
+        ):
+            if atom_index >= 0:
+                token_axis_values.append(result_system.atom_site(atom_index))
+            else:
+                token_axis_values.append(result_system.component_reference(component_index))
+        token_axis = tuple(token_axis_values)
 
-        coordinates = output.coordinates[0, :, :atom_count].to(device="cpu", dtype=torch.float32).numpy()
+        coordinates = output.coordinates[0, :, :atom_count].to(
+            device="cpu",
+            dtype=torch.float32,
+        )
         plddt_logits = output.plddt_logits[0, :, :atom_count].float()
         pae_logits = output.pae_logits[0, :, :token_count, :token_count].float()
         pde_logits = output.pde_logits[0, :, :token_count, :token_count].float()
@@ -682,22 +693,28 @@ class ProtenixModel(Model):
             reference_mask=input.reference_mask,
             reference_space_id=input.reference_space_id,
             token_to_rep_atom=input.token_to_rep_atom,
-            atom_sites=input.atom_sites,
-            token_sites=input.token_sites,
+            atom_count=atom_count,
+            token_atom_index=input.token_atom_index[0, :token_count],
         )
         token_chain = input.chain_index[0, :token_count].to(device=pae_logits.device, dtype=torch.long)
         atom_to_token = input.atom_to_token[0, :atom_count].to(device=pae_logits.device, dtype=torch.long)
-        atom_is_polymer = torch.tensor(
-            [
-                isinstance(
-                    input.system.entities[input.system.instances[site.instance_id]],
-                    PolymerSequence,
-                )
-                for site in input.atom_sites
-            ],
-            dtype=torch.bool,
-            device=pae_logits.device,
+        component_instance = torch.repeat_interleave(
+            torch.arange(
+                input.system.instance_symbol.numel(),
+                device=input.system.instance_symbol.device,
+            ),
+            input.system.instance_component_ptr[1:] - input.system.instance_component_ptr[:-1],
         )
+        atom_component = torch.repeat_interleave(
+            torch.arange(
+                input.system.component_symbol.numel(),
+                device=input.system.component_symbol.device,
+            ),
+            input.system.component_atom_ptr[1:] - input.system.component_atom_ptr[:-1],
+        )
+        canonical_atom_device = canonical_atom_index.to(device=atom_component.device)
+        atom_entity = input.system.instance_entity[component_instance[atom_component[canonical_atom_device]]]
+        atom_is_polymer = (input.system.entity_type[atom_entity] != ENTITY_MOLECULE).to(device=pae_logits.device)
         ptm, iptm, chain_ptm, chain_iptm, chain_pair_iptm, chain_pair_iptm_global = _protenix_tm_scores(
             pae_probability,
             token_has_frame=token_has_frame,
@@ -726,24 +743,56 @@ class ProtenixModel(Model):
         ranking_score = 0.8 * iptm + 0.2 * ptm + 0.5 * disorder - 100.0 * has_clash.to(ptm.dtype)
 
         contact_numpy = contact_probability.cpu().numpy()
-        token_instance_ids = tuple(
-            site.instance_id if isinstance(site, AtomSite) else site[0] for site in input.token_sites
-        )
-        token_chain_numpy = token_chain.cpu().numpy()
-        chain_axis = tuple(
-            token_instance_ids[int(np.argmax(token_chain_numpy == value))] for value in np.unique(token_chain_numpy)
-        )
+        component_instance_cpu = component_instance.detach().cpu()
+        token_chain_cpu = token_chain.detach().cpu()
+        chain_ids: list[str] = []
+        for chain in torch.unique(token_chain_cpu, sorted=True):
+            first_token = int((token_chain_cpu == chain).nonzero(as_tuple=False)[0, 0])
+            component_index = int(canonical_token_component[first_token])
+            instance_index = int(component_instance_cpu[component_index])
+            chain_ids.append(result_system.instance_id(instance_index))
+        chain_axis = tuple(chain_ids)
+        complete_atom_count = result_system.atom_symbol.numel()
+        complete_component_count = result_system.component_symbol.numel()
         predictions: list[FoldPrediction] = []
         for sample_index in range(num_samples):
-            complete_coordinates = np.zeros((len(complete_sites), 3), dtype=np.float32)
-            coordinate_mask = np.zeros(len(complete_sites), dtype=np.bool_)
-            complete_coordinates[model_to_complete] = coordinates[sample_index]
-            coordinate_mask[model_to_complete] = True
-            structure = Structure(
-                system=input.system,
-                sites=tuple(complete_sites),
+            complete_coordinates = torch.zeros(
+                complete_atom_count,
+                3,
+                dtype=torch.float32,
+            )
+            coordinate_mask = torch.zeros(
+                complete_atom_count,
+                dtype=torch.bool,
+            )
+            complete_coordinates[canonical_atom_index] = coordinates[sample_index]
+            coordinate_mask[canonical_atom_index] = True
+            structure = Structure(  # type: ignore[call-arg]
+                system=result_system,
                 coordinates=complete_coordinates,
                 coordinate_mask=coordinate_mask,
+                occupancy=torch.zeros(complete_atom_count),
+                occupancy_mask=torch.zeros(
+                    complete_atom_count,
+                    dtype=torch.bool,
+                ),
+                b_factor=torch.zeros(complete_atom_count),
+                b_factor_mask=torch.zeros(
+                    complete_atom_count,
+                    dtype=torch.bool,
+                ),
+                source_symbols=(),
+                residue_id=torch.full(
+                    (complete_component_count,),
+                    -1,
+                    dtype=torch.int64,
+                ),
+                insertion_code=torch.full(
+                    (complete_component_count,),
+                    -1,
+                    dtype=torch.int64,
+                ),
+                batch_size=[],
             )
             sample_plddt = atom_plddt[sample_index].cpu().numpy()
             sample_pae = pae[sample_index].cpu().numpy()
@@ -762,10 +811,10 @@ class ProtenixModel(Model):
                         "ranking_score": Score(float(ranking_score[sample_index]), preferred="higher"),
                     },
                     metrics={
-                        "plddt": Metric(values=sample_plddt, axis=input.atom_sites),
+                        "plddt": Metric(values=sample_plddt, axis=atom_axis),
                         "resolved_probability": Metric(
                             values=sample_resolved_probability,
-                            axis=input.atom_sites,
+                            axis=atom_axis,
                         ),
                         "chain_plddt": Metric(
                             values=chain_plddt[sample_index].cpu().numpy(),
@@ -788,20 +837,20 @@ class ProtenixModel(Model):
                     pair_metrics={
                         "pae": PairMetric(
                             values=sample_pae,
-                            row_axis=input.token_sites,
-                            column_axis=input.token_sites,
+                            row_axis=token_axis,
+                            column_axis=token_axis,
                             unit="angstrom",
                         ),
                         "pde": PairMetric(
                             values=sample_pde,
-                            row_axis=input.token_sites,
-                            column_axis=input.token_sites,
+                            row_axis=token_axis,
+                            column_axis=token_axis,
                             unit="angstrom",
                         ),
                         "contact_probs": PairMetric(
                             values=contact_numpy,
-                            row_axis=input.token_sites,
-                            column_axis=input.token_sites,
+                            row_axis=token_axis,
+                            column_axis=token_axis,
                         ),
                         "chain_pair_iptm": PairMetric(
                             values=chain_pair_iptm[sample_index].cpu().numpy(),
@@ -1143,7 +1192,7 @@ class ProtenixModel(Model):
             reference.shape[-2],
             3,
         )
-        coordinates = noise_schedule[0] * torch.empty_like(noise_template).normal_(generator=generator)
+        coordinates = noise_schedule[0] * _draw_normal_like(noise_template, generator)
         for step_index, (sigma_previous, sigma_next) in enumerate(zip(noise_schedule[:-1], noise_schedule[1:])):
             coordinates = self.coordinate_sampler.augment_target(
                 coordinates,
@@ -1158,9 +1207,7 @@ class ProtenixModel(Model):
             sigma_hat = sigma_previous * (churn + 1)
             delta_noise = torch.sqrt(sigma_hat**2 - sigma_previous**2)
             noisy_coordinates = coordinates + (
-                self.coordinate_sampler.noise_scale
-                * delta_noise
-                * torch.empty_like(coordinates).normal_(generator=generator)
+                self.coordinate_sampler.noise_scale * delta_noise * _draw_normal_like(coordinates, generator)
             )
             noise_level = (
                 sigma_hat.reshape((1,) * (len(context.batch_shape) + 1))
@@ -1233,7 +1280,7 @@ class ProtenixModel(Model):
                     step_scale * (sigma_next - noise_level)[..., None, None] * derivative
                 )
                 if outer_index + 1 < guidance.outer_steps:
-                    outer_noise = torch.empty_like(next_coordinates).normal_(generator=generator)
+                    outer_noise = _draw_normal_like(next_coordinates, generator)
                     outer_noise_scale = torch.sqrt(noise_level**2 - sigma_next**2)
                     working_coordinates = next_coordinates + outer_noise_scale[..., None, None] * outer_noise
             coordinates = next_coordinates
@@ -1250,17 +1297,24 @@ class ProtenixModel(Model):
         Draw one recycle MSA subset without privileging the query row.
         """
 
+        random_device = device if generator is None else generator.device
         count = int(
             torch.randint(
                 1,
                 num_rows + 1,
                 (),
-                device=device,
+                device=random_device,
                 generator=generator,
             )
         )
         count = min(count, 16384)
-        return torch.randperm(num_rows, device=device, generator=generator)[:count]
+        return torch.randperm(
+            num_rows,
+            device=random_device,
+            generator=generator,
+        )[
+            :count
+        ].to(device)
 
 
 class ProtenixStructureConditionModel(ProtenixModel):
@@ -1275,25 +1329,31 @@ class ProtenixStructureConditionModel(ProtenixModel):
             configuration.
 
     Examples:
-        >>> import numpy as np
         >>> import torch
-        >>> from ofoldx.data import AtomSite, MolecularSystem, PolymerSequence, Structure
+        >>> from ofoldx.data import MolecularSystem, PolymerSequence, Structure
         >>> from ofoldx.models.protenix import (
         ...     ProtenixStructureConditionConfig,
         ...     ProtenixStructureConditionModel,
         ...     ProtenixStructureConditionProcessor,
         ... )
         >>> sequence = PolymerSequence.from_one_letter("G")
-        >>> system = MolecularSystem({"protein": sequence}, {"A": "protein"})
-        >>> sites = tuple(AtomSite("A", 0, atom) for atom in ("N", "CA", "C", "O"))
+        >>> system = MolecularSystem.from_entities(
+        ...     {"protein": sequence}, {"A": "protein"}
+        ... )
+        >>> atom_count = system.atom_symbol.numel()
+        >>> component_count = system.component_symbol.numel()
         >>> structure = Structure(
-        ...     system,
-        ...     sites,
-        ...     np.asarray(
-        ...         [[-1., 0., 0.], [0., 0., 0.], [1., 1., 0.], [1., 2., 0.]],
-        ...         dtype=np.float32,
-        ...     ),
-        ...     np.ones(len(sites), dtype=np.bool_),
+        ...     system=system,
+        ...     coordinates=system.reference_coordinates.clone(),
+        ...     coordinate_mask=system.reference_coordinate_mask.clone(),
+        ...     occupancy=torch.ones(atom_count),
+        ...     occupancy_mask=torch.ones(atom_count, dtype=torch.bool),
+        ...     b_factor=torch.zeros(atom_count),
+        ...     b_factor_mask=torch.zeros(atom_count, dtype=torch.bool),
+        ...     source_symbols=(),
+        ...     residue_id=torch.full((component_count,), -1, dtype=torch.long),
+        ...     insertion_code=torch.full((component_count,), -1, dtype=torch.long),
+        ...     batch_size=[],
         ... )
         >>> input = ProtenixStructureConditionProcessor()(
         ...     structure,
@@ -1519,6 +1579,24 @@ class ProtenixTemplateModel(ProtenixModel):
     Identical to [`ProtenixModel`][] except its config defaults ``template`` on, so a fresh build always
     constructs the template embedder that its ``ProtenixTemplateProcessor`` feeds, rather than silently
     dropping template features.
+
+    Examples:
+        >>> import torch
+        >>> from ofoldx.models.protenix import ProtenixTemplateModel, ProtenixTemplateModelConfig
+        >>> config = ProtenixTemplateModelConfig({
+        ...     "trunk": {"num_msa_stages": 1, "num_pairformer_blocks": 1},
+        ...     "denoiser": {
+        ...         "num_token_encoder_blocks": 1,
+        ...         "num_atom_encoder_blocks": 1,
+        ...         "num_atom_decoder_blocks": 1,
+        ...     },
+        ...     "confidence": {"num_blocks": 1},
+        ...     "template": {"num_blocks": 1},
+        ... })
+        >>> with torch.device("meta"):
+        ...     model = ProtenixTemplateModel(config)
+        >>> model.template_embedder is not None
+        True
     """
 
     config_class = ProtenixTemplateModelConfig
@@ -1597,7 +1675,7 @@ class ProtenixNoisyStructureEmbedder(nn.Module):
         if add_noise > 0.0:
             distance = (
                 distance
-                + torch.randn(
+                + _draw_normal(
                     distance.shape,
                     device=distance.device,
                     dtype=distance.dtype,
@@ -3553,21 +3631,25 @@ def _protenix_token_has_frame(
     reference_mask: Tensor,
     reference_space_id: Tensor,
     token_to_rep_atom: Tensor,
-    atom_sites: tuple[AtomSite, ...],
-    token_sites: tuple[AtomSite | tuple[str, int], ...],
+    atom_count: int,
+    token_atom_index: Tensor,
 ) -> Tensor:
     r"""
     Compute token-frame validity from the reference conformer.
     """
 
-    atom_count = len(atom_sites)
     reference_positions = reference_positions[0, :atom_count].float()
     reference_mask = reference_mask[0, :atom_count].bool()
     reference_space = reference_space_id[0, :atom_count]
-    representative_atom = token_to_rep_atom[0, : len(token_sites)].long()
-    has_frame = torch.zeros(len(token_sites), dtype=torch.bool, device=reference_positions.device)
-    for token_index, token_site in enumerate(token_sites):
-        if type(token_site) is tuple:
+    token_count = token_atom_index.numel()
+    representative_atom = token_to_rep_atom[0, :token_count].long()
+    has_frame = torch.zeros(
+        token_count,
+        dtype=torch.bool,
+        device=reference_positions.device,
+    )
+    for token_index in range(token_count):
+        if int(token_atom_index[token_index]) < 0:
             has_frame[token_index] = True
             continue
         center = representative_atom[token_index]
@@ -3662,11 +3744,12 @@ def _protenix_tfg_monte_carlo_noise(
 ) -> Tensor:
     if guidance.monte_carlo_std == 0.0:
         return coordinates.new_zeros((1, *coordinates.shape))
-    noise = torch.empty(
+    noise = _draw_normal(
         (guidance.monte_carlo_samples, *coordinates.shape),
         device=coordinates.device,
         dtype=coordinates.dtype,
-    ).normal_(generator=generator)
+        generator=generator,
+    )
     return guidance.monte_carlo_std * noise
 
 
@@ -4082,10 +4165,10 @@ def _gather_protenix_structure_target(
     input: ProtenixInput,
 ) -> tuple[Tensor, Tensor]:
     r"""
-    Gather heavy-atom truth onto the current atom axis.
+    Gather canonical truth onto the current model atom axis.
     """
 
-    atom_index = target.atom_index.long()
+    atom_index = input.atom_index.long()
     valid = atom_index >= 0
     gather_index = atom_index.clamp_min(0)
     coordinates = target.coordinates.gather(
@@ -4096,6 +4179,39 @@ def _gather_protenix_structure_target(
     coordinate_mask = coordinate_mask & valid & input.atom_mask.bool()
     coordinates = coordinates.masked_fill(~coordinate_mask.unsqueeze(-1), 0)
     return coordinates, coordinate_mask
+
+
+def _draw_normal(
+    size: tuple[int, ...] | torch.Size,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    generator: torch.Generator | None,
+) -> Tensor:
+    r"""
+    Draw standard-normal values from ``generator`` and place them on ``device``.
+    """
+
+    random_device = device if generator is None else generator.device
+    return torch.randn(
+        size,
+        device=random_device,
+        dtype=dtype,
+        generator=generator,
+    ).to(device)
+
+
+def _draw_normal_like(reference: Tensor, generator: torch.Generator | None) -> Tensor:
+    r"""
+    Draw standard-normal values from ``generator`` with ``reference`` shape and placement.
+    """
+
+    return _draw_normal(
+        reference.shape,
+        device=reference.device,
+        dtype=reference.dtype,
+        generator=generator,
+    )
 
 
 def _center_random_augmentation(
@@ -4118,19 +4234,19 @@ def _center_random_augmentation(
     centered = coordinates - centroid
     if not augmentation:
         return centered
+    random_device = coordinates.device if generator is None else generator.device
     rotation = uniform_random_rotation(
         coordinates.shape[0],
+        device=random_device,
+        dtype=coordinates.dtype,
+        generator=generator,
+    ).to(coordinates.device)
+    translation = _draw_normal(
+        (coordinates.shape[0], 1, 3),
         device=coordinates.device,
         dtype=coordinates.dtype,
         generator=generator,
     )
-    translation = torch.empty(
-        coordinates.shape[0],
-        1,
-        3,
-        device=coordinates.device,
-        dtype=coordinates.dtype,
-    ).normal_(generator=generator)
     return torch.einsum("bmd,bds->bms", centered, rotation) + translation_scale * translation
 
 
@@ -4299,27 +4415,26 @@ class ProtenixPocket:
 @tensorclass
 class ProtenixStructureTarget:
     r"""
-    Heavy-atom structure truth for Protenix training.
+    Canonical full-axis structure truth for Protenix training.
 
     Args:
-        coordinates: Heavy-atom truth coordinates with shape ``(B, T, 3)`` in
-            angstroms.
+        coordinates: Full canonical atom-axis coordinates with shape
+            ``(B, T, 3)`` in angstroms.
         coordinate_mask: Resolved-coordinate mask with shape ``(B, T)``.
-        atom_index: Current model-atom to truth-pool mapping with shape
-            ``(B, A)``; ``-1`` marks padding.
     """
 
     coordinates: Tensor
     coordinate_mask: Tensor
-    atom_index: Tensor
 
 
 @tensorclass
 class ProtenixInput:
     r"""
-    Tensor and molecular-layout input for Protenix.
+    Tensor input whose model axes bind to one canonical molecular graph.
 
-    ``B`` is batch size, ``N`` token count, ``A`` atom count, and ``M`` MSA depth.
+    ``B`` is the explicit tensor batch axis, ``N`` token count, ``A`` atom
+    count, and ``M`` MSA depth. The tensorclass batch size is empty because the
+    nested canonical system uses ragged pointer axes rather than a dense prefix.
 
     Args:
         token_mask: Valid-token mask with shape ``(B, N)``.
@@ -4365,9 +4480,12 @@ class ProtenixInput:
         tfg_features: Optional static geometry prepared for training-free guidance.
         tfg_guidance: The guidance ``tfg_features`` was prepared for; ``sample`` defaults to it when no
             guidance is passed explicitly, so a processor-prepared input carries its own guidance.
-        system: Molecular system represented by the tensors.
-        atom_sites: Atom occurrences aligned to the atom axis.
-        token_sites: Molecular occurrences aligned to the token axis.
+        system: Canonical molecular system represented by the tensors.
+        atom_index: Canonical atom index for each model atom with shape ``(B, A)``.
+        token_component_index: Canonical component index for each model token
+            with shape ``(B, N)``.
+        token_atom_index: Canonical atom index for atom-level tokens and ``-1``
+            for component-level tokens, with shape ``(B, N)``.
     """
 
     token_mask: Tensor
@@ -4403,8 +4521,9 @@ class ProtenixInput:
     template_features: ProtenixTemplateFeatures | None
     tfg_features: ProtenixTfgFeatures | None
     system: MolecularSystem
-    atom_sites: tuple[AtomSite, ...]
-    token_sites: tuple[AtomSite | ComponentReference, ...]
+    atom_index: Tensor
+    token_component_index: Tensor
+    token_atom_index: Tensor
     tfg_guidance: ProtenixTfgGuidance | None = None
 
 

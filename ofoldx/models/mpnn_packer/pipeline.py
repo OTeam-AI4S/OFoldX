@@ -138,9 +138,12 @@ class MpnnPackerPipeline(PairedPipeline[MpnnPackerModel, MpnnPackerProcessor]):
         if num_samples <= 0:
             raise ValueError("num_samples must be positive")
 
-        # Model.sample consumes only the tensor fields; the structure metadata is carried per batch element
-        # (a list -> NonTensorStack) so the B-sized input stays internally consistent -- ``batched[i]`` maps
-        # to ``inputs[i]``. Realization below still reads each item directly.
+        component_offsets = []
+        component_offset = 0
+        for item in inputs:
+            component_offsets.append(component_offset)
+            component_offset += item.structure.system.component_symbol.numel()
+        batched_structure = Structure.batch([item.structure for item in inputs])
         batched = MpnnPackerInput(  # type: ignore[call-arg]
             backbone_coordinates=torch.cat([item.backbone_coordinates for item in inputs]),
             sequence_tokens=torch.cat([item.sequence_tokens for item in inputs]),
@@ -153,9 +156,26 @@ class MpnnPackerPipeline(PairedPipeline[MpnnPackerModel, MpnnPackerProcessor]):
             atom37_coordinates=torch.cat([item.atom37_coordinates for item in inputs]),
             atom37_mask=torch.cat([item.atom37_mask for item in inputs]),
             pack_positions=torch.cat([item.pack_positions for item in inputs]),
-            structure=[item.structure for item in inputs],
-            component_references=[item.component_references for item in inputs],
-            batch_size=[len(inputs)],
+            structure=batched_structure,
+            component_index=torch.cat(
+                [
+                    item.component_index + offset
+                    for item, offset in zip(
+                        inputs,
+                        component_offsets,
+                        strict=True,
+                    )
+                ]
+            ),
+            batch_size=[],
+        )
+        realization_inputs = tuple(
+            item.replace(structure=target)  # type: ignore[attr-defined]
+            for item, target in zip(
+                inputs,
+                batched_structure.unbatch(),
+                strict=True,
+            )
         )
 
         predictions: list[list[PackPrediction]] = [[] for _ in inputs]
@@ -166,7 +186,7 @@ class MpnnPackerPipeline(PairedPipeline[MpnnPackerModel, MpnnPackerProcessor]):
                 num_torsion_samples=num_torsion_samples,
                 generator=generator,
             )
-            for index, item in enumerate(inputs):
+            for index, item in enumerate(realization_inputs):
                 candidate = MpnnPackerSamplingOutput(
                     atom14_coordinates=packed.atom14_coordinates[index : index + 1],
                     atom14_mask=packed.atom14_mask[index : index + 1],

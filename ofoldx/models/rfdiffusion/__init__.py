@@ -20,23 +20,25 @@ from .model import (
     RFDIFFUSION_RESIDUE_TYPES,
     RFDIFFUSION_UNKNOWN_TOKEN_ID,
     RfDiffusionCoordination,
-    RfDiffusionDesignCandidate,
-    RfDiffusionDesignResult,
     RfDiffusionDistance,
     RfDiffusionInput,
-    RfDiffusionLayout,
     RfDiffusionModel,
     RfDiffusionOutput,
     RfDiffusionPlacements,
     RfDiffusionPointGroupSymmetry,
+    RfDiffusionPotentialInput,
     RfDiffusionRadiusOfGyration,
-    RfDiffusionReferenceCoordinates,
+    RfDiffusionSamplingOutput,
     RfDiffusionSecondaryStructure,
     RfDiffusionSubstrateInteraction,
     RfDiffusionTrajectory,
     rfdiffusion_residue_token_id,
 )
-from .pipeline import RfDiffusionPipeline
+from .pipeline import (
+    RfDiffusionDesignCandidate,
+    RfDiffusionDesignResult,
+    RfDiffusionPipeline,
+)
 from .processor import RfDiffusionProcessor, from_contig_string, to_contig_string
 
 _MODELS.register(

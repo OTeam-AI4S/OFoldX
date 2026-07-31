@@ -61,11 +61,11 @@ model-topology switches. Protein, DNA, and RNA candidates become canonical
 the previously completed OInvFold alternatives without presenting them as the
 official ODesign routes. Their converter selectors are
 `oinvfold-protein-flex`, `oinvfold-protein-rigid`, and
-`oinvfold-rna-rigid`. Ligand generation is deliberately
-provisional: candidates retain ordered slot identities, coordinates, predicted
-elements, probabilities, and ODesign bond logits, but their bonds, formal
-charges, and component identity remain unresolved. OFoldX does not fabricate a
-canonical molecule from those predictions.
+`oinvfold-rna-rigid`. Ligand generation is deliberately provisional:
+candidates retain row-aligned coordinates, predicted elements, probabilities,
+and ODesign bond logits, but their bonds, formal charges, and component identity
+remain unresolved. OFoldX does not fabricate a canonical molecule from those
+predictions.
 
 ### Links
 
@@ -142,11 +142,11 @@ pipeline = ofoldx.pipeline(
 )
 output = pipeline.design(
     "target.cif",
-    generated_atoms=ODesignGeneratedAtoms("ligand", 8, 16),
+    generated_atoms=ODesignGeneratedAtoms(8, 16),
 )
 ```
 
-The returned ligand slots are not a chemically complete molecule until an
+The returned ligand rows are not a chemically complete molecule until an
 external chemical-realization step resolves connectivity, charge, and component
 identity.
 
@@ -166,12 +166,17 @@ DNA/RNA `6`, ligand `11`), and scored with the EDM-weighted MSE. Rigid and
 flexible receptor behavior is Processor conditioning rather than a separate
 architecture.
 
+For direct conditioning, the polymer and ligand Processors expose named
+`hotspots`, `fixed_atoms`, and `constraint_atoms` arguments; polymer processing
+also accepts `cyclic_bonds`. Variable segment lengths and ligand atom counts are
+sampled once by the Processor using the caller's generator.
+
 ## Limitations
 
-The built-in Runner objective covers the canonical polymer Processor only; the
-provisional ligand artifact has no complete target-identity contract. Ligand
-outputs remain provisional atom slots until an external chemical-realization
-step supplies bonds, formal charges, and component identity.
+Ligand training requires the caller to supply the ordered generated target atom
+indices because provisional rows do not yet have canonical chemical identity.
+Ligand outputs remain provisional until an external chemical-realization step
+supplies bonds, formal charges, and component identity.
 
 ## Citation
 

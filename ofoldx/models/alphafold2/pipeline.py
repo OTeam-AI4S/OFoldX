@@ -404,7 +404,7 @@ def _monomer_input(
             if len(named) != 1:
                 raise ValueError("AlphaFold 2 monomer requires exactly one PolymerSequence")
             entity_id, sequence = named[0]
-            return MolecularSystem(
+            return MolecularSystem.from_entities(
                 entities={entity_id: sequence},
                 instances={entity_id: entity_id},
             )
@@ -426,5 +426,5 @@ def _monomer_msa(
 
     if not isinstance(msa, str | PathLike):
         return msa
-    _target, instance_id = protein_monomer(system)
-    return read_msa(Path(msa).expanduser(), entity_id=system.instances[instance_id])
+    entity_index, _instance_index, _component_index = protein_monomer(system)
+    return read_msa(Path(msa).expanduser(), entity_id=system.entity_id(entity_index))

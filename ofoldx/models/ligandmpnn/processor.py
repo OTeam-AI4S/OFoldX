@@ -7,18 +7,12 @@ from __future__ import annotations
 import operator
 from collections.abc import Mapping, Sequence
 
-import numpy as np
 import torch
 from torch import Tensor
 
-from ...data import ATOMIC_NUMBER_BY_ELEMENT, is_water_component
+from ...data import ENTITY_PROTEIN, water_component_mask
 from ...data.conditions import AllowedResidueIdentities, TiedResidueIdentities
-from ...data.molecular import (
-    AtomSite,
-    ComponentReference,
-    MolecularSystem,
-    PolymerSequence,
-)
+from ...data.molecular import ComponentReference, MolecularSystem
 from ...data.structure import Structure
 from ...modules.mpnn import (
     AMINO_ACID_COMPONENT_IDS,
@@ -76,14 +70,14 @@ _GENERATED_IDENTITIES = len(AMINO_ACID_COMPONENT_IDS)
 _VOCABULARY = _GENERATED_IDENTITIES + 1
 
 _LoweredRows = tuple[
-    list[ComponentReference],
-    list[np.ndarray],
-    list[np.ndarray],
-    list[np.ndarray],
-    list[int],
-    list[bool],
-    list[int],
-    list[int],
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
+    Tensor,
     list[str],
 ]
 
@@ -145,12 +139,13 @@ class LigandMpnnProcessor(Processor):
 
         Returns:
             A single-example ``LigandMpnnInput`` whose residue axes align with
-            ``component_references``.
+            ``component_index``.
 
         Notes:
-            Protein rows follow observed CA sites in ``structure.sites`` order, and
-            ``component_references`` uses the same axis. Each row's context axis contains its
-            nearest nonwater, nonprotein heavy atoms, padded to ``config.num_context_atoms``.
+            Protein rows follow observed CA atoms in canonical atom order.
+            ``component_index`` uses the same axis. Each row's context axis
+            contains its nearest nonwater, nonprotein heavy atoms, padded to
+            ``config.num_context_atoms``.
         """
 
         cutoff = float(ligand_interface_cutoff)
@@ -161,8 +156,8 @@ class LigandMpnnProcessor(Processor):
                 raise TypeError(f"LigandMPNN cannot consume {type(condition).__name__}")
 
         observed = structure.coordinate_mask
-        if filter_by_occupancy and structure.occupancy is not None:
-            observed = observed & (np.isnan(structure.occupancy) | (structure.occupancy > 0))
+        if filter_by_occupancy:
+            observed = observed & (~structure.occupancy_mask | (structure.occupancy > 0))
 
         rows = self._lower_structure_rows(structure, system, observed)
         return self._finalize(
@@ -183,91 +178,132 @@ class LigandMpnnProcessor(Processor):
         self,
         structure: Structure,
         system: MolecularSystem,
-        observed: np.ndarray,
+        observed: Tensor,
     ) -> _LoweredRows:
         r"""
         Build rows: observed-CA protein occurrences in CA-site order, cumulative positions.
         """
 
-        coordinate_index = {site: index for index, site in enumerate(structure.sites)}
-
-        row_references: list[ComponentReference] = []
-        row_backbone: list[np.ndarray] = []
-        row_residue_context_coordinates: list[np.ndarray] = []
-        row_residue_context_mask: list[np.ndarray] = []
-        row_valid: list[bool] = []
-        row_component_ids: list[str] = []
-        row_chain_index: list[int] = []
-        row_source_numbers: list[int | None] = []
-        chain_label_by_instance: dict[str, int] = {}
-        for index, site in enumerate(structure.sites):
-            if site.atom_id != "CA" or not bool(observed[index]):
-                continue
-            entity = system.entities[system.instances[site.instance_id]]
-            if not isinstance(entity, PolymerSequence) or entity.polymer_type != "protein":
-                continue
-            reference = (site.instance_id, site.component_index)
-            if site.instance_id not in chain_label_by_instance:
-                chain_label_by_instance[site.instance_id] = len(chain_label_by_instance)
-
-            atom37 = np.zeros((len(_ATOM37), 3), dtype=structure.coordinates.dtype)
-            atom37_mask = np.zeros(len(_ATOM37), dtype=np.bool_)
-            for atom_index, atom_id in enumerate(_ATOM37):
-                if atom_id == "OXT":
-                    # OXT remains empty so atom37[_RESIDUE_CONTEXT_START:] retains
-                    # the 32-slot residue-context layout.
-                    continue
-                position = coordinate_index.get(AtomSite(site.instance_id, site.component_index, atom_id))
-                if position is not None and bool(observed[position]):
-                    atom37[atom_index] = structure.coordinates[position]
-                    atom37_mask[atom_index] = True
-
-            backbone = atom37[list(_BACKBONE_ATOM37_INDICES)]
-            valid = bool(atom37_mask[list(_BACKBONE_ATOM37_INDICES)].all())
-            row_references.append(reference)
-            row_backbone.append(backbone)
-            row_residue_context_coordinates.append(atom37[_RESIDUE_CONTEXT_START:])
-            row_residue_context_mask.append(atom37_mask[_RESIDUE_CONTEXT_START:])
-            row_valid.append(valid)
-            row_component_ids.append(system.component(reference).component_id)
-            row_chain_index.append(chain_label_by_instance[site.instance_id])
-            row_source_numbers.append(
-                None if structure.residue_numbers is None else structure.residue_numbers[reference].number
-            )
-
-        if not row_references:
+        device = system.atom_symbol.device
+        component_count = system.component_symbol.numel()
+        component_instance = torch.repeat_interleave(
+            torch.arange(
+                system.instance_symbol.numel(),
+                dtype=torch.int64,
+                device=device,
+            ),
+            system.instance_component_ptr[1:] - system.instance_component_ptr[:-1],
+        )
+        atom_component = torch.repeat_interleave(
+            torch.arange(component_count, dtype=torch.int64, device=device),
+            system.component_atom_ptr[1:] - system.component_atom_ptr[:-1],
+        )
+        atom_instance = component_instance[atom_component]
+        protein_instance = system.entity_type[system.instance_entity] == ENTITY_PROTEIN
+        symbol_index = {symbol: index for index, symbol in enumerate(system.symbols)}
+        ca_symbol = symbol_index.get("CA")
+        if ca_symbol is None:
+            row_atom = system.atom_symbol.new_empty((0,))
+        else:
+            row_atom = torch.nonzero(
+                observed & protein_instance[atom_instance] & (system.atom_symbol == ca_symbol),
+                as_tuple=False,
+            ).flatten()
+        row_component = atom_component[row_atom]
+        if not row_component.numel():
             raise ValueError("LigandMPNN requires at least one protein residue with an observed CA")
-        if not any(row_valid):
+
+        length = row_component.numel()
+        row_by_component = torch.full(
+            (component_count,),
+            -1,
+            dtype=torch.int64,
+            device=device,
+        )
+        row_by_component[row_component] = torch.arange(
+            length,
+            dtype=torch.int64,
+            device=device,
+        )
+        atom37 = structure.coordinates.new_zeros((length, len(_ATOM37), 3))
+        atom37_mask = torch.zeros(
+            (length, len(_ATOM37)),
+            dtype=torch.bool,
+            device=observed.device,
+        )
+        for atom37_index, atom_id in enumerate(_ATOM37):
+            if atom_id == "OXT" or atom_id not in symbol_index:
+                continue
+            matching_atom = torch.nonzero(
+                (system.atom_symbol == symbol_index[atom_id]) & (row_by_component[atom_component] >= 0),
+                as_tuple=False,
+            ).flatten()
+            matching_row = row_by_component[atom_component[matching_atom]]
+            atom37[matching_row, atom37_index] = structure.coordinates[matching_atom]
+            atom37_mask[matching_row, atom37_index] = observed[matching_atom]
+
+        backbone_indices = torch.tensor(
+            _BACKBONE_ATOM37_INDICES,
+            dtype=torch.int64,
+            device=device,
+        )
+        row_backbone = atom37[:, backbone_indices]
+        row_valid = atom37_mask[:, backbone_indices].all(dim=-1)
+        if not bool(row_valid.any()):
             raise ValueError("LigandMPNN requires at least one residue with complete N/CA/C/O coordinates")
 
-        row_residue_index: list[int] = []
-        if structure.residue_numbers is None:
-            for reference in row_references:
-                row_residue_index.append(reference[1])
-        else:
+        row_instance = component_instance[row_component]
+        row_instance_host = row_instance.detach().cpu().tolist()
+        chain_by_instance: dict[int, int] = {}
+        row_chain_index = []
+        for instance in row_instance_host:
+            if instance not in chain_by_instance:
+                chain_by_instance[instance] = len(chain_by_instance)
+            row_chain_index.append(chain_by_instance[instance])
+
+        row_source_id = structure.residue_id[row_component]
+        has_source_id = row_source_id >= 0
+        if not bool(has_source_id.any()):
+            row_residue_index = (row_component - system.instance_component_ptr[row_instance]).detach().cpu().tolist()
+        elif bool(has_source_id.all()):
+            row_source_numbers = [
+                int(structure.source_symbols[index]) for index in row_source_id.detach().cpu().tolist()
+            ]
+            row_residue_index = []
             duplicate_count = 0
             previous_number: int | None = None
             for source_number in row_source_numbers:
-                assert source_number is not None
                 if source_number == previous_number:
                     duplicate_count += 1
                 row_residue_index.append(source_number + duplicate_count)
                 previous_number = source_number
+        else:
+            raise ValueError("LigandMPNN requires source residue IDs for every retained row or none")
 
-        row_tokens = [
-            AMINO_ACID_TOKEN_BY_COMPONENT.get(component_id, AMINO_ACID_UNKNOWN_TOKEN)
-            for component_id in row_component_ids
+        row_component_ids = [
+            system.symbols[index] for index in system.component_symbol[row_component].detach().cpu().tolist()
         ]
+        row_tokens = torch.tensor(
+            [
+                AMINO_ACID_TOKEN_BY_COMPONENT.get(
+                    component_id,
+                    AMINO_ACID_UNKNOWN_TOKEN,
+                )
+                for component_id in row_component_ids
+            ],
+            dtype=torch.int64,
+            device=device,
+        )
 
         return (
-            row_references,
+            row_component,
             row_backbone,
-            row_residue_context_coordinates,
-            row_residue_context_mask,
+            atom37[:, _RESIDUE_CONTEXT_START:],
+            atom37_mask[:, _RESIDUE_CONTEXT_START:],
             row_tokens,
             row_valid,
-            row_residue_index,
-            row_chain_index,
+            torch.tensor(row_residue_index, dtype=torch.int64, device=device),
+            torch.tensor(row_chain_index, dtype=torch.int64, device=device),
             row_component_ids,
         )
 
@@ -275,34 +311,40 @@ class LigandMpnnProcessor(Processor):
         self,
         structure: Structure,
         system: MolecularSystem,
-        observed: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray]:
+        observed: Tensor,
+    ) -> tuple[Tensor, Tensor]:
         r"""
         Collect observed nonprotein, nonwater, nonhydrogen atoms as ordinary context.
         """
 
-        context_coordinates: list[np.ndarray] = []
-        context_atomic_numbers: list[int] = []
-        for index, site in enumerate(structure.sites):
-            if not bool(observed[index]):
-                continue
-            entity = system.entities[system.instances[site.instance_id]]
-            if isinstance(entity, PolymerSequence) and entity.polymer_type == "protein":
-                continue
-            if is_water_component(entity.components[site.component_index]):
-                continue
-            element = system.atom(site).element
-            if element == "H":
-                continue
-            context_coordinates.append(structure.coordinates[index])
-            context_atomic_numbers.append(ATOMIC_NUMBER_BY_ELEMENT[element])
-        if not context_coordinates:
-            context_coordinates.append(np.zeros(3, dtype=np.float32))
-            context_atomic_numbers.append(0)
-        return (
-            np.stack(context_coordinates),
-            np.asarray(context_atomic_numbers, dtype=np.int64),
+        device = system.atom_symbol.device
+        component_instance = torch.repeat_interleave(
+            torch.arange(
+                system.instance_symbol.numel(),
+                dtype=torch.int64,
+                device=device,
+            ),
+            system.instance_component_ptr[1:] - system.instance_component_ptr[:-1],
         )
+        atom_component = torch.repeat_interleave(
+            torch.arange(
+                system.component_symbol.numel(),
+                dtype=torch.int64,
+                device=device,
+            ),
+            system.component_atom_ptr[1:] - system.component_atom_ptr[:-1],
+        )
+        atom_instance = component_instance[atom_component]
+        protein_atom = system.entity_type[system.instance_entity[atom_instance]] == ENTITY_PROTEIN
+        retained = (
+            observed & ~protein_atom & ~water_component_mask(system)[atom_component] & (system.atomic_number != 1)
+        )
+        if not bool(retained.any()):
+            return (
+                structure.coordinates.new_zeros((1, 3)),
+                torch.zeros(1, dtype=torch.int64, device=device),
+            )
+        return structure.coordinates[retained], system.atomic_number[retained].to(dtype=torch.int64)
 
     def _select_context(
         self,
@@ -358,7 +400,7 @@ class LigandMpnnProcessor(Processor):
         system: MolecularSystem,
         rows: _LoweredRows,
         *,
-        observed: np.ndarray,
+        observed: Tensor,
         design_positions: Sequence[ComponentReference] | None,
         conditions: Sequence[AllowedResidueIdentities | TiedResidueIdentities],
         tied_weights: Mapping[ComponentReference, float] | None,
@@ -372,7 +414,7 @@ class LigandMpnnProcessor(Processor):
         """
 
         (
-            row_references,
+            row_component_index,
             row_backbone,
             row_residue_context_coordinates,
             row_residue_context_mask,
@@ -382,26 +424,50 @@ class LigandMpnnProcessor(Processor):
             row_chain_index,
             row_component_ids,
         ) = rows
-        length = len(row_references)
-        row_by_reference = {reference: index for index, reference in enumerate(row_references)}
+        length = row_component_index.numel()
+        row_components = row_component_index.detach().cpu().tolist()
+        row_by_component = {component: row for row, component in enumerate(row_components)}
 
-        row_design = self._lower_design(row_references, row_valid, design_positions)
-        tied_group_id_values, tied_groups, restrictions = self._close_conditions(conditions, row_by_reference, length)
+        row_design = self._lower_design(
+            system,
+            row_components,
+            row_valid.detach().cpu().tolist(),
+            design_positions,
+        )
+        tied_group_id_values, tied_groups, restrictions = self._close_conditions(
+            conditions,
+            system,
+            row_by_component,
+            length,
+        )
         allowed_token_mask = self._lower_allowed(tied_groups, restrictions, row_design, row_component_ids)
         residue_logit_bias_values = self._lower_logit_bias(
             global_logit_bias,
             residue_logit_bias,
-            row_by_reference,
+            system,
+            row_by_component,
             length,
             tied_groups,
         )
-        tied_weight_values = self._lower_tied_weights(tied_weights, row_by_reference, tied_groups)
+        tied_weight_values = self._lower_tied_weights(
+            tied_weights,
+            system,
+            row_by_component,
+            tied_groups,
+        )
 
-        backbone = torch.as_tensor(np.stack(row_backbone), device=self.device, dtype=self.dtype)
-        residue_mask = torch.tensor(row_valid, device=self.device, dtype=torch.bool)
-        context_coordinates_array, context_atomic_numbers_array = self._lower_context_atoms(structure, system, observed)
-        context_coordinates = torch.as_tensor(context_coordinates_array, device=self.device, dtype=self.dtype)
-        context_atomic_numbers = torch.as_tensor(context_atomic_numbers_array, device=self.device, dtype=torch.int64)
+        backbone = row_backbone.to(device=self.device, dtype=self.dtype)
+        residue_mask = row_valid.to(device=self.device)
+        context_coordinates, context_atomic_numbers = self._lower_context_atoms(
+            structure,
+            system,
+            observed,
+        )
+        context_coordinates = context_coordinates.to(
+            device=self.device,
+            dtype=self.dtype,
+        )
+        context_atomic_numbers = context_atomic_numbers.to(device=self.device)
         (
             selected_coordinates,
             selected_atomic_numbers,
@@ -415,17 +481,18 @@ class LigandMpnnProcessor(Processor):
             use_atom_context=use_atom_context,
             ligand_interface_cutoff=ligand_interface_cutoff,
         )
-        residue_context_coordinates = torch.as_tensor(
-            np.stack(row_residue_context_coordinates), device=self.device, dtype=self.dtype
+        residue_context_coordinates = row_residue_context_coordinates.to(
+            device=self.device,
+            dtype=self.dtype,
         )
-        residue_context_mask = torch.as_tensor(np.stack(row_residue_context_mask), device=self.device)
+        residue_context_mask = row_residue_context_mask.to(device=self.device)
 
         return LigandMpnnInput(  # type: ignore[call-arg]
             backbone_coordinates=backbone.unsqueeze(0),
-            sequence_tokens=torch.tensor(row_tokens, device=self.device, dtype=torch.int64).unsqueeze(0),
+            sequence_tokens=row_tokens.to(device=self.device).unsqueeze(0),
             residue_mask=residue_mask.unsqueeze(0),
-            residue_index=torch.tensor(row_residue_index, device=self.device, dtype=torch.int64).unsqueeze(0),
-            chain_index=torch.tensor(row_chain_index, device=self.device, dtype=torch.int64).unsqueeze(0),
+            residue_index=row_residue_index.to(device=self.device).unsqueeze(0),
+            chain_index=row_chain_index.to(device=self.device).unsqueeze(0),
             context_coordinates=selected_coordinates.unsqueeze(0),
             context_atomic_numbers=selected_atomic_numbers.unsqueeze(0),
             context_mask=selected_mask.unsqueeze(0),
@@ -434,17 +501,18 @@ class LigandMpnnProcessor(Processor):
             design_positions=torch.tensor(row_design, device=self.device, dtype=torch.bool).unsqueeze(0),
             ligand_interface_mask=interface.unsqueeze(0),
             structure=structure,
-            component_references=tuple(row_references),
+            component_index=row_component_index.to(device=self.device).unsqueeze(0),
             tied_group_ids=torch.tensor(tied_group_id_values, device=self.device, dtype=torch.int64).unsqueeze(0),
             tied_weights=tied_weight_values,
             allowed_token_mask=allowed_token_mask,
             residue_logit_bias=residue_logit_bias_values,
-            batch_size=[1],
+            batch_size=[],
         )
 
     def _lower_design(
         self,
-        row_references: list[ComponentReference],
+        system: MolecularSystem,
+        row_components: list[int],
         row_valid: list[bool],
         design_positions: Sequence[ComponentReference] | None,
     ) -> list[bool]:
@@ -452,22 +520,24 @@ class LigandMpnnProcessor(Processor):
         Resolve the designable rows from the shared ``positions`` selection meaning.
         """
 
-        valid_by_reference = dict(zip(row_references, row_valid))
+        valid_by_component = dict(zip(row_components, row_valid, strict=True))
         if design_positions is None:
-            selected = {reference for reference, valid in zip(row_references, row_valid) if valid}
+            selected = {component for component, valid in valid_by_component.items() if valid}
         else:
-            selected = set(design_positions)
-            for reference in selected:
-                if reference not in valid_by_reference:
+            selected = {system.component_index(reference) for reference in design_positions}
+            for component in selected:
+                reference = system.component_reference(component)
+                if component not in valid_by_component:
                     raise ValueError(f"LigandMPNN position {reference!r} is not a protein occurrence")
-                if not valid_by_reference[reference]:
+                if not valid_by_component[component]:
                     raise ValueError(f"LigandMPNN position {reference!r} lacks its required backbone coordinates")
-        return [reference in selected and valid for reference, valid in zip(row_references, row_valid)]
+        return [component in selected and valid for component, valid in zip(row_components, row_valid, strict=True)]
 
     def _close_conditions(
         self,
         conditions: Sequence[AllowedResidueIdentities | TiedResidueIdentities],
-        row_by_reference: Mapping[ComponentReference, int],
+        system: MolecularSystem,
+        row_by_component: Mapping[int, int],
         length: int,
     ) -> tuple[list[int], tuple[tuple[int, ...], ...], dict[int, set[str]]]:
         r"""
@@ -487,7 +557,7 @@ class LigandMpnnProcessor(Processor):
         for condition in conditions:
             if isinstance(condition, TiedResidueIdentities):
                 for group in condition.groups:
-                    members = [self._resolve(reference, row_by_reference) for reference in group]
+                    members = [self._resolve(reference, system, row_by_component) for reference in group]
                     unique_members = tuple(dict.fromkeys(members))
                     if len(unique_members) < 2:
                         continue
@@ -499,7 +569,7 @@ class LigandMpnnProcessor(Processor):
                             parent[member_root] = root
             else:
                 for reference in condition.positions:
-                    row = self._resolve(reference, row_by_reference)
+                    row = self._resolve(reference, system, row_by_component)
                     allowed = set(condition.component_ids)
                     if row in restrictions:
                         restrictions[row].intersection_update(allowed)
@@ -524,14 +594,15 @@ class LigandMpnnProcessor(Processor):
     @staticmethod
     def _resolve(
         reference: ComponentReference,
-        row_by_reference: Mapping[ComponentReference, int],
+        system: MolecularSystem,
+        row_by_component: Mapping[int, int],
     ) -> int:
         r"""
         Map one condition reference to its Model row or fail with a clear message.
         """
 
         try:
-            return row_by_reference[reference]
+            return row_by_component[system.component_index(reference)]
         except KeyError:
             raise ValueError(
                 f"LigandMPNN condition references a residue outside the protein layout: {reference!r}"
@@ -596,7 +667,8 @@ class LigandMpnnProcessor(Processor):
         self,
         global_logit_bias: Tensor | None,
         residue_logit_bias: Mapping[ComponentReference, Tensor] | None,
-        row_by_reference: Mapping[ComponentReference, int],
+        system: MolecularSystem,
+        row_by_component: Mapping[int, int],
         length: int,
         tied_groups: tuple[tuple[int, ...], ...],
     ) -> Tensor | None:
@@ -618,7 +690,7 @@ class LigandMpnnProcessor(Processor):
             bias_values[0, :, :_GENERATED_IDENTITIES] = converted
         if residue_logit_bias:
             for reference, value in residue_logit_bias.items():
-                row = self._resolve(reference, row_by_reference)
+                row = self._resolve(reference, system, row_by_component)
                 converted = value.to(device=self.device, dtype=self.dtype)
                 if converted.shape != (_GENERATED_IDENTITIES,):
                     raise ValueError(f"LigandMPNN residue logit bias must have shape ({_GENERATED_IDENTITIES},)")
@@ -633,7 +705,8 @@ class LigandMpnnProcessor(Processor):
     def _lower_tied_weights(
         self,
         tied_weights: Mapping[ComponentReference, float] | None,
-        row_by_reference: Mapping[ComponentReference, int],
+        system: MolecularSystem,
+        row_by_component: Mapping[int, int],
         tied_groups: tuple[tuple[int, ...], ...],
     ) -> Tensor | None:
         r"""
@@ -643,10 +716,10 @@ class LigandMpnnProcessor(Processor):
         if tied_weights is None:
             return None
         grouped_rows = {row for group in tied_groups for row in group}
-        length = len(row_by_reference)
+        length = len(row_by_component)
         tied_weight_values = torch.ones(1, length, device=self.device, dtype=self.dtype)
         for reference, value in tied_weights.items():
-            row = self._resolve(reference, row_by_reference)
+            row = self._resolve(reference, system, row_by_component)
             if row not in grouped_rows:
                 raise ValueError("LigandMPNN tied weights require a tied residue")
             tied_weight_values[0, row] = value

@@ -13,14 +13,6 @@ from .model import Model
 from .models.registry import MODELS
 from .processor import Processor
 
-MODEL_REPOSITORY_FILES = (
-    "model.json",
-    "processor.json",
-    "pipeline.json",
-    "model.safetensors",
-    "model.safetensors.index.json",
-)
-
 
 def _config_json(config: Mapping[str, object], *, architecture: str | None = None) -> str:
     values = dict(config)
@@ -37,35 +29,6 @@ def _processor_json(processor: Processor, config: Mapping[str, object] | None) -
         raise ValueError("Processor config must not contain repository dtype metadata")
     values["dtype"] = str(processor.dtype).removeprefix("torch.")
     return json.dumps(values, indent=2, sort_keys=True, allow_nan=False) + "\n"
-
-
-def clear_model_subrepositories(
-    directory: str | PathLike[str],
-    *,
-    keep: set[Path] | None = None,
-) -> None:
-    r"""
-    Remove OFoldX-managed artifacts from stale descendant pair repositories.
-
-    Args:
-        directory: Root model repository being replaced.
-        keep: Descendant directories owned by the new repository layout.
-    """
-
-    destination = Path(directory).expanduser()
-    if not destination.is_dir():
-        return
-    retained = set() if keep is None else keep
-    for model_path in destination.rglob("model.json"):
-        child = model_path.parent
-        if child == destination or child.is_symlink() or child in retained:
-            continue
-        if not (child / "processor.json").is_file():
-            continue
-        for filename in MODEL_REPOSITORY_FILES:
-            (child / filename).unlink(missing_ok=True)
-        for shard in child.glob("model-*-of-*.safetensors"):
-            shard.unlink()
 
 
 def save_model(

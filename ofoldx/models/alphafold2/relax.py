@@ -21,11 +21,10 @@ import torch
 from numpy.typing import NDArray
 from torch import Tensor
 
-from ...data.molecular import AtomSite
+from ...data.elements import ATOMIC_NUMBER_BY_ELEMENT
 from ...data.structure import Structure
-from ...io.pdb import PdbAtomRecord, prepare_pdb_atoms
 from ...modules import residue_constants
-from .processor import protein_monomer
+from .processor import _atom37_indices, _component_ids, protein_monomer
 
 _CA_C_N_COSINE = -0.4473
 _CA_C_N_STDDEV = 0.0311
@@ -455,12 +454,12 @@ class AlphaFold2AmberRelaxation:
             Relaxed structure, energies, displacement, and per-residue violations.
         """
 
-        target, _instance_id = protein_monomer(structure.system)
+        _entity_index, _instance_index, component_index = protein_monomer(structure.system)
         source_pdb, locations = _structure_pdb(structure)
         pdb_string = _clean_pdb(source_pdb)
         excluded = set(self.exclude_residues)
         final: _MinimizationResult | None = None
-        violations = np.ones(len(target), dtype=np.float32)
+        violations = np.ones(component_index.numel(), dtype=np.float32)
         iterations = 0
         while bool(violations.any()) and iterations < self.max_outer_iterations:
             final = _minimize(
@@ -512,30 +511,34 @@ def alphafold2_structural_violations(structure: Structure) -> NDArray[np.float32
     the monomer's canonical component order.
     """
 
-    target, instance_id = protein_monomer(structure.system)
-    num_residues = len(target)
+    system = structure.system
+    _entity_index, _instance_index, component_index = protein_monomer(system)
+    component_ids = _component_ids(system, component_index)
+    num_residues = component_index.numel()
     positions = torch.zeros(num_residues, 14, 3, dtype=torch.float32)
     exists = torch.zeros(num_residues, 14, dtype=torch.bool)
-    coordinate_by_site = {
-        site: torch.as_tensor(structure.coordinates[index], dtype=torch.float32)
-        for index, site in enumerate(structure.sites)
-        if structure.coordinate_mask[index]
-    }
+    atom37_index = _atom37_indices(system, component_index)
     residue_type_indices: list[int] = []
     component_id_to_index = {
         residue_constants.AMINO_ACID_ONE_TO_THREE[one_letter]: index
         for index, one_letter in enumerate(residue_constants.AMINO_ACID_ONE_LETTER_CODES)
     }
-    for residue_index, component in enumerate(target.components):
-        component_id = component.component_id
+    for residue_index, component_id in enumerate(component_ids):
         residue_type_indices.append(component_id_to_index[component_id])
         for atom14_index, atom_name in enumerate(residue_constants.AMINO_ACID_ATOM14_NAMES[component_id]):
             if not atom_name:
                 continue
-            coordinate = coordinate_by_site.get(AtomSite(instance_id, residue_index, atom_name))
-            if coordinate is None:
+            atom = int(atom37_index[residue_index, residue_constants.atom_order[atom_name]])
+            if atom < 0 or not bool(structure.coordinate_mask[atom]):
                 continue
-            positions[residue_index, atom14_index] = coordinate
+            positions[residue_index, atom14_index] = (
+                structure.coordinates[atom]
+                .detach()
+                .to(
+                    device=positions.device,
+                    dtype=positions.dtype,
+                )
+            )
             exists[residue_index, atom14_index] = True
     residue_types = torch.tensor(residue_type_indices, dtype=torch.long)
     connection = _connection_violations(positions, exists, residue_types)
@@ -717,34 +720,68 @@ def _within_residue_violations(positions: Tensor, exists: Tensor, residue_types:
 
 def _structure_pdb(
     structure: Structure,
-) -> tuple[str, dict[tuple[str, int], tuple[str, str, str]]]:
-    atoms, _dropped, _rewritten = prepare_pdb_atoms(structure)
-    atoms = tuple(atom for atom in atoms if atom.element != "H")
-    lines = [_pdb_atom_line(atom) for atom in atoms]
+) -> tuple[str, dict[int, tuple[str, str, str]]]:
+    system = structure.system
+    _entity_index, instance_index, component_index = protein_monomer(system)
+    coordinates = structure.coordinates.detach().cpu()
+    coordinate_mask = structure.coordinate_mask.detach().cpu()
+    occupancy = structure.occupancy.detach().cpu()
+    occupancy_mask = structure.occupancy_mask.detach().cpu()
+    b_factor = structure.b_factor.detach().cpu()
+    b_factor_mask = structure.b_factor_mask.detach().cpu()
+    residue_id = structure.residue_id.detach().cpu()
+    insertion_code = structure.insertion_code.detach().cpu()
+    element_by_number = {number: element for element, number in ATOMIC_NUMBER_BY_ELEMENT.items()}
+    preferred_chain = system.instance_id(instance_index)
+    chain_id = preferred_chain if len(preferred_chain) == 1 and preferred_chain.isalnum() else "A"
+
+    lines: list[str] = []
+    locations: dict[int, tuple[str, str, str]] = {}
+    serial = 0
+    for local_component, component in enumerate(component_index.detach().cpu().tolist()):
+        source_residue = int(residue_id[component])
+        if source_residue >= 0:
+            try:
+                residue_number = int(structure.source_symbols[source_residue])
+            except ValueError:
+                residue_number = local_component + 1
+        else:
+            residue_number = local_component + 1
+        source_insertion = int(insertion_code[component])
+        code = "" if source_insertion < 0 else structure.source_symbols[source_insertion][:1]
+        locations[component] = (chain_id, str(residue_number), code)
+        component_id = system.symbols[int(system.component_symbol[component])][:3]
+        atom_start = int(system.component_atom_ptr[component])
+        atom_stop = int(system.component_atom_ptr[component + 1])
+        for atom in range(atom_start, atom_stop):
+            atomic_number = int(system.atomic_number[atom])
+            if atomic_number == 1 or not bool(coordinate_mask[atom]):
+                continue
+            serial += 1
+            atom_id = system.symbols[int(system.atom_symbol[atom])][:4]
+            element = element_by_number[atomic_number]
+            atom_name = atom_id
+            if len(atom_name) < 4:
+                atom_name = (
+                    f" {atom_name:<3}" if len(element) == 1 and not atom_name[0].isdigit() else f"{atom_name:<4}"
+                )
+            charge_value = int(system.formal_charge[atom]) if bool(system.formal_charge_known[atom]) else 0
+            charge = (
+                "  "
+                if charge_value == 0 or abs(charge_value) > 9
+                else f"{abs(charge_value)}{'+' if charge_value > 0 else '-'}"
+            )
+            atom_occupancy = float(occupancy[atom]) if bool(occupancy_mask[atom]) else 1.0
+            atom_b_factor = float(b_factor[atom]) if bool(b_factor_mask[atom]) else 0.0
+            x, y, z = (float(value) for value in coordinates[atom])
+            lines.append(
+                f"ATOM  {serial:>5} {atom_name} {component_id:>3} "
+                f"{chain_id}{residue_number:>4}{code or ' '}   "
+                f"{x:>8.3f}{y:>8.3f}{z:>8.3f}{atom_occupancy:>6.2f}{atom_b_factor:>6.2f}          "
+                f"{element:>2}{charge:>2}"
+            )
     lines.append("END")
-    component_locations = {
-        (atom.site.instance_id, atom.site.component_index): (
-            atom.chain_id,
-            str(atom.residue_id),
-            atom.insertion_code,
-        )
-        for atom in atoms
-    }
-    return "\n".join(lines) + "\n", component_locations
-
-
-def _pdb_atom_line(atom: PdbAtomRecord) -> str:
-    x, y, z = atom.coordinates
-    atom_name = atom.atom_name[:4]
-    if len(atom_name) < 4:
-        atom_name = f" {atom_name:<3}" if len(atom.element) == 1 and not atom_name[0].isdigit() else f"{atom_name:<4}"
-    charge = "  " if atom.charge == 0 else f"{abs(atom.charge)}{'+' if atom.charge > 0 else '-'}"
-    return (
-        f"{atom.group:<6}{atom.serial:>5} {atom_name}{atom.altloc_id or ' '}{atom.component_id:>3} "
-        f"{atom.chain_id}{atom.residue_id:>4}{atom.insertion_code or ' '}   "
-        f"{x:>8.3f}{y:>8.3f}{z:>8.3f}{atom.occupancy:>6.2f}{atom.b_factor:>6.2f}          "
-        f"{atom.element:>2}{charge:>2}"
-    )
+    return "\n".join(lines) + "\n", locations
 
 
 def _clean_pdb(pdb_string: str) -> str:
@@ -871,44 +908,41 @@ def _structure_from_openmm(
     source: Structure,
     topology: _OpenMMTopology,
     positions: NDArray,
-    locations: dict[tuple[str, int], tuple[str, str, str]],
+    locations: dict[int, tuple[str, str, str]],
 ) -> Structure:
-    site_by_location: dict[tuple[str, str, str, str], AtomSite] = {}
-    for site, _atom in source.system.iter_atoms():
-        component_location = locations.get((site.instance_id, site.component_index))
-        if component_location is None:
-            continue
-        chain_id, residue_id, insertion_code = component_location
-        site_by_location[(chain_id, residue_id, insertion_code, site.atom_id)] = site
+    system = source.system.cpu()  # type: ignore[attr-defined]
+    atom_by_location: dict[tuple[str, str, str, str], int] = {}
+    for component, (chain_id, residue_id, insertion_code) in locations.items():
+        atom_start = int(system.component_atom_ptr[component])
+        atom_stop = int(system.component_atom_ptr[component + 1])
+        for atom in range(atom_start, atom_stop):
+            atom_name = system.symbols[int(system.atom_symbol[atom])]
+            atom_by_location[(chain_id, residue_id, insertion_code, atom_name)] = atom
 
-    coordinate_by_site: dict[AtomSite, NDArray] = {}
-    for atom, coordinate in zip(topology.atoms(), positions, strict=True):
-        matched_site = site_by_location.get(
-            (atom.residue.chain.id, atom.residue.id, atom.residue.insertionCode.strip(), atom.name)
+    coordinates = torch.zeros(system.atom_symbol.numel(), 3, dtype=torch.float32)
+    coordinate_mask = torch.zeros(system.atom_symbol.numel(), dtype=torch.bool)
+    for openmm_atom, coordinate in zip(topology.atoms(), positions, strict=True):
+        matched_atom = atom_by_location.get(
+            (
+                openmm_atom.residue.chain.id,
+                openmm_atom.residue.id,
+                openmm_atom.residue.insertionCode.strip(),
+                openmm_atom.name,
+            )
         )
-        if matched_site is not None:
-            coordinate_by_site[matched_site] = coordinate
-    sites = tuple(site for site, _atom in source.system.iter_atoms() if site in coordinate_by_site)
-    coordinates = np.asarray([coordinate_by_site[site] for site in sites], dtype=np.float32)
-    original_index = {site: index for index, site in enumerate(source.sites)}
-    occupancy = None
-    if source.occupancy is not None:
-        occupancy = np.asarray(
-            [source.occupancy[original_index[site]] if site in original_index else np.nan for site in sites],
-            dtype=source.occupancy.dtype,
-        )
-    b_factor = None
-    if source.b_factor is not None:
-        b_factor = np.asarray(
-            [source.b_factor[original_index[site]] if site in original_index else np.nan for site in sites],
-            dtype=source.b_factor.dtype,
-        )
-    return Structure(
-        system=source.system,
-        sites=sites,
+        if matched_atom is not None:
+            coordinates[matched_atom] = torch.as_tensor(coordinate, dtype=torch.float32)
+            coordinate_mask[matched_atom] = True
+    return Structure(  # type: ignore[call-arg]
+        system=system,
         coordinates=coordinates,
-        coordinate_mask=np.ones(len(sites), dtype=np.bool_),
-        occupancy=occupancy,
-        b_factor=b_factor,
-        residue_numbers=source.residue_numbers,
+        coordinate_mask=coordinate_mask,
+        occupancy=source.occupancy.detach().cpu(),
+        occupancy_mask=source.occupancy_mask.detach().cpu(),
+        b_factor=source.b_factor.detach().cpu(),
+        b_factor_mask=source.b_factor_mask.detach().cpu(),
+        source_symbols=source.source_symbols,
+        residue_id=source.residue_id.detach().cpu(),
+        insertion_code=source.insertion_code.detach().cpu(),
+        batch_size=[],
     )

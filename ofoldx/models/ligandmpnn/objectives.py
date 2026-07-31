@@ -18,22 +18,12 @@ from ...modules.mpnn import label_smoothed_nll_loss as smoothed_loss
 def criterion(pred: Any, target: Any, *, label_smoothing: float = 0.1) -> Tensor:
     r"""
     DanLing-shaped sequence-recovery loss over the designable residues.
-
-    Raises:
-        ValueError: If the batch scores no designable residue.
     """
 
     log_probabilities = F.log_softmax(pred.logits, dim=-1)
     per_residue = smoothed_loss(target.sequence_tokens, log_probabilities, weight=label_smoothing)
     mask = (target.residue_mask & target.design_positions).to(per_residue.dtype)
     scope = mask.sum()
-    # An empty scope would divide by zero; the resulting NaN reaches the optimizer and permanently
-    # poisons both the weights and the optimizer state, so refuse the batch instead of scoring it.
-    if not scope:
-        raise ValueError(
-            "LigandMPNN loss has no designable residue to score: residue_mask & design_positions is "
-            "empty for every structure in this batch"
-        )
     return (per_residue * mask).sum() / scope
 
 

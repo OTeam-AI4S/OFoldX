@@ -8,15 +8,16 @@ intended for visualization rather than general ``Structure`` exchange.
 
 from __future__ import annotations
 
+import math
 import string
 from os import PathLike
 from pathlib import Path
 
-import numpy as np
+import torch
 from biotite.rust.structure.io.pdb import encode_hybrid36
 
-from ...data import is_water_component
-from ...data.molecular import ComponentReference, PolymerSequence
+from ...data import ATOMIC_NUMBER_BY_ELEMENT, ENTITY_PROTEIN, water_component_mask
+from ...data.molecular import ComponentReference
 from ...modules import residue_constants as rc
 from ...results import PackPrediction
 
@@ -39,34 +40,67 @@ def write_pdb(
 
     structure = prediction.structure
     system = structure.system
-    record_indices = tuple(
-        index
-        for index, site in enumerate(structure.sites)
-        if bool(structure.coordinate_mask[index])
-        and not is_water_component(system.component((site.instance_id, site.component_index)))
+    instance_component_ptr = system.instance_component_ptr.detach().cpu()
+    component_atom_ptr = system.component_atom_ptr.detach().cpu()
+    component_symbol = system.component_symbol.detach().cpu()
+    atom_symbol = system.atom_symbol.detach().cpu()
+    atomic_number = system.atomic_number.detach().cpu()
+    instance_symbol = system.instance_symbol.detach().cpu()
+    instance_entity = system.instance_entity.detach().cpu()
+    entity_type = system.entity_type.detach().cpu()
+    coordinates = structure.coordinates.detach().cpu()
+    coordinate_mask = structure.coordinate_mask.detach().cpu()
+    occupancy = structure.occupancy.detach().cpu()
+    occupancy_mask = structure.occupancy_mask.detach().cpu()
+    residue_id = structure.residue_id.detach().cpu()
+    insertion_code = structure.insertion_code.detach().cpu()
+
+    component_instance = torch.repeat_interleave(
+        torch.arange(system.instance_symbol.numel()),
+        instance_component_ptr[1:] - instance_component_ptr[:-1],
     )
-    retained_instances = {structure.sites[index].instance_id for index in record_indices}
-    instance_ids = tuple(instance_id for instance_id in system.instances if instance_id in retained_instances)
+    atom_component = torch.repeat_interleave(
+        torch.arange(system.component_symbol.numel()),
+        component_atom_ptr[1:] - component_atom_ptr[:-1],
+    )
+    retained_atom = coordinate_mask & ~water_component_mask(system).detach().cpu()[atom_component]
+    record_indices = (
+        torch.nonzero(
+            retained_atom,
+            as_tuple=False,
+        )
+        .flatten()
+        .tolist()
+    )
+    retained_instances = {int(component_instance[int(atom_component[index])]) for index in record_indices}
+    instance_indices = [index for index in range(system.instance_symbol.numel()) if index in retained_instances]
+    instance_ids = {index: system.symbols[int(instance_symbol[index])] for index in instance_indices}
+    element_by_number = {number: element for element, number in ATOMIC_NUMBER_BY_ELEMENT.items()}
     chain_alphabet = string.ascii_uppercase + string.ascii_lowercase + string.digits + string.punctuation + " "
-    chain_by_instance: dict[str, str] = {}
+    chain_by_instance: dict[int, str] = {}
     retained_chain_ids = {
         instance_id
-        for instance_id in instance_ids
+        for instance_id in instance_ids.values()
         if len(instance_id) == 1 and instance_id.isascii() and instance_id.isprintable() and not instance_id.isspace()
     }
     used_chains = set(retained_chain_ids)
-    if "" in retained_instances:
-        chain_by_instance[""] = " "
+    empty_instance = next(
+        (index for index, instance_id in instance_ids.items() if instance_id == ""),
+        None,
+    )
+    if empty_instance is not None:
+        chain_by_instance[empty_instance] = " "
         used_chains.add(" ")
     available_chains = (chain for chain in chain_alphabet if chain not in used_chains)
-    for instance_id in instance_ids:
+    for instance_index in instance_indices:
+        instance_id = instance_ids[instance_index]
         if instance_id == "":
             continue
         if instance_id in retained_chain_ids:
-            chain_by_instance[instance_id] = instance_id
+            chain_by_instance[instance_index] = instance_id
             continue
         try:
-            chain_by_instance[instance_id] = next(available_chains)
+            chain_by_instance[instance_index] = next(available_chains)
         except StopIteration:
             raise ValueError("PDB cannot encode all MolecularSystem instance IDs as unique chains") from None
 
@@ -84,18 +118,20 @@ def write_pdb(
 
     lines: list[str] = []
     serialized_reference_by_key: dict[tuple[str, int, str], ComponentReference] = {}
-    for serial, site_index in enumerate(record_indices, start=1):
-        site = structure.sites[site_index]
-        reference = (site.instance_id, site.component_index)
-        component = system.component(reference)
+    for serial, atom_index in enumerate(record_indices, start=1):
+        component_index = int(atom_component[atom_index])
+        instance_index = int(component_instance[component_index])
+        local_component = component_index - int(instance_component_ptr[instance_index])
+        instance_id = instance_ids[instance_index]
+        reference = (instance_id, local_component)
 
         serial_field = f"{encode_hybrid36(serial, 5):>5}"
-        entity = system.entities[system.instances[site.instance_id]]
-        record = "ATOM" if isinstance(entity, PolymerSequence) and entity.polymer_type == "protein" else "HETATM"
-        component_id = component.component_id
-        atom_id = site.atom_id
-        atom = system.atom(site)
-        element = atom.element
+        entity_index = int(instance_entity[instance_index])
+        is_protein = int(entity_type[entity_index]) == ENTITY_PROTEIN
+        record = "ATOM" if is_protein else "HETATM"
+        component_id = system.symbols[int(component_symbol[component_index])]
+        atom_id = system.symbols[int(atom_symbol[atom_index])]
+        element = element_by_number[int(atomic_number[atom_index])]
         if not component_id or len(component_id) > 3:
             raise ValueError(f"PDB cannot encode component ID {component_id!r}")
         if not atom_id or len(atom_id) > 4:
@@ -111,21 +147,27 @@ def write_pdb(
         else:
             atom_field = f"{atom_id:<4}"
 
-        residue_number = None if structure.residue_numbers is None else structure.residue_numbers.get(reference)
-        number = site.component_index + 1 if residue_number is None else residue_number.number
-        insertion_code = "" if residue_number is None else residue_number.insertion_code
-        chain = chain_by_instance[site.instance_id]
+        source_residue = int(residue_id[component_index])
+        if source_residue < 0:
+            number = local_component + 1
+        else:
+            value = structure.source_symbols[source_residue]
+            try:
+                number = int(value)
+            except ValueError:
+                raise ValueError(f"PDB cannot encode residue number {value!r}") from None
+        source_insertion = int(insertion_code[component_index])
+        code = "" if source_insertion < 0 else structure.source_symbols[source_insertion]
+        chain = chain_by_instance[instance_index]
         if number < 0:
             residue_field = f"{number:>4}"
             if len(residue_field) != 4:
                 raise ValueError(f"PDB cannot encode residue number {number}")
         else:
             residue_field = f"{encode_hybrid36(number, 4):>4}"
-        if insertion_code and (
-            len(insertion_code) != 1 or not insertion_code.isascii() or not insertion_code.isalpha()
-        ):
-            raise ValueError(f"PDB cannot encode insertion code {insertion_code!r}")
-        occurrence_key = (chain, number, insertion_code)
+        if code and (len(code) != 1 or not code.isascii() or not code.isalpha()):
+            raise ValueError(f"PDB cannot encode insertion code {code!r}")
+        occurrence_key = (chain, number, code)
         serialized_reference = serialized_reference_by_key.setdefault(occurrence_key, reference)
         if serialized_reference != reference:
             raise ValueError(
@@ -133,23 +175,22 @@ def write_pdb(
                 f"collide at {occurrence_key!r}"
             )
 
-        coordinate_fields = tuple(f"{float(value):8.3f}" for value in structure.coordinates[site_index])
-        if (
-            any(len(value) != 8 for value in coordinate_fields)
-            or not np.isfinite(structure.coordinates[site_index]).all()
+        coordinate_fields = tuple(f"{float(value):8.3f}" for value in coordinates[atom_index])
+        if any(len(value) != 8 for value in coordinate_fields) or not all(
+            math.isfinite(float(value)) for value in coordinates[atom_index]
         ):
-            raise ValueError(f"PDB cannot encode coordinates for {site!r}")
-        if structure.occupancy is None or np.isnan(structure.occupancy[site_index]):
+            raise ValueError(f"PDB cannot encode coordinates for " f"{(instance_id, local_component, atom_id)!r}")
+        if not bool(occupancy_mask[atom_index]):
             occupancy_field = " " * 6
         else:
-            occupancy = float(structure.occupancy[site_index])
-            occupancy_field = f"{occupancy:6.2f}"
-            if len(occupancy_field) != 6 or not np.isfinite(occupancy):
-                raise ValueError(f"PDB cannot encode occupancy {occupancy!r}")
+            occupancy_value = float(occupancy[atom_index])
+            occupancy_field = f"{occupancy_value:6.2f}"
+            if len(occupancy_field) != 6 or not math.isfinite(occupancy_value):
+                raise ValueError(f"PDB cannot encode occupancy {occupancy_value!r}")
 
         b_value = 0.0
         amino_acid_index = amino_acid_index_by_component.get(component_id)
-        if isinstance(entity, PolymerSequence) and entity.polymer_type == "protein" and amino_acid_index is not None:
+        if is_protein and amino_acid_index is not None:
             atom14_names = rc.AMINO_ACID_ATOM14_NAMES[component_id]
             if atom_id in atom14_names:
                 atom14_index = atom14_names.index(atom_id)
@@ -158,12 +199,12 @@ def write_pdb(
                 if density is not None:
                     b_value = float(density)
         b_field = f"{b_value:6.2f}"
-        if len(b_field) != 6 or not np.isfinite(b_value):
+        if len(b_field) != 6 or not math.isfinite(b_value):
             raise ValueError(f"PDB cannot encode chi log density {b_value!r}")
 
         lines.append(
             f"{record:<6}{serial_field} {atom_field} {component_id:>3} {chain}{residue_field}"
-            f"{insertion_code or ' '}   {''.join(coordinate_fields)}{occupancy_field}{b_field}"
+            f"{code or ' '}   {''.join(coordinate_fields)}{occupancy_field}{b_field}"
             f"          {element:>2}  "
         )
 

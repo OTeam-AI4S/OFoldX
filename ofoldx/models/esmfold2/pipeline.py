@@ -13,12 +13,16 @@ from os import PathLike
 from pathlib import Path
 from typing import cast
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 
 from ...data.evidence import MSA, MSACollection
-from ...data.molecular import AMINO_ACID_THREE_TO_ONE, MolecularSystem, PolymerSequence
+from ...data.molecular import (
+    AMINO_ACID_THREE_TO_ONE,
+    ENTITY_PROTEIN,
+    MolecularSystem,
+    PolymerSequence,
+)
 from ...data.structure import Structure
 from ...io import read_fasta_records, read_msa
 from ...pipelines import CompositePair, CompositePipeline, PairedPipeline, resolve_generator
@@ -1042,28 +1046,43 @@ def _experimental_fold_prediction(
     batch_index: int,
     sample_index: int,
 ) -> FoldPrediction:
-    layout = input.layout
-    atom_count = len(layout.atom_sites)
-    raw_coordinates = (
-        prediction.sample.coordinates[batch_index, sample_index, :atom_count]
+    system = input.system.cpu()  # type: ignore[attr-defined]
+    model_atom_mask = input.atom_index[0] >= 0
+    canonical_atom_index = input.atom_index[0, model_atom_mask].detach().cpu()
+    token_component_index = input.token_component_index[0].detach().cpu()
+    token_atom_index = input.token_atom_index[0].detach().cpu()
+    token_axis = tuple(
+        (
+            system.component_reference(int(component_index))
+            if int(component_index) >= 0
+            else system.atom_site(int(atom_index))
+        )
+        for component_index, atom_index in zip(token_component_index, token_atom_index)
+    )
+    atom_axis = tuple(system.atom_site(int(atom_index)) for atom_index in canonical_atom_index)
+    chain_axis = tuple(system.instance_id(index) for index in range(system.instance_symbol.numel()))
+    coordinates = torch.zeros(system.atom_symbol.numel(), 3, dtype=torch.float32)
+    coordinate_mask = torch.zeros(system.atom_symbol.numel(), dtype=torch.bool)
+    coordinates[canonical_atom_index] = (
+        prediction.sample.coordinates[batch_index, sample_index, model_atom_mask]
         .detach()
         .to(device="cpu", dtype=torch.float32)
-        .numpy()
     )
-    complete_sites = tuple(site for site, atom in layout.system.iter_atoms() if atom.element != "H")
-    complete_index = {site: index for index, site in enumerate(complete_sites)}
-    model_to_complete = np.asarray([complete_index[site] for site in layout.atom_sites], dtype=np.intp)
-    coordinates = np.zeros((len(complete_sites), 3), dtype=np.float32)
-    coordinate_mask = np.zeros(len(complete_sites), dtype=np.bool_)
-    coordinates[model_to_complete] = raw_coordinates
-    coordinate_mask[model_to_complete] = True
+    coordinate_mask[canonical_atom_index] = True
     confidence = prediction.confidence
     return FoldPrediction(
-        structure=Structure(
-            system=layout.system,
-            sites=complete_sites,
+        structure=Structure(  # type: ignore[call-arg]
+            system=system,
             coordinates=coordinates,
             coordinate_mask=coordinate_mask,
+            occupancy=torch.zeros(system.atom_symbol.numel(), dtype=torch.float32),
+            occupancy_mask=torch.zeros(system.atom_symbol.numel(), dtype=torch.bool),
+            b_factor=torch.zeros(system.atom_symbol.numel(), dtype=torch.float32),
+            b_factor_mask=torch.zeros(system.atom_symbol.numel(), dtype=torch.bool),
+            source_symbols=(),
+            residue_id=torch.full((system.component_symbol.numel(),), -1, dtype=torch.long),
+            insertion_code=torch.full((system.component_symbol.numel(),), -1, dtype=torch.long),
+            batch_size=[],
         ),
         scores={
             "ptm": Score(
@@ -1086,28 +1105,32 @@ def _experimental_fold_prediction(
         metrics={
             "plddt": Metric(
                 values=confidence.plddt[batch_index, sample_index].detach().float().cpu().numpy(),
-                axis=layout.token_sites,
+                axis=token_axis,
             ),
             "plddt_per_atom": Metric(
-                values=confidence.plddt_per_atom[batch_index, sample_index, :atom_count].detach().float().cpu().numpy(),
-                axis=layout.atom_sites,
+                values=confidence.plddt_per_atom[batch_index, sample_index, model_atom_mask]
+                .detach()
+                .float()
+                .cpu()
+                .numpy(),
+                axis=atom_axis,
             ),
             "plddt_ca": Metric(
                 values=confidence.plddt_ca[batch_index, sample_index].detach().float().cpu().numpy(),
-                axis=layout.token_sites,
+                axis=token_axis,
             ),
         },
         pair_metrics={
             "pae": PairMetric(
                 values=confidence.pae[batch_index, sample_index].detach().float().cpu().numpy(),
-                row_axis=layout.token_sites,
-                column_axis=layout.token_sites,
+                row_axis=token_axis,
+                column_axis=token_axis,
                 unit="angstrom",
             ),
             "chain_pair_iptm": PairMetric(
                 values=confidence.chain_pair_iptm[batch_index, sample_index].detach().float().cpu().numpy(),
-                row_axis=tuple(layout.system.instances),
-                column_axis=tuple(layout.system.instances),
+                row_axis=chain_axis,
+                column_axis=chain_axis,
             ),
         },
     )
@@ -1145,6 +1168,38 @@ def _stack_design_inputs(inputs: tuple[EsmFold2Input, ...]) -> EsmFold2Input:
             values.append(value)
         return torch.cat(values, dim=0)
 
+    atom_offsets: list[int] = []
+    component_offsets: list[int] = []
+    atom_offset = 0
+    component_offset = 0
+    for value in inputs:
+        atom_offsets.append(atom_offset)
+        component_offsets.append(component_offset)
+        atom_offset += value.system.atom_symbol.numel()
+        component_offset += value.system.component_symbol.numel()
+
+    def stack_canonical_indices(
+        name: str,
+        offsets: list[int],
+        *,
+        pad_atoms: bool = False,
+    ) -> torch.Tensor:
+        values = []
+        for value, offset in zip(inputs, offsets):
+            indices = cast(torch.Tensor, getattr(value, name))
+            indices = torch.where(indices >= 0, indices + offset, indices)
+            padding = max_atoms - indices.shape[1] if pad_atoms else 0
+            if padding:
+                indices = torch.cat(
+                    [
+                        indices,
+                        indices.new_full((indices.shape[0], padding), -1),
+                    ],
+                    dim=1,
+                )
+            values.append(indices)
+        return torch.cat(values, dim=0)
+
     language_model_tokens = [cast(torch.Tensor, value.language_model_tokens) for value in inputs]
     language_model_masks = [cast(torch.Tensor, value.language_model_mask) for value in inputs]
     token_to_esmc: list[torch.Tensor] = []
@@ -1158,6 +1213,7 @@ def _stack_design_inputs(inputs: tuple[EsmFold2Input, ...]) -> EsmFold2Input:
     first = inputs[0]
     return replace(
         first,
+        system=MolecularSystem.batch([value.system for value in inputs]),
         token_index=stack("token_index"),
         residue_index=stack("residue_index"),
         chain_index=stack("chain_index"),
@@ -1174,6 +1230,12 @@ def _stack_design_inputs(inputs: tuple[EsmFold2Input, ...]) -> EsmFold2Input:
         reference_space_id=stack_atoms("reference_space_id"),
         atom_mask=stack_atoms("atom_mask"),
         atom_to_token=stack_atoms("atom_to_token"),
+        atom_index=stack_canonical_indices("atom_index", atom_offsets, pad_atoms=True),
+        token_component_index=stack_canonical_indices(
+            "token_component_index",
+            component_offsets,
+        ),
+        token_atom_index=stack_canonical_indices("token_atom_index", atom_offsets),
         distogram_atom_index=stack("distogram_atom_index"),
         token_has_esmc=stack("token_has_esmc"),
         deletion_mean=stack_optional("deletion_mean"),
@@ -1245,9 +1307,9 @@ def _fold_msa(
     if msa is None or isinstance(msa, MSA | MSACollection):
         return msa
     proteins = [
-        entity_id
-        for entity_id, entity in system.entities.items()
-        if isinstance(entity, PolymerSequence) and entity.polymer_type == "protein"
+        system.entity_id(entity_index)
+        for entity_index, entity_type in enumerate(system.entity_type.detach().cpu().tolist())
+        if entity_type == ENTITY_PROTEIN
     ]
     if len(proteins) != 1:
         raise ValueError("an alignment path is unambiguous only for one protein entity; pass MSACollection")
@@ -1265,14 +1327,20 @@ def _target_one_letter(input: str | PathLike[str] | Structure | MolecularSystem)
     elif isinstance(input, MolecularSystem):
         system = input
     if system is not None:
-        proteins: list[PolymerSequence] = []
-        for entity_key in system.instances.values():
-            entity = system.entities[entity_key]
-            if isinstance(entity, PolymerSequence) and entity.polymer_type == "protein":
-                proteins.append(entity)
-        if len(proteins) != 1:
+        protein_instances = [
+            instance_index
+            for instance_index, entity_index in enumerate(system.instance_entity.detach().cpu().tolist())
+            if int(system.entity_type[entity_index]) == ENTITY_PROTEIN
+        ]
+        if len(protein_instances) != 1:
             raise ValueError("ESMFold2 design requires one single-chain protein target")
-        return "".join(AMINO_ACID_THREE_TO_ONE[component.component_id] for component in proteins[0].components)
+        instance_index = protein_instances[0]
+        component_start = int(system.instance_component_ptr[instance_index])
+        component_stop = int(system.instance_component_ptr[instance_index + 1])
+        return "".join(
+            AMINO_ACID_THREE_TO_ONE[system.symbols[int(component_symbol)]]
+            for component_symbol in system.component_symbol[component_start:component_stop].detach().cpu()
+        )
 
     classified = classify_reference(cast(str | PathLike[str], input))
     if isinstance(classified, Path):

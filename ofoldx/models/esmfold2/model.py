@@ -8,15 +8,15 @@ import math
 from dataclasses import dataclass
 from typing import Any, cast
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from multimolecule import EsmCConfig, EsmCForMaskedLM, EsmCModel
 from tensordict import tensorclass
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint
 
-from ...data.molecular import AtomSite, MolecularSystem
+from ...data.molecular import MolecularSystem
 from ...data.structure import Structure
 from ...model import Model
 from ...modules.adaptive_norm import AdaptiveLayerNorm
@@ -24,11 +24,11 @@ from ...modules.atom import AtomToTokenMean, TokenToAtomBroadcast
 from ...modules.backend import LayerNorm
 from ...modules.backend.attention import projected_attention
 from ...modules.backend.outer_product_mean import outer_product_mean as dispatch_outer_product_mean
-from ...modules.backend.resolve import resolve_tensor_backend
+from ...modules.backend.resolve import resolve_config_backend, resolve_tensor_backend
 from ...modules.backend.triangle_multiplication import triangle_multiplication as dispatch_triangle_multiplication
 from ...modules.feed_forward import SwiGluFeedForward
 from ...modules.transition import ConditionedTransition, Transition
-from ...modules.trunk.msa import MsaPairWeightedAveraging, OuterProductMean
+from ...modules.trunk.msa import MsaPairWeightedAveraging
 from ...results import FoldPrediction, FoldResult, Metric, PairMetric, Score
 from .config import EsmFold2Config, EsmFold2ExperimentalConfig
 
@@ -835,33 +835,46 @@ class EsmFold2Model(Model):
             generator=generator,
         )
 
-        layout = input.layout
-        atom_count = len(layout.atom_sites)
-        raw_coordinates = raw["coordinates"][:, :atom_count].to(device="cpu", dtype=torch.float32).numpy()
+        system = input.system.cpu()  # type: ignore[attr-defined]
+        model_atom_mask = input.atom_index[0] >= 0
+        canonical_atom_index = input.atom_index[0, model_atom_mask].detach().cpu()
+        token_component_index = input.token_component_index[0].detach().cpu()
+        token_atom_index = input.token_atom_index[0].detach().cpu()
+        token_axis = tuple(
+            (
+                system.component_reference(int(component_index))
+                if int(component_index) >= 0
+                else system.atom_site(int(atom_index))
+            )
+            for component_index, atom_index in zip(token_component_index, token_atom_index)
+        )
+        atom_axis = tuple(system.atom_site(int(atom_index)) for atom_index in canonical_atom_index)
         raw_plddt = raw["plddt"].to(device="cpu", dtype=torch.float32).numpy()
         raw_plddt_ca = raw["plddt_ca"].to(device="cpu", dtype=torch.float32).numpy()
         raw_pae = raw["pae"].to(device="cpu", dtype=torch.float32).numpy()
-        resolved_probability = raw["resolved_logits"][:, :atom_count].float().softmax(dim=-1)[..., 1].cpu().numpy()
-        complete_sites = tuple(site for site, atom in layout.system.iter_atoms() if atom.element != "H")
-        complete_index = {site: index for index, site in enumerate(complete_sites)}
-        model_to_complete = np.asarray(
-            [complete_index[site] for site in layout.atom_sites],
-            dtype=np.intp,
-        )
-        # Chains carry chain_index 0..n-1 in system.instances order (processor), so the
-        # instance ids are the row/column axis for the per-chain-pair confidence.
-        chain_axis = tuple(layout.system.instances)
+        resolved_probability = raw["resolved_logits"][:, model_atom_mask].float().softmax(dim=-1)[..., 1].cpu().numpy()
+        # Chains carry chain_index 0..n-1 in canonical instance-axis order.
+        chain_axis = tuple(system.instance_id(index) for index in range(system.instance_symbol.numel()))
         predictions: list[FoldPrediction] = []
         for sample_index in range(num_samples):
-            coordinates = np.zeros((len(complete_sites), 3), dtype=np.float32)
-            coordinate_mask = np.zeros(len(complete_sites), dtype=np.bool_)
-            coordinates[model_to_complete] = raw_coordinates[sample_index]
-            coordinate_mask[model_to_complete] = True
-            structure = Structure(
-                system=layout.system,
-                sites=complete_sites,
+            coordinates = torch.zeros(system.atom_symbol.numel(), 3, dtype=torch.float32)
+            coordinate_mask = torch.zeros(system.atom_symbol.numel(), dtype=torch.bool)
+            coordinates[canonical_atom_index] = (
+                raw["coordinates"][sample_index, model_atom_mask].detach().to(device="cpu", dtype=torch.float32)
+            )
+            coordinate_mask[canonical_atom_index] = True
+            structure = Structure(  # type: ignore[call-arg]
+                system=system,
                 coordinates=coordinates,
                 coordinate_mask=coordinate_mask,
+                occupancy=torch.zeros(system.atom_symbol.numel(), dtype=torch.float32),
+                occupancy_mask=torch.zeros(system.atom_symbol.numel(), dtype=torch.bool),
+                b_factor=torch.zeros(system.atom_symbol.numel(), dtype=torch.float32),
+                b_factor_mask=torch.zeros(system.atom_symbol.numel(), dtype=torch.bool),
+                source_symbols=(),
+                residue_id=torch.full((system.component_symbol.numel(),), -1, dtype=torch.long),
+                insertion_code=torch.full((system.component_symbol.numel(),), -1, dtype=torch.long),
+                batch_size=[],
             )
             scores = {
                 "ptm": Score(float(raw["ptm"][sample_index].item()), preferred="higher"),
@@ -880,34 +893,32 @@ class EsmFold2Model(Model):
                     structure=structure,
                     scores=scores,
                     metrics={
-                        "plddt": Metric(values=raw_plddt[sample_index], axis=layout.token_sites),
-                        # Per-atom pLDDT is not recoverable from token pLDDT and is
-                        # therefore preserved on the AtomSite axis.
+                        "plddt": Metric(values=raw_plddt[sample_index], axis=token_axis),
                         "plddt_per_atom": Metric(
-                            values=raw["plddt_per_atom"][sample_index, :atom_count].float().cpu().numpy(),
-                            axis=layout.atom_sites,
+                            values=raw["plddt_per_atom"][sample_index, model_atom_mask].float().cpu().numpy(),
+                            axis=atom_axis,
                         ),
                         "plddt_ca": Metric(
                             values=raw_plddt_ca[sample_index],
-                            axis=layout.token_sites,
+                            axis=token_axis,
                         ),
                         "resolved_probability": Metric(
                             values=resolved_probability[sample_index],
-                            axis=layout.atom_sites,
+                            axis=atom_axis,
                         ),
                     },
                     pair_metrics={
                         "pae": PairMetric(
                             values=raw_pae[sample_index],
-                            row_axis=layout.token_sites,
-                            column_axis=layout.token_sites,
+                            row_axis=token_axis,
+                            column_axis=token_axis,
                             unit="angstrom",
                         ),
                         # Predicted distance error on the token axes.
                         "pde": PairMetric(
                             values=raw["pde"][sample_index].float().cpu().numpy(),
-                            row_axis=layout.token_sites,
-                            column_axis=layout.token_sites,
+                            row_axis=token_axis,
+                            column_axis=token_axis,
                             unit="angstrom",
                         ),
                         # Per-chain-pair interface confidence on the chain (instance_id) axis.
@@ -1803,13 +1814,22 @@ class EsmFold2FoldingStack(nn.Module):
     ) -> None:
         super().__init__()
         self.num_blocks = num_blocks
+        self.gradient_checkpointing = False
         self.blocks = nn.ModuleList(
             [EsmFold2FoldingBlock(backend, pair_size=pair_size, expansion=expansion) for _ in range(num_blocks)]
         )
 
     def forward(self, pair: Tensor, pair_attention_mask: Tensor | None = None) -> Tensor:
         for block in self.blocks:
-            pair = block(pair, pair_attention_mask=pair_attention_mask)
+            if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+                pair = checkpoint(
+                    block,
+                    pair,
+                    pair_attention_mask=pair_attention_mask,
+                    use_reentrant=False,
+                )
+            else:
+                pair = block(pair, pair_attention_mask=pair_attention_mask)
         return pair
 
 
@@ -1834,6 +1854,7 @@ class EsmFold2MsaEncoder(nn.Module):
     ) -> None:
         super().__init__()
         self.num_stages = num_stages
+        self.gradient_checkpointing = False
         self.msa_projection = nn.Linear(35, msa_size, bias=False)
         self.input_projection = nn.Linear(input_size, msa_size, bias=False)
         self.blocks = nn.ModuleList(
@@ -1888,7 +1909,17 @@ class EsmFold2MsaEncoder(nn.Module):
         token_mask = msa_mask[:, :, 0].bool()
         pair_attention_mask = token_mask.unsqueeze(2) & token_mask.unsqueeze(1)
         for block in self.blocks:
-            m, pair = block(m, pair, msa_mask, pair_attention_mask)
+            if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+                m, pair = checkpoint(
+                    block,
+                    m,
+                    pair,
+                    msa_mask,
+                    pair_attention_mask,
+                    use_reentrant=False,
+                )
+            else:
+                m, pair = block(m, pair, msa_mask, pair_attention_mask)
         if self.final_outer_product_mean is not None and self.final_pair_update is not None:
             pair = pair + self.final_outer_product_mean(m, msa_mask)
             pair = self.final_pair_update(pair, pair_attention_mask)
@@ -1919,6 +1950,7 @@ class EsmFold2ExperimentalMsaEncoder(nn.Module):
     ) -> None:
         super().__init__()
         self.num_blocks = num_blocks
+        self.gradient_checkpointing = False
         self.msa_projection = nn.Linear(35, msa_size, bias=False)
         self.input_projection = nn.Linear(input_size, msa_size, bias=False)
         self.blocks = nn.ModuleList(
@@ -1963,7 +1995,18 @@ class EsmFold2ExperimentalMsaEncoder(nn.Module):
         token_mask = msa_mask[:, :, 0]
         pair_attention_mask = token_mask.unsqueeze(2) * token_mask.unsqueeze(1)
         for block in self.blocks:
-            m, pair = block(m, pair, msa_mask, pair_attention_mask, msa_track_mask)
+            if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+                m, pair = checkpoint(
+                    block,
+                    m,
+                    pair,
+                    msa_mask,
+                    pair_attention_mask,
+                    msa_track_mask,
+                    use_reentrant=False,
+                )
+            else:
+                m, pair = block(m, pair, msa_mask, pair_attention_mask, msa_track_mask)
         return pair * msa_track_mask[:, None, None, None].to(pair.dtype)
 
 
@@ -2359,6 +2402,7 @@ class EsmFold2AtomTransformerEncoder(nn.Module):
     ) -> None:
         super().__init__()
         self.num_blocks = num_blocks
+        self.gradient_checkpointing = False
         self.head_dim = atom_hidden_size // num_attention_heads
         self.spatial_rope_base_frequency = spatial_rope_base_frequency
         self.num_spatial_rope_pairs_per_axis = num_spatial_rope_pairs_per_axis
@@ -2400,7 +2444,18 @@ class EsmFold2AtomTransformerEncoder(nn.Module):
     ) -> Tensor | tuple[Tensor, list[Tensor]]:
         intermediates: list[Tensor] = []
         for block in self.blocks:
-            atom_query = block(atom_query, atom_conditioning, attention_cos, attention_sin, atom_mask)
+            if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+                atom_query = checkpoint(
+                    block,
+                    atom_query,
+                    atom_conditioning,
+                    attention_cos,
+                    attention_sin,
+                    atom_mask,
+                    use_reentrant=False,
+                )
+            else:
+                atom_query = block(atom_query, atom_conditioning, attention_cos, attention_sin, atom_mask)
             if return_intermediates:
                 intermediates.append(atom_query)
         if return_intermediates:
@@ -2638,6 +2693,7 @@ class EsmFold2DiffusionTransformerEncoder(nn.Module):
     ) -> None:
         super().__init__()
         self.num_blocks = num_blocks
+        self.gradient_checkpointing = False
         self.blocks = nn.ModuleList(
             EsmFold2DiffusionTransformerEncoderBlock(
                 hidden_size=hidden_size,
@@ -2661,13 +2717,24 @@ class EsmFold2DiffusionTransformerEncoder(nn.Module):
     ) -> tuple[Tensor, list[Tensor]]:
         intermediates: list[Tensor] = []
         for block in self.blocks:
-            hidden = block(
-                hidden,
-                conditioning,
-                pair,
-                attention_mask=attention_mask,
-                num_diffusion_samples=num_diffusion_samples,
-            )
+            if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+                hidden = checkpoint(
+                    block,
+                    hidden,
+                    conditioning,
+                    pair,
+                    attention_mask=attention_mask,
+                    num_diffusion_samples=num_diffusion_samples,
+                    use_reentrant=False,
+                )
+            else:
+                hidden = block(
+                    hidden,
+                    conditioning,
+                    pair,
+                    attention_mask=attention_mask,
+                    num_diffusion_samples=num_diffusion_samples,
+                )
             if return_intermediates:
                 intermediates.append(hidden)
         return hidden, intermediates
@@ -3001,7 +3068,7 @@ class EsmFold2TriangleMultiplication(nn.Module):
         return mixed * output_gate
 
 
-class EsmFold2OuterProductMean(OuterProductMean):
+class EsmFold2OuterProductMean(nn.Module):
     r"""
     Outer-product mean: maps a token-major MSA representation into a pair update.
 
@@ -3009,6 +3076,20 @@ class EsmFold2OuterProductMean(OuterProductMean):
     shared outer-product-mean operation. The mask-weighted mean is taken *after* the affine
     output projection, so the projection bias is divided by the clamped valid-row count.
     """
+
+    def __init__(
+        self,
+        msa_size: int,
+        hidden_size: int,
+        pair_size: int,
+        backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.backend = resolve_config_backend(backend, supported=("oops", "eager"), public_default="eager")
+        self.msa_norm = LayerNorm(msa_size, backend=backend)
+        self.left_projection = nn.Linear(msa_size, hidden_size, bias=False)
+        self.right_projection = nn.Linear(msa_size, hidden_size, bias=False)
+        self.output_projection = nn.Linear(hidden_size * hidden_size, pair_size)
 
     def forward(self, msa: Tensor, msa_mask: Tensor | None = None) -> Tensor:
         r"""
@@ -3039,13 +3120,27 @@ class EsmFold2OuterProductMean(OuterProductMean):
         )
 
 
-class EsmFold2ExperimentalOuterProductMean(OuterProductMean):
+class EsmFold2ExperimentalOuterProductMean(nn.Module):
     r"""
     Experimental ESMFold2 outer-product mean with normalization before the biased projection.
 
     Shares the token-major layout of [`EsmFold2OuterProductMean`][] but divides by the clamped
     valid-row count *before* the affine output projection, so the projection bias is added once.
     """
+
+    def __init__(
+        self,
+        msa_size: int,
+        hidden_size: int,
+        pair_size: int,
+        backend: str = "auto",
+    ) -> None:
+        super().__init__()
+        self.backend = resolve_config_backend(backend, supported=("oops", "eager"), public_default="eager")
+        self.msa_norm = LayerNorm(msa_size, backend=backend)
+        self.left_projection = nn.Linear(msa_size, hidden_size, bias=False)
+        self.right_projection = nn.Linear(msa_size, hidden_size, bias=False)
+        self.output_projection = nn.Linear(hidden_size * hidden_size, pair_size)
 
     def forward(self, msa: Tensor, msa_mask: Tensor | None = None) -> Tensor:
         r"""
@@ -4459,25 +4554,14 @@ def _dropout(input: Tensor, p: float, generator: torch.Generator | None) -> Tens
 
 
 # ===========================================================================
-# ESMFold2 tensor boundary and molecular layout.
+# ESMFold2 tensor and molecular-system boundary.
 # ===========================================================================
-
-
-@dataclass(frozen=True)
-class EsmFold2Layout:
-    r"""
-    Molecular identities aligned to ESMFold2 token and atom tensors.
-    """
-
-    system: MolecularSystem
-    atom_sites: tuple[AtomSite, ...]
-    token_sites: tuple[AtomSite | tuple[str, int], ...]
 
 
 @dataclass(kw_only=True, eq=False)
 class EsmFold2Input:
     r"""
-    Tensor and molecular-layout input for ESMFold2.
+    Tensor input for ESMFold2 over one canonical molecular system.
 
     ``B`` is batch size, ``N`` token count, ``A`` atom count, ``M`` MSA depth,
     ``C`` protein-chain count, and ``L`` padded language-model length.
@@ -4505,7 +4589,13 @@ class EsmFold2Input:
             ``(B, N)``.
         token_has_esmc: Mask of tokens backed by language-model states with shape
             ``(B, N)``.
-        layout: Molecular identities aligned to the token and atom axes.
+        system: Canonical molecular system represented by the family tensors.
+        atom_index: Canonical system-atom index aligned to the model atom axis with
+            shape ``(B, A)``; ``-1`` marks padding.
+        token_component_index: Canonical component index for residue tokens with
+            shape ``(B, N)``; ``-1`` marks atom tokens.
+        token_atom_index: Canonical atom index for atom tokens with shape ``(B, N)``;
+            ``-1`` marks residue tokens.
         deletion_mean: Optional per-token mean deletion values with shape ``(B, N)``.
         msa_tokens: Optional MSA token IDs with shape ``(B, M, N)``.
         has_deletion: Optional MSA deletion flags with shape ``(B, M, N)``.
@@ -4538,7 +4628,10 @@ class EsmFold2Input:
     atom_to_token: Tensor
     distogram_atom_index: Tensor
     token_has_esmc: Tensor
-    layout: EsmFold2Layout
+    system: MolecularSystem
+    atom_index: Tensor
+    token_component_index: Tensor
+    token_atom_index: Tensor
     deletion_mean: Tensor | None = None
     msa_tokens: Tensor | None = None
     has_deletion: Tensor | None = None

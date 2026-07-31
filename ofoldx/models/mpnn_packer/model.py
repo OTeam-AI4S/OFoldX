@@ -7,14 +7,13 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-import numpy as np
 import torch
 import torch.distributions as distributions
 import torch.nn.functional as F
 from tensordict import tensorclass
 from torch import Tensor, nn
 
-from ...data.molecular import AMINO_ACID_THREE_TO_ONE, AtomSite, ComponentReference
+from ...data.molecular import AMINO_ACID_THREE_TO_ONE
 from ...data.structure import Structure
 from ...model import Model
 from ...modules import residue_constants as rc
@@ -48,7 +47,6 @@ class MpnnPackerModel(Model):
         config: Model architecture and inference configuration.
 
     Examples:
-        >>> import numpy as np
         >>> import torch
         >>> from ofoldx.data import AtomSite, MolecularSystem, PolymerSequence, Structure
         >>> from ofoldx.models.mpnn_packer import (
@@ -56,19 +54,31 @@ class MpnnPackerModel(Model):
         ...     MpnnPackerProcessorConfig,
         ... )
         >>> sequence = PolymerSequence.from_one_letter("R")
-        >>> system = MolecularSystem({"protein": sequence}, {"A": "protein"})
-        >>> sites = tuple(
-        ...     AtomSite("A", residue, atom)
-        ...     for residue in range(1)
-        ...     for atom in ("N", "CA", "C", "O")
+        >>> system = MolecularSystem.from_entities(
+        ...     {"protein": sequence}, {"A": "protein"}
         ... )
-        >>> coordinates = np.array(
-        ...     [
-        ...         [-1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [1.0, 0.5, 0.0], [1.0, 1.0, 0.0],
-        ...     ],
-        ...     dtype=np.float32,
+        >>> coordinates = torch.zeros(system.atom_symbol.numel(), 3)
+        >>> coordinate_mask = torch.zeros(system.atom_symbol.numel(), dtype=torch.bool)
+        >>> for atom_id, value in {
+        ...     "N": (-1.0, 0.0, 0.0), "CA": (0.0, 0.0, 0.0),
+        ...     "C": (1.0, 0.5, 0.0), "O": (1.0, 1.0, 0.0),
+        ... }.items():
+        ...     atom = system.atom_index(AtomSite("A", 0, atom_id))
+        ...     coordinates[atom] = torch.tensor(value)
+        ...     coordinate_mask[atom] = True
+        >>> structure = Structure(
+        ...     system=system,
+        ...     coordinates=coordinates,
+        ...     coordinate_mask=coordinate_mask,
+        ...     occupancy=torch.zeros(system.atom_symbol.numel()),
+        ...     occupancy_mask=torch.zeros(system.atom_symbol.numel(), dtype=torch.bool),
+        ...     b_factor=torch.zeros(system.atom_symbol.numel()),
+        ...     b_factor_mask=torch.zeros(system.atom_symbol.numel(), dtype=torch.bool),
+        ...     source_symbols=(),
+        ...     residue_id=torch.full((1,), -1, dtype=torch.int64),
+        ...     insertion_code=torch.full((1,), -1, dtype=torch.int64),
+        ...     batch_size=[],
         ... )
-        >>> structure = Structure(system, sites, coordinates, np.ones(len(sites), dtype=np.bool_))
         >>> input = MpnnPackerProcessor(
         ...     MpnnPackerProcessorConfig({"num_context_atoms": 1})
         ... )(structure)
@@ -633,6 +643,8 @@ class MpnnPackerModel(Model):
 
         if input.sequence_tokens.shape[0] != 1:
             raise ValueError("pack requires batch size one")
+        if input.structure.system.system_instance_ptr.numel() != 2:
+            raise ValueError("pack requires one molecular system")
         if num_samples <= 0:
             raise ValueError("num_samples must be positive")
         if num_denoising_steps <= 0:
@@ -1211,121 +1223,82 @@ def pack_candidate(
         packed: Sampled atom14 coordinates, masks, and torsions.
 
     Returns:
-        A packed structure containing sampled atoms only at selected residues.
+        A packed structure with sampled selected side chains on the canonical atom axis.
     """
 
     structure = input.structure
-    source_index = {site: index for index, site in enumerate(structure.sites)}
+    system = structure.system
+    realized = structure.clone()  # type: ignore[attr-defined]
     selected = input.pack_positions[0].detach().cpu().tolist()
-    selected_references = {
-        reference for reference, is_selected in zip(input.component_references, selected) if is_selected
-    }
-    component_ids = {
-        reference: AMINO_ACID_COMPONENT_IDS[int(token)]
-        for reference, token, is_selected in zip(
-            input.component_references,
-            input.sequence_tokens[0].detach().cpu().tolist(),
+    component_indices = input.component_index[0].detach().cpu().tolist()
+    component_ids = [system.symbols[int(system.component_symbol[component])] for component in component_indices]
+    atom14_coordinates = (
+        packed.atom14_coordinates[0]
+        .detach()
+        .to(
+            device=realized.coordinates.device,
+            dtype=realized.coordinates.dtype,
+        )
+    )
+    atom14_mask = (
+        packed.atom14_mask[0]
+        .detach()
+        .to(
+            device=realized.coordinate_mask.device,
+        )
+    )
+    for row, (component, component_id, is_selected) in enumerate(
+        zip(
+            component_indices,
+            component_ids,
             selected,
+            strict=True,
         )
-        if is_selected
-    }
-    expected_atoms = {
-        reference: frozenset(filter(None, rc.AMINO_ACID_ATOM14_NAMES[component_ids[reference]]))
-        for reference in selected_references
-    }
-    site_list = [
-        site
-        for site in structure.sites
-        if (site.instance_id, site.component_index) not in selected_references
-        or (
-            (site.instance_id, site.component_index) in selected_references
-            and (site.atom_id in expected_atoms[(site.instance_id, site.component_index)] or site.atom_id == "OXT")
-        )
-    ]
-    retained_sites = set(site_list)
-    for reference, is_selected in zip(input.component_references, selected):
+    ):
         if not is_selected:
             continue
-        for atom_name in rc.AMINO_ACID_ATOM14_NAMES[component_ids[reference]][4:]:
+        start = int(system.component_atom_ptr[component])
+        stop = int(system.component_atom_ptr[component + 1])
+        atom_by_name = {
+            system.symbols[symbol]: atom
+            for atom, symbol in enumerate(
+                system.atom_symbol[start:stop].detach().cpu().tolist(),
+                start=start,
+            )
+        }
+        for atom14_index, atom_name in enumerate(
+            rc.AMINO_ACID_ATOM14_NAMES[component_id][4:],
+            start=4,
+        ):
             if not atom_name:
                 continue
-            site = AtomSite(reference[0], reference[1], atom_name)
-            if site not in retained_sites:
-                site_list.append(site)
-                retained_sites.add(site)
-    sites = tuple(site_list)
-    output_index = {site: index for index, site in enumerate(sites)}
-    atom14 = packed.atom14_coordinates[0].detach().cpu().numpy()
-    coordinate_dtype = np.result_type(structure.coordinates.dtype, atom14.dtype)
-    coordinates = np.zeros((len(sites), 3), dtype=coordinate_dtype)
-    coordinate_mask = np.zeros(len(sites), dtype=np.bool_)
-    source_occupancy = structure.occupancy
-    occupancy = (
-        None
-        if source_occupancy is None
-        else np.full(
-            len(sites),
-            np.nan,
-            dtype=np.result_type(source_occupancy.dtype, np.float32),
-        )
-    )
-    source_b_factor = structure.b_factor
-    b_factor = (
-        None
-        if source_b_factor is None
-        else np.full(
-            len(sites),
-            np.nan,
-            dtype=np.result_type(source_b_factor.dtype, np.float32),
-        )
-    )
-    for index, site in enumerate(sites):
-        source = source_index.get(site)
-        if source is None:
-            continue
-        coordinates[index] = structure.coordinates[source]
-        coordinate_mask[index] = structure.coordinate_mask[source]
-        if occupancy is not None and source_occupancy is not None:
-            occupancy[index] = source_occupancy[source]
-        if b_factor is not None and source_b_factor is not None:
-            b_factor[index] = source_b_factor[source]
+            atom = atom_by_name[atom_name]
+            realized.coordinates[atom] = atom14_coordinates[
+                row,
+                atom14_index,
+            ]
+            realized.coordinate_mask[atom] = atom14_mask[
+                row,
+                atom14_index,
+            ]
+            realized.occupancy[atom] = 0
+            realized.occupancy_mask[atom] = False
+            realized.b_factor[atom] = 0
+            realized.b_factor_mask[atom] = False
 
-    atom14_mask = packed.atom14_mask[0].detach().cpu().numpy()
-    for row, (reference, is_selected) in enumerate(zip(input.component_references, selected)):
-        if not is_selected:
-            continue
-        for atom, atom_name in enumerate(rc.AMINO_ACID_ATOM14_NAMES[component_ids[reference]][4:], start=4):
-            if not atom_name:
-                continue
-            index = output_index[AtomSite(reference[0], reference[1], atom_name)]
-            coordinates[index] = atom14[row, atom]
-            coordinate_mask[index] = atom14_mask[row, atom]
-            if occupancy is not None:
-                occupancy[index] = np.nan
-            if b_factor is not None:
-                b_factor[index] = np.nan
-
-    realized = Structure(
-        structure.system,
-        sites,
-        coordinates,
-        coordinate_mask,
-        occupancy,
-        b_factor,
-        structure.residue_numbers,
-    )
     metrics: dict[str, Metric] = {}
     chi_log_densities = packed.chi_log_densities[0].detach().cpu().numpy()
+    references = tuple(system.component_reference(component) for component in component_indices)
     for chi_index in range(4):
         rows = tuple(
             row
-            for row, (reference, is_selected) in enumerate(zip(input.component_references, selected))
-            if is_selected and len(rc.chi_angles_atoms[component_ids[reference]]) > chi_index
+            for row, (component_id, is_selected) in enumerate(zip(component_ids, selected, strict=True))
+            if is_selected and len(rc.chi_angles_atoms[component_id]) > chi_index
         )
         if rows:
             metrics[f"chi{chi_index + 1}_log_density"] = Metric(
                 values=chi_log_densities[rows, chi_index],
-                axis=tuple(input.component_references[row] for row in rows),
+                axis=tuple(references[row] for row in rows),
                 unit="nat/radian",
             )
     return PackPrediction(structure=realized, metrics=metrics)
@@ -1524,8 +1497,9 @@ class MpnnPackerInput:
             ``(batch_size, num_residues, 37)``.
         pack_positions: Residues selected for packing with shape
             ``(batch_size, num_residues)``.
-        structure: Source structure.
-        component_references: Component occurrences aligned to residue rows.
+        structure: Canonical target-identity structure.
+        component_index: Canonical component indices aligned to residue rows with
+            shape ``(batch_size, num_residues)``.
     """
 
     backbone_coordinates: Tensor
@@ -1540,7 +1514,7 @@ class MpnnPackerInput:
     atom37_mask: Tensor
     pack_positions: Tensor
     structure: Structure
-    component_references: tuple[ComponentReference, ...]
+    component_index: Tensor
 
 
 @dataclass(eq=False)

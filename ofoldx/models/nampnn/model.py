@@ -11,10 +11,10 @@ import torch
 import torch.nn.functional as F
 from tensordict import tensorclass
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
 from ...data.components import get_component
-from ...data.conditions import AllowedResidueIdentities, TiedResidueIdentities
-from ...data.molecular import ComponentReference, MolecularSystem
+from ...data.molecular import MolecularSystem, replace_components
 from ...data.structure import Structure
 from ...model import Model
 from ...modules.backend import LayerNorm
@@ -109,6 +109,84 @@ NA_MPNN_RNA_SEPARATE_GENERATABLE_TOKEN_IDS = tuple(range(26, 30))
 _RNA_SHARED_INPUT_TOKENS = frozenset((*NA_MPNN_RNA_SHARED_GENERATABLE_TOKEN_IDS, NA_MPNN_TOKEN_BY_COMPONENT["DX"]))
 
 
+def _repartition_entities_by_sequence(
+    original: MolecularSystem,
+    realized: MolecularSystem,
+) -> MolecularSystem:
+    r"""
+    Split copies of each original entity by their realized component sequence.
+    """
+
+    symbols = list(realized.symbols)
+    symbol_index = {symbol: index for index, symbol in enumerate(symbols)}
+
+    def intern(symbol: str) -> int:
+        index = symbol_index.get(symbol)
+        if index is None:
+            index = len(symbols)
+            symbols.append(symbol)
+            symbol_index[symbol] = index
+        return index
+
+    def component_ids(
+        system: MolecularSystem,
+        instance: int,
+    ) -> tuple[str, ...]:
+        start = int(system.instance_component_ptr[instance])
+        stop = int(system.instance_component_ptr[instance + 1])
+        return tuple(system.symbols[int(symbol)] for symbol in system.component_symbol[start:stop].tolist())
+
+    instances_by_entity: list[list[int]] = [[] for _ in range(original.entity_symbol.numel())]
+    for instance, entity in enumerate(original.instance_entity.tolist()):
+        instances_by_entity[entity].append(instance)
+
+    used_ids = {original.symbols[int(symbol)] for symbol in original.entity_symbol.tolist()}
+    new_entity_symbols: list[int] = []
+    new_entity_types: list[int] = []
+    new_entity_molecule_types: list[int] = []
+    new_instance_entity = torch.empty_like(realized.instance_entity)
+    for entity, instances in enumerate(instances_by_entity):
+        entity_id = original.symbols[int(original.entity_symbol[entity])]
+        if not instances:
+            new_entity_symbols.append(intern(entity_id))
+            new_entity_types.append(int(original.entity_type[entity]))
+            new_entity_molecule_types.append(int(original.entity_molecule_type[entity]))
+            continue
+        original_signature = component_ids(original, instances[0])
+        groups: dict[tuple[str, ...], list[int]] = {}
+        for instance in instances:
+            groups.setdefault(component_ids(realized, instance), []).append(instance)
+        primary = original_signature if original_signature in groups else next(iter(groups))
+        ordered = (
+            primary,
+            *(signature for signature in groups if signature != primary),
+        )
+        for partition, signature in enumerate(ordered):
+            if partition == 0:
+                output_id = entity_id
+            else:
+                suffix = 2
+                output_id = f"{entity_id}_{suffix}"
+                while output_id in used_ids:
+                    suffix += 1
+                    output_id = f"{entity_id}_{suffix}"
+                used_ids.add(output_id)
+            output_entity = len(new_entity_symbols)
+            new_entity_symbols.append(intern(output_id))
+            new_entity_types.append(int(original.entity_type[entity]))
+            new_entity_molecule_types.append(int(original.entity_molecule_type[entity]))
+            new_instance_entity[groups[signature]] = output_entity
+
+    return realized.replace(  # type: ignore[attr-defined]
+        symbols=tuple(symbols),
+        system_entity_ptr=realized.system_entity_ptr.new_tensor([0, len(new_entity_symbols)]),
+        entity_symbol=realized.entity_symbol.new_tensor(new_entity_symbols),
+        entity_type=realized.entity_type.new_tensor(new_entity_types),
+        entity_molecule_type=realized.entity_molecule_type.new_tensor(new_entity_molecule_types),
+        instance_entity=new_instance_entity,
+    )
+
+
 class NaMpnnModel(Model):
     r"""
     Design protein and nucleic-acid sequences with NA-MPNN.
@@ -120,29 +198,24 @@ class NaMpnnModel(Model):
         config: Model architecture and inference configuration.
 
     Examples:
-        >>> import numpy as np
         >>> import torch
-        >>> from ofoldx.data import AtomSite, MolecularSystem, PolymerSequence, Structure
+        >>> from ofoldx.data import MolecularSystem, PolymerSequence, Structure
         >>> from ofoldx.models.nampnn import NaMpnnConfig, NaMpnnModel, NaMpnnProcessor
         >>> sequence = PolymerSequence.from_one_letter("A", polymer_type="rna")
-        >>> system = MolecularSystem({"rna": sequence}, {"A": "rna"})
-        >>> sites = tuple(
-        ...     AtomSite("A", 0, atom)
-        ...     for atom in (
-        ...         "OP1", "OP2", "P", "O5'", "C5'", "C4'",
-        ...         "O4'", "C3'", "O3'", "C2'", "O2'", "C1'",
-        ...     )
+        >>> system = MolecularSystem.from_entities({"rna": sequence}, {"A": "rna"})
+        >>> structure = Structure(
+        ...     system=system,
+        ...     coordinates=system.reference_coordinates,
+        ...     coordinate_mask=system.reference_coordinate_mask,
+        ...     occupancy=torch.zeros(system.atom_symbol.numel()),
+        ...     occupancy_mask=torch.zeros(system.atom_symbol.numel(), dtype=torch.bool),
+        ...     b_factor=torch.zeros(system.atom_symbol.numel()),
+        ...     b_factor_mask=torch.zeros(system.atom_symbol.numel(), dtype=torch.bool),
+        ...     source_symbols=(),
+        ...     residue_id=torch.full((system.component_symbol.numel(),), -1),
+        ...     insertion_code=torch.full((system.component_symbol.numel(),), -1),
+        ...     batch_size=[],
         ... )
-        >>> coordinates = np.array(
-        ...     [
-        ...         [-1.0, 1.0, 0.0], [-1.0, -1.0, 0.0], [0.0, 0.0, 0.0],
-        ...         [1.0, 0.0, 0.0], [2.0, 0.5, 0.0], [3.0, 0.0, 0.5],
-        ...         [3.5, 1.0, 0.0], [4.0, -0.5, 0.0], [5.0, 0.0, 0.0],
-        ...         [3.5, -1.5, 0.5], [4.0, -2.5, 0.0], [2.5, -1.0, 1.0],
-        ...     ],
-        ...     dtype=np.float32,
-        ... )
-        >>> structure = Structure(system, sites, coordinates, np.ones(len(sites), dtype=np.bool_))
         >>> input = NaMpnnProcessor()(structure)
         >>> config = NaMpnnConfig(
         ...     {"hidden_size": 8, "feature_size": 8, "num_encoder_blocks": 1,
@@ -164,6 +237,7 @@ class NaMpnnModel(Model):
     def __init__(self, config: NaMpnnConfig | None = None) -> None:
         config = NaMpnnConfig() if config is None else config
         super().__init__(config)
+        self.gradient_checkpointing = False
         self.vocab_size = self.config.vocab_size
         self.feature_encoder = NaMpnnFeatures(self.config)
         self.node_embedding = nn.Linear(self.config.feature_size, self.config.hidden_size)
@@ -199,7 +273,7 @@ class NaMpnnModel(Model):
         Reject an execution-batch axis on one-target biological operations.
         """
 
-        if input.atom_coordinates.shape[0] != 1 or len(input.structures) != 1:
+        if input.atom_coordinates.shape[0] != 1 or input.structure.system.system_entity_ptr.numel() != 2:
             raise ValueError("this NaMpnn operation returns one target and therefore accepts one input")
 
     @staticmethod
@@ -224,15 +298,13 @@ class NaMpnnModel(Model):
             rna_mask=repeat(input.rna_mask),
             design_positions=repeat(input.design_positions),
             tied_group_ids=repeat(input.tied_group_ids),
-            structures=input.structures * count,
-            component_references=input.component_references * count,
-            polymer_types=input.polymer_types * count,
-            conditions=input.conditions * count,
+            structure=input.structure,
+            component_index=repeat(input.component_index),
             tied_weights=repeat(input.tied_weights),
             residue_logit_bias=repeat(input.residue_logit_bias),
             allowed_token_mask=repeat(input.allowed_token_mask),
             pair_logit_bias=repeat(input.pair_logit_bias),
-            batch_size=[input.atom_coordinates.shape[0] * count],
+            batch_size=[],
         )
 
     def _probability_result(
@@ -245,9 +317,13 @@ class NaMpnnModel(Model):
         Wrap aligned per-evaluation logits with the one target's identity.
         """
 
+        component_indices = input.component_index[0].detach().cpu().tolist()
         return MpnnProbabilityResult(
-            target=input.structures[0],
-            component_references=input.component_references[0],
+            target=input.structure,
+            component_references=tuple(
+                None if component < 0 else input.structure.system.component_reference(component)
+                for component in component_indices
+            ),
             sequence_tokens=input.sequence_tokens[0],
             residue_mask=input.residue_mask[0],
             design_positions=input.design_positions[0],
@@ -360,8 +436,20 @@ class NaMpnnModel(Model):
         node_states = self.node_embedding(node_features)
         edge_states = self.edge_embedding(edge_features)
         mask = input.residue_mask.to(dtype=node_states.dtype)
+        checkpointing = self.gradient_checkpointing and self.training and torch.is_grad_enabled()
         for block in self.encoder_blocks:
-            node_states, edge_states = block(node_states, edge_states, neighbor_indices, mask, attend_mask)
+            if checkpointing:
+                node_states, edge_states = checkpoint(
+                    block,
+                    node_states,
+                    edge_states,
+                    neighbor_indices,
+                    mask,
+                    attend_mask,
+                    use_reentrant=False,
+                )
+            else:
+                node_states, edge_states = block(node_states, edge_states, neighbor_indices, mask, attend_mask)
         return node_states, edge_states, neighbor_indices, attend_mask
 
     def _decode_logits(
@@ -390,9 +478,20 @@ class NaMpnnModel(Model):
         )
         forward_context = forward_mask * encoder_context
         mask = residue_mask.to(node_states.dtype)
+        checkpointing = self.gradient_checkpointing and self.training and torch.is_grad_enabled()
         for block in self.decoder_blocks:
             decoder_context = cat_neighbors_nodes(node_states, sequence_edges, neighbor_indices)
-            node_states = block(node_states, backward_mask * decoder_context + forward_context, mask)
+            context = backward_mask * decoder_context + forward_context
+            if checkpointing:
+                node_states = checkpoint(
+                    block,
+                    node_states,
+                    context,
+                    mask,
+                    use_reentrant=False,
+                )
+            else:
+                node_states = block(node_states, context, mask)
         return self.output_projection(node_states)
 
     def _decode_unconditional_logits(
@@ -867,8 +966,8 @@ class NaMpnnModel(Model):
     @staticmethod
     def _realize_sequence(
         system: MolecularSystem,
-        component_references: tuple[ComponentReference | None, ...],
-        polymer_types: tuple[str, ...],
+        component_index: Tensor,
+        polymer_type_index: Tensor,
         sampled_tokens: list[int],
         design_positions: list[bool],
     ) -> MolecularSystem:
@@ -876,17 +975,34 @@ class NaMpnnModel(Model):
         Realize one candidate while preserving entity and bond identity.
         """
 
-        replacements = {
-            reference: get_component(_component_from_token(int(token), polymer_type))
-            for reference, polymer_type, token, selected in zip(
-                component_references,
-                polymer_types,
-                sampled_tokens,
-                design_positions,
-            )
-            if reference is not None and selected
-        }
-        return system.replace_components(replacements)
+        selected_components = []
+        replacements = []
+        for component, polymer_type, token, selected in zip(
+            component_index.detach().cpu().tolist(),
+            polymer_type_index.detach().cpu().tolist(),
+            sampled_tokens,
+            design_positions,
+            strict=True,
+        ):
+            if component < 0 or not selected:
+                continue
+            component_id = _component_from_token(int(token), int(polymer_type))
+            if system.symbols[int(system.component_symbol[component])] == component_id:
+                continue
+            selected_components.append(component)
+            replacements.append(get_component(component_id))
+        if not selected_components:
+            return system
+        realized, _, _ = replace_components(
+            system,
+            torch.tensor(
+                selected_components,
+                dtype=torch.int64,
+                device=system.component_symbol.device,
+            ),
+            replacements,
+        )
+        return _repartition_entities_by_sequence(system, realized)
 
     @torch.inference_mode()
     def design(
@@ -933,8 +1049,11 @@ class NaMpnnModel(Model):
         )
         recovery = (matches * designed).sum(dim=-1) / design_count.clamp_min(1.0)
 
-        references = input.component_references[0]
-        polymer_types = input.polymer_types[0]
+        component_indices = input.component_index[0].detach().cpu().tolist()
+        references = tuple(
+            None if component < 0 else input.structure.system.component_reference(component)
+            for component in component_indices
+        )
         design_rows = (input.design_positions[0] & input.residue_mask[0]).tolist()
         designed_scope = frozenset(
             reference for reference, selected in zip(references, design_rows) if reference is not None and selected
@@ -947,9 +1066,9 @@ class NaMpnnModel(Model):
         candidates: list[DesignCandidate] = []
         for index in range(num_candidates):
             system = self._realize_sequence(
-                input.structures[0].system,
-                references,
-                polymer_types,
+                input.structure.system,
+                input.component_index[0],
+                input.polymer_type_index[0],
                 host_sequence_tokens[index],
                 design_rows,
             )
@@ -1012,15 +1131,13 @@ class NaMpnnModel(Model):
             rna_mask=input.rna_mask,
             design_positions=na_design,
             tied_group_ids=input.tied_group_ids,
-            structures=input.structures,
-            component_references=input.component_references,
-            polymer_types=input.polymer_types,
-            conditions=input.conditions,
+            structure=input.structure,
+            component_index=input.component_index,
             tied_weights=input.tied_weights,
             residue_logit_bias=input.residue_logit_bias,
             allowed_token_mask=input.allowed_token_mask,
             pair_logit_bias=input.pair_logit_bias,
-            batch_size=[input.atom_coordinates.shape[0]],
+            batch_size=[],
         )
         sampled = self.sample(
             fixed,
@@ -1031,19 +1148,23 @@ class NaMpnnModel(Model):
         )
         mean_probabilities = sampled.sampling_probabilities.to(torch.float64).mean(dim=0).cpu().numpy()
 
-        references = input.component_references[0]
-        polymer_types = input.polymer_types[0]
+        component_indices = input.component_index[0].detach().cpu().tolist()
+        references = tuple(
+            None if component < 0 else input.structure.system.component_reference(component)
+            for component in component_indices
+        )
+        polymer_types = input.polymer_type_index[0].detach().cpu().tolist()
         selected = (na_design[0] & input.residue_mask[0]).tolist()
         na_rows = [
             (index, reference)
             for index, (reference, polymer, keep) in enumerate(zip(references, polymer_types, selected))
-            if reference is not None and keep and polymer in ("dna", "rna")
+            if reference is not None and keep and polymer in (1, 2)
         ]
         axis = tuple(reference for _index, reference in na_rows)
         token_columns = {
             row: (
                 NA_MPNN_DNA_GENERATABLE_TOKEN_IDS
-                if polymer_types[row] == "dna"
+                if polymer_types[row] == 1
                 else (
                     NA_MPNN_RNA_SHARED_GENERATABLE_TOKEN_IDS
                     if int(input.sequence_tokens[0, row]) in _RNA_SHARED_INPUT_TOKENS
@@ -1066,7 +1187,7 @@ class NaMpnnModel(Model):
                 dtype=np.float64,
             )
             metrics[f"{base}_probability"] = Metric(values=values, axis=axis)
-        return ScoreResult(target=input.structures[0], scores={}, metrics=metrics)
+        return ScoreResult(target=input.structure, scores={}, metrics=metrics)
 
 
 class NaMpnnFeatures(nn.Module):
@@ -1210,22 +1331,22 @@ def _all_pair_rbf(coordinates: Tensor, atom_mask: Tensor, neighbor_indices: Tens
     return rbf.reshape(coordinates.shape[0], coordinates.shape[1], neighbor_indices.shape[-1], -1)
 
 
-def _component_from_token(token: int, polymer_type: str) -> str:
+def _component_from_token(token: int, polymer_type: int) -> str:
     r"""
     Realize one sampled token as a canonical component under its polymer type.
     """
 
-    if polymer_type == "protein":
+    if polymer_type == 0:
         if token >= 20:
             raise RuntimeError(f"NA-MPNN sampled non-protein token {token} for a protein residue")
         return NA_MPNN_COMPONENT_IDS[token]
-    if polymer_type == "dna":
+    if polymer_type == 1:
         if not 21 <= token <= 24:
             raise RuntimeError(f"NA-MPNN sampled non-DNA token {token} for a DNA residue")
         return ("DA", "DC", "DG", "DT")[token - 21]
-    if 21 <= token <= 24:
+    if polymer_type == 2 and 21 <= token <= 24:
         return ("A", "C", "G", "U")[token - 21]
-    if 26 <= token <= 29:
+    if polymer_type == 2 and 26 <= token <= 29:
         return ("A", "C", "G", "U")[token - 26]
     raise RuntimeError(f"NA-MPNN sampled non-RNA token {token} for an RNA residue")
 
@@ -1257,10 +1378,8 @@ class NaMpnnInput:
         design_positions: Positions eligible for design with shape
             ``(batch_size, num_residues)``.
         tied_group_ids: Autoregressive unit ID for each residue row.
-        structures: Source structure for each batch item.
-        component_references: Component occurrence aligned to every residue row.
-        polymer_types: Polymer type aligned to every residue row.
-        conditions: Sequence constraints associated with each batch item.
+        structure: Source structure.
+        component_index: Canonical component indices aligned to residue rows.
         tied_weights: Optional tied-group weights with shape ``(batch_size, num_residues)``.
         residue_logit_bias: Optional additive bias with shape
             ``(batch_size, num_residues, vocabulary_size)``.
@@ -1282,10 +1401,8 @@ class NaMpnnInput:
     rna_mask: Tensor
     design_positions: Tensor
     tied_group_ids: Tensor
-    structures: tuple[Structure, ...]
-    component_references: tuple[tuple[ComponentReference | None, ...], ...]
-    polymer_types: tuple[tuple[str, ...], ...]
-    conditions: tuple[tuple[AllowedResidueIdentities | TiedResidueIdentities, ...], ...]
+    structure: Structure
+    component_index: Tensor
     tied_weights: Tensor | None = None
     residue_logit_bias: Tensor | None = None
     allowed_token_mask: Tensor | None = None

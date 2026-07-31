@@ -16,6 +16,7 @@ import torch
 import torch.nn.functional as F
 from tensordict import tensorclass
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
 from ...data.molecular import AtomSite, ComponentReference, MolecularSystem
 from ...data.structure import Structure
@@ -88,7 +89,9 @@ class Boltz1Model(Model):
         >>> from ofoldx.data import MolecularSystem, PolymerSequence
         >>> from ofoldx.models.boltz1 import Boltz1Config, Boltz1Model, Boltz1Processor
         >>> sequence = PolymerSequence.from_one_letter("G")
-        >>> system = MolecularSystem({"protein": sequence}, {"A": "protein"})
+        >>> system = MolecularSystem.from_entities(
+        ...     {"protein": sequence}, {"A": "protein"}
+        ... )
         >>> input = Boltz1Processor()(system)
         >>> config = Boltz1Config(
         ...     {
@@ -379,7 +382,7 @@ class Boltz1Model(Model):
 
         Args:
             input: Model-visible structure and evidence features.
-            target: Complete pre-crop structure truth.
+            target: Full-axis canonical structure truth.
             num_samples: Number ``S`` of independently corrupted copies per input.
             synchronize_noise_levels: Whether samples from one example share sigma.
             coordinate_augmentation: Whether to apply random rigid augmentation.
@@ -657,8 +660,8 @@ class Boltz1Model(Model):
             values are in angstroms; pLDDT is on the ``0--100`` scale.
 
         Raises:
-            ValueError: If ``num_samples`` is not positive, the batch contains
-                more than one system, or molecular identities are absent.
+            ValueError: If ``num_samples`` is not positive or the batch
+                contains more than one system.
         """
 
         num_samples = operator.index(num_samples)
@@ -666,9 +669,6 @@ class Boltz1Model(Model):
             raise ValueError("num_samples must be positive")
         if input.token_mask.shape[0] != 1:
             raise ValueError("Boltz1Model.fold accepts one molecular system per call")
-        if input.layout is None:
-            raise ValueError("Boltz1Model.fold requires the canonical layout produced by its Processor")
-
         output = self._predict(
             input,
             recycling_steps=recycling_steps,
@@ -1180,6 +1180,7 @@ class Boltz1MsaTrunk(nn.Module):
         )
         self.token_projection = nn.Linear(single_size, msa_size, bias=False)
         self.num_blocks = num_blocks
+        self.gradient_checkpointing = False
         self.blocks = nn.ModuleList(
             Boltz1MsaBlock(
                 msa_size=msa_size,
@@ -1215,11 +1216,14 @@ class Boltz1MsaTrunk(nn.Module):
             msa_max_depth = operator.index(msa_max_depth)
             if msa_max_depth < 1:
                 raise ValueError("msa_max_depth must be positive")
+            random_device = msa_tokens.device if generator is None else generator.device
             indices = torch.randperm(
                 msa_tokens.shape[1],
-                device=msa_tokens.device,
+                device=random_device,
                 generator=generator,
-            )[:msa_max_depth]
+            )[
+                :msa_max_depth
+            ].to(msa_tokens.device)
             msa_tokens = msa_tokens[:, indices]
             has_deletion = has_deletion[:, indices]
             deletion_value = deletion_value[:, indices]
@@ -1236,7 +1240,17 @@ class Boltz1MsaTrunk(nn.Module):
         msa = msa + self.token_projection(single_inputs).unsqueeze(1)
         pair_mask = pair_mask_from_token_mask(token_mask)
         for block in self.blocks:
-            pair, msa = block(pair, msa, pair_mask, msa_mask)
+            if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+                pair, msa = checkpoint(
+                    block,
+                    pair,
+                    msa,
+                    pair_mask,
+                    msa_mask,
+                    use_reentrant=False,
+                )
+            else:
+                pair, msa = block(pair, msa, pair_mask, msa_mask)
         return pair
 
 
@@ -1318,6 +1332,7 @@ class Boltz1PairformerStack(nn.Module):
     ) -> None:
         super().__init__()
         self.num_blocks = num_blocks
+        self.gradient_checkpointing = False
         self.blocks = nn.ModuleList(
             Boltz1PairformerBlock(
                 single_size=single_size,
@@ -1335,7 +1350,16 @@ class Boltz1PairformerStack(nn.Module):
 
     def forward(self, single: Tensor, pair: Tensor, pair_mask: Tensor | None = None) -> tuple[Tensor, Tensor]:
         for block in self.blocks:
-            single, pair = block(single, pair, pair_mask=pair_mask)
+            if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+                single, pair = checkpoint(
+                    block,
+                    single,
+                    pair,
+                    pair_mask=pair_mask,
+                    use_reentrant=False,
+                )
+            else:
+                single, pair = block(single, pair, pair_mask=pair_mask)
         return single, pair
 
 
@@ -1399,6 +1423,7 @@ class Boltz1TrianglePairUpdateStack(nn.Module):
     ) -> None:
         super().__init__()
         self.num_blocks = num_blocks
+        self.gradient_checkpointing = False
         self.blocks = nn.ModuleList(
             Boltz1TrianglePairUpdateBlock(
                 pair_size=pair_size,
@@ -1414,7 +1439,15 @@ class Boltz1TrianglePairUpdateStack(nn.Module):
 
     def forward(self, pair: Tensor, pair_mask: Tensor | None = None) -> Tensor:
         for block in self.blocks:
-            pair = block(pair, pair_mask=pair_mask)
+            if self.gradient_checkpointing and self.training and torch.is_grad_enabled():
+                pair = checkpoint(
+                    block,
+                    pair,
+                    pair_mask=pair_mask,
+                    use_reentrant=False,
+                )
+            else:
+                pair = block(pair, pair_mask=pair_mask)
         return pair
 
 
@@ -1800,7 +1833,12 @@ class Boltz1CoordinateDiffusion(nn.Module):
     ) -> Tensor:
         log_mean = self.noise_log_mean if log_mean is None else log_mean
         log_std = self.noise_log_std if log_std is None else log_std
-        normal = torch.empty(batch_size, device=device, dtype=dtype).normal_(generator=generator)
+        normal = _draw_normal(
+            (batch_size,),
+            device=device,
+            dtype=dtype,
+            generator=generator,
+        )
         return self.sigma_data * (log_mean + log_std * normal).exp()
 
     def loss_weight(self, sigma: Tensor) -> Tensor:
@@ -1901,7 +1939,12 @@ class Boltz1CoordinateDiffusion(nn.Module):
             translation_scale=augmentation_translation_scale,
             generator=generator,
         )
-        noise = torch.empty_like(augmented_target_coordinates).normal_(generator=generator)
+        noise = _draw_normal(
+            augmented_target_coordinates.shape,
+            device=augmented_target_coordinates.device,
+            dtype=augmented_target_coordinates.dtype,
+            generator=generator,
+        )
         noisy_coordinates = augmented_target_coordinates + noise_level[:, None, None] * noise
         denoised_coordinates = self.preconditioned_network_forward(
             noisy_coordinates,
@@ -1931,11 +1974,18 @@ class Boltz1CoordinateDiffusion(nn.Module):
         coords = coords - centroid
         if not coordinate_augmentation:
             return coords
+        random_device = coords.device if generator is None else generator.device
         rotation = uniform_random_rotation(
-            coords.shape[0], device=coords.device, dtype=coords.dtype, generator=generator
-        )
-        translation = torch.empty(coords.shape[0], 1, 3, device=coords.device, dtype=coords.dtype).normal_(
-            generator=generator
+            coords.shape[0],
+            device=random_device,
+            dtype=coords.dtype,
+            generator=generator,
+        ).to(coords.device)
+        translation = _draw_normal(
+            (coords.shape[0], 1, 3),
+            device=coords.device,
+            dtype=coords.dtype,
+            generator=generator,
         )
         return torch.einsum("bmd,bds->bms", coords, rotation) + translation_scale * translation
 
@@ -2024,7 +2074,12 @@ class Boltz1CoordinateDiffusion(nn.Module):
             Draw standard-normal noise of the expanded coordinate ``shape`` on the sampler device/generator.
             """
 
-            return torch.randn(shape, device=device, dtype=dtype, generator=generator)
+            return _draw_normal(
+                shape,
+                device=device,
+                dtype=dtype,
+                generator=generator,
+            )
 
         coords = sigmas[0] * randn()
         if feynman_kac:
@@ -2047,13 +2102,15 @@ class Boltz1CoordinateDiffusion(nn.Module):
         # per-step tensor math remains free of host synchronizations on the ordinary (unsteered) sampling path.
         for index in range(len(sigmas) - 1):
             sigma_current, sigma_next, gamma = sigmas[index], sigmas[index + 1], gammas[index + 1]
+            random_device = device if generator is None else generator.device
             rotation = uniform_random_rotation(
-                expanded_atom_mask.shape[0], device=device, dtype=coords.dtype, generator=generator
-            )
-            translation = torch.randn(
                 expanded_atom_mask.shape[0],
-                1,
-                3,
+                device=random_device,
+                dtype=coords.dtype,
+                generator=generator,
+            ).to(device)
+            translation = _draw_normal(
+                (expanded_atom_mask.shape[0], 1, 3),
                 device=device,
                 dtype=dtype,
                 generator=generator,
@@ -2165,8 +2222,14 @@ class Boltz1CoordinateDiffusion(nn.Module):
 
             if should_resample:
                 sample_count = num_particles if index < len(sigmas) - 2 else 1
+                random_device = resample_weights.device if generator is None else generator.device
                 resample_indices = (
-                    torch.multinomial(resample_weights, sample_count, replacement=True, generator=generator)
+                    torch.multinomial(
+                        resample_weights.to(random_device),
+                        sample_count,
+                        replacement=True,
+                        generator=generator,
+                    ).to(device)
                     + num_particles * torch.arange(resample_weights.shape[0], device=device).unsqueeze(-1)
                 ).flatten()
                 coords = coords[resample_indices]
@@ -2989,6 +3052,26 @@ class Boltz1ConfidenceOutputHead(nn.Module):
         if self.pae_projection is not None:
             logits["pae_logits"] = self.pae_projection(pair)
         return logits
+
+
+def _draw_normal(
+    size: tuple[int, ...] | torch.Size,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    generator: torch.Generator | None,
+) -> Tensor:
+    r"""
+    Draw standard-normal values from ``generator`` and place them on ``device``.
+    """
+
+    random_device = device if generator is None else generator.device
+    return torch.randn(
+        size,
+        device=random_device,
+        dtype=dtype,
+        generator=generator,
+    ).to(device)
 
 
 def _boltz1_steering_features(input: Boltz1Input, *, atom_features: Tensor) -> dict[str, Tensor]:
@@ -4078,30 +4161,41 @@ def _decode_boltz1_fold_result(output: _Boltz1FoldOutput, input: Boltz1Input) ->
     r"""
     Decode one model output into structures and confidence values.
 
-    Maps model atom order back onto the system's complete heavy-atom sites to build one ``Structure`` per
-    sample, and lifts the confidence head's per-token metrics, token-pair PAE/PDE, and per-sample ranking
-    scores onto values aligned to the layout's token axis.
+    Maps model atom order back onto the complete canonical atom axis and lifts
+    confidence values onto public symbolic axes only at this result boundary.
 
     Args:
         output: The raw folding output with sampled coordinates and optional
             typed confidence predictions.
-        input: The Boltz-1 input batch whose ``layout`` names the aligned molecular identities.
+        input: The Boltz-1 input batch carrying the canonical molecular system
+            and integer axis mappings.
 
     Returns:
         A [`FoldResult`][ofoldx.results.FoldResult] with one prediction per drawn sample.
     """
 
-    layout = cast(Boltz1Layout, input.layout)
-    token_count = len(layout.token_sites)
-    atom_count = len(layout.atom_sites)
+    token_count = int(input.token_mask[0].sum())
+    atom_count = int(input.atom_mask[0].sum())
+    canonical_atom_index = input.atom_index[0, :atom_count].detach().cpu().long()
+    canonical_token_component = input.token_component_index[0, :token_count].detach().cpu().long()
+    canonical_token_atom = input.token_atom_index[0, :token_count].detach().cpu().long()
+    result_system = input.system.cpu()  # type: ignore[attr-defined]
+    token_axis_values: list[ComponentReference | AtomSite] = []
+    for atom_index, component_index in zip(
+        canonical_token_atom.tolist(),
+        canonical_token_component.tolist(),
+    ):
+        if atom_index >= 0:
+            token_axis_values.append(result_system.atom_site(atom_index))
+        else:
+            token_axis_values.append(result_system.component_reference(component_index))
+    token_axis = tuple(token_axis_values)
 
-    complete_sites = [site for site, atom in layout.system.iter_atoms() if atom.element not in {"H", "D", "T"}]
-    complete_index = {site: index for index, site in enumerate(complete_sites)}
-    model_to_complete = np.asarray([complete_index[site] for site in layout.atom_sites], dtype=np.intp)
-
-    coordinates = output.coordinates[0, :, :atom_count].to(device="cpu", dtype=torch.float32).numpy()
+    coordinates = output.coordinates[0, :, :atom_count].to(
+        device="cpu",
+        dtype=torch.float32,
+    )
     num_samples = coordinates.shape[0]
-    token_axis = layout.token_sites
     confidence = output.confidence
 
     def per_sample(value: Tensor | None) -> np.ndarray | None:
@@ -4120,7 +4214,9 @@ def _decode_boltz1_fold_result(output: _Boltz1FoldOutput, input: Boltz1Input) ->
     ligand_iptm = per_sample(None if confidence is None else confidence.ligand_iptm)
     protein_iptm = per_sample(None if confidence is None else confidence.protein_iptm)
     chain_pair_iptm = per_sample(None if confidence is None else confidence.chain_pair_iptm)
-    chain_axis = tuple(layout.system.instances.keys())
+    chain_axis = tuple(
+        result_system.instance_id(instance_index) for instance_index in range(result_system.instance_symbol.numel())
+    )
 
     resolved_probability: np.ndarray | None = None
     if confidence is not None:
@@ -4129,16 +4225,46 @@ def _decode_boltz1_fold_result(output: _Boltz1FoldOutput, input: Boltz1Input) ->
         )
 
     predictions: list[FoldPrediction] = []
+    complete_atom_count = result_system.atom_symbol.numel()
+    complete_component_count = result_system.component_symbol.numel()
     for sample_index in range(num_samples):
-        complete_coordinates = np.zeros((len(complete_sites), 3), dtype=np.float32)
-        coordinate_mask = np.zeros(len(complete_sites), dtype=np.bool_)
-        complete_coordinates[model_to_complete] = coordinates[sample_index]
-        coordinate_mask[model_to_complete] = True
-        structure = Structure(
-            system=layout.system,
-            sites=tuple(complete_sites),
+        complete_coordinates = torch.zeros(
+            complete_atom_count,
+            3,
+            dtype=torch.float32,
+        )
+        coordinate_mask = torch.zeros(
+            complete_atom_count,
+            dtype=torch.bool,
+        )
+        complete_coordinates[canonical_atom_index] = coordinates[sample_index]
+        coordinate_mask[canonical_atom_index] = True
+        structure = Structure(  # type: ignore[call-arg]
+            system=result_system,
             coordinates=complete_coordinates,
             coordinate_mask=coordinate_mask,
+            occupancy=torch.zeros(complete_atom_count),
+            occupancy_mask=torch.zeros(
+                complete_atom_count,
+                dtype=torch.bool,
+            ),
+            b_factor=torch.zeros(complete_atom_count),
+            b_factor_mask=torch.zeros(
+                complete_atom_count,
+                dtype=torch.bool,
+            ),
+            source_symbols=(),
+            residue_id=torch.full(
+                (complete_component_count,),
+                -1,
+                dtype=torch.int64,
+            ),
+            insertion_code=torch.full(
+                (complete_component_count,),
+                -1,
+                dtype=torch.int64,
+            ),
+            batch_size=[],
         )
 
         sample_scores: dict[str, Score] = {}
@@ -4198,10 +4324,10 @@ def _gather_boltz1_structure_target(
     input: Boltz1Input,
 ) -> tuple[Tensor, Tensor]:
     r"""
-    Gather complete-pool truth onto the current padded atom axis.
+    Gather canonical truth onto the current padded model atom axis.
     """
 
-    atom_index = target.atom_index.long()
+    atom_index = input.atom_index.long()
     valid = atom_index >= 0
     gather_index = atom_index.clamp_min(0)
     coordinates = target.coordinates.gather(
@@ -4230,8 +4356,8 @@ def _unflatten_sample_axis(tensor: Tensor, batch_size: int, multiplicity: int) -
 
 
 # ---------------------------------------------------------------------------
-# Tensor boundary of the Boltz-1 model graph: the pure-tensor input,
-# output, molecular-identity layout, trunk representations, and pocket record.
+# Tensor boundary of the Boltz-1 model graph: typed input and output tensors,
+# trunk representations, and the public pocket declaration.
 # ---------------------------------------------------------------------------
 
 
@@ -4255,31 +4381,20 @@ class Boltz1Pocket:
     pocket: tuple[ComponentReference, ...] = ()
 
 
-@dataclass(frozen=True)
-class Boltz1Layout:
-    r"""
-    Molecular identities aligned to one Boltz-1 tensor layout.
-    """
-
-    system: MolecularSystem
-    atom_sites: tuple[AtomSite, ...]
-    token_sites: tuple[AtomSite | tuple[str, int], ...]
-
-
 @tensorclass
 class Boltz1StructureTarget:
     r"""
-    Complete pre-crop structure truth for Boltz-1 training.
+    Full canonical atom-axis structure truth for Boltz-1 training.
 
-    Local symmetry groups name rows on the current atom axis; all coordinate
-    values live in the complete target pool.
+    Local symmetry groups name rows on the model atom axis; all coordinate
+    values live on the canonical system atom axis.
 
     Args:
-        coordinates: Complete-assembly coordinates with shape ``(B, T, 3)``.
-        coordinate_mask: Resolved complete-assembly mask with shape ``(B, T)``.
-        atom_index: Current atom-to-pool mapping with shape ``(B, A)`` and
-            ``-1`` padding.
-        chain_span: Half-open pool chain spans with shape ``(B, C, 2)``.
+        coordinates: Full canonical coordinates with shape
+            ``(B, A_system, 3)``.
+        coordinate_mask: Resolved canonical atom mask with shape
+            ``(B, A_system)``.
+        chain_span: Half-open canonical chain spans with shape ``(B, C, 2)``.
         chain_equivalence_index: Entity-and-layout equivalence ids with
             shape ``(B, C)``.
         symmetry_atom_index: Current-axis atoms in each local symmetry
@@ -4290,7 +4405,6 @@ class Boltz1StructureTarget:
 
     coordinates: Tensor
     coordinate_mask: Tensor
-    atom_index: Tensor
     chain_span: Tensor
     chain_equivalence_index: Tensor
     symmetry_atom_index: Tensor
@@ -4305,7 +4419,9 @@ class Boltz1Input:
     The contract is Boltz-1 specific: residue-token geometry, optional MSA features, molecule/frame fields used
     by confidence ranking, and optional token-level ``pocket_feature`` one-hot with classes ``UNSPECIFIED``,
     ``UNSELECTED``, ``POCKET``, and ``BINDER``. When omitted, the model uses all ``UNSPECIFIED`` pocket
-    conditioning. All tensors carry a leading batch axis; ``N`` is the token count and ``M`` the atom count.
+    conditioning. Tensor fields carry an explicit leading family batch axis;
+    ``N`` is the token count and ``M`` the atom count. The tensorclass batch
+    size is empty because the nested canonical system uses ragged pointer axes.
 
     Args:
         token_mask: `[B, N]` per-token validity mask.
@@ -4348,8 +4464,13 @@ class Boltz1Input:
         msa_paired: Optional `[B, S, N]` cross-chain pairing flag.
         msa_mask: Optional `[B, S, N]` MSA validity mask.
         pocket_feature: Optional `[B, N, pocket_feature_size]` pocket one-hot conditioning.
-        layout: Optional [`Boltz1Layout`][ofoldx.models.boltz1.model.Boltz1Layout] aligning the
-            tensor axes to molecular identities; populated by ``Boltz1Processor`` and required by ``fold``.
+        system: Canonical molecular system represented by these tensors.
+        atom_index: Canonical atom index for each model atom with shape
+            ``(B, M)`` and ``-1`` padding.
+        token_component_index: Canonical component index for each model token
+            with shape ``(B, N)``.
+        token_atom_index: Canonical atom index for atom-level tokens and ``-1``
+            for component-level tokens, with shape ``(B, N)``.
     """
 
     token_mask: Tensor
@@ -4385,6 +4506,10 @@ class Boltz1Input:
     connected_atom_index: Tensor
     symmetric_chain_index: Tensor
     frame_atom_index: Tensor
+    system: MolecularSystem
+    atom_index: Tensor
+    token_component_index: Tensor
+    token_atom_index: Tensor
     cyclic_period: Tensor | None = None
     msa_tokens: Tensor | None = None
     has_deletion: Tensor | None = None
@@ -4392,7 +4517,6 @@ class Boltz1Input:
     msa_paired: Tensor | None = None
     msa_mask: Tensor | None = None
     pocket_feature: Tensor | None = None
-    layout: Boltz1Layout | None = None
 
 
 @tensorclass

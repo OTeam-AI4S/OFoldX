@@ -19,6 +19,8 @@ def point_group_rotations(kind: str, order: int | None = None) -> tuple[Tensor, 
     """
 
     if kind in ("cyclic", "dihedral"):
+        if order is None:
+            raise ValueError(f"{kind} symmetry requires order")
         angles = np.arange(order, dtype=np.float64) * (2 * np.pi / order)
         rotations = [
             np.array(
@@ -34,6 +36,15 @@ def point_group_rotations(kind: str, order: int | None = None) -> tuple[Tensor, 
             flip = np.diag((1.0, -1.0, -1.0))
             rotations = [matrix for rotation in rotations for matrix in (rotation, flip @ rotation)]
         matrices = np.stack(rotations)
+    elif kind == "t3":
+        matrices = np.asarray(
+            (
+                ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)),
+                ((-1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, -1.0)),
+                ((-1.0, 0.0, 0.0), (0.0, -1.0, 0.0), (0.0, 0.0, 1.0)),
+                ((1.0, 0.0, 0.0), (0.0, -1.0, 0.0), (0.0, 0.0, -1.0)),
+            )
+        )
     else:
         group = {"tetrahedral": "T", "octahedral": "O", "icosahedral": "I"}[kind]
         matrices = Rotation.create_group(group).as_matrix()
@@ -118,7 +129,7 @@ def match_symmetric_truth(
     predicted_coordinates: Tensor,
     target_coordinates: Tensor,
     target_mask: Tensor,
-    target_atom_index: Tensor,
+    coordinate_atom_index: Tensor,
     target_chain_span: Tensor,
     target_chain_equivalence_index: Tensor,
     target_symmetry_atom_index: Tensor,
@@ -148,7 +159,10 @@ def match_symmetric_truth(
         dtype=predicted_coordinates.dtype,
     )
     target_mask = target_mask.to(device=device, dtype=torch.bool)
-    target_atom_index = target_atom_index.to(device=device, dtype=torch.long)
+    model_atom_index = coordinate_atom_index.to(
+        device=device,
+        dtype=torch.long,
+    )
     target_chain_span = target_chain_span.to(device=device, dtype=torch.long)
     target_chain_equivalence_index = target_chain_equivalence_index.to(
         device=device,
@@ -175,11 +189,11 @@ def match_symmetric_truth(
         valid_chain = spans[:, 1] > spans[:, 0]
         spans = spans[valid_chain]
         equivalence = target_chain_equivalence_index[batch_index][valid_chain]
-        atom_index = target_atom_index[batch_index]
+        current_atom_index = model_atom_index[batch_index]
         assignment_groups = _chain_assignment_groups(
             spans,
             equivalence,
-            atom_index,
+            current_atom_index,
         )
         assignment_counts = [math.perm(len(destinations), len(sources)) for sources, destinations in assignment_groups]
         total_assignments = math.prod(assignment_counts)
@@ -206,7 +220,7 @@ def match_symmetric_truth(
                     assignment_counts,
                 )
                 candidate_atom_index = _assigned_atom_index(
-                    atom_index,
+                    current_atom_index,
                     spans,
                     assignment,
                 )

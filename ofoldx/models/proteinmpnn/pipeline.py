@@ -13,7 +13,12 @@ from torch import Tensor
 from typing_extensions import Self
 
 from ...data.conditions import AllowedResidueIdentities, TiedResidueIdentities
-from ...data.molecular import ComponentReference, MolecularSystem, PolymerSequence
+from ...data.molecular import (
+    ENTITY_PROTEIN,
+    ComponentReference,
+    MolecularSystem,
+    PolymerSequence,
+)
 from ...data.structure import Structure
 from ...io import read_structure
 from ...modules.mpnn import (
@@ -209,7 +214,8 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
 
         Notes:
             The leading tensor axis enumerates decoding orders, and the residue axis follows
-            ``component_references``. ``seed`` and ``generator`` are mutually exclusive.
+            the processed canonical component indices. ``seed`` and ``generator``
+            are mutually exclusive.
         """
 
         structure = read_structure(input) if isinstance(input, (str, PathLike)) else input
@@ -258,7 +264,8 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
 
         Notes:
             The leading tensor axis enumerates decoding orders, and the residue axis follows
-            ``component_references``. ``seed`` and ``generator`` are mutually exclusive.
+            the processed canonical component indices. ``seed`` and ``generator``
+            are mutually exclusive.
         """
 
         structure = read_structure(input) if isinstance(input, (str, PathLike)) else input
@@ -306,7 +313,8 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
         Notes:
             ``logits`` use decoding-order, target-residue, and vocabulary axes;
             ``decoding_ranks`` add a final residue-order axis. Residue axes follow
-            ``component_references``. ``seed`` and ``generator`` are mutually exclusive.
+            the processed canonical component indices. ``seed`` and ``generator``
+            are mutually exclusive.
         """
 
         structure = read_structure(input) if isinstance(input, (str, PathLike)) else input
@@ -353,7 +361,8 @@ class ProteinMpnnPipeline(PairedPipeline[ProteinMpnnModel, ProteinMpnnProcessor]
         Notes:
             ``logits`` use decoding-order, target-residue, and vocabulary axes;
             ``decoding_ranks`` add a final residue-order axis. Residue axes follow
-            ``component_references``. ``seed`` and ``generator`` are mutually exclusive.
+            the processed canonical component indices. ``seed`` and ``generator``
+            are mutually exclusive.
         """
 
         structure = read_structure(input) if isinstance(input, (str, PathLike)) else input
@@ -510,13 +519,16 @@ class ProteinMpnnDesignAndPackPipeline:
         if repack_everything:
             pack_positions: Sequence[ComponentReference] | None = None
         else:
-            references = model_input.component_references[0]
+            references = tuple(
+                None if component < 0 else model_input.structure.system.component_reference(component)
+                for component in model_input.component_index[0].detach().cpu().tolist()
+            )
             selected = (model_input.residue_mask[0] & model_input.design_positions[0]).tolist()
             pack_positions = [
                 reference for reference, keep in zip(references, selected) if keep and reference is not None
             ]
         packs = self.packer.pack_sequences(
-            model_input.structures[0],
+            model_input.structure,
             sequences=[_candidate_protein_sequences(candidate.system) for candidate in design_result.candidates],
             pack_positions=pack_positions,
             use_atom_context=use_packing_atom_context,
@@ -565,8 +577,13 @@ def _candidate_protein_sequences(
     """
 
     sequences: dict[str, tuple[str, ...]] = {}
-    for instance_id, entity_id in system.instances.items():
-        entity = system.entities[entity_id]
-        if isinstance(entity, PolymerSequence) and entity.polymer_type == "protein":
-            sequences[instance_id] = tuple(component.component_id for component in entity.components)
+    for instance in range(system.instance_symbol.numel()):
+        entity = int(system.instance_entity[instance])
+        if int(system.entity_type[entity]) != ENTITY_PROTEIN:
+            continue
+        start = int(system.instance_component_ptr[instance])
+        stop = int(system.instance_component_ptr[instance + 1])
+        sequences[system.instance_id(instance)] = tuple(
+            system.symbols[int(symbol)] for symbol in system.component_symbol[start:stop].tolist()
+        )
     return sequences

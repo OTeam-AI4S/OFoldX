@@ -10,17 +10,19 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from ...data.evidence import MSACollection, Template, TemplateAlignment
-from ...data.molecular import AtomSite, MolecularSystem, Molecule, PolymerSequence
+from ...data.evidence import MSA, MSACollection, Template, TemplateAlignment, resolve_msa_bindings
+from ...data.molecular import ENTITY_PROTEIN, MolecularSystem, PolymerSequence
 from ...modules import residue_constants
 from ...processor import Processor
 from .config import AlphaFold2MultimerProcessorConfig
-from .model import AlphaFold2MultimerInput, AlphaFold2MultimerLayout
+from .model import AlphaFold2MultimerInput
 from .processor import (
     GAP_RESIDUE_TYPE_INDEX,
     RESIDUE_TYPE_INDEX_BY_COMPONENT,
     RESIDUE_TYPE_INDEX_BY_SYMBOL,
     UNKNOWN_RESIDUE_TYPE_INDEX,
+    _atom37_indices,
+    _component_ids,
     select_template_alignment,
 )
 
@@ -73,14 +75,15 @@ class AlphaFold2MultimerProcessor(Processor):
 
         system = input if isinstance(input, MolecularSystem) else multimer_system(input)
         chains = multimer_chains(system)
-        normalized_msa = normalize_collection(msa, chains)
+        msa_bindings = () if msa is None else resolve_msa_bindings(msa, system)
         normalized_templates = tuple(templates)
         if len(normalized_templates) > self.config.max_templates:
             raise ValueError(f"AlphaFold-Multimer accepts at most {self.config.max_templates} templates")
         return prepare_multimer_features(
             system,
             chains=chains,
-            msa=normalized_msa,
+            msa=msa,
+            msa_bindings=msa_bindings,
             templates=normalized_templates,
             device=self.device,
             dtype=self.dtype,
@@ -93,12 +96,12 @@ class MultimerChain:
     """
 
     __slots__ = (
-        "instance_id",
-        "entity_id",
-        "entity",
+        "instance_index",
+        "system_entity_index",
         "chain_index",
-        "entity_index",
+        "model_entity_index",
         "symmetry_index",
+        "component_index",
         "start",
         "stop",
     )
@@ -106,21 +109,21 @@ class MultimerChain:
     def __init__(
         self,
         *,
-        instance_id: str,
-        entity_id: str,
-        entity: PolymerSequence,
+        instance_index: int,
+        system_entity_index: int,
         chain_index: int,
-        entity_index: int,
+        model_entity_index: int,
         symmetry_index: int,
+        component_index: Tensor,
         start: int,
         stop: int,
     ) -> None:
-        self.instance_id = instance_id
-        self.entity_id = entity_id
-        self.entity = entity
+        self.instance_index = instance_index
+        self.system_entity_index = system_entity_index
         self.chain_index = chain_index
-        self.entity_index = entity_index
+        self.model_entity_index = model_entity_index
         self.symmetry_index = symmetry_index
+        self.component_index = component_index
         self.start = start
         self.stop = stop
 
@@ -141,24 +144,18 @@ def multimer_system(
         named = [(f"chain_{index}", sequence) for index, sequence in enumerate(input)]
     if not named:
         raise ValueError("AlphaFold-Multimer requires at least one PolymerSequence")
-    for _, sequence in named:
-        if not isinstance(sequence, PolymerSequence):
-            raise TypeError("AlphaFold-Multimer requires PolymerSequence chains")
 
-    entities: dict[str, PolymerSequence | Molecule] = {}
+    entities: dict[str, PolymerSequence] = {}
     instances: dict[str, str] = {}
-    sequence_to_entity: dict[tuple[object, ...], str] = {}
+    sequence_to_entity: dict[PolymerSequence, str] = {}
     for instance_id, sequence in named:
-        if instance_id in instances:
-            raise ValueError(f"duplicate chain identifier {instance_id!r}")
-        key = (sequence.polymer_type, tuple(component.component_id for component in sequence.components))
-        entity_id = sequence_to_entity.get(key)
+        entity_id = sequence_to_entity.get(sequence)
         if entity_id is None:
             entity_id = f"entity_{len(entities)}"
-            sequence_to_entity[key] = entity_id
+            sequence_to_entity[sequence] = entity_id
             entities[entity_id] = sequence
         instances[instance_id] = entity_id
-    return MolecularSystem(entities=entities, instances=instances)
+    return MolecularSystem.from_entities(entities=entities, instances=instances)
 
 
 def multimer_chains(system: MolecularSystem) -> tuple[MultimerChain, ...]:
@@ -166,74 +163,41 @@ def multimer_chains(system: MolecularSystem) -> tuple[MultimerChain, ...]:
     Resolve chain identity and reject monomer/unsupported molecular meaning.
     """
 
-    if len(system.instances) < 2:
+    if system.instance_entity.numel() < 2:
         raise ValueError("AlphaFold-Multimer requires at least two chain instances; use alphafold2 for monomers")
-    grouped: dict[tuple[object, ...], list[tuple[str, str, PolymerSequence]]] = {}
-    for instance_id, entity_id in system.instances.items():
-        entity = system.entities[entity_id]
-        if not isinstance(entity, PolymerSequence) or entity.polymer_type != "protein":
-            raise ValueError("AlphaFold-Multimer requires protein PolymerSequence chains")
-        for component in entity.components:
-            component_id = component.component_id
-            if component_id not in RESIDUE_TYPE_INDEX_BY_COMPONENT:
-                raise ValueError(f"AlphaFold-Multimer does not support protein component {component_id!r}")
-        key = (entity.polymer_type, *(component.component_id for component in entity.components))
-        grouped.setdefault(key, []).append((instance_id, entity_id, entity))
-
+    model_entity_index: dict[int, int] = {}
+    symmetry_count: dict[int, int] = {}
     chains: list[MultimerChain] = []
     cursor = 0
-    for entity_index, instances in enumerate(grouped.values(), start=1):
-        for symmetry_index, (instance_id, entity_id, entity) in enumerate(instances, start=1):
-            length = len(entity.components)
-            chains.append(
-                MultimerChain(
-                    instance_id=instance_id,
-                    entity_id=entity_id,
-                    entity=entity,
-                    chain_index=len(chains) + 1,
-                    entity_index=entity_index,
-                    symmetry_index=symmetry_index,
-                    start=cursor,
-                    stop=cursor + length,
-                )
+    for instance_index, system_entity_index in enumerate(system.instance_entity.tolist()):
+        if int(system.entity_type[system_entity_index]) != ENTITY_PROTEIN:
+            raise ValueError("AlphaFold-Multimer requires protein PolymerSequence chains")
+        component_index = torch.arange(
+            int(system.instance_component_ptr[instance_index]),
+            int(system.instance_component_ptr[instance_index + 1]),
+            device=system.instance_component_ptr.device,
+        )
+        for component_id in _component_ids(system, component_index):
+            if component_id not in RESIDUE_TYPE_INDEX_BY_COMPONENT:
+                raise ValueError(f"AlphaFold-Multimer does not support protein component {component_id!r}")
+        if system_entity_index not in model_entity_index:
+            model_entity_index[system_entity_index] = len(model_entity_index) + 1
+        symmetry_count[system_entity_index] = symmetry_count.get(system_entity_index, 0) + 1
+        length = component_index.numel()
+        chains.append(
+            MultimerChain(
+                instance_index=instance_index,
+                system_entity_index=system_entity_index,
+                chain_index=len(chains) + 1,
+                model_entity_index=model_entity_index[system_entity_index],
+                symmetry_index=symmetry_count[system_entity_index],
+                component_index=component_index,
+                start=cursor,
+                stop=cursor + length,
             )
-            cursor += length
+        )
+        cursor += length
     return tuple(chains)
-
-
-def normalize_collection(
-    msa: MSACollection | None,
-    chains: tuple[MultimerChain, ...],
-) -> MSACollection | None:
-    r"""
-    Validate a paired MSACollection against the assembly, or reject a bare MSA.
-    """
-
-    if msa is None:
-        return None
-    if not isinstance(msa, MSACollection):
-        raise ValueError("AlphaFold-Multimer requires a paired MSACollection, not a bare entity-bound MSA")
-    entity_length = {chain.entity_id: chain.stop - chain.start for chain in chains}
-    chain_by_instance = {chain.instance_id: chain for chain in chains}
-    for column_index, column in enumerate(msa.msas):
-        if msa.target_instance_ids is None:
-            if column.entity_id not in entity_length:
-                raise ValueError(f"MSACollection column entity {column.entity_id!r} is not an assembly entity")
-            expected_length = entity_length[column.entity_id]
-        else:
-            instance_id = msa.target_instance_ids[column_index]
-            chain = chain_by_instance.get(instance_id)
-            if chain is None:
-                raise ValueError(f"MSACollection targets unknown assembly instance {instance_id!r}")
-            if chain.entity_id != column.entity_id:
-                raise ValueError(
-                    f"MSACollection target instance {instance_id!r} belongs to entity "
-                    f"{chain.entity_id!r}, not {column.entity_id!r}"
-                )
-            expected_length = chain.stop - chain.start
-        if len(column.unpaired_sequences[0]) != expected_length:
-            raise ValueError("MSACollection column query width disagrees with its target length")
-    return msa
 
 
 def prepare_multimer_features(
@@ -241,6 +205,7 @@ def prepare_multimer_features(
     *,
     chains: tuple[MultimerChain, ...],
     msa: MSACollection | None,
+    msa_bindings: tuple[tuple[MSA, int | None, int], ...],
     templates: tuple[Template, ...],
     device: torch.device,
     dtype: torch.dtype,
@@ -250,12 +215,9 @@ def prepare_multimer_features(
     """
 
     total_length = chains[-1].stop
+    component_index = torch.cat([chain.component_index for chain in chains])
     residue_type_ids = torch.tensor(
-        [
-            RESIDUE_TYPE_INDEX_BY_COMPONENT[component.component_id]
-            for chain in chains
-            for component in chain.entity.components
-        ],
+        [RESIDUE_TYPE_INDEX_BY_COMPONENT[component_id] for component_id in _component_ids(system, component_index)],
         dtype=torch.long,
     )
     token_features = F.one_hot(residue_type_ids, num_classes=residue_constants.NUM_AMINO_ACID_TYPES + 1).to(
@@ -264,21 +226,31 @@ def prepare_multimer_features(
 
     residue_index = torch.cat([torch.arange(chain.stop - chain.start) for chain in chains]).long()
     chain_index = torch.cat([torch.full((chain.stop - chain.start,), chain.chain_index) for chain in chains]).long()
-    entity_index = torch.cat([torch.full((chain.stop - chain.start,), chain.entity_index) for chain in chains]).long()
+    entity_index = torch.cat(
+        [torch.full((chain.stop - chain.start,), chain.model_entity_index) for chain in chains]
+    ).long()
     symmetry_index = torch.cat(
         [torch.full((chain.stop - chain.start,), chain.symmetry_index) for chain in chains]
     ).long()
 
     query_tokens = residue_type_ids.clone()
-    tokens, deletions = materialize_collection(msa, chains, total_length, query_tokens)
+    tokens, deletions = materialize_collection(
+        msa,
+        msa_bindings,
+        chains,
+        total_length,
+        query_tokens,
+    )
     # The Processor emits the raw paired alignment pool and its full-pool profile.
     # The Model samples clustered and extra rows once per recycle. ``msa_profile``
     # is the mean of ``one_hot(tokens, 22)`` before sampling or masking.
     msa_profile = F.one_hot(tokens, num_classes=22).to(torch.float32).mean(dim=0)
-    template_values = multimer_template_features(templates, chains=chains, total_length=total_length)
-
-    residue_sites = tuple((chain.instance_id, index) for chain in chains for index in range(chain.stop - chain.start))
-    chain_boundaries = tuple((chain.instance_id, chain.start, chain.stop) for chain in chains)
+    template_values = multimer_template_features(
+        templates,
+        system=system,
+        chains=chains,
+        total_length=total_length,
+    )
 
     floating = {
         "token_features": token_features,
@@ -305,11 +277,9 @@ def prepare_multimer_features(
     }
     placed_integral = {name: value.to(device=device).unsqueeze(0) for name, value in integral.items()}
     return AlphaFold2MultimerInput(  # type: ignore[call-arg]
-        layout=AlphaFold2MultimerLayout(
-            system=system,
-            residue_sites=residue_sites,
-            chain_boundaries=chain_boundaries,
-        ),
+        system=system,
+        component_index=component_index.to(device=device).unsqueeze(0),
+        atom37_index=_atom37_indices(system, component_index).to(device=device).unsqueeze(0),
         **placed,
         **placed_integral,
         batch_size=[1],
@@ -318,6 +288,7 @@ def prepare_multimer_features(
 
 def materialize_collection(
     msa: MSACollection | None,
+    msa_bindings: tuple[tuple[MSA, int | None, int], ...],
     chains: tuple[MultimerChain, ...],
     total_length: int,
     query_tokens: Tensor,
@@ -338,7 +309,7 @@ def materialize_collection(
         deletions = torch.zeros_like(tokens, dtype=torch.float32)
         return tokens, deletions
 
-    columns_for_chain = _columns_for_chain(msa, chains)
+    columns_for_chain = _columns_for_chain(msa_bindings, chains)
     row_count = msa.row_pairing.shape[0]
     token_rows: list[list[int]] = []
     deletion_rows: list[list[float]] = []
@@ -346,7 +317,7 @@ def materialize_collection(
         token_row = [GAP_RESIDUE_TYPE_INDEX] * total_length
         deletion_row = [0.0] * total_length
         for chain in chains:
-            column = columns_for_chain.get(chain.instance_id)
+            column = columns_for_chain.get(chain.instance_index)
             if column is None:
                 continue
             source = int(msa.row_pairing[row, column])
@@ -367,23 +338,25 @@ def materialize_collection(
     return tokens, deletions
 
 
-def _columns_for_chain(msa: MSACollection, chains: tuple[MultimerChain, ...]) -> dict[str, int]:
-    mapping: dict[str, int] = {}
-    if msa.target_instance_ids is None:
-        entity_to_column = {entry.entity_id: column for column, entry in enumerate(msa.msas)}
+def _columns_for_chain(
+    msa_bindings: tuple[tuple[MSA, int | None, int], ...],
+    chains: tuple[MultimerChain, ...],
+) -> dict[int, int]:
+    mapping: dict[int, int] = {}
+    for column, (_msa, target_instance_index, entity_index) in enumerate(msa_bindings):
         for chain in chains:
-            column = entity_to_column.get(chain.entity_id)
-            if column is not None:
-                mapping[chain.instance_id] = column
-    else:
-        for column, instance_id in enumerate(msa.target_instance_ids):
-            mapping[instance_id] = column
+            if target_instance_index is None:
+                if chain.system_entity_index == entity_index:
+                    mapping[chain.instance_index] = column
+            elif chain.instance_index == target_instance_index:
+                mapping[chain.instance_index] = column
     return mapping
 
 
 def multimer_template_features(
     templates: tuple[Template, ...],
     *,
+    system: MolecularSystem,
     chains: tuple[MultimerChain, ...],
     total_length: int,
 ) -> dict[str, Tensor]:
@@ -408,10 +381,10 @@ def multimer_template_features(
             "template_backbone_frame_mask": torch.zeros(1, total_length),
         }
 
-    instance_to_chain = {chain.instance_id: chain for chain in chains}
-    entity_to_chains: dict[str, list[MultimerChain]] = {}
+    instance_to_chain = {chain.instance_index: chain for chain in chains}
+    entity_to_chains: dict[int, list[MultimerChain]] = {}
     for chain in chains:
-        entity_to_chains.setdefault(chain.entity_id, []).append(chain)
+        entity_to_chains.setdefault(chain.system_entity_index, []).append(chain)
 
     template_residue_type_ids: list[Tensor] = []
     positions_list: list[Tensor] = []
@@ -420,20 +393,41 @@ def multimer_template_features(
         residue_type_ids = torch.full((total_length,), GAP_RESIDUE_TYPE_INDEX, dtype=torch.long)
         positions = torch.zeros(total_length, atom_type_num, 3)
         masks = torch.zeros(total_length, atom_type_num)
+        projected_instances: set[int] = set()
         for alignment in template.alignments:
+            try:
+                target_entity_index = system.entity_index(alignment.target_entity_id)
+                target_instance_index = (
+                    None
+                    if alignment.target_instance_id is None
+                    else system.instance_index(alignment.target_instance_id)
+                )
+            except KeyError:
+                continue
             target_chains = (
-                [instance_to_chain[alignment.target_instance_id]]
-                if alignment.target_instance_id in instance_to_chain
-                else entity_to_chains.get(alignment.target_entity_id, [])
+                entity_to_chains.get(target_entity_index, [])
+                if target_instance_index is None
+                else [instance_to_chain[target_instance_index]] if target_instance_index in instance_to_chain else []
             )
             for chain in target_chains:
-                select_template_alignment(
+                if chain.instance_index in projected_instances:
+                    continue
+                selected_alignment = select_template_alignment(
                     template,
+                    system=system,
                     target_length=chain.stop - chain.start,
-                    target_entity_id=chain.entity_id,
-                    target_instance_id=chain.instance_id,
+                    target_entity_index=chain.system_entity_index,
+                    target_instance_index=chain.instance_index,
                 )
-                _project_template_chain(template, alignment, chain, residue_type_ids, positions, masks)
+                _project_template_chain(
+                    template,
+                    selected_alignment,
+                    chain,
+                    residue_type_ids,
+                    positions,
+                    masks,
+                )
+                projected_instances.add(chain.instance_index)
         template_residue_type_ids.append(residue_type_ids)
         positions_list.append(positions)
         masks_list.append(masks)
@@ -464,21 +458,31 @@ def _project_template_chain(
     masks: Tensor,
 ) -> None:
     structure = template.structure
-    template_entity_id = structure.system.instances[alignment.template_instance_id]
-    template_entity = structure.system.entities[template_entity_id]
-    if not isinstance(template_entity, PolymerSequence) or template_entity.polymer_type != "protein":
+    system = structure.system
+    template_instance_index = system.instance_index(alignment.template_instance_id)
+    template_entity_index = int(system.instance_entity[template_instance_index])
+    if int(system.entity_type[template_entity_index]) != ENTITY_PROTEIN:
         raise ValueError("AlphaFold-Multimer templates must align a protein instance")
-    sites = {site: index for index, site in enumerate(structure.sites)}
+    component_start = int(system.instance_component_ptr[template_instance_index])
     for target_index, template_index in alignment.residue_pairs:
         global_index = chain.start + target_index
-        component_id = template_entity.components[template_index].component_id
+        component = component_start + template_index
+        component_id = system.symbols[int(system.component_symbol[component])]
         residue_type_ids[global_index] = RESIDUE_TYPE_INDEX_BY_COMPONENT.get(component_id, UNKNOWN_RESIDUE_TYPE_INDEX)
-        for atom_name, atom_index in residue_constants.atom_order.items():
-            site = AtomSite(alignment.template_instance_id, template_index, atom_name)
-            coordinate_index = sites.get(site)
-            if coordinate_index is None or not structure.coordinate_mask[coordinate_index]:
+        atom_start = int(system.component_atom_ptr[component])
+        atom_stop = int(system.component_atom_ptr[component + 1])
+        for atom in range(atom_start, atom_stop):
+            atom_index = residue_constants.atom_order.get(system.symbols[int(system.atom_symbol[atom])])
+            if atom_index is None or not bool(structure.coordinate_mask[atom]):
                 continue
-            positions[global_index, atom_index] = torch.from_numpy(structure.coordinates[coordinate_index].copy())
+            positions[global_index, atom_index] = (
+                structure.coordinates[atom]
+                .detach()
+                .to(
+                    device=positions.device,
+                    dtype=positions.dtype,
+                )
+            )
             masks[global_index, atom_index] = 1.0
 
 

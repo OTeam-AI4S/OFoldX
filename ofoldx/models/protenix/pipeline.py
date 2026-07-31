@@ -13,7 +13,12 @@ import numpy as np
 import torch
 
 from ...data.evidence import MSA, MSACollection, Template
-from ...data.molecular import MolecularSystem, PolymerSequence
+from ...data.molecular import (
+    ENTITY_PROTEIN,
+    ENTITY_RNA,
+    MolecularSystem,
+    PolymerSequence,
+)
 from ...data.structure import Structure
 from ...io import pair_msa_rows_by_key, read_fasta_records, read_msa, read_msa_with_headers, read_structure
 from ...pipelines import PairedPipeline, resolve_generator
@@ -444,9 +449,9 @@ def _canonical_msa(
     if not isinstance(msa, str | PathLike):
         return msa
     proteins = [
-        entity_id
-        for entity_id, entity in system.entities.items()
-        if isinstance(entity, PolymerSequence) and entity.polymer_type == "protein"
+        system.entity_id(entity_index)
+        for entity_index, entity_type in enumerate(system.entity_type.detach().cpu().tolist())
+        if entity_type == ENTITY_PROTEIN
     ]
     if len(proteins) != 1:
         raise ValueError("an aligned FASTA MSA is unambiguous only for one protein entity")
@@ -464,9 +469,9 @@ def _canonical_template_msa(
     if not isinstance(msa, str | PathLike):
         return msa
     candidates = [
-        entity_id
-        for entity_id, entity in system.entities.items()
-        if isinstance(entity, PolymerSequence) and entity.polymer_type in {"protein", "rna"}
+        system.entity_id(entity_index)
+        for entity_index, entity_type in enumerate(system.entity_type.detach().cpu().tolist())
+        if entity_type in {ENTITY_PROTEIN, ENTITY_RNA}
     ]
     if len(candidates) != 1:
         raise ValueError("an aligned FASTA MSA is unambiguous only for one protein or RNA entity")

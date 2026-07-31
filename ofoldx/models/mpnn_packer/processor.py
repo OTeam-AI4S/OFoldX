@@ -6,19 +6,22 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 
-import numpy as np
 import torch
+from torch import Tensor
 
-from ...data import ATOMIC_NUMBER_BY_ELEMENT, is_water_component
+from ...data import ATOMIC_NUMBER_BY_ELEMENT, water_component_mask
 from ...data.components import get_component
 from ...data.molecular import (
-    AtomSite,
+    BOND_ROLE_COMPONENT,
+    BOND_ROLE_POLYMER,
+    ENTITY_PROTEIN,
     ChemicalAtom,
     ChemicalComponent,
     ComponentReference,
     MolecularSystem,
-    Molecule,
+    PolymerAttachment,
     PolymerSequence,
+    replace_components,
 )
 from ...data.structure import Structure
 from ...modules import residue_constants as rc
@@ -30,6 +33,272 @@ from ...modules.mpnn import (
 from ...processor import Processor
 from .config import MpnnPackerProcessorConfig
 from .model import MpnnPackerInput
+
+_BACKBONE_ATOM37_INDICES = (0, 1, 2, 4)
+
+
+def _repartition_entities(
+    system: MolecularSystem,
+    target_component_ids: Sequence[str],
+) -> MolecularSystem:
+    r"""
+    Split copies of each original entity by their complete target sequence.
+    """
+
+    symbols = list(system.symbols)
+    symbol_index = {symbol: index for index, symbol in enumerate(symbols)}
+
+    def intern(symbol: str) -> int:
+        index = symbol_index.get(symbol)
+        if index is None:
+            index = len(symbols)
+            symbols.append(symbol)
+            symbol_index[symbol] = index
+        return index
+
+    instance_entity = system.instance_entity.detach().cpu().tolist()
+    instances_by_entity: list[list[int]] = [[] for _ in range(system.entity_symbol.numel())]
+    for instance, entity in enumerate(instance_entity):
+        instances_by_entity[entity].append(instance)
+
+    used_ids = {system.symbols[int(symbol)] for symbol in system.entity_symbol.detach().cpu().tolist()}
+    output_entity_symbol: list[int] = []
+    output_entity_type: list[int] = []
+    output_entity_molecule_type: list[int] = []
+    output_instance_entity = [-1] * system.instance_symbol.numel()
+    current_component_ids = [system.symbols[int(symbol)] for symbol in system.component_symbol.detach().cpu().tolist()]
+    for entity, instances in enumerate(instances_by_entity):
+        entity_id = system.entity_id(entity)
+        entity_type = int(system.entity_type[entity])
+        entity_molecule_type = int(system.entity_molecule_type[entity])
+        if not instances:
+            output_entity_symbol.append(intern(entity_id))
+            output_entity_type.append(entity_type)
+            output_entity_molecule_type.append(entity_molecule_type)
+            continue
+
+        def signature(instance: int, values: Sequence[str]) -> tuple[str, ...]:
+            start = int(system.instance_component_ptr[instance])
+            stop = int(system.instance_component_ptr[instance + 1])
+            return tuple(values[start:stop])
+
+        original_signature = signature(
+            instances[0],
+            current_component_ids,
+        )
+        groups: dict[tuple[str, ...], list[int]] = {}
+        for instance in instances:
+            groups.setdefault(
+                signature(instance, target_component_ids),
+                [],
+            ).append(instance)
+        primary = original_signature if original_signature in groups else next(iter(groups))
+        ordered = (
+            primary,
+            *(value for value in groups if value != primary),
+        )
+        suffix = 2
+        for partition, value in enumerate(ordered):
+            if partition == 0:
+                output_id = entity_id
+            else:
+                output_id = f"{entity_id}_{suffix}"
+                while output_id in used_ids:
+                    suffix += 1
+                    output_id = f"{entity_id}_{suffix}"
+                used_ids.add(output_id)
+                suffix += 1
+            output_entity = len(output_entity_symbol)
+            output_entity_symbol.append(intern(output_id))
+            output_entity_type.append(entity_type)
+            output_entity_molecule_type.append(entity_molecule_type)
+            for instance in groups[value]:
+                output_instance_entity[instance] = output_entity
+
+    return system.replace(  # type: ignore[attr-defined]
+        symbols=tuple(symbols),
+        system_entity_ptr=system.system_entity_ptr.new_tensor([0, len(output_entity_symbol)]),
+        entity_symbol=system.entity_symbol.new_tensor(output_entity_symbol),
+        entity_type=system.entity_type.new_tensor(output_entity_type),
+        entity_molecule_type=system.entity_molecule_type.new_tensor(output_entity_molecule_type),
+        instance_entity=system.instance_entity.new_tensor(output_instance_entity),
+    )
+
+
+def _open_replacement(
+    system: MolecularSystem,
+    component: int,
+    target: ChemicalComponent,
+    polymer_neighbors: Mapping[int, set[int]],
+) -> ChemicalComponent:
+    r"""
+    Build the smallest target component justified by an open source occurrence.
+    """
+
+    audited_atoms = {atom.atom_id: atom for atom in target.atoms}
+    atom_ids: list[str] = []
+    retained = set()
+    for atom_id in rc.AMINO_ACID_ATOM14_NAMES.get(target.component_id, ()):
+        if atom_id:
+            atom_ids.append(atom_id)
+            retained.add(atom_id)
+
+    atom_start = int(system.component_atom_ptr[component])
+    atom_stop = int(system.component_atom_ptr[component + 1])
+    for symbol in system.atom_symbol[atom_start:atom_stop].detach().cpu().tolist():
+        atom_id = system.symbols[symbol]
+        if atom_id in audited_atoms and atom_id not in retained:
+            atom_ids.append(atom_id)
+            retained.add(atom_id)
+
+    neighbors = polymer_neighbors.get(component, set())
+    previous = target.previous_attachment if any(neighbor < component for neighbor in neighbors) else None
+    following = target.next_attachment if any(neighbor > component for neighbor in neighbors) else None
+    for attachment in (previous, following):
+        if attachment is not None and attachment.atom_id not in retained:
+            atom_ids.append(attachment.atom_id)
+            retained.add(attachment.atom_id)
+
+    return ChemicalComponent(
+        component_id=target.component_id,
+        atoms=tuple(
+            ChemicalAtom(
+                atom_id=atom_id,
+                element=audited_atoms[atom_id].element,
+            )
+            for atom_id in atom_ids
+        ),
+        bonds=None,
+        previous_attachment=(None if previous is None else PolymerAttachment(previous.atom_id)),
+        next_attachment=(None if following is None else PolymerAttachment(following.atom_id)),
+    )
+
+
+def _supplement_incomplete_atom14(
+    system: MolecularSystem,
+) -> tuple[MolecularSystem, Tensor]:
+    r"""
+    Append missing standard atom14 heavy nodes to incomplete components.
+    """
+
+    additions: list[tuple[str, ...]] = []
+    audited_components: list[ChemicalComponent | None] = []
+    for component in range(system.component_symbol.numel()):
+        component_id = system.symbols[int(system.component_symbol[component])]
+        if component_id not in AMINO_ACID_COMPONENT_IDS or bool(system.component_topology_complete[component]):
+            additions.append(())
+            audited_components.append(None)
+            continue
+        start = int(system.component_atom_ptr[component])
+        stop = int(system.component_atom_ptr[component + 1])
+        present = {system.symbols[symbol] for symbol in system.atom_symbol[start:stop].detach().cpu().tolist()}
+        missing = tuple(
+            atom_id for atom_id in rc.AMINO_ACID_ATOM14_NAMES[component_id] if atom_id and atom_id not in present
+        )
+        additions.append(missing)
+        audited_components.append(None if not missing else get_component(component_id))
+
+    added_count = sum(map(len, additions))
+    if not added_count:
+        return (
+            system,
+            torch.arange(
+                system.atom_symbol.numel(),
+                dtype=torch.int64,
+                device=system.atom_symbol.device,
+            ),
+        )
+
+    symbols = list(system.symbols)
+    symbol_index = {symbol: index for index, symbol in enumerate(symbols)}
+
+    def intern(symbol: str) -> int:
+        index = symbol_index.get(symbol)
+        if index is None:
+            index = len(symbols)
+            symbols.append(symbol)
+            symbol_index[symbol] = index
+        return index
+
+    old_count = system.atom_symbol.numel()
+    new_count = old_count + added_count
+    old_to_new = torch.empty(
+        old_count,
+        dtype=torch.int64,
+        device=system.atom_symbol.device,
+    )
+    component_atom_ptr = [0]
+    added_atoms: list[tuple[int, str, int]] = []
+    for component, missing in enumerate(additions):
+        old_start = int(system.component_atom_ptr[component])
+        old_stop = int(system.component_atom_ptr[component + 1])
+        new_start = component_atom_ptr[-1]
+        old_to_new[old_start:old_stop] = torch.arange(
+            new_start,
+            new_start + old_stop - old_start,
+            dtype=torch.int64,
+            device=system.atom_symbol.device,
+        )
+        audited = audited_components[component]
+        if audited is not None:
+            audited_atoms = {atom.atom_id: atom for atom in audited.atoms}
+            for offset, atom_id in enumerate(missing):
+                atom = audited_atoms[atom_id]
+                added_atoms.append(
+                    (
+                        new_start + old_stop - old_start + offset,
+                        atom_id,
+                        ATOMIC_NUMBER_BY_ELEMENT[atom.element],
+                    )
+                )
+        component_atom_ptr.append(new_start + old_stop - old_start + len(missing))
+
+    retained_index = old_to_new
+
+    def copied(field: Tensor, fill: int | float | bool = 0) -> Tensor:
+        output = field.new_full((new_count, *field.shape[1:]), fill)
+        output[retained_index] = field
+        return output
+
+    atom_symbol = copied(system.atom_symbol)
+    atomic_number = copied(system.atomic_number)
+    for index, atom_id, number in added_atoms:
+        atom_symbol[index] = intern(atom_id)
+        atomic_number[index] = number
+
+    bond_stereo_index = torch.where(
+        system.bond_stereo_index < 0,
+        system.bond_stereo_index,
+        old_to_new[system.bond_stereo_index.clamp_min(0)],
+    )
+    return (
+        system.replace(  # type: ignore[attr-defined]
+            symbols=tuple(symbols),
+            component_atom_ptr=system.component_atom_ptr.new_tensor(component_atom_ptr),
+            atom_symbol=atom_symbol,
+            atomic_number=atomic_number,
+            isotope=copied(system.isotope),
+            isotope_known=copied(system.isotope_known),
+            formal_charge=copied(system.formal_charge),
+            formal_charge_known=copied(system.formal_charge_known),
+            radical_electrons=copied(system.radical_electrons),
+            radical_electrons_known=copied(system.radical_electrons_known),
+            explicit_hydrogens=copied(system.explicit_hydrogens),
+            explicit_hydrogens_known=copied(system.explicit_hydrogens_known),
+            implicit_hydrogens=copied(system.implicit_hydrogens),
+            implicit_hydrogens_known=copied(system.implicit_hydrogens_known),
+            implicit_hydrogens_allowed=copied(system.implicit_hydrogens_allowed),
+            implicit_hydrogens_allowed_known=copied(system.implicit_hydrogens_allowed_known),
+            atom_aromatic=copied(system.atom_aromatic),
+            atom_aromatic_known=copied(system.atom_aromatic_known),
+            atom_stereo=copied(system.atom_stereo, -1),
+            reference_coordinates=copied(system.reference_coordinates),
+            reference_coordinate_mask=copied(system.reference_coordinate_mask),
+            edge_index=old_to_new[system.edge_index],
+            bond_stereo_index=bond_stereo_index,
+        ),
+        old_to_new,
+    )
 
 
 class MpnnPackerProcessor(Processor):
@@ -77,349 +346,511 @@ class MpnnPackerProcessor(Processor):
             filter_by_occupancy: Whether zero-occupancy atoms are treated as unobserved.
 
         Returns:
-            A single-example ``MpnnPackerInput`` with aligned atom14, context, and layout values.
+            A single-example ``MpnnPackerInput`` with a canonical target Structure.
         """
 
+        if structure.system.system_instance_ptr.numel() != 2:
+            raise ValueError("MpnnPackerProcessor requires one molecular system")
+        structure, changed_components = self._realize_target(
+            structure,
+            sequence,
+        )
+        return self._lower(
+            structure,
+            changed_components,
+            pack_positions=pack_positions,
+            use_atom_context=use_atom_context,
+            filter_by_occupancy=filter_by_occupancy,
+        )
+
+    def _realize_target(
+        self,
+        structure: Structure,
+        sequence: str | Mapping[str, str | Sequence[str]] | None,
+    ) -> tuple[Structure, set[int]]:
         system = structure.system
-        protein_instances: list[tuple[str, PolymerSequence]] = []
-        for instance_id, entity_id in system.instances.items():
-            entity = system.entities[entity_id]
-            if isinstance(entity, PolymerSequence) and entity.polymer_type == "protein":
-                protein_instances.append((instance_id, entity))
+        protein_instances = torch.nonzero(
+            system.entity_type[system.instance_entity] == ENTITY_PROTEIN,
+            as_tuple=False,
+        ).flatten()
+        if not protein_instances.numel():
+            raise ValueError("MpnnPacker requires at least one protein instance")
+
         if isinstance(sequence, str):
-            if len(protein_instances) != 1:
+            if protein_instances.numel() != 1:
                 raise ValueError("a bare packing sequence requires exactly one protein instance")
-            sequence = {protein_instances[0][0]: sequence}
+            sequence = {system.instance_id(int(protein_instances[0])): sequence}
 
-        target_components = {instance_id: entity.components for instance_id, entity in protein_instances}
-        if sequence is not None:
+        target_component_ids = [
+            system.symbols[int(symbol)] for symbol in system.component_symbol.detach().cpu().tolist()
+        ]
+        if sequence:
             for instance_id, value in sequence.items():
-                entity = system.entities[system.instances[instance_id]]
-                if not isinstance(entity, PolymerSequence) or entity.polymer_type != "protein":
+                instance = system.instance_index(instance_id)
+                entity = int(system.instance_entity[instance])
+                if int(system.entity_type[entity]) != ENTITY_PROTEIN:
                     raise ValueError(f"packing sequence instance {instance_id!r} is not a protein")
-                if isinstance(value, str):
-                    requested = PolymerSequence.from_one_letter(value).components
-                else:
-                    requested = tuple(get_component(component_id) for component_id in value)
-                if len(requested) != len(entity):
+                start = int(system.instance_component_ptr[instance])
+                stop = int(system.instance_component_ptr[instance + 1])
+                requested = (
+                    tuple(component.component_id for component in PolymerSequence.from_one_letter(value).components)
+                    if isinstance(value, str)
+                    else tuple(value)
+                )
+                if len(requested) != stop - start:
                     raise ValueError(
-                        f"packing sequence for instance {instance_id!r} has length {len(requested)}, "
-                        f"expected {len(entity)}"
+                        f"packing sequence for instance {instance_id!r} has length "
+                        f"{len(requested)}, expected {stop - start}"
                     )
-                target_components[instance_id] = tuple(
-                    original if original.component_id == replacement.component_id else replacement
-                    for original, replacement in zip(entity.components, requested)
+                target_component_ids[start:stop] = requested
+
+        source_component_ids = [
+            system.symbols[int(symbol)] for symbol in system.component_symbol.detach().cpu().tolist()
+        ]
+        changed_components = {
+            component
+            for component, (source, target) in enumerate(
+                zip(
+                    source_component_ids,
+                    target_component_ids,
+                    strict=True,
                 )
-
-        changed_references = {
-            (instance_id, component_index)
-            for instance_id, entity in protein_instances
-            for component_index, (original, target) in enumerate(zip(entity.components, target_components[instance_id]))
-            if original.component_id != target.component_id
-        }
-        if changed_references:
-            source_atom_ids: dict[ComponentReference, list[str]] = {}
-            for site in structure.sites:
-                source_atom_ids.setdefault((site.instance_id, site.component_index), []).append(site.atom_id)
-            entities: dict[str, PolymerSequence | Molecule] = {}
-            instance_entities: dict[str, str] = {}
-            allocated_ids = set(system.entities)
-            for entity_id, entity in system.entities.items():
-                entity_instances = tuple(
-                    instance_id
-                    for instance_id, instance_entity_id in system.instances.items()
-                    if instance_entity_id == entity_id
-                )
-                if not isinstance(entity, PolymerSequence) or entity.polymer_type != "protein":
-                    entities[entity_id] = entity
-                    for instance_id in entity_instances:
-                        instance_entities[instance_id] = entity_id
-                    continue
-
-                groups: dict[tuple[str, ...], list[str]] = {}
-                for instance_id in entity_instances:
-                    instance_components = target_components[instance_id]
-                    component_ids = tuple(component.component_id for component in instance_components)
-                    groups.setdefault(component_ids, []).append(instance_id)
-                original_ids = tuple(component.component_id for component in entity.components)
-                ordered_ids = tuple(groups)
-                retained_ids = original_ids if original_ids in groups else ordered_ids[0]
-                next_suffix = 2
-                for component_ids in ordered_ids:
-                    if component_ids == retained_ids:
-                        target_entity_id = entity_id
-                    else:
-                        while f"{entity_id}_{next_suffix}" in allocated_ids:
-                            next_suffix += 1
-                        target_entity_id = f"{entity_id}_{next_suffix}"
-                        allocated_ids.add(target_entity_id)
-                        next_suffix += 1
-                    group_instances = groups[component_ids]
-                    requested_components = target_components[group_instances[0]]
-                    realized_components: list[ChemicalComponent] = []
-                    for component_index, (original, target) in enumerate(zip(entity.components, requested_components)):
-                        if original.component_id == target.component_id:
-                            realized_components.append(original)
-                            continue
-
-                        previous_attachment = (
-                            target.previous_attachment if original.previous_attachment is not None else None
-                        )
-                        next_attachment = target.next_attachment if original.next_attachment is not None else None
-                        if original.bonds is not None:
-                            realized_components.append(
-                                ChemicalComponent(
-                                    component_id=target.component_id,
-                                    atoms=target.atoms,
-                                    bonds=target.bonds,
-                                    previous_attachment=previous_attachment,
-                                    next_attachment=next_attachment,
-                                    reference_coordinates=target.reference_coordinates,
-                                )
-                            )
-                            continue
-
-                        target_atoms = {atom.atom_id: atom for atom in target.atoms}
-                        atom_ids: list[str] = []
-                        seen_atom_ids: set[str] = set()
-                        for atom_id in rc.AMINO_ACID_ATOM14_NAMES.get(target.component_id, ()):
-                            if atom_id and atom_id not in seen_atom_ids:
-                                atom_ids.append(atom_id)
-                                seen_atom_ids.add(atom_id)
-                        for instance_id in group_instances:
-                            for atom_id in source_atom_ids.get((instance_id, component_index), ()):
-                                if atom_id in target_atoms and atom_id not in seen_atom_ids:
-                                    atom_ids.append(atom_id)
-                                    seen_atom_ids.add(atom_id)
-                        attachment_atom_ids: set[str] = set()
-                        for attachment in (previous_attachment, next_attachment):
-                            if attachment is not None:
-                                attachment_atom_ids.add(attachment.atom_id)
-                                attachment_atom_ids.update(attachment.leaving_atom_ids)
-                        for atom in target.atoms:
-                            if atom.atom_id in attachment_atom_ids and atom.atom_id not in seen_atom_ids:
-                                atom_ids.append(atom.atom_id)
-                                seen_atom_ids.add(atom.atom_id)
-                        realized_components.append(
-                            ChemicalComponent(
-                                component_id=target.component_id,
-                                atoms=tuple(
-                                    ChemicalAtom(atom_id=atom_id, element=target_atoms[atom_id].element)
-                                    for atom_id in atom_ids
-                                ),
-                                bonds=None,
-                                previous_attachment=previous_attachment,
-                                next_attachment=next_attachment,
-                            )
-                        )
-
-                    entities[target_entity_id] = PolymerSequence("protein", tuple(realized_components))
-                    for instance_id in group_instances:
-                        instance_entities[instance_id] = target_entity_id
-
-            instances = {instance_id: instance_entities[instance_id] for instance_id in system.instances}
-            system = MolecularSystem(entities, instances, system.bonds)
-            retained_sites = {site for site, _atom in system.iter_atoms()}
-            indices = tuple(index for index, site in enumerate(structure.sites) if site in retained_sites)
-            structure = Structure(
-                system,
-                tuple(structure.sites[index] for index in indices),
-                structure.coordinates[np.asarray(indices)],
-                structure.coordinate_mask[np.asarray(indices)],
-                None if structure.occupancy is None else structure.occupancy[np.asarray(indices)],
-                None if structure.b_factor is None else structure.b_factor[np.asarray(indices)],
-                structure.residue_numbers,
             )
+            if source != target
+        }
 
-        normalized_entities = dict(system.entities)
-        normalized = False
-        for entity_id, entity in system.entities.items():
-            if not isinstance(entity, PolymerSequence) or entity.polymer_type != "protein":
-                continue
-            components: list[ChemicalComponent] = []
-            entity_normalized = False
-            for component in entity.components:
-                if component.component_id not in AMINO_ACID_COMPONENT_IDS or component.bonds is not None:
-                    components.append(component)
-                    continue
-                declared_atom_ids = {atom.atom_id for atom in component.atoms}
-                missing_atom_ids = tuple(
-                    atom_id
-                    for atom_id in rc.AMINO_ACID_ATOM14_NAMES[component.component_id]
-                    if atom_id and atom_id not in declared_atom_ids
+        old_to_current = torch.arange(
+            system.atom_symbol.numel(),
+            dtype=torch.int64,
+            device=system.atom_symbol.device,
+        )
+        if changed_components:
+            system = _repartition_entities(
+                system,
+                target_component_ids,
+            )
+            atom_component = torch.repeat_interleave(
+                torch.arange(
+                    system.component_symbol.numel(),
+                    dtype=torch.int64,
+                    device=system.atom_symbol.device,
+                ),
+                system.component_atom_ptr[1:] - system.component_atom_ptr[:-1],
+            )
+            polymer_neighbors: dict[int, set[int]] = {}
+            polymer_edges = torch.nonzero(
+                system.bond_role == BOND_ROLE_POLYMER,
+                as_tuple=False,
+            ).flatten()
+            for left, right in atom_component[system.edge_index[:, polymer_edges]].T.detach().cpu().tolist():
+                polymer_neighbors.setdefault(left, set()).add(right)
+                polymer_neighbors.setdefault(right, set()).add(left)
+
+            ordered_components = sorted(changed_components)
+            open_components = {
+                component for component in ordered_components if not bool(system.component_topology_complete[component])
+            }
+            component_edge = (
+                (system.bond_role == BOND_ROLE_COMPONENT)
+                & torch.isin(
+                    atom_component[system.edge_index[0]],
+                    system.component_symbol.new_tensor(
+                        sorted(open_components),
+                        dtype=torch.int64,
+                    ),
                 )
-                if not missing_atom_ids:
-                    components.append(component)
-                    continue
-                audited_atoms = {atom.atom_id: atom for atom in get_component(component.component_id).atoms}
-                reference_coordinates = component.reference_coordinates
-                if reference_coordinates:
-                    reference_coordinates += (None,) * len(missing_atom_ids)
-                components.append(
-                    ChemicalComponent(
-                        component_id=component.component_id,
-                        atoms=component.atoms
-                        + tuple(
-                            ChemicalAtom(atom_id=atom_id, element=audited_atoms[atom_id].element)
-                            for atom_id in missing_atom_ids
+                & torch.isin(
+                    atom_component[system.edge_index[1]],
+                    system.component_symbol.new_tensor(
+                        sorted(open_components),
+                        dtype=torch.int64,
+                    ),
+                )
+            )
+            source_component_edges = torch.nonzero(
+                component_edge,
+                as_tuple=False,
+            ).flatten()
+            source_system = system
+            replacements = []
+            for component in ordered_components:
+                target = get_component(target_component_ids[component])
+                replacements.append(
+                    target
+                    if bool(system.component_topology_complete[component])
+                    else _open_replacement(
+                        system,
+                        component,
+                        target,
+                        polymer_neighbors,
+                    )
+                )
+            system, old_to_current, _ = replace_components(
+                system,
+                torch.tensor(
+                    ordered_components,
+                    dtype=torch.int64,
+                    device=system.component_symbol.device,
+                ),
+                replacements,
+            )
+            if source_component_edges.numel():
+                mapped_endpoints = old_to_current[source_system.edge_index[:, source_component_edges]]
+                surviving = (mapped_endpoints >= 0).all(dim=0)
+                source_component_edges = source_component_edges[surviving]
+                mapped_endpoints = mapped_endpoints[:, surviving]
+                if source_component_edges.numel():
+                    swapped = mapped_endpoints[1] < mapped_endpoints[0]
+                    mapped_endpoints = torch.sort(
+                        mapped_endpoints,
+                        dim=0,
+                    ).values
+                    direction = source_system.bond_direction[source_component_edges].clone()
+                    direction[swapped] = -direction[swapped]
+
+                    stereo_index = source_system.bond_stereo_index[
+                        :,
+                        source_component_edges,
+                    ]
+                    stereo_present = (stereo_index >= 0).all(dim=0)
+                    mapped_stereo = torch.full_like(stereo_index, -1)
+                    mapped_stereo[:, stereo_present] = old_to_current[stereo_index[:, stereo_present]]
+                    stereo_retained = stereo_present & (mapped_stereo >= 0).all(dim=0)
+                    mapped_stereo[:, ~stereo_retained] = -1
+                    mapped_stereo[:, swapped] = mapped_stereo[[1, 0],][:, swapped]
+
+                    symbols = list(system.symbols)
+                    symbol_index = {symbol: index for index, symbol in enumerate(symbols)}
+                    stereo = []
+                    for source_stereo, retained_stereo in zip(
+                        source_system.bond_stereo[source_component_edges].detach().cpu().tolist(),
+                        stereo_retained.detach().cpu().tolist(),
+                        strict=True,
+                    ):
+                        if source_stereo < 0 or not retained_stereo:
+                            stereo.append(-1)
+                            continue
+                        descriptor = source_system.symbols[source_stereo]
+                        index = symbol_index.get(descriptor)
+                        if index is None:
+                            index = len(symbols)
+                            symbols.append(descriptor)
+                            symbol_index[descriptor] = index
+                        stereo.append(index)
+
+                    edge_index = torch.cat(
+                        (system.edge_index, mapped_endpoints),
+                        dim=1,
+                    )
+                    fields = {
+                        "bond_order": torch.cat(
+                            (
+                                system.bond_order,
+                                source_system.bond_order[source_component_edges],
+                            )
                         ),
-                        bonds=None,
-                        previous_attachment=component.previous_attachment,
-                        next_attachment=component.next_attachment,
-                        reference_coordinates=reference_coordinates,
+                        "bond_order_known": torch.cat(
+                            (
+                                system.bond_order_known,
+                                source_system.bond_order_known[source_component_edges],
+                            )
+                        ),
+                        "bond_aromatic": torch.cat(
+                            (
+                                system.bond_aromatic,
+                                source_system.bond_aromatic[source_component_edges],
+                            )
+                        ),
+                        "bond_aromatic_known": torch.cat(
+                            (
+                                system.bond_aromatic_known,
+                                source_system.bond_aromatic_known[source_component_edges],
+                            )
+                        ),
+                        "bond_kind": torch.cat(
+                            (
+                                system.bond_kind,
+                                source_system.bond_kind[source_component_edges],
+                            )
+                        ),
+                        "bond_direction": torch.cat((system.bond_direction, direction)),
+                        "bond_role": torch.cat(
+                            (
+                                system.bond_role,
+                                source_system.bond_role[source_component_edges],
+                            )
+                        ),
+                        "bond_stereo": torch.cat(
+                            (
+                                system.bond_stereo,
+                                system.bond_stereo.new_tensor(stereo),
+                            )
+                        ),
+                    }
+                    bond_stereo_index = torch.cat(
+                        (system.bond_stereo_index, mapped_stereo),
+                        dim=1,
                     )
-                )
-                entity_normalized = True
-            if entity_normalized:
-                normalized_entities[entity_id] = PolymerSequence("protein", tuple(components))
-                normalized = True
+                    order = torch.argsort(edge_index[0] * system.atom_symbol.numel() + edge_index[1])
+                    system = system.replace(  # type: ignore[attr-defined]
+                        symbols=tuple(symbols),
+                        edge_index=edge_index[:, order],
+                        bond_stereo_index=bond_stereo_index[:, order],
+                        **{name: value[order] for name, value in fields.items()},
+                    )
 
-        if normalized:
-            system = MolecularSystem(normalized_entities, system.instances, system.bonds)
-            structure = Structure(
-                system,
-                structure.sites,
-                structure.coordinates,
-                structure.coordinate_mask,
-                structure.occupancy,
-                structure.b_factor,
-                structure.residue_numbers,
-            )
+        system, current_to_target = _supplement_incomplete_atom14(system)
+        retained = old_to_current >= 0
+        old_to_target = torch.full_like(old_to_current, -1)
+        old_to_target[retained] = current_to_target[old_to_current[retained]]
 
+        atom_count = system.atom_symbol.numel()
+
+        def transferred(field: Tensor) -> Tensor:
+            output = field.new_zeros((atom_count, *field.shape[1:]))
+            output[old_to_target[retained]] = field[retained]
+            return output
+
+        structure = Structure(  # type: ignore[call-arg]
+            system=system,
+            coordinates=transferred(structure.coordinates),
+            coordinate_mask=transferred(structure.coordinate_mask),
+            occupancy=transferred(structure.occupancy),
+            occupancy_mask=transferred(structure.occupancy_mask),
+            b_factor=transferred(structure.b_factor),
+            b_factor_mask=transferred(structure.b_factor_mask),
+            source_symbols=structure.source_symbols,
+            residue_id=structure.residue_id,
+            insertion_code=structure.insertion_code,
+            batch_size=[],
+        )
+        return structure, changed_components
+
+    def _lower(
+        self,
+        structure: Structure,
+        changed_components: set[int],
+        *,
+        pack_positions: Sequence[ComponentReference] | None,
+        use_atom_context: bool,
+        filter_by_occupancy: bool,
+    ) -> MpnnPackerInput:
+        system = structure.system
+        device = system.atom_symbol.device
         observed = structure.coordinate_mask
-        if filter_by_occupancy and structure.occupancy is not None:
-            observed = observed & (structure.occupancy > 0)
+        if filter_by_occupancy:
+            observed = observed & (~structure.occupancy_mask | (structure.occupancy > 0))
 
-        rows: list[tuple[ComponentReference, str, int, int]] = []
-        chain_index_by_instance: dict[str, int] = {}
-        for site, present in zip(structure.sites, observed):
-            if not present or site.atom_id != "CA":
-                continue
-            entity = system.entities[system.instances[site.instance_id]]
-            if not isinstance(entity, PolymerSequence) or entity.polymer_type != "protein":
-                continue
-            if site.instance_id not in chain_index_by_instance:
-                chain_index_by_instance[site.instance_id] = len(chain_index_by_instance)
-            reference = (site.instance_id, site.component_index)
-            component = entity.components[site.component_index]
-            residue_index = (
-                site.component_index
-                if structure.residue_numbers is None
-                else structure.residue_numbers[reference].number
-            )
-            rows.append(
-                (
-                    reference,
-                    component.component_id,
-                    chain_index_by_instance[site.instance_id],
-                    residue_index,
-                )
-            )
+        component_count = system.component_symbol.numel()
+        component_instance = torch.repeat_interleave(
+            torch.arange(
+                system.instance_symbol.numel(),
+                dtype=torch.int64,
+                device=device,
+            ),
+            system.instance_component_ptr[1:] - system.instance_component_ptr[:-1],
+        )
+        atom_component = torch.repeat_interleave(
+            torch.arange(
+                component_count,
+                dtype=torch.int64,
+                device=device,
+            ),
+            system.component_atom_ptr[1:] - system.component_atom_ptr[:-1],
+        )
+        atom_instance = component_instance[atom_component]
+        protein_instance = system.entity_type[system.instance_entity] == ENTITY_PROTEIN
+        symbol_index = {symbol: index for index, symbol in enumerate(system.symbols)}
+        ca_symbol = symbol_index.get("CA")
+        row_atom = (
+            system.atom_symbol.new_empty(0)
+            if ca_symbol is None
+            else torch.nonzero(
+                observed & protein_instance[atom_instance] & (system.atom_symbol == ca_symbol),
+                as_tuple=False,
+            ).flatten()
+        )
+        row_component = atom_component[row_atom]
+        if not row_component.numel():
+            raise ValueError("MpnnPacker requires at least one protein residue with an observed CA")
 
-        adjusted_rows: list[tuple[ComponentReference, str, int, int]] = []
-        duplicate_count = 0
-        previous_residue_index: int | None = None
-        for reference, component_id, row_chain_index, residue_index in rows:
-            if previous_residue_index == residue_index:
-                duplicate_count += 1
-            adjusted_rows.append((reference, component_id, row_chain_index, residue_index + duplicate_count))
-            previous_residue_index = residue_index
-        rows = adjusted_rows
-        unresolved_expected_atoms: list[tuple[str, ...]] = []
-        for reference, component_id, _chain_index, _residue_index in rows:
-            if component_id not in AMINO_ACID_COMPONENT_IDS:
-                unresolved_expected_atoms.append(())
+        length = row_component.numel()
+        row_by_component = torch.full(
+            (component_count,),
+            -1,
+            dtype=torch.int64,
+            device=device,
+        )
+        row_by_component[row_component] = torch.arange(
+            length,
+            dtype=torch.int64,
+            device=device,
+        )
+        atom37 = structure.coordinates.new_zeros((length, len(rc.atom_types), 3))
+        atom37_mask = torch.zeros(
+            (length, len(rc.atom_types)),
+            dtype=torch.bool,
+            device=device,
+        )
+        for atom37_index, atom_id in enumerate(rc.atom_types):
+            if atom_id == "OXT" or atom_id not in symbol_index:
                 continue
-            unresolved: list[str] = []
-            for atom_id in rc.AMINO_ACID_ATOM14_NAMES[component_id]:
-                if not atom_id:
-                    continue
-                try:
-                    system.atom(AtomSite(reference[0], reference[1], atom_id))
-                except KeyError:
-                    unresolved.append(atom_id)
-            unresolved_expected_atoms.append(tuple(unresolved))
-        coordinate_index = {site: index for index, site in enumerate(structure.sites)}
-        coordinate_dtype = structure.coordinates.dtype
-        backbone: list[np.ndarray] = []
-        all_atom = np.zeros((len(rows), len(rc.atom_types), 3), dtype=coordinate_dtype)
-        all_atom_mask = np.zeros((len(rows), len(rc.atom_types)), dtype=np.bool_)
-        valid: list[bool] = []
-        for row_index, (residue, _component_id, _chain_index, _residue_index) in enumerate(rows):
-            for atom_index, atom_name in enumerate(rc.atom_types):
-                if atom_name == "OXT":
-                    continue
-                site = AtomSite(residue[0], residue[1], atom_name)
-                index = coordinate_index.get(site)
-                if index is not None and bool(observed[index]):
-                    all_atom[row_index, atom_index] = structure.coordinates[index]
-                    all_atom_mask[row_index, atom_index] = True
-            backbone.append(all_atom[row_index, (0, 1, 2, 4)])
-            valid.append(bool(all_atom_mask[row_index, (0, 1, 2, 4)].all()))
-        row_references = tuple(row[0] for row in rows)
-        if pack_positions is None:
-            selected = tuple(
-                is_valid and component_id in AMINO_ACID_COMPONENT_IDS and not unresolved
-                for (_residue, component_id, _chain_index, _residue_index), is_valid, unresolved in zip(
-                    rows,
-                    valid,
-                    unresolved_expected_atoms,
-                )
-            )
+            matching_atom = torch.nonzero(
+                (system.atom_symbol == symbol_index[atom_id]) & (row_by_component[atom_component] >= 0),
+                as_tuple=False,
+            ).flatten()
+            matching_row = row_by_component[atom_component[matching_atom]]
+            atom37[matching_row, atom37_index] = structure.coordinates[matching_atom]
+            atom37_mask[matching_row, atom37_index] = observed[matching_atom]
+
+        backbone_index = torch.tensor(
+            _BACKBONE_ATOM37_INDICES,
+            dtype=torch.int64,
+            device=device,
+        )
+        backbone = atom37[:, backbone_index]
+        valid = atom37_mask[:, backbone_index].all(dim=-1)
+        row_instance = component_instance[row_component]
+        chain_by_instance: dict[int, int] = {}
+        chain_index = []
+        for instance in row_instance.detach().cpu().tolist():
+            if instance not in chain_by_instance:
+                chain_by_instance[instance] = len(chain_by_instance)
+            chain_index.append(chain_by_instance[instance])
+
+        source_id = structure.residue_id[row_component]
+        has_source_id = source_id >= 0
+        if not bool(has_source_id.any()):
+            residue_index = row_component.detach().cpu().tolist()
+        elif bool(has_source_id.all()):
+            source_numbers = [int(structure.source_symbols[index]) for index in source_id.detach().cpu().tolist()]
+            residue_index = []
+            duplicate_count = 0
+            previous_number: int | None = None
+            for number in source_numbers:
+                if number == previous_number:
+                    duplicate_count += 1
+                residue_index.append(number + duplicate_count)
+                previous_number = number
         else:
-            selected_references = set(pack_positions)
-            unknown = selected_references - set(row_references)
+            raise ValueError("MpnnPacker requires source residue IDs for every retained row or none")
+
+        component_ids = [
+            system.symbols[index] for index in system.component_symbol[row_component].detach().cpu().tolist()
+        ]
+        unresolved: list[tuple[str, ...]] = []
+        for component, component_id in zip(
+            row_component.detach().cpu().tolist(),
+            component_ids,
+            strict=True,
+        ):
+            if component_id not in AMINO_ACID_COMPONENT_IDS:
+                unresolved.append(())
+                continue
+            start = int(system.component_atom_ptr[component])
+            stop = int(system.component_atom_ptr[component + 1])
+            atom_ids = {system.symbols[index] for index in system.atom_symbol[start:stop].detach().cpu().tolist()}
+            unresolved.append(
+                tuple(
+                    atom_id
+                    for atom_id in rc.AMINO_ACID_ATOM14_NAMES[component_id]
+                    if atom_id and atom_id not in atom_ids
+                )
+            )
+
+        row_components = row_component.detach().cpu().tolist()
+        if pack_positions is None:
+            selected = [
+                bool(is_valid) and component_id in AMINO_ACID_COMPONENT_IDS
+                for is_valid, component_id in zip(
+                    valid.detach().cpu().tolist(),
+                    component_ids,
+                    strict=True,
+                )
+            ]
+        else:
+            requested = {system.component_index(reference) for reference in pack_positions}
+            unknown = requested - set(row_components)
             if unknown:
-                raise ValueError(f"packing positions are outside the observed protein layout: {sorted(unknown)!r}")
-            selected = tuple(residue in selected_references for residue in row_references)
-            for row, is_selected, is_valid, unresolved_atom_ids in zip(
-                rows, selected, valid, unresolved_expected_atoms
-            ):
-                if not is_selected:
-                    continue
-                if row[1] not in AMINO_ACID_COMPONENT_IDS:
-                    raise ValueError(f"MpnnPacker cannot pack residue identity {row[1]!r} at {row[0]!r}")
-                if unresolved_atom_ids:
-                    raise ValueError(
-                        f"MpnnPacker cannot pack residue {row[0]!r} because expected atom14 sites "
-                        f"do not resolve: {unresolved_atom_ids!r}"
-                    )
-                if not is_valid:
-                    raise ValueError(f"MpnnPacker cannot pack residue {row[0]!r} without complete backbone coordinates")
+                references = sorted(system.component_reference(component) for component in unknown)
+                raise ValueError("packing positions are outside the observed protein " f"layout: {references!r}")
+            selected = [component in requested for component in row_components]
 
-        unselected_changes = changed_references - {
-            reference for reference, is_selected in zip(row_references, selected) if is_selected
+        for component, component_id, is_selected, is_valid, missing in zip(
+            row_components,
+            component_ids,
+            selected,
+            valid.detach().cpu().tolist(),
+            unresolved,
+            strict=True,
+        ):
+            if not is_selected:
+                continue
+            reference = system.component_reference(component)
+            if component_id not in AMINO_ACID_COMPONENT_IDS:
+                raise ValueError(f"MpnnPacker cannot pack residue identity " f"{component_id!r} at {reference!r}")
+            if missing:
+                raise ValueError(
+                    f"MpnnPacker cannot pack residue {reference!r} "
+                    f"because expected atom14 sites do not resolve: {missing!r}"
+                )
+            if not is_valid:
+                raise ValueError(
+                    f"MpnnPacker cannot pack residue {reference!r} " "without complete backbone coordinates"
+                )
+
+        selected_components = {
+            component
+            for component, is_selected in zip(
+                row_components,
+                selected,
+                strict=True,
+            )
+            if is_selected
         }
+        unselected_changes = changed_components - selected_components
         if unselected_changes:
-            raise ValueError(f"changed identities must be selected for packing: {sorted(unselected_changes)!r}")
+            references = sorted(system.component_reference(component) for component in unselected_changes)
+            raise ValueError(f"changed identities must be selected for packing: {references!r}")
 
-        backbone_tensor = torch.as_tensor(np.stack(backbone), device=self.device, dtype=self.dtype).unsqueeze(0)
-        valid_tensor = torch.tensor(valid, dtype=torch.bool, device=self.device).unsqueeze(0)
+        backbone_tensor = backbone.to(
+            device=self.device,
+            dtype=self.dtype,
+        ).unsqueeze(0)
+        valid_tensor = valid.to(device=self.device).unsqueeze(0)
         num_context_atoms = self.config.num_context_atoms
-        selected_coords = torch.zeros(len(rows), num_context_atoms, 3, device=self.device, dtype=self.dtype)
-        selected_types = torch.zeros(len(rows), num_context_atoms, device=self.device, dtype=torch.int64)
-        selected_mask = torch.zeros(len(rows), num_context_atoms, device=self.device, dtype=torch.bool)
+        context_coordinates = torch.zeros(
+            length,
+            num_context_atoms,
+            3,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        context_atomic_numbers = torch.zeros(
+            length,
+            num_context_atoms,
+            device=self.device,
+            dtype=torch.int64,
+        )
+        context_mask = torch.zeros(
+            length,
+            num_context_atoms,
+            device=self.device,
+            dtype=torch.bool,
+        )
         if use_atom_context:
-            context_coords: list[np.ndarray] = []
-            context_types: list[int] = []
-            for site, coordinates, present in zip(structure.sites, structure.coordinates, observed):
-                if not present:
-                    continue
-                entity = system.entities[system.instances[site.instance_id]]
-                if isinstance(entity, PolymerSequence) and entity.polymer_type == "protein":
-                    continue
-                if is_water_component(entity.components[site.component_index]):
-                    continue
-                element = system.atom(site).element
-                if element == "H":
-                    continue
-                context_coords.append(coordinates)
-                context_types.append(ATOMIC_NUMBER_BY_ELEMENT[element])
-
-            if context_coords:
-                context = torch.as_tensor(np.stack(context_coords), device=self.device, dtype=self.dtype)
-                context_type = torch.tensor(context_types, dtype=torch.int64, device=self.device)
-                context_mask = context_type != 0
+            retained_context = (
+                observed
+                & ~protein_instance[atom_instance]
+                & ~water_component_mask(system)[atom_component]
+                & (system.atomic_number != 1)
+            )
+            if bool(retained_context.any()):
+                context = structure.coordinates[retained_context].to(
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+                context_type = system.atomic_number[retained_context].to(device=self.device, dtype=torch.int64)
                 n = backbone_tensor[0, :, 0]
                 ca = backbone_tensor[0, :, 1]
                 c = backbone_tensor[0, :, 2]
@@ -430,8 +861,12 @@ class MpnnPackerProcessor(Processor):
                     + ca
                 )
                 squared_distance = ((cb[:, None] - context[None]) ** 2).sum(dim=-1)
-                pair_mask = valid_tensor[0, :, None] * context_mask[None]
-                adjusted_distance = squared_distance * pair_mask + (~pair_mask) * 1000.0
+                pair_mask = valid_tensor[0, :, None]
+                adjusted_distance = torch.where(
+                    pair_mask,
+                    squared_distance,
+                    torch.full_like(squared_distance, 1000.0),
+                )
                 atom_count = min(num_context_atoms, context.shape[0])
                 nearest = torch.topk(
                     adjusted_distance,
@@ -440,27 +875,51 @@ class MpnnPackerProcessor(Processor):
                     largest=False,
                     sorted=True,
                 ).indices
-                selected_coords[:, :atom_count] = context[nearest]
-                selected_types[:, :atom_count] = context_type[nearest]
-                selected_mask[:, :atom_count] = context_mask[nearest]
+                context_coordinates[:, :atom_count] = context[nearest]
+                context_atomic_numbers[:, :atom_count] = context_type[nearest]
+                context_mask[:, :atom_count] = True
 
         return MpnnPackerInput(  # type: ignore[call-arg]
             backbone_coordinates=backbone_tensor,
             sequence_tokens=torch.tensor(
-                [AMINO_ACID_TOKEN_BY_COMPONENT.get(row[1], AMINO_ACID_UNKNOWN_TOKEN) for row in rows],
+                [
+                    AMINO_ACID_TOKEN_BY_COMPONENT.get(
+                        component_id,
+                        AMINO_ACID_UNKNOWN_TOKEN,
+                    )
+                    for component_id in component_ids
+                ],
                 device=self.device,
                 dtype=torch.int64,
             ).unsqueeze(0),
             residue_mask=valid_tensor,
-            residue_index=torch.tensor([row[3] for row in rows], device=self.device, dtype=torch.int64).unsqueeze(0),
-            chain_index=torch.tensor([row[2] for row in rows], device=self.device, dtype=torch.int64).unsqueeze(0),
-            context_coordinates=selected_coords.unsqueeze(0),
-            context_atomic_numbers=selected_types.unsqueeze(0),
-            context_mask=selected_mask.unsqueeze(0),
-            atom37_coordinates=torch.as_tensor(all_atom, device=self.device, dtype=self.dtype).unsqueeze(0),
-            atom37_mask=torch.as_tensor(all_atom_mask, device=self.device).unsqueeze(0),
-            pack_positions=torch.tensor(selected, device=self.device, dtype=torch.bool).unsqueeze(0),
+            residue_index=torch.tensor(
+                residue_index,
+                device=self.device,
+                dtype=torch.int64,
+            ).unsqueeze(0),
+            chain_index=torch.tensor(
+                chain_index,
+                device=self.device,
+                dtype=torch.int64,
+            ).unsqueeze(0),
+            context_coordinates=context_coordinates.unsqueeze(0),
+            context_atomic_numbers=context_atomic_numbers.unsqueeze(0),
+            context_mask=context_mask.unsqueeze(0),
+            atom37_coordinates=atom37.to(
+                device=self.device,
+                dtype=self.dtype,
+            ).unsqueeze(0),
+            atom37_mask=atom37_mask.to(device=self.device).unsqueeze(0),
+            pack_positions=torch.tensor(
+                selected,
+                device=self.device,
+                dtype=torch.bool,
+            ).unsqueeze(0),
             structure=structure,
-            component_references=row_references,
-            batch_size=[1],
+            component_index=row_component.to(
+                device=self.device,
+                dtype=torch.int64,
+            ).unsqueeze(0),
+            batch_size=[],
         )

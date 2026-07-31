@@ -16,11 +16,18 @@ from typing import Literal, TypeAlias
 
 import biotite.structure as struc
 import numpy as np
+import torch
 from biotite.structure.info import vdw_radius_protor, vdw_radius_single
 from numpy.typing import NDArray
 
-from ...data import AtomSite, ComponentReference, Molecule, PolymerSequence, Structure
-from ...data.molecular import AMINO_ACID_ONE_TO_THREE
+from ...data import AtomSite, ComponentReference, Structure
+from ...data.molecular import (
+    AMINO_ACID_ONE_TO_THREE,
+    ENTITY_DNA,
+    ENTITY_MOLECULE,
+    ENTITY_PROTEIN,
+    ENTITY_RNA,
+)
 
 AnalysisValue: TypeAlias = float | int | bool | str
 LiabilityModality: TypeAlias = Literal["antibody", "peptide"]
@@ -352,6 +359,44 @@ def lddt(
     return float((1e-10 + np.sum(score * scored)) / (1e-10 + np.sum(scored)))
 
 
+def _component_instance_index(structure: Structure) -> torch.Tensor:
+    system = structure.system
+    return torch.repeat_interleave(
+        torch.arange(
+            system.instance_symbol.numel(),
+            device=system.instance_component_ptr.device,
+        ),
+        system.instance_component_ptr[1:] - system.instance_component_ptr[:-1],
+    )
+
+
+def _atom_component_index(structure: Structure) -> torch.Tensor:
+    system = structure.system
+    return torch.repeat_interleave(
+        torch.arange(
+            system.component_symbol.numel(),
+            device=system.component_atom_ptr.device,
+        ),
+        system.component_atom_ptr[1:] - system.component_atom_ptr[:-1],
+    )
+
+
+def _canonical_atom_sites(structure: Structure) -> tuple[AtomSite, ...]:
+    system = structure.system
+    atom_component = _atom_component_index(structure).detach().cpu().tolist()
+    component_instance = _component_instance_index(structure).detach().cpu().tolist()
+    atom_symbols = system.atom_symbol.detach().cpu().tolist()
+    component_start = system.instance_component_ptr.detach().cpu().tolist()
+    return tuple(
+        AtomSite(
+            system.instance_id(component_instance[component_index]),
+            component_index - component_start[component_instance[component_index]],
+            system.symbols[atom_symbols[atom_index]],
+        )
+        for atom_index, component_index in enumerate(atom_component)
+    )
+
+
 def structure_coordinates(
     reference: Structure,
     predicted: Structure,
@@ -362,26 +407,30 @@ def structure_coordinates(
     r"""
     Return observed coordinates for exact atom sites shared by two structures.
 
-    The output order follows ``reference.sites``.  ``components`` selects exact
-    component occurrences; ``backbone_only`` uses the released BoltzGen protein
-    and nucleic-acid backbone atom definitions.
+    The output order follows the reference canonical atom axis. ``components``
+    selects exact component occurrences; ``backbone_only`` uses the released
+    BoltzGen protein and nucleic-acid backbone atom definitions.
     """
 
-    predicted_index = {site: index for index, site in enumerate(predicted.sites) if predicted.coordinate_mask[index]}
+    predicted_index = {
+        site: index
+        for index, site in enumerate(_canonical_atom_sites(predicted))
+        if bool(predicted.coordinate_mask[index])
+    }
     component_set = None if components is None else frozenset(components)
     reference_coordinates = []
     predicted_coordinates = []
     sites = []
-    for index, site in enumerate(reference.sites):
+    for index, site in enumerate(_canonical_atom_sites(reference)):
         component = (site.instance_id, site.component_index)
-        if not reference.coordinate_mask[index] or site not in predicted_index:
+        if not bool(reference.coordinate_mask[index]) or site not in predicted_index:
             continue
         if component_set is not None and component not in component_set:
             continue
         if backbone_only and not _is_backbone_site(reference, site):
             continue
-        reference_coordinates.append(reference.coordinates[index])
-        predicted_coordinates.append(predicted.coordinates[predicted_index[site]])
+        reference_coordinates.append(reference.coordinates[index].detach().cpu().numpy())
+        predicted_coordinates.append(predicted.coordinates[predicted_index[site]].detach().cpu().numpy())
         sites.append(site)
     return np.asarray(reference_coordinates), np.asarray(predicted_coordinates), tuple(sites)
 
@@ -414,7 +463,12 @@ def structure_rmsd_metrics(
     unweighted = np.ones(len(sites), dtype=np.float64)
     target_alignment_supported = (
         any(
-            isinstance(original.system.entities[original.system.instances[instance_id]], PolymerSequence)
+            int(
+                original.system.entity_type[
+                    int(original.system.instance_entity[original.system.instance_index(instance_id)])
+                ]
+            )
+            != ENTITY_MOLECULE
             for instance_id, _ in target
         )
         or int(np.sum(target_mask)) > 3
@@ -488,32 +542,37 @@ def assign_secondary_structure(
     import pydssp
 
     selected = None if components is None else frozenset(components)
-    coordinate_by_site = {
-        site: structure.coordinates[index]
-        for index, site in enumerate(structure.sites)
-        if structure.coordinate_mask[index]
-    }
+    system = structure.system
+    component_instances = _component_instance_index(structure).detach().cpu().tolist()
+    atom_symbols = system.atom_symbol.detach().cpu().tolist()
     references = []
     backbone = []
-    for instance_id, entity_id in structure.system.instances.items():
-        entity = structure.system.entities[entity_id]
-        if not isinstance(entity, PolymerSequence) or entity.polymer_type != "protein":
+    for component_index, instance_index in enumerate(component_instances):
+        entity_index = int(system.instance_entity[instance_index])
+        if int(system.entity_type[entity_index]) != ENTITY_PROTEIN:
             continue
-        for component_index in range(len(entity.components)):
-            reference = (instance_id, component_index)
-            if selected is not None and reference not in selected:
-                continue
-            sites = tuple(AtomSite(instance_id, component_index, atom_id) for atom_id in ("N", "CA", "C", "O"))
-            if not all(site in coordinate_by_site for site in sites):
-                raise ValueError(f"protein component {reference!r} does not have a complete observed N/CA/C/O backbone")
-            references.append(reference)
-            backbone.append(np.stack([coordinate_by_site[site] for site in sites]))
+        reference = system.component_reference(component_index)
+        if selected is not None and reference not in selected:
+            continue
+        by_name = {
+            system.symbols[atom_symbols[atom_index]]: atom_index
+            for atom_index in range(
+                int(system.component_atom_ptr[component_index]),
+                int(system.component_atom_ptr[component_index + 1]),
+            )
+            if bool(structure.coordinate_mask[atom_index])
+        }
+        names = ("N", "CA", "C", "O")
+        if not all(name in by_name for name in names):
+            raise ValueError(f"protein component {reference!r} does not have a complete " "observed N/CA/C/O backbone")
+        references.append(reference)
+        backbone.append(torch.stack([structure.coordinates[by_name[name]] for name in names]).detach().cpu().numpy())
 
     if len(backbone) <= 5:
         return {}
     assignment = np.asarray(pydssp.assign(np.stack(backbone), out_type="index"))
-    names = ("L", "H", "E")
-    return {reference: names[int(value)] for reference, value in zip(references, assignment, strict=True)}
+    dssp_states = ("L", "H", "E")
+    return {reference: dssp_states[int(value)] for reference, value in zip(references, assignment, strict=True)}
 
 
 def secondary_structure_fractions(assignments: Mapping[ComponentReference, str] | Sequence[str]) -> dict[str, float]:
@@ -1505,23 +1564,29 @@ def _liability_motifs(
 
 
 def _is_backbone_site(structure: Structure, site: AtomSite) -> bool:
-    entity = structure.system.entities[structure.system.instances[site.instance_id]]
-    if not isinstance(entity, PolymerSequence):
+    system = structure.system
+    instance_index = system.instance_index(site.instance_id)
+    entity_index = int(system.instance_entity[instance_index])
+    entity_type = int(system.entity_type[entity_index])
+    if entity_type == ENTITY_MOLECULE:
         return False
-    if entity.polymer_type == "protein":
+    if entity_type == ENTITY_PROTEIN:
         return site.atom_id in _PROTEIN_BACKBONE_ATOMS
-    if entity.polymer_type == "dna":
+    if entity_type == ENTITY_DNA:
         return site.atom_id in _DNA_BACKBONE_ATOMS
-    if entity.polymer_type == "rna":
+    if entity_type == ENTITY_RNA:
         return site.atom_id in _RNA_BACKBONE_ATOMS
     return site.atom_id in _RNA_BACKBONE_ATOMS
 
 
 def _atom_rmsd_weight(structure: Structure, site: AtomSite) -> float:
-    entity = structure.system.entities[structure.system.instances[site.instance_id]]
-    if isinstance(entity, Molecule):
+    system = structure.system
+    instance_index = system.instance_index(site.instance_id)
+    entity_index = int(system.instance_entity[instance_index])
+    entity_type = int(system.entity_type[entity_index])
+    if entity_type == ENTITY_MOLECULE:
         return 11.0
-    return 1.0 if entity.polymer_type == "protein" else 6.0
+    return 1.0 if entity_type == ENTITY_PROTEIN else 6.0
 
 
 def _biotite_atom_array(
@@ -1534,33 +1599,56 @@ def _biotite_atom_array(
     components = None if components is None else frozenset(components)
     design = frozenset(design)
     chain_design = frozenset(chain_design)
+    system = structure.system
+    all_sites = _canonical_atom_sites(structure)
     indices = [
         index
-        for index, site in enumerate(structure.sites)
-        if structure.coordinate_mask[index]
+        for index, site in enumerate(all_sites)
+        if bool(structure.coordinate_mask[index])
         and (components is None or (site.instance_id, site.component_index) in components)
     ]
-    sites = tuple(structure.sites[index] for index in indices)
+    sites = tuple(all_sites[index] for index in indices)
     atom_array = struc.AtomArray(len(indices))
-    atom_array.coord = np.asarray(structure.coordinates[indices])
-    chain_ids = {instance_id: str(index) for index, instance_id in enumerate(structure.system.instances)}
+    canonical_index = torch.tensor(
+        indices,
+        dtype=torch.long,
+        device=structure.coordinates.device,
+    )
+    atom_array.coord = structure.coordinates[canonical_index].detach().cpu().numpy()
+    chain_ids = {system.instance_id(index): str(index) for index in range(system.instance_symbol.numel())}
     atom_array.chain_id = np.array([chain_ids[site.instance_id] for site in sites])
     atom_array.res_id = np.array([site.component_index + 1 for site in sites])
     atom_array.ins_code = np.full(len(sites), "")
     atom_array.atom_name = np.array([site.atom_id for site in sites])
     atom_array.res_name = np.array(
-        [structure.system.component((site.instance_id, site.component_index)).component_id for site in sites]
+        [
+            system.symbols[
+                int(system.component_symbol[system.component_index((site.instance_id, site.component_index))])
+            ]
+            for site in sites
+        ]
     )
-    atoms = [structure.system.atom(site) for site in sites]
-    atom_array.element = np.array([atom.element for atom in atoms])
+    from rdkit.Chem import GetPeriodicTable
+
+    periodic_table = GetPeriodicTable()
+    atom_array.element = np.array(
+        [periodic_table.GetElementSymbol(int(system.atomic_number[index])) for index in indices]
+    )
     atom_array.hetero = np.array(
         [
-            isinstance(structure.system.entities[structure.system.instances[site.instance_id]], Molecule)
+            int(system.entity_type[int(system.instance_entity[system.instance_index(site.instance_id)])])
+            == ENTITY_MOLECULE
             for site in sites
         ],
         dtype=np.bool_,
     )
-    atom_array.set_annotation("charge", np.array([atom.formal_charge or 0 for atom in atoms], dtype=np.int64))
+    atom_array.set_annotation(
+        "charge",
+        np.array(
+            [int(system.formal_charge[index]) if bool(system.formal_charge_known[index]) else 0 for index in indices],
+            dtype=np.int64,
+        ),
+    )
     atom_array.set_annotation(
         "is_design",
         np.array(
@@ -1576,15 +1664,24 @@ def _biotite_atom_array(
         ),
     )
 
-    site_index = {site: index for index, site in enumerate(sites)}
+    selected_index = {canonical_atom_index: output_index for output_index, canonical_atom_index in enumerate(indices)}
     bonds: list[tuple[int, int, int]] = []
-    for bond in structure.system.iter_bonds():
-        if bond.site_a in site_index and bond.site_b in site_index:
+    for edge_index, (first, second) in enumerate(system.edge_index.detach().cpu().T.tolist()):
+        if first in selected_index and second in selected_index:
             bonds.append(
                 (
-                    site_index[bond.site_a],
-                    site_index[bond.site_b],
-                    int(_biotite_bond_type(bond.order, bond.aromatic)),
+                    selected_index[first],
+                    selected_index[second],
+                    int(
+                        _biotite_bond_type(
+                            float(system.bond_order[edge_index]) if bool(system.bond_order_known[edge_index]) else 0.0,
+                            (
+                                bool(system.bond_aromatic[edge_index])
+                                if bool(system.bond_aromatic_known[edge_index])
+                                else False
+                            ),
+                        )
+                    ),
                 )
             )
     atom_array.bonds = struc.BondList(len(atom_array), np.asarray(bonds, dtype=np.uint32).reshape(-1, 3))

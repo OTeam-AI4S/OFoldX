@@ -6,10 +6,11 @@ from __future__ import annotations
 
 from typing import Any
 
+import torch
 from torch import Tensor
 
-from ...data.molecular import Molecule
-from ...modules.diffusion.loss import edm_loss_weight, resolved_atom_mask
+from ...data.molecular import ENTITY_MOLECULE, ENTITY_PROTEIN
+from ...modules.diffusion.loss import edm_loss_weight
 from ...modules.geometry import weighted_rigid_align
 
 
@@ -28,26 +29,44 @@ def weighted_denoising_loss(
     protein, 6 for DNA/RNA, and 11 for ligand atoms.
     """
 
-    resolved = resolved_atom_mask(target, model_input)
+    resolved = target.coordinate_mask.bool() & model_input.atom_mask.bool()
     scored = resolved & ~model_input.fixed_coordinate_mask.bool()
-    atom_index = target.atom_index.long()
-    target_coordinates = target.coordinates.gather(
-        1,
-        atom_index.clamp_min(0).unsqueeze(-1).expand(-1, -1, 3),
+    target_coordinates = target.coordinates.masked_fill(
+        ~resolved.unsqueeze(-1),
+        0,
     )
-    target_coordinates = target_coordinates.masked_fill(~resolved.unsqueeze(-1), 0)
 
-    system = model_input.layout.system
-    weights = []
-    for site in model_input.layout.atom_sites:
-        entity = system.entities[system.instances[site.instance_id]]
-        if isinstance(entity, Molecule):
-            weights.append(11.0)
-        elif entity.polymer_type != "protein":
-            weights.append(6.0)
-        else:
-            weights.append(1.0)
-    atom_weight = model_input.reference_positions.new_tensor(weights).unsqueeze(0).expand_as(scored)
+    system = model_input.system
+    component_instance = torch.repeat_interleave(
+        torch.arange(
+            system.instance_symbol.numel(),
+            dtype=torch.int64,
+            device=system.atom_symbol.device,
+        ),
+        system.instance_component_ptr[1:] - system.instance_component_ptr[:-1],
+    )
+    atom_component = torch.repeat_interleave(
+        torch.arange(
+            system.component_symbol.numel(),
+            dtype=torch.int64,
+            device=system.atom_symbol.device,
+        ),
+        system.component_atom_ptr[1:] - system.component_atom_ptr[:-1],
+    )
+    atom_entity_type = system.entity_type[system.instance_entity[component_instance[atom_component]]]
+    canonical_weight = torch.where(
+        atom_entity_type == ENTITY_PROTEIN,
+        1.0,
+        torch.where(atom_entity_type == ENTITY_MOLECULE, 11.0, 6.0),
+    ).to(model_input.reference_positions)
+    atom_index = model_input.atom_index.long()
+    canonical = atom_index >= 0
+    atom_weight = torch.full_like(
+        atom_index,
+        11.0,
+        dtype=model_input.reference_positions.dtype,
+    )
+    atom_weight[canonical] = canonical_weight[atom_index[canonical].to(canonical_weight.device)].to(atom_weight.device)
     alignment_weight = (atom_weight * scored).unsqueeze(1).expand_as(pred.coordinates[..., 0])
     aligned_target = weighted_rigid_align(
         source=target_coordinates.unsqueeze(1).expand_as(pred.coordinates),

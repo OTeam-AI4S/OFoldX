@@ -36,6 +36,9 @@ def test_only_a_missing_top_level_oops_package_is_optional(monkeypatch) -> None:
     module = _execute_oops_import(monkeypatch, "oops")
 
     assert module.OOPS_AVAILABLE is False
+    with pytest.raises(ModuleNotFoundError) as error:
+        module.oops_kernel("transition")()
+    assert error.value.name == "oops"
 
 
 def test_a_broken_oops_dependency_propagates(monkeypatch) -> None:

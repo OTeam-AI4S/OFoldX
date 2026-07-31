@@ -18,21 +18,18 @@ from .config import (
 from .model import (
     ODesignGeneratedAtoms,
     ODesignInput,
-    ODesignLigandBackbone,
     ODesignLigandInput,
-    ODesignLigandLayout,
     ODesignModel,
     ODesignOutput,
     ODesignPlacements,
-    ODesignProvisionalAtomSlot,
     ODesignRawOutput,
-    ODesignReferenceCoordinates,
     ODesignSamplingOutput,
     ODesignStructureTarget,
 )
 from .objectives import criterion_factory, weighted_denoising_loss
 from .pipeline import (
     ODesignGrnadeChainPrediction,
+    ODesignLigandBackbone,
     ODesignLigandDesignCandidate,
     ODesignLigandDesignResult,
     ODesignLigandPipeline,

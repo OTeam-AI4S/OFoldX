@@ -13,15 +13,13 @@ from .config import (
     PxDesignSamplerConfig,
 )
 from .model import (
-    PxDesignBackboneCandidate,
-    PxDesignBackboneResult,
     PxDesignInput,
-    PxDesignLayout,
     PxDesignModel,
     PxDesignOutput,
 )
 from .pipeline import (
     PxDesignBackbonePipeline,
+    PxDesignBackboneResult,
     PxDesignCandidate,
     PxDesignFilterResult,
     PxDesignPipeline,

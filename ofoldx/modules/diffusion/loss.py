@@ -3,17 +3,19 @@ Shared EDM coordinate-denoising training loss for the diffusion structure famili
 
 The internally-noising diffusion models (AlphaFold 3, Boltz-1, Boltz-2,
 BoltzGen, Protenix) expose their denoised coordinates, the augmented training
-target, and the per-sample noise level, so the canonical EDM denoising objective
--- the ``1/c_out(sigma)**2``-weighted squared error -- grounds directly against
-the model output. The target is rigidly aligned onto the prediction first
-(detached weighted Kabsch, as in AF3/Boltz/Protenix): the denoiser output is not
-exactly equivariant, so its global pose is not anchored to the augmented frame
-and the arbitrary augmentation rotation would otherwise be penalized.
+target, and the per-sample noise level, so the unified OFoldX Runner can apply
+one aligned EDM denoising objective -- the
+``1/c_out(sigma)**2``-weighted squared error -- directly to the model output.
+This intentionally does not claim each family's complete upstream aggregate
+training recipe. The target is rigidly aligned onto the prediction first: the
+denoiser output is not exactly equivariant, so its global pose is not anchored
+to the augmented frame and the arbitrary augmentation rotation would otherwise
+be penalized.
 
 The loss is reduced over the *resolved* atoms only. ``input.atom_mask`` marks every atom slot in the
 padded layout, but unresolved/missing atoms carry no ground truth, so their augmented target coordinates
 are meaningless; including them corrupts the loss. The resolved set is reconstructed from the structure
-Target (``coordinate_mask`` gathered through ``atom_index``) intersected with ``input.atom_mask`` -- the
+Target (``coordinate_mask`` gathered through ``input.atom_index``) intersected with ``input.atom_mask`` -- the
 same mask the models' own ``_gather_*_structure_target`` helpers compute.
 """
 
@@ -31,13 +33,14 @@ def resolved_atom_mask(target: Any, model_input: Any) -> Tensor:
     Return the ``(B, A)`` boolean mask of atoms that carry ground-truth coordinates and are present.
 
     Args:
-        target: The structure Target, carrying ``coordinate_mask`` ``(B, T)`` over the complete atom pool
-            and ``atom_index`` ``(B, A)`` mapping each padded-layout atom to a pool index (``-1`` for
-            padding).
-        model_input: The batched model Input, carrying ``atom_mask`` ``(B, A)``.
+        target: The structure Target, carrying ``coordinate_mask`` ``(B, T)`` over
+            the complete canonical atom axis.
+        model_input: The batched model Input, carrying ``atom_mask`` ``(B, A)``
+            and ``atom_index`` ``(B, A)`` mapping each model atom to a canonical
+            atom index (``-1`` for padding).
     """
 
-    atom_index = target.atom_index.long()
+    atom_index = model_input.atom_index.long()
     valid = atom_index >= 0
     resolved = target.coordinate_mask.gather(1, atom_index.clamp_min(0)).bool()
     return resolved & valid & model_input.atom_mask.bool()
@@ -74,13 +77,10 @@ def edm_denoising_loss(pred: Any, resolved: Tensor, *, sigma_data: float) -> Ten
 
     The denominator is the same resolved-atom count the training batch reports as its
     ``loss_normalizer``, so DanLing's accumulation/DDP reduction forms the true global per-atom mean.
-
-    Raises:
-        ValueError: If the batch scores no resolved atom.
     """
 
-    # Rigidly align the augmented target onto the prediction (per sample, over resolved atoms) before the
-    # MSE, as AF3/Boltz/Protenix -- and this repo's own BoltzGen loss -- do. The EDM output
+    # Rigidly align the augmented target onto the prediction (per sample, over resolved atoms) before
+    # applying the Runner's shared coordinate term. The EDM output
     # ``denoised = c_skip*noisy + c_out*update`` is dominated at high sigma by the non-equivariant network
     # ``update``, whose global pose is NOT anchored to the augmented frame, so the arbitrary augmentation
     # rotation must be aligned out rather than penalized. ``weighted_rigid_align`` is detached, so the
@@ -97,13 +97,6 @@ def edm_denoising_loss(pred: Any, resolved: Tensor, *, sigma_data: float) -> Ten
     weighted_error = weight * squared_error  # (B, S, A)
     mask = resolved.to(weighted_error.dtype).unsqueeze(1).expand_as(weighted_error)  # (B, S, A)
     scope = mask.sum()
-    # An empty scope would divide by zero; the resulting NaN reaches the optimizer and permanently
-    # poisons both the weights and the optimizer state, so refuse the batch instead of scoring it.
-    if not scope:
-        raise ValueError(
-            "coordinate-denoising loss has no resolved atom to score: the resolved mask is empty for "
-            "every structure in this batch"
-        )
     return (weighted_error * mask).sum() / scope
 
 

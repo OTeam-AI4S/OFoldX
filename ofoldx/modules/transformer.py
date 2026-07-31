@@ -6,7 +6,9 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 
+import torch
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
 from .adaptive_norm import AdaptiveLayerNorm
 from .attention.multihead import GatedMultiheadAttention
@@ -32,6 +34,7 @@ class ConditionedTransformerEncoder(nn.Module):
         super().__init__()
         conditioning_size = hidden_size if conditioning_size is None else conditioning_size
         self.num_blocks = num_blocks
+        self.gradient_checkpointing = False
         self.blocks = nn.ModuleList(
             ConditionedTransformerEncoderBlock(
                 hidden_size,
@@ -52,7 +55,15 @@ class ConditionedTransformerEncoder(nn.Module):
         mask: Tensor | None = None,
         to_keys: Callable[[Tensor], Tensor] | None = None,
     ) -> Tensor:
-        return _run_blocks(self.blocks, hidden, conditioning, bias, mask, to_keys)
+        return _run_blocks(
+            self.blocks,
+            hidden,
+            conditioning,
+            bias,
+            mask,
+            to_keys,
+            gradient_checkpointing=self.gradient_checkpointing and self.training and torch.is_grad_enabled(),
+        )
 
 
 class DenoisingTransformerEncoder(nn.Module):
@@ -71,6 +82,7 @@ class DenoisingTransformerEncoder(nn.Module):
         super().__init__()
         conditioning_size = hidden_size if conditioning_size is None else conditioning_size
         self.num_blocks = num_blocks
+        self.gradient_checkpointing = False
         self.blocks = nn.ModuleList(
             DenoisingTransformerEncoderBlock(
                 hidden_size,
@@ -89,7 +101,15 @@ class DenoisingTransformerEncoder(nn.Module):
         mask: Tensor | None = None,
         to_keys: Callable[[Tensor], Tensor] | None = None,
     ) -> Tensor:
-        return _run_blocks(self.blocks, hidden, conditioning, bias, mask, to_keys)
+        return _run_blocks(
+            self.blocks,
+            hidden,
+            conditioning,
+            bias,
+            mask,
+            to_keys,
+            gradient_checkpointing=self.gradient_checkpointing and self.training and torch.is_grad_enabled(),
+        )
 
 
 class AtomCrossAttentionTransformerEncoder(nn.Module):
@@ -107,6 +127,7 @@ class AtomCrossAttentionTransformerEncoder(nn.Module):
     ) -> None:
         super().__init__()
         self.num_blocks = num_blocks
+        self.gradient_checkpointing = False
         self.blocks = nn.ModuleList(
             AtomCrossAttentionTransformerEncoderBlock(
                 hidden_size,
@@ -125,7 +146,15 @@ class AtomCrossAttentionTransformerEncoder(nn.Module):
         mask: Tensor | None = None,
         to_keys: Callable[[Tensor], Tensor] | None = None,
     ) -> Tensor:
-        return _run_blocks(self.blocks, hidden, conditioning, bias, mask, to_keys)
+        return _run_blocks(
+            self.blocks,
+            hidden,
+            conditioning,
+            bias,
+            mask,
+            to_keys,
+            gradient_checkpointing=self.gradient_checkpointing and self.training and torch.is_grad_enabled(),
+        )
 
 
 class NormalizedKeyAtomCrossAttentionTransformerEncoder(nn.Module):
@@ -143,6 +172,7 @@ class NormalizedKeyAtomCrossAttentionTransformerEncoder(nn.Module):
     ) -> None:
         super().__init__()
         self.num_blocks = num_blocks
+        self.gradient_checkpointing = False
         self.blocks = nn.ModuleList(
             NormalizedKeyAtomCrossAttentionTransformerEncoderBlock(
                 hidden_size,
@@ -161,7 +191,15 @@ class NormalizedKeyAtomCrossAttentionTransformerEncoder(nn.Module):
         mask: Tensor | None = None,
         to_keys: Callable[[Tensor], Tensor] | None = None,
     ) -> Tensor:
-        return _run_blocks(self.blocks, hidden, conditioning, bias, mask, to_keys)
+        return _run_blocks(
+            self.blocks,
+            hidden,
+            conditioning,
+            bias,
+            mask,
+            to_keys,
+            gradient_checkpointing=self.gradient_checkpointing and self.training and torch.is_grad_enabled(),
+        )
 
 
 class ConditionedTransformerEncoderBlock(nn.Module):
@@ -392,6 +430,8 @@ def _run_blocks(
     bias: Tensor,
     mask: Tensor | None,
     to_keys: Callable[[Tensor], Tensor] | None,
+    *,
+    gradient_checkpointing: bool,
 ) -> Tensor:
     blocks = tuple(blocks)
     if not blocks:
@@ -404,7 +444,18 @@ def _run_blocks(
         )
     bias = bias.view(*prefix, len(blocks), packed // len(blocks))
     for index, block in enumerate(blocks):
-        hidden = block(hidden, conditioning, bias[..., index, :], mask, to_keys)
+        if gradient_checkpointing:
+            hidden = checkpoint(
+                block,
+                hidden,
+                conditioning,
+                bias[..., index, :],
+                mask,
+                to_keys,
+                use_reentrant=False,
+            )
+        else:
+            hidden = block(hidden, conditioning, bias[..., index, :], mask, to_keys)
     return hidden
 
 

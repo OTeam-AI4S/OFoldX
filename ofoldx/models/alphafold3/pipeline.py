@@ -13,7 +13,7 @@ import numpy as np
 import torch
 
 from ...data.evidence import MSA, MSACollection, Template
-from ...data.molecular import MolecularSystem, PolymerSequence
+from ...data.molecular import ENTITY_PROTEIN, MolecularSystem, PolymerSequence
 from ...data.structure import Structure
 from ...io import pair_msa_rows_by_key, read_fasta_records, read_msa, read_msa_with_headers, read_structure
 from ...pipelines import PairedPipeline, resolve_generator
@@ -153,7 +153,10 @@ class AlphaFold3Pipeline(PairedPipeline[AlphaFold3Model, AlphaFold3Processor]):
         """
 
         generator = resolve_generator(seed, generator, device=self.processor.device)
-        canonical_input = _canonical_input(input)
+        canonical_input = _canonical_input(
+            input,
+            revision=self.processor.config.ccd_revision,
+        )
         system = canonical_input.system if isinstance(canonical_input, Structure) else canonical_input
         model_input = self.processor(
             canonical_input,
@@ -171,6 +174,8 @@ class AlphaFold3Pipeline(PairedPipeline[AlphaFold3Model, AlphaFold3Processor]):
 
 def _canonical_input(
     input: str | PathLike[str] | PolymerSequence | Sequence[PolymerSequence] | MolecularSystem | Structure,
+    *,
+    revision: str,
 ) -> MolecularSystem | Structure:
     r"""
     Resolve AlphaFold 3's inline-sequence, FASTA, and structure conveniences.
@@ -179,11 +184,14 @@ def _canonical_input(
     if not isinstance(input, str | PathLike):
         if isinstance(input, MolecularSystem | Structure):
             return input
-        return molecular_system_from_input(input)
+        return molecular_system_from_input(input, revision=revision)
     classified = classify_reference(input)
     if not isinstance(classified, Path):
         sequence = PolymerSequence.from_one_letter(classified.strip().upper())
-        return molecular_system_from_named_sequences((("protein", sequence),))
+        return molecular_system_from_named_sequences(
+            (("protein", sequence),),
+            revision=revision,
+        )
     if any(suffix.lower() in _FASTA_SUFFIXES for suffix in classified.suffixes):
         sequences = tuple(
             (
@@ -192,7 +200,7 @@ def _canonical_input(
             )
             for index, record in enumerate(read_fasta_records(classified))
         )
-        return molecular_system_from_named_sequences(sequences)
+        return molecular_system_from_named_sequences(sequences, revision=revision)
     return read_structure(classified)
 
 
@@ -207,9 +215,10 @@ def _canonical_msa(
     if not isinstance(msa, str | PathLike):
         return msa
     proteins = [
-        entity_id
-        for entity_id, entity in system.entities.items()
-        if isinstance(entity, PolymerSequence) and entity.polymer_type == "protein"
+        system.entity_id(entity_index)
+        for entity_index in (
+            (system.entity_type == ENTITY_PROTEIN).nonzero(as_tuple=False).flatten().detach().cpu().tolist()
+        )
     ]
     if len(proteins) != 1:
         raise ValueError("an aligned FASTA MSA is unambiguous only for one protein entity")

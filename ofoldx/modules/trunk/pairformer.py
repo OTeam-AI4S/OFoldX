@@ -4,7 +4,8 @@ Pairformer blocks and stacks.
 
 from __future__ import annotations
 
-from torch import Tensor, nn
+from torch import Tensor, is_grad_enabled, nn
+from torch.utils.checkpoint import checkpoint
 
 from ..attention import PairBiasedSelfAttention
 from ..transition import Transition
@@ -45,6 +46,7 @@ class PairformerStack(nn.Module):
     ) -> None:
         super().__init__()
         self.num_blocks = num_blocks
+        self.gradient_checkpointing = False
         self.blocks = nn.ModuleList(
             [
                 PairformerBlock(
@@ -76,7 +78,16 @@ class PairformerStack(nn.Module):
         """
 
         for block in self.blocks:
-            single, pair = block(single, pair, pair_mask=pair_mask)
+            if self.gradient_checkpointing and self.training and is_grad_enabled():
+                single, pair = checkpoint(
+                    block,
+                    single,
+                    pair,
+                    pair_mask=pair_mask,
+                    use_reentrant=False,
+                )
+            else:
+                single, pair = block(single, pair, pair_mask=pair_mask)
         return single, pair
 
 
