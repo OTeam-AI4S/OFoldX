@@ -1,0 +1,107 @@
+[build-system]
+build-backend = "setuptools.build_meta"
+requires = [
+  "setuptools>=77",
+  "setuptools-scm",
+]
+
+[project]
+name = "ofoldx"
+description = "Fold molecules, unfold possibilities. Open biomolecular models for prediction and design."
+readme = "README.md"
+keywords = [
+  "biomolecular-design",
+  "deep-learning",
+  "dna",
+  "machine-learning",
+  "protein",
+  "rna",
+]
+license = "AGPL-3.0-or-later"
+license-files = [ "license.md", "license.zh.md", "license-faq.md", "license-faq.zh.md", "privacy.md", "privacy.zh.md" ]
+maintainers = [
+  { name = "Zhiyuan Chen", email = "z@valtech.ai" },
+]
+authors = [
+  { name = "Zhiyuan Chen", email = "z@valtech.ai" },
+]
+requires-python = ">=3.12"
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Education",
+  "Intended Audience :: Science/Research",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dynamic = [
+  "version",
+]
+dependencies = [
+  "abnumber>=0.4.4",
+  "accelerate>=0.8",
+  "anarci",
+  "biotite>=1.2",
+  "chanfig>=0.0.117",
+  "chembl-structure-pipeline",
+  "danling",
+  "gemmi",
+  "huggingface-hub>=0.24",
+  "multimolecule",
+  "numpy",
+  "rdkit",
+  "safetensors>=0.6.1",
+  "scipy",
+  "tensordict>=0.12",
+  "torch>=2.5",
+  "transformers",
+  "zstandard",
+]
+optional-dependencies.oops = [
+  "ooperators",
+]
+urls.homepage = "https://github.com/OTeam-AI4S/OFoldX"
+urls.issues = "https://github.com/OTeam-AI4S/OFoldX/issues"
+urls.repository = "https://github.com/OTeam-AI4S/OFoldX"
+
+[tool.setuptools]
+packages.find.include = [ "ofoldx*" ]
+package-data.ofoldx = [ "py.typed" ]
+
+[tool.setuptools_scm]
+write_to = "ofoldx/_version.py"
+
+[tool.black]
+line-length = 120
+target-version = [ "py312" ]
+workers = 1
+
+[tool.isort]
+line_length = 120
+profile = "black"
+
+[tool.mypy]
+# Only third-party packages and the version file setuptools-scm writes at install time may be unresolvable.
+ignore_missing_imports = true
+python_version = "3.12"
+overrides = [
+  { module = "ofoldx.*", ignore_missing_imports = false },
+  { module = "ofoldx._version", ignore_missing_imports = true },
+]
+
+[tool.pytest]
+ini_options.addopts = "--import-mode=importlib --doctest-modules --cov=ofoldx"
+ini_options.testpaths = [ "ofoldx", "tests" ]
+
+[tool.coverage]
+run.branch = true
+run.source = [ "ofoldx" ]
+paths.source = [ "ofoldx" ]
+report.fail_under = 50
+report.show_missing = true
+json.output = "coverage.json"
+xml.output = "coverage.xml"
