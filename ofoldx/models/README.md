@@ -49,7 +49,10 @@ nll = result.scores["designed_sequence_nll"]
 print(nll.value, nll.unit)
 ```
 
-Model files are downloaded and cached on first use.
+Model files are downloaded and cached on first use. The [standalone scoring example](../../examples/pipelines/proteinmpnn.py)
+writes named scores, their units and molecular scopes to JSON. Its `--model`
+argument also accepts a native local export.
+
 The [pipeline guide](../pipelines/README.md) describes preparation, execution,
 postprocessing and workflow composition. Use a family's concrete classes when
 you need direct access to its model or input processor.
@@ -91,7 +94,8 @@ the model family; processors without target preparation raise an error when a ta
 
 `prepare` combines these operations and returns `(input, target)`. Without an explicit target, it returns
 `(input, None)`. To use the source structure as truth, pass `target=structure` explicitly. Targets contain
-supervision values separately from the input features.
+supervision values separately from the input features. The [Runner guide](../runners/README.md#data-preparation)
+explains how objectives use these values for training and evaluation.
 
 ## Convert and Publish Weights
 

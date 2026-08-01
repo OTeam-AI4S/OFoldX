@@ -67,5 +67,6 @@ absent from that mapping.
 ## Related Modules
 
 - [Models](../models/README.md): each family's accepted MSA evidence and sampling controls.
+- [Runners](../runners/README.md): dataset manifests and indexed MSA configuration.
 - [Templates](../templates/README.md): aligned structural evidence.
 - [Data](../data/README.md): target instances, sequence classes, and token layouts.

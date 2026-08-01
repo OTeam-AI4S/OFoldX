@@ -148,7 +148,7 @@ combines the five released objectives: weighted coordinate error, covalent-bond 
 classification and binary token-bond prediction.
 
 These operations support custom training loops without reproducing the upstream data curation or complete training
-program. Known zero-occupancy
+program. The [Runner guide](https://github.com/OTeam-AI4S/OFoldX/blob/main/ofoldx/runners/README.md) describes input and target preparation. Known zero-occupancy
 coordinates are unresolved by default for conditioning and truth; set `filter_by_occupancy=False` to ignore occupancy.
 
 ## Citation

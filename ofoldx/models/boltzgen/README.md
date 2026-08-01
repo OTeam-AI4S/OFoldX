@@ -146,7 +146,9 @@ The structure designer learns from cropped structures with sampled design and co
 follows `sigma = sigma_data * exp(-1.2 + 1.5 * z)`, `z ~ N(0, 1)`, with EDM loss weight
 `(sigma^2 + sigma_data^2) / (sigma * sigma_data)^2`.
 
-The [`diffusion_loss`][ofoldx.models.boltzgen.diffusion_loss] function exposes the family coordinate objective.
+OFoldX's built-in Runner uses the shared aligned EDM coordinate error for structure generation. The separate
+[`diffusion_loss`][ofoldx.models.boltzgen.diffusion_loss] function exposes the fuller family coordinate objective;
+see the [Runner guide](https://github.com/OTeam-AI4S/OFoldX/blob/main/ofoldx/runners/README.md) for training and export.
 
 ### Coordinate Loss
 

@@ -69,6 +69,7 @@ SECTION_PACKAGES = {
     "Metrics": ("metrics", PACKAGE_ROOT / "metrics", "ofoldx.metrics"),
     "Pipelines": ("pipelines", PACKAGE_ROOT / "pipelines", "ofoldx.pipelines"),
     "Results": ("results", PACKAGE_ROOT / "results", "ofoldx.results"),
+    "Runners": ("runners", PACKAGE_ROOT / "runners", "ofoldx.runners"),
     "Task API": ("api", PACKAGE_ROOT / "api", "ofoldx.api"),
     "Templates": ("templates", PACKAGE_ROOT / "templates", "ofoldx.templates"),
 }
