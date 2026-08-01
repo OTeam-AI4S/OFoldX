@@ -153,6 +153,8 @@ def _lower_row(row: dict[str, object]) -> ChemicalComponent:
 
     bond_rows = _lower_bond_rows(row, component_id)
     reference_coordinates = _lower_reference_coordinates(row, component_id, count)
+    leaving_atom_ids = frozenset(_require_str_list(row, "leaving_atom_ids"))
+    non_leaving_atom_ids = frozenset(_require_str_list(row, "non_leaving_atom_ids"))
     previous_attachment = _lower_attachment(row, "previous")
     next_attachment = _lower_attachment(row, "next")
 
@@ -169,6 +171,8 @@ def _lower_row(row: dict[str, object]) -> ChemicalComponent:
         reference_coordinates=reference_coordinates,
         previous_attachment=previous_attachment,
         next_attachment=next_attachment,
+        leaving_atom_ids=leaving_atom_ids,
+        non_leaving_atom_ids=non_leaving_atom_ids,
     )
 
 

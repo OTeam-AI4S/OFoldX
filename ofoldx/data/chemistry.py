@@ -39,8 +39,8 @@ def to_rdkit_component(system: MolecularSystem, component_index: int) -> Mol:
     )
 
 
-def to_rdkit_system(system: MolecularSystem) -> Mol:
-    r"""Project and chemically validate every atom and bond in a molecular system."""
+def to_rdkit_system(system: MolecularSystem, *, sanitize: bool = True) -> Mol:
+    r"""Project every atom and bond, optionally applying RDKit chemical validation."""
 
     incomplete = (~system.component_topology_complete).nonzero(as_tuple=False).flatten()
     if incomplete.numel():
@@ -52,6 +52,7 @@ def to_rdkit_system(system: MolecularSystem) -> Mol:
         range(int(system.atom_symbol.numel())),
         range(int(system.edge_index.shape[1])),
         "molecular system",
+        sanitize=sanitize,
     )
 
 
@@ -60,6 +61,8 @@ def _to_rdkit_graph(
     atom_indices: Sequence[int],
     edge_rows: Sequence[int],
     description: str,
+    *,
+    sanitize: bool = True,
 ) -> Mol:
     r"""Build one RDKit graph from selected canonical tensor rows."""
 
@@ -134,6 +137,8 @@ def _to_rdkit_graph(
             bond_stereo.append((rdkit_bond.GetIdx(), system.symbols[stereo_index], stereo_atoms))
 
     molecule = editable.GetMol()
+    if not sanitize:
+        return molecule
     Chem.SanitizeMol(molecule)
     conformer = Chem.Conformer(len(atom_indices))
     reference_coordinates = system.reference_coordinates.detach().cpu()
@@ -170,9 +175,15 @@ def _to_rdkit_graph(
             second_neighbors = [
                 atom for atom in molecule.GetAtomWithIdx(second).GetNeighbors() if atom.GetIdx() != first
             ]
+            if not first_neighbors or not second_neighbors:
+                raise ValueError(f"{description} has bond stereo without retained defining atoms")
+
+            def cip_rank(atom: Chem.Atom) -> int:
+                return int(atom.GetProp("_CIPRank")) if atom.HasProp("_CIPRank") else atom.GetAtomicNum()
+
             stereo_atoms = (
-                max(first_neighbors, key=lambda atom: int(atom.GetProp("_CIPRank"))).GetIdx(),
-                max(second_neighbors, key=lambda atom: int(atom.GetProp("_CIPRank"))).GetIdx(),
+                max(first_neighbors, key=cip_rank).GetIdx(),
+                max(second_neighbors, key=cip_rank).GetIdx(),
             )
         bond.SetStereoAtoms(*stereo_atoms)
         try:
@@ -180,5 +191,5 @@ def _to_rdkit_graph(
         except KeyError:
             raise ValueError(f"{description} has unsupported bond stereo {stereo!r}") from None
         bond.SetStereo(stereo_type)
-    Chem.AssignStereochemistry(molecule, force=True, cleanIt=True)
+    Chem.AssignStereochemistry(molecule, force=True, cleanIt=False)
     return molecule

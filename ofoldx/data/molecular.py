@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Literal, NamedTuple, TypeAlias, TypeVar
 
 import torch
-from tensordict import tensorclass
+from tensordict import NonTensorData, tensorclass
 from torch import Tensor
 
 from .elements import ATOMIC_NUMBER_BY_ELEMENT
@@ -252,6 +252,9 @@ class ChemicalComponent:
         next_attachment: Endpoint connecting to the following polymer component.
         reference_coordinates: Optional coordinates aligned with ``atoms``; ``None``
             entries denote atoms without reference coordinates.
+        leaving_atom_ids: Atoms explicitly marked as leaving by the component source.
+        non_leaving_atom_ids: Atoms explicitly marked as non-leaving. Atoms in neither
+            set have an unknown leaving flag.
 
     Raises:
         ValueError: If atom identifiers, bonds, attachments, or reference coordinates
@@ -264,6 +267,8 @@ class ChemicalComponent:
     previous_attachment: PolymerAttachment | None = None
     next_attachment: PolymerAttachment | None = None
     reference_coordinates: tuple[tuple[float, float, float] | None, ...] = ()
+    leaving_atom_ids: frozenset[str] = frozenset()
+    non_leaving_atom_ids: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         atom_ids = {atom.atom_id for atom in self.atoms}
@@ -289,6 +294,12 @@ class ChemicalComponent:
                 raise ValueError("polymer attachment references an unknown atom")
             if attachment is not None and attachment.atom_id in attachment.leaving_atom_ids:
                 raise ValueError("a polymer attachment endpoint cannot also be a leaving atom")
+        if self.leaving_atom_ids & self.non_leaving_atom_ids:
+            raise ValueError("component leaving and non-leaving atom sets must be disjoint")
+        if not self.leaving_atom_ids <= atom_ids:
+            raise ValueError("component leaving atoms reference an unknown atom")
+        if not self.non_leaving_atom_ids <= atom_ids:
+            raise ValueError("component non-leaving atoms reference an unknown atom")
 
         if self.reference_coordinates and len(self.reference_coordinates) != len(self.atoms):
             raise ValueError("component reference coordinates must align with its atoms")
@@ -365,6 +376,8 @@ class ChemicalComponent:
                 if self.reference_coordinates
                 else ()
             ),
+            leaving_atom_ids=self.leaving_atom_ids & retained,
+            non_leaving_atom_ids=self.non_leaving_atom_ids & retained,
         )
 
 
@@ -1390,7 +1403,7 @@ class MolecularSystem:
         keep[tensor(sorted(removed_atoms), torch.int64)] = False
         if formed_endpoints & removed_atoms:
             raise ValueError("a bond endpoint cannot also be a leaving atom")
-        return _canonicalize_symbols(_atom_subgraph(graph, keep)[0])
+        return _canonicalize_symbols(atom_subgraph(graph, keep)[0])
 
     def _unique_index(self, values: Tensor, value: str) -> int:
         rows = [index for index, symbol in enumerate(values.tolist()) if self.symbols[symbol] == value]
@@ -1837,13 +1850,20 @@ def component_boundary_atoms(
     return tuple(tuple(sorted(values)) for values in grouped)
 
 
-def _atom_subgraph(
+def atom_subgraph(
     system: MolecularSystem,
     atom_mask: Tensor,
 ) -> tuple[MolecularSystem, Tensor]:
     r"""
     Keep selected atoms, compact atom indices, and return the old-to-new mapping.
     """
+
+    if atom_mask.dtype != torch.bool:
+        raise TypeError("atom_mask must have bool dtype")
+    if atom_mask.shape != system.atom_symbol.shape:
+        raise ValueError("atom_mask must have one value per atom")
+    if atom_mask.device != system.atom_symbol.device:
+        raise ValueError("atom_mask must be on the same device as the molecular system")
 
     old_to_new = torch.full(
         (system.atom_symbol.numel(),),
@@ -1892,51 +1912,182 @@ def _atom_subgraph(
         system.bond_stereo[edge_mask],
         torch.full_like(system.bond_stereo[edge_mask], -1),
     )
+    subgraph = MolecularSystem(  # type: ignore[call-arg]
+        symbols=system.symbols,
+        system_entity_ptr=system.system_entity_ptr,
+        system_instance_ptr=system.system_instance_ptr,
+        entity_symbol=system.entity_symbol,
+        entity_type=system.entity_type,
+        entity_molecule_type=system.entity_molecule_type,
+        instance_symbol=system.instance_symbol,
+        instance_entity=system.instance_entity,
+        instance_component_ptr=system.instance_component_ptr,
+        component_symbol=system.component_symbol,
+        component_topology_complete=system.component_topology_complete,
+        component_atom_ptr=component_atom_ptr,
+        atom_symbol=system.atom_symbol[atom_mask],
+        atomic_number=system.atomic_number[atom_mask],
+        isotope=system.isotope[atom_mask],
+        isotope_known=system.isotope_known[atom_mask],
+        formal_charge=system.formal_charge[atom_mask],
+        formal_charge_known=system.formal_charge_known[atom_mask],
+        radical_electrons=system.radical_electrons[atom_mask],
+        radical_electrons_known=system.radical_electrons_known[atom_mask],
+        explicit_hydrogens=system.explicit_hydrogens[atom_mask],
+        explicit_hydrogens_known=system.explicit_hydrogens_known[atom_mask],
+        implicit_hydrogens=system.implicit_hydrogens[atom_mask],
+        implicit_hydrogens_known=system.implicit_hydrogens_known[atom_mask],
+        implicit_hydrogens_allowed=system.implicit_hydrogens_allowed[atom_mask],
+        implicit_hydrogens_allowed_known=system.implicit_hydrogens_allowed_known[atom_mask],
+        atom_aromatic=system.atom_aromatic[atom_mask],
+        atom_aromatic_known=system.atom_aromatic_known[atom_mask],
+        atom_stereo=atom_stereo,
+        reference_coordinates=system.reference_coordinates[atom_mask],
+        reference_coordinate_mask=system.reference_coordinate_mask[atom_mask],
+        edge_index=old_to_new[system.edge_index[:, edge_mask]],
+        bond_order=system.bond_order[edge_mask],
+        bond_order_known=system.bond_order_known[edge_mask],
+        bond_aromatic=system.bond_aromatic[edge_mask],
+        bond_aromatic_known=system.bond_aromatic_known[edge_mask],
+        bond_kind=system.bond_kind[edge_mask],
+        bond_direction=system.bond_direction[edge_mask],
+        bond_role=system.bond_role[edge_mask],
+        bond_stereo=bond_stereo,
+        bond_stereo_index=stereo_index,
+        batch_size=[],
+    )
+    return subgraph, old_to_new
+
+
+def suppress_hydrogens(system: MolecularSystem) -> tuple[MolecularSystem, Tensor]:
+    r"""
+    Remove hydrogen vertices and fold ordinary terminal bonds into heavy-atom counts.
+
+    Bond formation and leaving-atom removal must happen before this projection. A
+    retained heavy atom receives one explicit-hydrogen count for every terminal,
+    covalently bound H/D/T vertex removed beside it. Disconnected neutral,
+    non-radical hydrogen-only species are removed without a replacement vertex;
+    isotope-specific atom metadata is intentionally absent from the
+    hydrogen-suppressed representation.
+
+    Returns:
+        The hydrogen-suppressed graph and the old-to-new atom-index mapping.
+
+    Raises:
+        ValueError: If a hydrogen has known nonzero charge or radical metadata,
+            has unknown charge or radical state while disconnected from heavy atoms,
+            or has a heavy-atom connection that cannot be represented as an explicit
+            hydrogen count.
+    """
+
+    hydrogen = system.atomic_number == ATOMIC_NUMBER_BY_ELEMENT["H"]
+    if not bool(hydrogen.any().item()):
+        return (
+            system,
+            torch.arange(
+                system.atom_symbol.numel(),
+                dtype=torch.int64,
+                device=system.atom_symbol.device,
+            ),
+        )
+
+    unrepresentable_hydrogen = hydrogen & (
+        (system.formal_charge_known & (system.formal_charge != 0))
+        | (system.radical_electrons_known & (system.radical_electrons != 0))
+    )
+    if bool(unrepresentable_hydrogen.any().item()):
+        raise ValueError("cannot suppress a charged or radical hydrogen")
+
+    hydrogen_endpoints = hydrogen[system.edge_index]
+    heavy_hydrogen_edge = hydrogen_endpoints.sum(0) == 1
+    selected_edges = torch.nonzero(heavy_hydrogen_edge, as_tuple=False).flatten()
+    if selected_edges.numel():
+        if bool((system.bond_kind[selected_edges] != BOND_KIND_COVALENT).any().item()):
+            raise ValueError("cannot suppress a hydrogen connected by a non-covalent bond")
+        if bool((~system.bond_order_known[selected_edges]).any().item()) or bool(
+            (system.bond_order[selected_edges] != 1).any().item()
+        ):
+            raise ValueError("cannot suppress a hydrogen connected by a non-single bond")
+
+    first_is_hydrogen = hydrogen[system.edge_index[0, selected_edges]]
+    heavy_neighbors = torch.where(
+        first_is_hydrogen,
+        system.edge_index[1, selected_edges],
+        system.edge_index[0, selected_edges],
+    )
+    hydrogen_neighbors = torch.where(
+        first_is_hydrogen,
+        system.edge_index[0, selected_edges],
+        system.edge_index[1, selected_edges],
+    )
+    connection_count = torch.zeros_like(system.atom_symbol)
+    connection_count.scatter_add_(
+        0,
+        hydrogen_neighbors,
+        torch.ones_like(hydrogen_neighbors),
+    )
+    if bool((connection_count[hydrogen] > 1).any().item()):
+        raise ValueError("cannot suppress a hydrogen connected to multiple heavy atoms")
+    ambiguous_hydrogen_only = (
+        hydrogen & (connection_count == 0) & (~system.formal_charge_known | ~system.radical_electrons_known)
+    )
+    if bool(ambiguous_hydrogen_only.any().item()):
+        raise ValueError("cannot suppress a hydrogen-only species with unknown charge or radical state")
+
+    edge_count = torch.zeros_like(system.atom_symbol)
+    edge_count.scatter_add_(0, system.edge_index.flatten(), torch.ones_like(system.edge_index).flatten())
+    if bool(((connection_count[hydrogen] > 0) & (edge_count[hydrogen] != 1)).any().item()):
+        raise ValueError("cannot suppress a hydrogen with additional bonds")
+
+    folded_count = torch.zeros_like(system.explicit_hydrogens)
+    folded_count.scatter_add_(
+        0,
+        heavy_neighbors,
+        torch.ones_like(heavy_neighbors, dtype=folded_count.dtype),
+    )
+    keep = ~hydrogen
+    suppressed, old_to_new = atom_subgraph(system, keep)
+    retained_folded_count = folded_count[keep]
+    explicit_hydrogens = torch.where(
+        suppressed.explicit_hydrogens_known,
+        suppressed.explicit_hydrogens + retained_folded_count,
+        retained_folded_count,
+    )
+    explicit_hydrogens_known = suppressed.explicit_hydrogens_known | (retained_folded_count > 0)
+
+    # Removing an ordinary terminal H changes only its representation. Restore
+    # stereochemistry that the generic induced-subgraph operation conservatively
+    # clears, but do not do so for isotope-defined stereochemistry.
+    ordinary_hydrogen = hydrogen & (~system.isotope_known | (system.isotope == 1))
+    safe_stereo_hydrogen = ordinary_hydrogen & (connection_count == 1) & (edge_count == 1)
+    removed_neighbors = torch.zeros_like(system.atom_symbol)
+    safe_removed_neighbors = torch.zeros_like(system.atom_symbol)
+    removed_neighbors.scatter_add_(0, heavy_neighbors, torch.ones_like(heavy_neighbors))
+    safe_removed_neighbors.scatter_add_(
+        0,
+        heavy_neighbors,
+        safe_stereo_hydrogen[hydrogen_neighbors].to(safe_removed_neighbors.dtype),
+    )
+    atom_stereo = suppressed.atom_stereo.clone()
+    restore_atom_stereo = (removed_neighbors[keep] > 0) & (removed_neighbors[keep] == safe_removed_neighbors[keep])
+    atom_stereo[restore_atom_stereo] = system.atom_stereo[keep][restore_atom_stereo]
+
+    retained_edges = keep[system.edge_index].all(0)
+    original_stereo_sites = system.bond_stereo_index[:, retained_edges]
+    removed_stereo_sites = original_stereo_sites >= 0
+    removed_stereo_sites &= hydrogen[original_stereo_sites.clamp_min(0)]
+    safe_removed_stereo_sites = safe_stereo_hydrogen[original_stereo_sites.clamp_min(0)]
+    restore_bond_stereo = removed_stereo_sites.any(0) & ((~removed_stereo_sites | safe_removed_stereo_sites).all(0))
+    bond_stereo = suppressed.bond_stereo.clone()
+    bond_stereo[restore_bond_stereo] = system.bond_stereo[retained_edges][restore_bond_stereo]
+    suppressed = suppressed.replace(  # type: ignore[attr-defined]
+        explicit_hydrogens=explicit_hydrogens,
+        explicit_hydrogens_known=explicit_hydrogens_known,
+        atom_stereo=atom_stereo,
+        bond_stereo=bond_stereo,
+    )
     return (
-        MolecularSystem(  # type: ignore[call-arg]
-            symbols=system.symbols,
-            system_entity_ptr=system.system_entity_ptr,
-            system_instance_ptr=system.system_instance_ptr,
-            entity_symbol=system.entity_symbol,
-            entity_type=system.entity_type,
-            entity_molecule_type=system.entity_molecule_type,
-            instance_symbol=system.instance_symbol,
-            instance_entity=system.instance_entity,
-            instance_component_ptr=system.instance_component_ptr,
-            component_symbol=system.component_symbol,
-            component_topology_complete=system.component_topology_complete,
-            component_atom_ptr=component_atom_ptr,
-            atom_symbol=system.atom_symbol[atom_mask],
-            atomic_number=system.atomic_number[atom_mask],
-            isotope=system.isotope[atom_mask],
-            isotope_known=system.isotope_known[atom_mask],
-            formal_charge=system.formal_charge[atom_mask],
-            formal_charge_known=system.formal_charge_known[atom_mask],
-            radical_electrons=system.radical_electrons[atom_mask],
-            radical_electrons_known=system.radical_electrons_known[atom_mask],
-            explicit_hydrogens=system.explicit_hydrogens[atom_mask],
-            explicit_hydrogens_known=system.explicit_hydrogens_known[atom_mask],
-            implicit_hydrogens=system.implicit_hydrogens[atom_mask],
-            implicit_hydrogens_known=system.implicit_hydrogens_known[atom_mask],
-            implicit_hydrogens_allowed=system.implicit_hydrogens_allowed[atom_mask],
-            implicit_hydrogens_allowed_known=system.implicit_hydrogens_allowed_known[atom_mask],
-            atom_aromatic=system.atom_aromatic[atom_mask],
-            atom_aromatic_known=system.atom_aromatic_known[atom_mask],
-            atom_stereo=atom_stereo,
-            reference_coordinates=system.reference_coordinates[atom_mask],
-            reference_coordinate_mask=system.reference_coordinate_mask[atom_mask],
-            edge_index=old_to_new[system.edge_index[:, edge_mask]],
-            bond_order=system.bond_order[edge_mask],
-            bond_order_known=system.bond_order_known[edge_mask],
-            bond_aromatic=system.bond_aromatic[edge_mask],
-            bond_aromatic_known=system.bond_aromatic_known[edge_mask],
-            bond_kind=system.bond_kind[edge_mask],
-            bond_direction=system.bond_direction[edge_mask],
-            bond_role=system.bond_role[edge_mask],
-            bond_stereo=bond_stereo,
-            bond_stereo_index=stereo_index,
-            batch_size=[],
-        ),
+        _canonicalize_symbols(suppressed),
         old_to_new,
     )
 
@@ -2958,7 +3109,7 @@ def replace_components(
         )
     else:
         keep[replacement_system.atom_symbol.new_tensor(sorted(leaving_atoms))] = False
-        lowered_replacements, raw_to_lowered = _atom_subgraph(
+        lowered_replacements, raw_to_lowered = atom_subgraph(
             replacement_system,
             keep,
         )
@@ -3171,7 +3322,7 @@ def form_bond(
     keep[leaving_b] = False
     if not bool(keep[atom_a].item()) or not bool(keep[atom_b].item()):
         raise ValueError("a bond endpoint cannot also be a leaving atom")
-    edited, old_to_new = _atom_subgraph(system, keep)
+    edited, old_to_new = atom_subgraph(system, keep)
     atom_a = int(old_to_new[atom_a].item())
     atom_b = int(old_to_new[atom_b].item())
     stereo_a, stereo_b = (
@@ -3252,7 +3403,7 @@ def form_bond(
     implicit_hydrogens_known[endpoints] &= edited.implicit_hydrogens[endpoints] == 0
     return (
         edited.replace(  # type: ignore[attr-defined]
-            symbols=symbols,
+            symbols=NonTensorData(symbols),
             atom_stereo=atom_stereo,
             explicit_hydrogens_known=explicit_hydrogens_known,
             implicit_hydrogens_known=implicit_hydrogens_known,

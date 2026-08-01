@@ -65,6 +65,7 @@ from .molecular import (
     PolymerSequence,
     PolymerType,
     SystemBond,
+    atom_subgraph,
     component_boundary_atoms,
     copy_components,
     disjoint_union,
@@ -72,6 +73,7 @@ from .molecular import (
     instance_subgraph,
     is_water_component,
     replace_components,
+    suppress_hydrogens,
     water_component_mask,
 )
 from .placement import (
@@ -158,6 +160,7 @@ __all__ = [
     "SymbolicAtomSite",
     "SymbolicResidueSite",
     "SystemBond",
+    "atom_subgraph",
     "Template",
     "TemplateAlignment",
     "TiedResidueIdentities",
@@ -174,6 +177,7 @@ __all__ = [
     "msa_residue_index",
     "replace_components",
     "save_structure",
+    "suppress_hydrogens",
     "validate_placement",
     "water_component_mask",
 ]

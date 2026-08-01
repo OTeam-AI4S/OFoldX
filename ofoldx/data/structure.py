@@ -16,12 +16,12 @@ from safetensors.torch import save_file
 from tensordict import tensorclass
 from torch import Tensor
 
-from .molecular import MolecularSystem, PolymerType
+from .molecular import MolecularSystem, PolymerType, atom_subgraph, suppress_hydrogens
 
 STRUCTURE_ARTIFACT_SUFFIX = ".structure.safetensors"
 
 _STRUCTURE_ARTIFACT_FORMAT = "ofoldx.structure"
-_STRUCTURE_ARTIFACT_VERSION = "3"
+_STRUCTURE_ARTIFACT_VERSION = "4"
 
 RESOLUTION_KIND_UNKNOWN = 0
 RESOLUTION_KIND_REFINEMENT = 1
@@ -53,11 +53,21 @@ class Structure:
     residue_id: Tensor
     insertion_code: Tensor
     standard_component_id: Tensor
+    source_formal_charge_mask: Tensor = field(default_factory=lambda: torch.empty(0, dtype=torch.bool))
     system_resolution_ptr: Tensor = field(default_factory=lambda: torch.empty(0, dtype=torch.int64))
     resolution: Tensor = field(default_factory=lambda: torch.empty(0, dtype=torch.float64))
     resolution_kind: Tensor = field(default_factory=lambda: torch.empty(0, dtype=torch.uint8))
 
     def __post_init__(self) -> None:
+        atom_count = int(self.system.atom_symbol.numel())
+        if not self.source_formal_charge_mask.numel():
+            self.source_formal_charge_mask = torch.zeros(
+                atom_count,
+                dtype=torch.bool,
+                device=self.coordinates.device,
+            )
+        if self.source_formal_charge_mask.shape != (atom_count,):
+            raise ValueError("source_formal_charge_mask must have one value per atom")
         system_count = int(self.system.system_entity_ptr.numel()) - 1
         if not self.system_resolution_ptr.numel() and not self.resolution.numel() and not self.resolution_kind.numel():
             self.system_resolution_ptr = torch.zeros(
@@ -177,10 +187,47 @@ class Structure:
             residue_id=move(self.residue_id),
             insertion_code=move(self.insertion_code),
             standard_component_id=move(self.standard_component_id),
+            source_formal_charge_mask=move(self.source_formal_charge_mask),
             system_resolution_ptr=move(self.system_resolution_ptr),
             resolution=move(self.resolution),
             resolution_kind=move(self.resolution_kind),
             batch_size=[],
+        )
+
+    def atom_subgraph(self, atom_mask: Tensor) -> tuple[Structure, Tensor]:
+        r"""Keep selected atoms while preserving every atom-aligned field."""
+
+        system, old_to_new = atom_subgraph(self.system, atom_mask)
+        return (
+            self.replace(  # type: ignore[attr-defined]
+                system=system,
+                coordinates=self.coordinates[atom_mask],
+                coordinate_mask=self.coordinate_mask[atom_mask],
+                occupancy=self.occupancy[atom_mask],
+                occupancy_mask=self.occupancy_mask[atom_mask],
+                b_factor=self.b_factor[atom_mask],
+                b_factor_mask=self.b_factor_mask[atom_mask],
+                source_formal_charge_mask=self.source_formal_charge_mask[atom_mask],
+            ),
+            old_to_new,
+        )
+
+    def suppress_hydrogens(self) -> Structure:
+        r"""Return the same realization with hydrogen vertices folded into heavy atoms."""
+
+        system, old_to_new = suppress_hydrogens(self.system)
+        if system is self.system:
+            return self
+        keep = old_to_new >= 0
+        return self.replace(  # type: ignore[attr-defined]
+            system=system,
+            coordinates=self.coordinates[keep],
+            coordinate_mask=self.coordinate_mask[keep],
+            occupancy=self.occupancy[keep],
+            occupancy_mask=self.occupancy_mask[keep],
+            b_factor=self.b_factor[keep],
+            b_factor_mask=self.b_factor_mask[keep],
+            source_formal_charge_mask=self.source_formal_charge_mask[keep],
         )
 
     def float(self) -> Structure:
@@ -246,6 +293,7 @@ class Structure:
             residue_id=torch.cat(residue_ids),
             insertion_code=torch.cat(insertion_codes),
             standard_component_id=torch.cat(standard_component_ids),
+            source_formal_charge_mask=torch.cat([structure.source_formal_charge_mask for structure in structures]),
             system_resolution_ptr=torch.cat(
                 [
                     resolution_counts.new_zeros(1),
@@ -322,6 +370,7 @@ class Structure:
                     residue_id=remapped_residue_id,
                     insertion_code=remapped_insertion_code,
                     standard_component_id=remapped_standard_component_id,
+                    source_formal_charge_mask=self.source_formal_charge_mask[atom_start:atom_stop],
                     system_resolution_ptr=self.system_resolution_ptr.new_tensor(
                         [0, resolution_stop - resolution_start]
                     ),

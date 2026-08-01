@@ -1,5 +1,5 @@
 r"""
-Canonical neutral-element symbols and their 1-based atomic numbers.
+Canonical element symbols and the source-level unknown atom type.
 """
 
 from __future__ import annotations
@@ -14,9 +14,15 @@ _ELEMENTS = tuple(
     ).split()
 )
 
-#: Neutral element symbols mapped to their one-based atomic numbers.
-ATOMIC_NUMBER_BY_ELEMENT = {element: index for index, element in enumerate(_ELEMENTS, start=1)}
+#: Element symbols mapped to atomic numbers. ``X`` preserves a source atom whose
+#: element is explicitly unknown; it is not inferred to be any real element.
+ATOMIC_NUMBER_BY_ELEMENT = {
+    "X": 0,
+    **{element: index for index, element in enumerate(_ELEMENTS, start=1)},
+}
 
-#: Elements that never act as the metal center of a coordination bond: the non-metals,
-#: the noble gases, and the metalloids. Every other element is treated as a metal.
-NON_METAL_ELEMENTS = frozenset("H He B C N O F Ne Si P S Cl Ar Ge As Se Br Kr Sb Te I Xe At Rn".split())  # noqa: SIM905
+#: Symbols never inferred to be the metal center of a coordination bond: the unknown
+#: atom type, non-metals, noble gases, and metalloids. Every other element is a metal.
+NON_METAL_ELEMENTS = frozenset(
+    "X H He B C N O F Ne Si P S Cl Ar Ge As Se Br Kr Sb Te I Xe At Rn".split()  # noqa: SIM905
+)

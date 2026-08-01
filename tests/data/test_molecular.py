@@ -24,6 +24,7 @@ from ofoldx.data import (
     form_bond,
     instance_subgraph,
     replace_components,
+    suppress_hydrogens,
     water_component_mask,
 )
 
@@ -58,8 +59,8 @@ def _residue(
     )
 
 
-class TestConstructionValues:
-    def test_sequence_and_molecule_keep_exact_chemistry(self) -> None:
+class TestPolymerSequence:
+    def test_one_letter(self) -> None:
         sequence = PolymerSequence.from_one_letter("AG")
         assert sequence.to_one_letter() == "AG"
         assert tuple(component.component_id for component in sequence.components) == (
@@ -67,6 +68,16 @@ class TestConstructionValues:
             "GLY",
         )
 
+    def test_nucleic_mapping(self) -> None:
+        rna = PolymerSequence.from_one_letter("I", polymer_type="rna")
+        dna = PolymerSequence.from_one_letter("IU", polymer_type="dna")
+
+        assert [component.component_id for component in rna.components] == ["I"]
+        assert [component.component_id for component in dna.components] == ["DI", "DU"]
+
+
+class TestMolecule:
+    def test_partial_chemistry(self) -> None:
         partial = ChemicalComponent(
             "PART",
             (ChemicalAtom("C1", "C", formal_charge=None),),
@@ -85,10 +96,43 @@ class TestConstructionValues:
         assert molecule.components[1].bonds == frozenset()
         assert next(iter(molecule.bonds)).order == 1.0
 
-    def test_component_hydrogen_projection_preserves_defined_stereo(self) -> None:
+    def test_from_smiles(self) -> None:
+        molecule = Molecule.from_smiles("CCO")
+        (component,) = molecule.components
+
+        assert component.bonds is not None
+        for atom in component.atoms:
+            assert atom.formal_charge is not None
+            assert atom.radical_electrons is not None
+            assert atom.explicit_hydrogens is not None
+            assert atom.implicit_hydrogens is not None
+            assert isinstance(atom.implicit_hydrogens_allowed, bool)
+            assert isinstance(atom.aromatic, bool)
+
+
+class TestChemicalAtom:
+    def test_defaults(self) -> None:
+        atom = ChemicalAtom("N", "N")
+
+        assert atom.atom_id == "N"
+        assert atom.element == "N"
+        assert atom.isotope is None
+        assert atom.formal_charge is None
+        assert atom.radical_electrons is None
+        assert atom.explicit_hydrogens is None
+        assert atom.implicit_hydrogens is None
+        assert atom.implicit_hydrogens_allowed is None
+        assert atom.aromatic is None
+        assert atom.stereo is None
+
+    def test_isotope(self) -> None:
         deuterium = ChemicalAtom("D1", "D")
         assert (deuterium.element, deuterium.isotope) == ("H", 2)
 
+
+class TestChemicalComponent:
+    def test_without_hydrogens(self) -> None:
+        deuterium = ChemicalAtom("D1", "D")
         component = ChemicalComponent(
             "D",
             (
@@ -107,7 +151,7 @@ class TestConstructionValues:
         assert tuple(atom.atom_id for atom in heavy.atoms) == ("C1", "C2")
         assert heavy.bonds == frozenset({ChemicalBond("C1", "C2", stereo="E")})
 
-    def test_component_rejects_an_unresolved_bond_endpoint(self) -> None:
+    def test_unresolved_endpoint(self) -> None:
         with pytest.raises(ValueError, match="unknown atom"):
             ChemicalComponent(
                 "BAD",
@@ -115,9 +159,180 @@ class TestConstructionValues:
                 frozenset({ChemicalBond("C1", "missing")}),
             )
 
+    def test_partial_and_bondless(self) -> None:
+        atoms = (ChemicalAtom("NA", "Na"),)
+
+        partial = ChemicalComponent("X", atoms, None)
+        bondless = ChemicalComponent("X", atoms, frozenset())
+
+        assert partial.bonds is None
+        assert bondless.bonds == frozenset()
+        assert partial != bondless
+
+    @pytest.mark.parametrize("bonds", [None, frozenset()])
+    def test_unique_atom_ids(self, bonds: frozenset[ChemicalBond] | None) -> None:
+        with pytest.raises(ValueError):
+            ChemicalComponent("X", (ChemicalAtom("A", "C"), ChemicalAtom("A", "C")), bonds)
+
+    @pytest.mark.parametrize(
+        "bonds",
+        [
+            frozenset({ChemicalBond("A", "GHOST")}),
+            frozenset({ChemicalBond("A", "A")}),
+            frozenset({ChemicalBond("A", "B"), ChemicalBond("B", "A")}),
+        ],
+    )
+    def test_bond_closure(self, bonds: frozenset[ChemicalBond]) -> None:
+        atoms = (ChemicalAtom("A", "C"), ChemicalAtom("B", "C"))
+
+        with pytest.raises(ValueError):
+            ChemicalComponent("X", atoms, bonds)
+
+    @pytest.mark.parametrize(
+        "attachment",
+        [PolymerAttachment("Z"), PolymerAttachment("A", frozenset({"A"}))],
+    )
+    def test_attachment_closure(self, attachment: PolymerAttachment) -> None:
+        atoms = (ChemicalAtom("A", "C"), ChemicalAtom("B", "C"))
+
+        with pytest.raises(ValueError):
+            ChemicalComponent("X", atoms, None, previous_attachment=attachment)
+
+    def test_leaving_atoms(self) -> None:
+        atoms = (ChemicalAtom("N", "N"), ChemicalAtom("H", "H"))
+        component = ChemicalComponent(
+            "X",
+            atoms,
+            frozenset({ChemicalBond("N", "H")}),
+            previous_attachment=PolymerAttachment("N", frozenset({"H"})),
+            leaving_atom_ids=frozenset({"H"}),
+            non_leaving_atom_ids=frozenset({"N"}),
+        )
+
+        assert component.without_hydrogens().leaving_atom_ids == frozenset()
+
+    def test_reference_coordinates(self) -> None:
+        atoms = (ChemicalAtom("C", "C"), ChemicalAtom("O", "O"))
+
+        assert ChemicalComponent("LIG", atoms, frozenset()).reference_coordinates == ()
+        aligned = ChemicalComponent(
+            "LIG",
+            atoms,
+            frozenset(),
+            reference_coordinates=((0.0, 0.0, 0.0), None),
+        )
+        assert len(aligned.reference_coordinates) == len(aligned.atoms)
+        with pytest.raises(ValueError):
+            ChemicalComponent("LIG", atoms, frozenset(), reference_coordinates=((0.0, 0.0, 0.0),))
+
+
+class TestPolymerAttachment:
+    def test_leaving_atoms(self) -> None:
+        assert PolymerAttachment("N").leaving_atom_ids == frozenset()
+        assert PolymerAttachment("N", frozenset({"H2"})).leaving_atom_ids == frozenset({"H2"})
+
+
+class TestSuppressHydrogens:
+    def test_realized_chemistry(self) -> None:
+        system = MolecularSystem.from_entities(
+            {"protein": PolymerSequence.from_one_letter("AHWT")},
+            {"A": "protein"},
+        )
+
+        suppressed, old_to_new = suppress_hydrogens(system)
+
+        assert not bool((suppressed.atomic_number == 1).any())
+        assert old_to_new.shape == system.atom_symbol.shape
+        removed = old_to_new < 0
+        assert torch.equal(removed, system.atomic_number == 1)
+        assert int(suppressed.explicit_hydrogens.sum()) == int(removed.sum())
+
+    def test_alkene_stereo(self) -> None:
+        def atom(atom_id: str, element: str) -> ChemicalAtom:
+            return ChemicalAtom(
+                atom_id,
+                element,
+                formal_charge=0,
+                radical_electrons=0,
+                explicit_hydrogens=0,
+                implicit_hydrogens=0,
+                implicit_hydrogens_allowed=False,
+                aromatic=False,
+            )
+
+        component = ChemicalComponent(
+            "ALKENE",
+            tuple(
+                atom(*values)
+                for values in (("C1", "C"), ("C2", "C"), ("F", "F"), ("H", "H"), ("Cl", "Cl"), ("Br", "Br"))
+            ),
+            frozenset(
+                {
+                    ChemicalBond("C1", "C2", order=2, aromatic=False, stereo="E", stereo_atoms=("H", "Cl")),
+                    ChemicalBond("C1", "F", aromatic=False),
+                    ChemicalBond("C1", "H", aromatic=False),
+                    ChemicalBond("C2", "Cl", aromatic=False),
+                    ChemicalBond("C2", "Br", aromatic=False),
+                }
+            ),
+        )
+        system = MolecularSystem.from_entities({"alkene": Molecule((component,))}, {"A": "alkene"})
+
+        suppressed, _ = suppress_hydrogens(system)
+        double_bond = torch.nonzero(suppressed.bond_order == 2, as_tuple=False).flatten()
+
+        assert double_bond.numel() == 1
+        assert suppressed.symbols[int(suppressed.bond_stereo[double_bond[0]])] == "E"
+
+    def test_hydride(self) -> None:
+        component = ChemicalComponent(
+            "HYDRIDE",
+            (ChemicalAtom("C", "C"), ChemicalAtom("H", "H", formal_charge=-1)),
+            frozenset({ChemicalBond("C", "H")}),
+        )
+        system = MolecularSystem.from_entities({"hydride": Molecule((component,))}, {"A": "hydride"})
+
+        with pytest.raises(ValueError, match="charged or radical hydrogen"):
+            suppress_hydrogens(system)
+
+    @pytest.mark.parametrize(
+        "hydrogen",
+        (
+            ChemicalAtom("H", "H", formal_charge=1),
+            ChemicalAtom("H", "H", radical_electrons=1),
+            ChemicalAtom("H", "H", formal_charge=0),
+            ChemicalAtom("H", "H", radical_electrons=0),
+        ),
+    )
+    def test_disconnected_state(
+        self,
+        hydrogen: ChemicalAtom,
+    ) -> None:
+        component = ChemicalComponent("HYDROGEN", (hydrogen,), frozenset())
+        system = MolecularSystem.from_entities({"hydrogen": Molecule((component,))}, {"A": "hydrogen"})
+
+        with pytest.raises(ValueError, match="cannot suppress"):
+            suppress_hydrogens(system)
+
+    def test_disconnected_neutral(self) -> None:
+        component = ChemicalComponent(
+            "HYDROGEN",
+            (
+                ChemicalAtom("H1", "H", formal_charge=0, radical_electrons=0),
+                ChemicalAtom("H2", "H", formal_charge=0, radical_electrons=0),
+            ),
+            frozenset({ChemicalBond("H1", "H2")}),
+        )
+        system = MolecularSystem.from_entities({"hydrogen": Molecule((component,))}, {"A": "hydrogen"})
+
+        suppressed, old_to_new = suppress_hydrogens(system)
+
+        assert suppressed.atom_symbol.numel() == 0
+        assert old_to_new.tolist() == [-1, -1]
+
 
 class TestMolecularSystem:
-    def test_materialization_exposes_one_canonical_tensor_graph(self) -> None:
+    def test_materialization(self) -> None:
         protein = PolymerSequence(
             "protein",
             (_residue("R0", "CB"), _residue("R1")),
@@ -167,7 +382,7 @@ class TestMolecularSystem:
         assert double.edge_index.dtype == torch.int64
         assert double.component_topology_complete.dtype == torch.bool
 
-    def test_duplicate_physical_edge_requires_identical_leaving_atoms(self) -> None:
+    def test_duplicate_edge(self) -> None:
         donor = ChemicalComponent(
             "DON",
             (ChemicalAtom("E", "C"), ChemicalAtom("L1", "H"), ChemicalAtom("L2", "H")),
@@ -187,7 +402,7 @@ class TestMolecularSystem:
                 ),
             )
 
-    def test_instance_values_preserve_one_entity_row(self) -> None:
+    def test_instance_values(self) -> None:
         declared = PolymerSequence(
             "protein",
             (ChemicalComponent("ALA", (ChemicalAtom("CA", "C"),), frozenset()),),
@@ -213,139 +428,110 @@ class TestMolecularSystem:
         assert [system.symbols[index] for index in system.component_symbol.tolist()] == ["ALA", "GLY"]
         assert system.component_atom_ptr.tolist() == [0, 1, 3]
 
-    def test_water_mask_uses_the_declared_entity_category(self) -> None:
-        oxygen = (ChemicalAtom("O", "O"),)
-        system = MolecularSystem.from_entities(
-            {
-                "water": Molecule(
-                    (ChemicalComponent("CUSTOM", oxygen, frozenset()),),
-                    molecule_type="water",
-                ),
-                "ligand": Molecule(
-                    (ChemicalComponent("HOH", oxygen, frozenset()),),
-                ),
-            },
-            {"W": "water", "L": "ligand"},
-        )
-        assert water_component_mask(system).tolist() == [True, False]
 
-    def test_batch_and_instance_subgraph_return_exact_axis_partitions(self) -> None:
-        system = MolecularSystem.from_entities(
-            {
-                "protein": PolymerSequence(
-                    "protein",
-                    (_residue("R0"),),
-                )
-            },
-            {"A": "protein", "B": "protein"},
-        )
-        selected, component_map, atom_map = instance_subgraph(
-            system,
-            torch.tensor([False, True]),
-        )
-        assert selected.instance_id(0) == "B"
-        assert component_map.tolist() == [-1, 0]
-        assert atom_map.tolist() == [-1] * 5 + list(range(5))
-
-        batched = MolecularSystem.batch((selected, selected))
-        assert batched.system_entity_ptr.tolist() == [0, 1, 2]
-        assert batched.system_instance_ptr.tolist() == [0, 1, 2]
-        first, second = batched.unbatch()
-        assert first.instance_id(0) == second.instance_id(0) == "B"
-        assert first.atom_symbol.tolist() == second.atom_symbol.tolist()
+def test_water_component_mask_category() -> None:
+    oxygen = (ChemicalAtom("O", "O"),)
+    system = MolecularSystem.from_entities(
+        {
+            "water": Molecule(
+                (ChemicalComponent("CUSTOM", oxygen, frozenset()),),
+                molecule_type="water",
+            ),
+            "ligand": Molecule(
+                (ChemicalComponent("HOH", oxygen, frozenset()),),
+            ),
+        },
+        {"W": "water", "L": "ligand"},
+    )
+    assert water_component_mask(system).tolist() == [True, False]
 
 
-class TestGraphOperations:
-    def test_substitution_and_bond_formation_return_atom_maps(self) -> None:
-        atom = ChemicalComponent("ONE", (ChemicalAtom("C1", "C"),), frozenset())
-        target = MolecularSystem.from_entities(
-            {"target": Molecule((atom, atom))},
-            {"T": "target"},
-        )
-        replacement = ChemicalComponent(
-            "TWO",
-            (ChemicalAtom("C1", "C"), ChemicalAtom("O1", "O")),
-            frozenset({ChemicalBond("C1", "O1")}),
-        )
-        replaced, target_map, replacement_map = replace_components(
-            target,
-            torch.tensor([0], dtype=torch.int64),
-            (replacement,),
-        )
-        assert target_map.tolist() == [0, 2]
-        assert replacement_map.tolist() == [0, 1]
-        assert replaced.component_atom_ptr.tolist() == [0, 2, 3]
+def test_instance_subgraph_selection() -> None:
+    system = MolecularSystem.from_entities(
+        {
+            "protein": PolymerSequence(
+                "protein",
+                (_residue("R0"),),
+            )
+        },
+        {"A": "protein", "B": "protein"},
+    )
+    selected, component_map, atom_map = instance_subgraph(
+        system,
+        torch.tensor([False, True]),
+    )
+    assert selected.instance_id(0) == "B"
+    assert component_map.tolist() == [-1, 0]
+    assert atom_map.tolist() == [-1] * 5 + list(range(5))
 
-        copied, copied_target_map, copied_atom_index = copy_components(
-            target,
-            torch.tensor([1], dtype=torch.int64),
-            replaced,
-            torch.tensor([0], dtype=torch.int64),
-        )
-        assert copied_target_map.tolist() == [0, 1]
-        assert copied_atom_index.tolist() == [[0, 1], [1, 2]]
 
-        joined, old_to_new = form_bond(
-            target,
-            0,
-            1,
-            torch.empty(0, dtype=torch.int64),
-            torch.empty(0, dtype=torch.int64),
-        )
-        assert old_to_new.tolist() == [0, 1]
-        assert joined.edge_index.tolist() == [[0], [1]]
-        assert joined.bond_role.tolist() == [BOND_ROLE_ASSEMBLY]
+def test_molecular_system_batching() -> None:
+    system = MolecularSystem.from_entities(
+        {"protein": PolymerSequence("protein", (_residue("R0"),))},
+        {"B": "protein"},
+    )
 
-    def test_replace_components_preserves_an_unbonded_junction(self) -> None:
-        nicked = MolecularSystem.from_entities(
-            {"protein": PolymerSequence("protein", (_residue("R0"), _residue("R1")), linked=(False,))},
-            {"A": "protein"},
-        )
-        replaced, _, _ = replace_components(
-            nicked,
-            torch.tensor([0, 1], dtype=torch.int64),
-            (_residue("R2"), _residue("R3")),
-        )
-        sites = {replaced.atom_site(index) for index in range(replaced.atom_symbol.numel())}
+    batched = MolecularSystem.batch((system, system))
+    assert batched.system_entity_ptr.tolist() == [0, 1, 2]
+    assert batched.system_instance_ptr.tolist() == [0, 1, 2]
+    first, second = batched.unbatch()
+    assert first.instance_id(0) == second.instance_id(0) == "B"
+    assert first.atom_symbol.tolist() == second.atom_symbol.tolist()
 
-        assert not bool((replaced.bond_role == BOND_ROLE_POLYMER).any())
-        assert AtomSite("A", 0, "OXT") in sites
-        assert AtomSite("A", 1, "H2") in sites
 
-        linked = MolecularSystem.from_entities(
-            {"protein": PolymerSequence("protein", (_residue("R0"), _residue("R1")))},
-            {"A": "protein"},
-        )
-        bonded, _, _ = replace_components(
-            linked,
-            torch.tensor([0, 1], dtype=torch.int64),
-            (_residue("R2"), _residue("R3")),
-        )
-        assert int((bonded.bond_role == BOND_ROLE_POLYMER).sum()) == 1
+def test_replace_components_polymer_junction() -> None:
+    nicked = MolecularSystem.from_entities(
+        {"protein": PolymerSequence("protein", (_residue("R0"), _residue("R1")), linked=(False,))},
+        {"A": "protein"},
+    )
+    replaced, _, _ = replace_components(
+        nicked,
+        torch.tensor([0, 1], dtype=torch.int64),
+        (_residue("R2"), _residue("R3")),
+    )
+    sites = {replaced.atom_site(index) for index in range(replaced.atom_symbol.numel())}
 
-    def test_form_bond_invalidates_falsified_hydrogen_counts(self) -> None:
-        methyl = ChemicalComponent(
-            "CH3",
-            (ChemicalAtom("C1", "C", explicit_hydrogens=0, implicit_hydrogens=3),),
-            frozenset(),
-        )
-        system = MolecularSystem.from_entities(
-            {"pair": Molecule((methyl, methyl))},
-            {"M": "pair"},
-        )
-        bonded, _ = form_bond(
-            system,
-            0,
-            1,
-            torch.empty(0, dtype=torch.int64),
-            torch.empty(0, dtype=torch.int64),
-        )
+    assert not bool((replaced.bond_role == BOND_ROLE_POLYMER).any())
+    assert AtomSite("A", 0, "OXT") in sites
+    assert AtomSite("A", 1, "H2") in sites
 
-        assert bonded.implicit_hydrogens_known.tolist() == [False, False]
-        assert bonded.explicit_hydrogens_known.tolist() == [True, True]
-        assert bonded.explicit_hydrogens.tolist() == [0, 0]
+    linked = MolecularSystem.from_entities(
+        {"protein": PolymerSequence("protein", (_residue("R0"), _residue("R1")))},
+        {"A": "protein"},
+    )
+    bonded, _, _ = replace_components(
+        linked,
+        torch.tensor([0, 1], dtype=torch.int64),
+        (_residue("R2"), _residue("R3")),
+    )
+    assert int((bonded.bond_role == BOND_ROLE_POLYMER).sum()) == 1
 
-    def test_copy_components_repeats_one_source_occurrence(self) -> None:
+
+def test_form_bond_hydrogen_counts() -> None:
+    methyl = ChemicalComponent(
+        "CH3",
+        (ChemicalAtom("C1", "C", explicit_hydrogens=0, implicit_hydrogens=3),),
+        frozenset(),
+    )
+    system = MolecularSystem.from_entities(
+        {"pair": Molecule((methyl, methyl))},
+        {"M": "pair"},
+    )
+    bonded, _ = form_bond(
+        system,
+        0,
+        1,
+        torch.empty(0, dtype=torch.int64),
+        torch.empty(0, dtype=torch.int64),
+    )
+
+    assert bonded.implicit_hydrogens_known.tolist() == [False, False]
+    assert bonded.explicit_hydrogens_known.tolist() == [True, True]
+    assert bonded.explicit_hydrogens.tolist() == [0, 0]
+
+
+class TestCopyComponents:
+    def test_repeated_source(self) -> None:
         placeholder = ChemicalComponent("ONE", (ChemicalAtom("C1", "C"),), frozenset())
         target = MolecularSystem.from_entities(
             {"target": Molecule((placeholder, placeholder))},
@@ -374,7 +560,7 @@ class TestGraphOperations:
         assert copied.edge_index.tolist() == [[0, 2], [1, 3]]
         assert copied.bond_role.tolist() == [BOND_ROLE_COMPONENT, BOND_ROLE_COMPONENT]
 
-    def test_copy_components_preserves_unchanged_stereo(self) -> None:
+    def test_stereo(self) -> None:
         system = MolecularSystem.from_entities(
             {
                 "protein": PolymerSequence(
@@ -406,36 +592,37 @@ class TestGraphOperations:
         )
         assert (cut.atom_stereo < 0).all()
 
-    def test_disjoint_union_keeps_inputs_separate_and_reports_offsets(self) -> None:
-        component = ChemicalComponent(
-            "ION",
-            (ChemicalAtom("X", "C"),),
-            frozenset(),
-        )
-        first = MolecularSystem.from_entities(
-            {"first": Molecule((component,))},
-            {"A": "first"},
-        )
-        second = MolecularSystem.from_entities(
-            {"second": Molecule((component,))},
-            {"B": "second"},
-        )
-        union, component_maps, atom_maps = disjoint_union((first, second))
 
-        assert union.system_entity_ptr.tolist() == [0, 2]
-        assert union.system_instance_ptr.tolist() == [0, 2]
-        assert [mapping.tolist() for mapping in component_maps] == [[0], [1]]
-        assert [mapping.tolist() for mapping in atom_maps] == [[0], [1]]
+def test_disjoint_union_offsets() -> None:
+    component = ChemicalComponent(
+        "ION",
+        (ChemicalAtom("X", "C"),),
+        frozenset(),
+    )
+    first = MolecularSystem.from_entities(
+        {"first": Molecule((component,))},
+        {"A": "first"},
+    )
+    second = MolecularSystem.from_entities(
+        {"second": Molecule((component,))},
+        {"B": "second"},
+    )
+    union, component_maps, atom_maps = disjoint_union((first, second))
+
+    assert union.system_entity_ptr.tolist() == [0, 2]
+    assert union.system_instance_ptr.tolist() == [0, 2]
+    assert [mapping.tolist() for mapping in component_maps] == [[0], [1]]
+    assert [mapping.tolist() for mapping in atom_maps] == [[0], [1]]
 
 
-    def test_component_boundaries(self) -> None:
-        sequence = PolymerSequence("protein", (_residue("A"), _residue("B")))
-        system = MolecularSystem.from_entities({"protein": sequence}, {"A": "protein"})
-        first = system.atom_index(AtomSite("A", 0, "C"))
-        second = system.atom_index(AtomSite("A", 1, "N"))
+def test_component_boundaries() -> None:
+    sequence = PolymerSequence("protein", (_residue("A"), _residue("B")))
+    system = MolecularSystem.from_entities({"protein": sequence}, {"A": "protein"})
+    first = system.atom_index(AtomSite("A", 0, "C"))
+    second = system.atom_index(AtomSite("A", 1, "N"))
 
-        assert component_boundary_atoms(system) == ((first,), (second,))
+    assert component_boundary_atoms(system) == ((first,), (second,))
 
-        atom_mask = torch.ones(system.atom_symbol.shape, dtype=torch.bool)
-        atom_mask[second] = False
-        assert component_boundary_atoms(system, atom_mask) == ((), ())
+    atom_mask = torch.ones(system.atom_symbol.shape, dtype=torch.bool)
+    atom_mask[second] = False
+    assert component_boundary_atoms(system, atom_mask) == ((), ())

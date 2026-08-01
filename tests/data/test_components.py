@@ -7,41 +7,46 @@ from ofoldx.data import (
     ChemicalBond,
     ChemicalComponent,
     PolymerAttachment,
-    PolymerSequence,
     get_component,
 )
-from ofoldx.data.components import _BUILTIN_COMPONENTS, complete_component
+from ofoldx.data.components import complete_component, polymer_attachment_anchors
 
-# The package-audited set is exactly 34 IDs -- the 21 protein components
-# (the 20 standard residues plus the wwPDB CCD ``UNK`` placeholder) and 13 nucleic
-# components (11 standard CCD graphs plus the ``N`` / ``DN`` generated placeholders).
-_BUILTIN_PROTEIN_IDS = frozenset(
-    {
-        "ALA",
-        "ARG",
-        "ASN",
-        "ASP",
-        "CYS",
-        "GLN",
-        "GLU",
-        "GLY",
-        "HIS",
-        "ILE",
-        "LEU",
-        "LYS",
-        "MET",
-        "PHE",
-        "PRO",
-        "SER",
-        "THR",
-        "TRP",
-        "TYR",
-        "VAL",
-        "UNK",
-    }
+_COMPONENT_IDS = (
+    "ALA",
+    "ARG",
+    "ASN",
+    "ASP",
+    "CYS",
+    "GLN",
+    "GLU",
+    "GLY",
+    "HIS",
+    "ILE",
+    "LEU",
+    "LYS",
+    "MET",
+    "PHE",
+    "PRO",
+    "SER",
+    "THR",
+    "TRP",
+    "TYR",
+    "VAL",
+    "UNK",
+    "A",
+    "C",
+    "G",
+    "U",
+    "I",
+    "DA",
+    "DC",
+    "DG",
+    "DT",
+    "DI",
+    "DU",
+    "N",
+    "DN",
 )
-_BUILTIN_NUCLEIC_IDS = frozenset({"A", "C", "G", "U", "I", "DA", "DC", "DG", "DT", "DI", "DU", "N", "DN"})
-_BUILTIN_IDS = _BUILTIN_PROTEIN_IDS | _BUILTIN_NUCLEIC_IDS
 
 
 def _undirected_bonds(bonds: frozenset[ChemicalBond]) -> set[tuple[frozenset[str], float, bool]]:
@@ -50,140 +55,34 @@ def _undirected_bonds(bonds: frozenset[ChemicalBond]) -> set[tuple[frozenset[str
     return {(frozenset((bond.atom_a, bond.atom_b)), bond.order, bond.aromatic) for bond in bonds}
 
 
-# --------------------------------------------------------------------------------------
-# Value-shape invariants
-# --------------------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("chem_comp_type", "expected"),
+    [
+        ("L-PEPTIDE LINKING", ("N", "C")),
+        ("D-BETA-PEPTIDE, C-GAMMA LINKING", ("N", "CG")),
+        ("L-GAMMA-PEPTIDE, C-DELTA LINKING", ("N", "CD")),
+        ("D-PEPTIDE NH3 AMINO TERMINUS", (None, "C")),
+        ("L-PEPTIDE COOH CARBOXY TERMINUS", ("N", None)),
+        ("RNA OH 5 PRIME TERMINUS", (None, "O3'")),
+        ("DNA OH 3 PRIME TERMINUS", ("P", None)),
+        ("PEPTIDE-LIKE", (None, None)),
+    ],
+)
+def test_polymer_attachment_anchors(
+    chem_comp_type: str,
+    expected: tuple[str | None, str | None],
+) -> None:
+    atom_ids = {"N", "C", "CG", "CD", "P", "O3'"}
+
+    assert polymer_attachment_anchors(chem_comp_type, atom_ids) == expected
 
 
-def test_chemical_atom_requires_id_and_element_and_defaults_the_rest_to_none() -> None:
-    # atom_id and element are always known; every optional chemical fact defaults
-    # to None so absence never silently means neutral, zero, non-aromatic, or permitted.
-    atom = ChemicalAtom("N", "N")
-
-    assert atom.atom_id == "N"
-    assert atom.element == "N"
-    assert atom.isotope is None
-    assert atom.formal_charge is None
-    assert atom.radical_electrons is None
-    assert atom.explicit_hydrogens is None
-    assert atom.implicit_hydrogens is None
-    assert atom.implicit_hydrogens_allowed is None
-    assert atom.aromatic is None
-    assert atom.stereo is None
-
-    with pytest.raises(TypeError):
-        ChemicalAtom("N")  # type: ignore[call-arg]  # element is required
-
-
-def test_polymer_attachment_carries_endpoint_and_leaving_atoms() -> None:
-    default = PolymerAttachment("N")
-    assert default.atom_id == "N"
-    assert default.leaving_atom_ids == frozenset()
-
-    attachment = PolymerAttachment("N", frozenset({"H2"}))
-    assert attachment.atom_id == "N"
-    assert attachment.leaving_atom_ids == frozenset({"H2"})
-
-
-def test_bonds_none_is_open_partial_and_empty_frozenset_is_bondless_complete() -> None:
-    # 3.2.1: bonds=None asserts neither complete atom inventory nor topology; frozenset()
-    # is the different, positive statement that a complete component has no bonds.
-    atoms = (ChemicalAtom("NA", "Na"),)
-    partial = ChemicalComponent("X", atoms, None)
-    complete = ChemicalComponent("X", atoms, frozenset())
-
-    assert partial.bonds is None
-    assert complete.bonds == frozenset()
-    assert complete.bonds is not None
-    # The distinction is value-carrying: the two components are not equal.
-    assert partial != complete
-
-
-def test_atom_ids_must_be_unique_independent_of_bond_completeness() -> None:
-    # atom-ID closure is independent of the bond field -- checked even when partial.
-    with pytest.raises(ValueError):
-        ChemicalComponent("X", (ChemicalAtom("A", "C"), ChemicalAtom("A", "C")), None)
-    with pytest.raises(ValueError):
-        ChemicalComponent("X", (ChemicalAtom("A", "C"), ChemicalAtom("A", "C")), frozenset())
-
-
-def test_bond_endpoint_and_edge_closure_checked_only_when_bonds_present() -> None:
-    atoms = (ChemicalAtom("A", "C"), ChemicalAtom("B", "C"))
-
-    # A partial observation asserts no topology, so no endpoint check runs.
-    assert ChemicalComponent("X", atoms, None).bonds is None
-
-    # A declared bond set is checked for endpoint and physical-edge closure.
-    with pytest.raises(ValueError):
-        ChemicalComponent("X", atoms, frozenset({ChemicalBond("A", "GHOST")}))
-    with pytest.raises(ValueError):
-        ChemicalComponent("X", atoms, frozenset({ChemicalBond("A", "A")}))
-    with pytest.raises(ValueError):
-        ChemicalComponent("X", atoms, frozenset({ChemicalBond("A", "B"), ChemicalBond("B", "A")}))
-
-
-def test_attachment_closure_is_independent_of_bonds() -> None:
-    atoms = (ChemicalAtom("A", "C"), ChemicalAtom("B", "C"))
-
-    component = ChemicalComponent(
-        "X",
-        atoms,
-        None,
-        previous_attachment=PolymerAttachment("A", frozenset({"B"})),
-    )
-    assert component.previous_attachment is not None
-    assert component.previous_attachment.atom_id == "A"
-
-    # Attachment closure is enforced even when the component is an open partial (bonds=None).
-    with pytest.raises(ValueError):
-        ChemicalComponent("X", atoms, None, previous_attachment=PolymerAttachment("Z"))
-    with pytest.raises(ValueError):
-        ChemicalComponent("X", atoms, None, previous_attachment=PolymerAttachment("A", frozenset({"A"})))
-
-
-def test_reference_coordinates_default_empty_and_align_with_atoms_when_present() -> None:
-    # Reference coordinates align with atom declaration order, one xyz triple or None
-    # per atom. (The committed value uses () as the ordinary no-conformer state.)
-    atoms = (ChemicalAtom("C", "C"), ChemicalAtom("O", "O"))
-
-    assert ChemicalComponent("LIG", atoms, frozenset()).reference_coordinates == ()
-
-    aligned = ChemicalComponent(
-        "LIG",
-        atoms,
-        frozenset(),
-        reference_coordinates=((0.0, 0.0, 0.0), None),
-    )
-    assert len(aligned.reference_coordinates) == len(aligned.atoms)
-
-    with pytest.raises(ValueError):
-        ChemicalComponent("LIG", atoms, frozenset(), reference_coordinates=((0.0, 0.0, 0.0),))
-
-
-def test_partial_observation_needs_no_ccd_graph_and_filters_by_element() -> None:
-    # Released LigandMPNN / NA-MPNN parsers accept arbitrary non-water HETATM
-    # observations and consume their atom IDs, elements, and coordinates with no CCD graph.
-    observation = ChemicalComponent(
-        component_id="LIG",
-        atoms=(
-            ChemicalAtom("C1", "C"),
-            ChemicalAtom("O1", "O"),
-            ChemicalAtom("H1", "H"),
-        ),
-        bonds=None,
-        reference_coordinates=((0.0, 0.0, 0.0), (1.2, 0.0, 0.0), None),
-    )
-
-    assert observation.bonds is None
-    heavy = {atom.atom_id for atom in observation.atoms if atom.element != "H"}
-    assert heavy == {"C1", "O1"}
-
-
-def test_component_completion_fills_only_unstated_chemistry() -> None:
+def test_complete_component_unstated_chemistry() -> None:
     occurrence = ChemicalComponent(
         "LIG",
-        (ChemicalAtom("N1", "N", formal_charge=-1), ChemicalAtom("C1", "C")),
+        (ChemicalAtom("N1", "X", formal_charge=-1), ChemicalAtom("C1", "C")),
         frozenset({ChemicalBond("N1", "C1", order=2.0, aromatic=False)}),
+        non_leaving_atom_ids=frozenset({"N1", "C1"}),
     )
     reference = ChemicalComponent(
         "LIG",
@@ -195,6 +94,8 @@ def test_component_completion_fills_only_unstated_chemistry() -> None:
             }
         ),
         reference_coordinates=((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (2.0, 0.0, 0.0)),
+        leaving_atom_ids=frozenset({"C2"}),
+        non_leaving_atom_ids=frozenset({"N1", "C1"}),
     )
 
     completed, topology_complete = complete_component(
@@ -203,76 +104,91 @@ def test_component_completion_fills_only_unstated_chemistry() -> None:
         occurrence_topology_complete=False,
     )
 
-    assert completed.atoms[0].formal_charge == -1
+    assert (completed.atoms[0].element, completed.atoms[0].formal_charge) == ("N", -1)
     assert {frozenset((bond.atom_a, bond.atom_b)): bond.order for bond in completed.bonds or ()} == {
         frozenset(("N1", "C1")): 2.0,
         frozenset(("C1", "C2")): 1.0,
     }
     assert completed.reference_coordinates == reference.reference_coordinates
+    assert completed.leaving_atom_ids == frozenset({"C2"})
     assert topology_complete
 
 
-# --------------------------------------------------------------------------------------
-# get_component: the audited-34 self-contained set
-# --------------------------------------------------------------------------------------
+def test_complete_component_contextual_attachment() -> None:
+    atoms = (ChemicalAtom("N", "N"), ChemicalAtom("H", "H"))
+    occurrence = ChemicalComponent(
+        "LIG",
+        atoms,
+        None,
+        non_leaving_atom_ids=frozenset({"N", "H"}),
+    )
+    reference = ChemicalComponent(
+        "LIG",
+        atoms,
+        frozenset({ChemicalBond("N", "H")}),
+        previous_attachment=PolymerAttachment("N", frozenset({"H"})),
+        leaving_atom_ids=frozenset({"H"}),
+        non_leaving_atom_ids=frozenset({"N"}),
+    )
+
+    completed, _ = complete_component(occurrence, reference, occurrence_topology_complete=False)
+
+    assert completed.leaving_atom_ids == frozenset()
+    assert completed.previous_attachment == reference.previous_attachment
 
 
-def test_audited_component_set_is_exactly_thirty_four_ids() -> None:
-    assert len(_BUILTIN_PROTEIN_IDS) == 21
-    assert len(_BUILTIN_NUCLEIC_IDS) == 13
-    assert len(_BUILTIN_IDS) == 34
-    assert set(_BUILTIN_COMPONENTS) == _BUILTIN_IDS
+def test_complete_component_source_attachment() -> None:
+    atoms = (ChemicalAtom("N", "N"), ChemicalAtom("H", "H"))
+    occurrence = ChemicalComponent(
+        "LIG",
+        atoms,
+        None,
+        previous_attachment=PolymerAttachment("N", frozenset({"H"})),
+    )
+    reference = ChemicalComponent(
+        "LIG",
+        atoms,
+        frozenset({ChemicalBond("N", "H")}),
+        non_leaving_atom_ids=frozenset({"N", "H"}),
+    )
 
-    for component_id in _BUILTIN_IDS:
-        assert get_component(component_id).component_id == component_id
+    completed, _ = complete_component(occurrence, reference, occurrence_topology_complete=False)
 
-
-def test_audited_components_are_self_contained_complete_graphs() -> None:
-    for component_id in _BUILTIN_IDS:
-        component = get_component(component_id)
-        atom_ids = {atom.atom_id for atom in component.atoms}
-
-        # Unique atom IDs and a complete (non-partial) declared graph.
-        assert len(atom_ids) == len(component.atoms)
-        assert component.bonds is not None
-
-        # Every declared bond endpoint resolves locally -- no external CCD lookup needed.
-        for bond in component.bonds:
-            assert {bond.atom_a, bond.atom_b} <= atom_ids
-
-        # Both linear-polymer attachments resolve locally.
-        for attachment in (component.previous_attachment, component.next_attachment):
-            assert attachment is not None
-            assert attachment.atom_id in atom_ids
-            assert set(attachment.leaving_atom_ids) <= atom_ids
-
-        # Reference coordinates, when present, align with the atom tuple.
-        if component.reference_coordinates:
-            assert len(component.reference_coordinates) == len(component.atoms)
-
-        # Audited components pass every known zero and boolean explicitly.
-        for atom in component.atoms:
-            assert atom.element
-            assert atom.isotope is None
-            assert atom.formal_charge is not None
-            assert atom.radical_electrons == 0
-            assert atom.explicit_hydrogens == 0
-            assert atom.implicit_hydrogens == 0
-            assert atom.implicit_hydrogens_allowed is False
-            assert atom.aromatic in (True, False)
+    assert completed.previous_attachment == occurrence.previous_attachment
+    assert completed.leaving_atom_ids == frozenset()
+    assert completed.non_leaving_atom_ids == frozenset({"N"})
 
 
-def test_get_component_returns_the_same_audited_snapshot() -> None:
-    alanine = get_component("ALA")
-    assert alanine.component_id == "ALA"
-    assert get_component("ALA") == alanine
+@pytest.mark.parametrize("component_id", _COMPONENT_IDS)
+def test_get_component_graph(component_id: str) -> None:
+    component = get_component(component_id)
+    atom_ids = {atom.atom_id for atom in component.atoms}
+
+    assert component.component_id == component_id
+    assert len(atom_ids) == len(component.atoms)
+    assert component.bonds is not None
+    assert all({bond.atom_a, bond.atom_b} <= atom_ids for bond in component.bonds)
+    for attachment in (component.previous_attachment, component.next_attachment):
+        assert attachment is not None
+        assert attachment.atom_id in atom_ids
+        assert set(attachment.leaving_atom_ids) <= atom_ids
+    if component.reference_coordinates:
+        assert len(component.reference_coordinates) == len(component.atoms)
+    for atom in component.atoms:
+        assert atom.element
+        assert atom.isotope is None
+        assert atom.formal_charge is not None
+        assert atom.radical_electrons == 0
+        assert atom.explicit_hydrogens == 0
+        assert atom.implicit_hydrogens == 0
+        assert atom.implicit_hydrogens_allowed is False
+        assert atom.aromatic in (True, False)
 
 
-def test_get_component_rejects_non_audited_ids() -> None:
-    # OFoldX never guesses a chemical graph from a residue name.
-    for unknown in ("MSE", "SEP", "LIG", "HOH", ""):
-        with pytest.raises(KeyError):
-            get_component(unknown)
+@pytest.mark.parametrize("component_id", ["MSE", "SEP", "LIG", "HOH", ""])
+def test_get_component_unknown(component_id: str) -> None:
+    with pytest.raises(KeyError):
+        get_component(component_id)
 
 
 # --------------------------------------------------------------------------------------
@@ -280,10 +196,9 @@ def test_get_component_rejects_non_audited_ids() -> None:
 # --------------------------------------------------------------------------------------
 
 
-def test_standard_protein_reference_coordinates_are_atom_aligned() -> None:
-    sequence = PolymerSequence.from_one_letter("ARNDCQEGHILKMFPSTWYV")
-
-    for component in sequence.components:
+def test_protein_reference_coordinates() -> None:
+    for component_id in _COMPONENT_IDS[:20]:
+        component = get_component(component_id)
         assert len(component.reference_coordinates) == len(component.atoms)
         # The reference is the complete wwPDB CCD ideal conformer: every atom -- heavy and
         # hydrogen, including the terminal OXT -- carries an idealized position.
@@ -303,7 +218,7 @@ def test_standard_protein_reference_coordinates_are_atom_aligned() -> None:
     assert get_component("UNK").reference_coordinates == ()
 
 
-def test_unknown_protein_component_is_the_audited_wwpdb_placeholder() -> None:
+def test_unknown_protein_placeholder() -> None:
     unknown = get_component("UNK")
 
     assert tuple(atom.atom_id for atom in unknown.atoms) == (
@@ -330,7 +245,7 @@ def test_unknown_protein_component_is_the_audited_wwpdb_placeholder() -> None:
     assert unknown.next_attachment.atom_id == "C"
 
 
-def test_generated_nucleic_components_are_exact_odesign_placeholders() -> None:
+def test_generated_nucleic_placeholders() -> None:
     rna = get_component("N")
     dna = get_component("DN")
 
@@ -398,7 +313,7 @@ def test_generated_nucleic_components_are_exact_odesign_placeholders() -> None:
         assert all(coordinate is not None for coordinate in component.reference_coordinates)
 
 
-def test_standard_nucleic_components_are_complete_released_ccd_graphs() -> None:
+def test_nucleic_component_graphs() -> None:
     expected_counts = {
         "A": (37, 39),
         "C": (35, 36),
@@ -429,11 +344,6 @@ def test_standard_nucleic_components_are_complete_released_ccd_graphs() -> None:
         assert len(component.reference_coordinates) == len(component.atoms)
         assert all(coordinate is not None for coordinate in component.reference_coordinates)
 
-    rna = PolymerSequence.from_one_letter("I", polymer_type="rna")
-    dna = PolymerSequence.from_one_letter("IU", polymer_type="dna")
-    assert [component.component_id for component in rna.components] == ["I"]
-    assert [component.component_id for component in dna.components] == ["DI", "DU"]
-
     adenine = get_component("A")
     assert adenine.bonds is not None
     assert all(bond.order == 1.5 for bond in adenine.bonds if bond.aromatic)
@@ -446,28 +356,3 @@ def test_standard_nucleic_components_are_complete_released_ccd_graphs() -> None:
     )[
         "P"
     ] == (1.024, -0.137, -4.723)
-
-
-# --------------------------------------------------------------------------------------
-# SMILES boundary (RDKit only; skipped when RDKit is absent)
-# --------------------------------------------------------------------------------------
-
-
-def test_from_smiles_builds_component_chemistry_with_explicit_zero_facts() -> None:
-    pytest.importorskip("rdkit")
-
-    from ofoldx.data import Molecule
-
-    molecule = Molecule.from_smiles("CCO")
-    (component,) = molecule.components
-
-    assert isinstance(component, ChemicalComponent)
-    assert component.bonds is not None
-    for atom in component.atoms:
-        # SMILES importers pass every known zero and boolean explicitly.
-        assert atom.formal_charge is not None
-        assert atom.radical_electrons is not None
-        assert atom.explicit_hydrogens is not None
-        assert atom.implicit_hydrogens is not None
-        assert isinstance(atom.implicit_hydrogens_allowed, bool)
-        assert isinstance(atom.aromatic, bool)

@@ -21,7 +21,7 @@ field extraction below mirrors ``alphafold3/structure/chemical_components.py``
 - ``_chem_comp_atom.charge``                  -> ``formal_charges``
 - ``_chem_comp_atom.pdbx_stereo_config``      -> ``stereo`` (per atom; ``N`` -> None)
 - ``_chem_comp_atom.pdbx_model_Cartn_{x,y,z}_ideal`` -> ``reference_coordinates``
-- ``_chem_comp_atom.pdbx_leaving_atom_flag``  -> polymer attachment leaving atoms
+- ``_chem_comp_atom.pdbx_leaving_atom_flag``  -> component leaving atoms
 - ``_chem_comp_bond.atom_id_1`` / ``atom_id_2`` -> ``bond_atom_a`` / ``bond_atom_b``
 - ``_chem_comp_bond.value_order``             -> ``bond_orders``
 - ``_chem_comp_bond.pdbx_aromatic_flag``      -> ``bond_aromatic`` and per-atom ``aromatic``
@@ -36,10 +36,10 @@ points. Importing this module during modeling does not load either dependency.
 
 from __future__ import annotations
 
-import gzip
-from collections import deque
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
+
+from ..components import polymer_attachment_anchors, terminal_leaving_groups
 
 # CCD ``_chem_comp_bond.value_order`` tokens -> canonical bond order.
 _VALUE_ORDER = {"SING": 1.0, "DOUB": 2.0, "TRIP": 3.0, "QUAD": 4.0, "AROM": 1.5}
@@ -61,14 +61,11 @@ def build_rows(components_cif_path: str) -> list[dict[str, object]]:
         ValueError: If a component identifier occurs in more than one data block.
     """
 
+    import gemmi
     from biotite.structure.io.pdbx import CIFFile
 
     path = Path(components_cif_path)
-    if path.suffix == ".gz":
-        with gzip.open(path, "rt") as file:
-            cif = CIFFile.read(file)
-    else:
-        cif = CIFFile.read(path)
+    cif = CIFFile.deserialize(gemmi.cif.read(str(path)).as_string())
 
     rows: list[dict[str, object]] = []
     seen: set[str] = set()
@@ -117,7 +114,8 @@ def row_from_block(block: Mapping[str, Sequence[str]]) -> dict[str, object]:
     """
 
     component_id = _one(block, "_chem_comp.id")
-    chem_type = _classify_chem_type(_one(block, "_chem_comp.type", default=""))
+    raw_type = _one(block, "_chem_comp.type", default="")
+    chem_type = _classify_chem_type(raw_type)
     raw_parents = _one(block, "_chem_comp.mon_nstd_parent_comp_id", default="")
     parent_component_ids = [parent.strip() for parent in raw_parents.split(",") if parent.strip() not in {"", ".", "?"}]
 
@@ -127,6 +125,9 @@ def row_from_block(block: Mapping[str, Sequence[str]]) -> dict[str, object]:
     formal_charges = [_to_optional_int(value) for value in _column(block, "_chem_comp_atom.charge", n_atoms)]
     atom_stereo = [_stereo(value) for value in _column(block, "_chem_comp_atom.pdbx_stereo_config", n_atoms)]
     leaving_flags = _column(block, "_chem_comp_atom.pdbx_leaving_atom_flag", n_atoms)
+    normalized_leaving_flags = [_optional_flag(value) for value in leaving_flags]
+    leaving_atom_ids = [atom_id for atom_id, flag in zip(atom_ids, normalized_leaving_flags) if flag]
+    non_leaving_atom_ids = [atom_id for atom_id, flag in zip(atom_ids, normalized_leaving_flags) if flag is False]
     reference_coordinates = _reference_coordinates(block, n_atoms)
 
     bond_atom_a = list(block.get("_chem_comp_bond.atom_id_1", []))
@@ -148,9 +149,9 @@ def row_from_block(block: Mapping[str, Sequence[str]]) -> dict[str, object]:
     aromatic = [aromatic_by_atom[atom_id] for atom_id in atom_ids]
 
     previous_atom, previous_leaving, next_atom, next_leaving = _attachments(
-        chem_type,
+        raw_type,
         atom_ids,
-        leaving_flags,
+        leaving_atom_ids if len(leaving_atom_ids) + len(non_leaving_atom_ids) == len(atom_ids) else None,
         bond_atom_a,
         bond_atom_b,
     )
@@ -170,6 +171,8 @@ def row_from_block(block: Mapping[str, Sequence[str]]) -> dict[str, object]:
         "bond_aromatic": bond_aromatic,
         "bond_stereo": bond_stereo,
         "reference_coordinates": reference_coordinates,
+        "leaving_atom_ids": leaving_atom_ids,
+        "non_leaving_atom_ids": non_leaving_atom_ids,
         "previous_attachment_atom": previous_atom,
         "previous_leaving_atoms": previous_leaving,
         "next_attachment_atom": next_atom,
@@ -179,8 +182,13 @@ def row_from_block(block: Mapping[str, Sequence[str]]) -> dict[str, object]:
 
 def _classify_chem_type(raw_type: str) -> str:
     upper = raw_type.upper()
-    if "PEPTIDE" in upper and upper != "PEPTIDE-LIKE":
+    if ("PEPTIDE" in upper and upper != "PEPTIDE-LIKE") or upper in {
+        "C-GAMMA LINKING",
+        "C-DELTA LINKING",
+    }:
         return "protein"
+    if "DNA" in upper and "RNA" in upper:
+        return "dna_rna_hybrid"
     if "DNA" in upper:
         return "dna"
     if "RNA" in upper:
@@ -189,70 +197,49 @@ def _classify_chem_type(raw_type: str) -> str:
 
 
 def _attachments(
-    chem_type: str,
+    chem_comp_type: str,
     atom_ids: Sequence[str],
-    leaving_flags: Sequence[str],
+    leaving_atom_ids: Sequence[str] | None,
     bond_atom_a: Sequence[str] = (),
     bond_atom_b: Sequence[str] = (),
 ) -> tuple[str | None, list[str], str | None, list[str]]:
     r"""
     Derive default linear-polymer attachments for a polymer component.
 
-    Non-polymer components carry no attachments. For polymers the backbone anchor
-    atoms follow the standard convention (protein ``N``/``C``, nucleic ``P``/``O3'``)
-    and each leaving group is assigned to the anchor to which that connected group
-    is bonded. Source-declared leaving atoms attached elsewhere are not linear-
-    polymer attachment atoms.
+    Non-polymer components carry no linear attachments but retain their generic
+    leaving-atom facts in the row. For polymers each connected leaving group is
+    assigned to its unique non-leaving graph boundary; this recovers nonstandard
+    peptide backbones without hard-coding every CCD component ID.
     """
 
-    if chem_type == "protein":
-        previous_anchor_name, next_anchor_name = "N", "C"
-    elif chem_type in {"rna", "dna"}:
-        previous_anchor_name, next_anchor_name = "P", "O3'"
-    else:
+    previous_anchor, next_anchor = polymer_attachment_anchors(chem_comp_type, atom_ids)
+    if (previous_anchor is None and next_anchor is None) or leaving_atom_ids is None:
         return None, [], None, []
 
-    present = set(atom_ids)
-    leaving = {atom_id for atom_id, flag in zip(atom_ids, leaving_flags) if _flag(flag)}
-    previous_anchor: str | None = previous_anchor_name if previous_anchor_name in present else None
-    next_anchor: str | None = next_anchor_name if next_anchor_name in present else None
-
-    adjacency: dict[str, set[str]] = {atom_id: set() for atom_id in atom_ids}
-    for atom_a, atom_b in zip(bond_atom_a, bond_atom_b):
-        if atom_a not in present or atom_b not in present:
-            raise ValueError("CCD bond references an unknown atom")
-        adjacency[atom_a].add(atom_b)
-        adjacency[atom_b].add(atom_a)
-
-    groups: list[set[str]] = []
-    unseen = set(leaving)
-    while unseen:
-        start = unseen.pop()
-        group = {start}
-        queue = deque((start,))
-        while queue:
-            atom_id = queue.popleft()
-            for neighbor in adjacency[atom_id] & unseen:
-                unseen.remove(neighbor)
-                group.add(neighbor)
-                queue.append(neighbor)
-        groups.append(group)
-
-    previous_leaving: set[str] = set()
-    next_leaving: set[str] = set()
-    for group in groups:
-        neighbors = {neighbor for atom_id in group for neighbor in adjacency[atom_id] if neighbor not in leaving}
-        if previous_anchor is not None and previous_anchor in neighbors:
-            previous_leaving.update(group)
-        if next_anchor is not None and next_anchor in neighbors:
-            next_leaving.update(group)
-
     order = {atom_id: index for index, atom_id in enumerate(atom_ids)}
+
+    def attachment(anchor: str | None) -> tuple[str | None, list[str]]:
+        if anchor is None:
+            return None, []
+        matching = terminal_leaving_groups(
+            atom_ids,
+            zip(bond_atom_a, bond_atom_b),
+            leaving_atom_ids,
+            anchor,
+        )
+        if len(matching) > 1:
+            return None, []
+        if not matching:
+            return anchor, []
+        return anchor, sorted(matching[0], key=order.__getitem__)
+
+    previous_anchor, previous_leaving = attachment(previous_anchor)
+    next_anchor, next_leaving = attachment(next_anchor)
     return (
         previous_anchor,
-        sorted(previous_leaving, key=order.__getitem__),
+        previous_leaving,
         next_anchor,
-        sorted(next_leaving, key=order.__getitem__),
+        next_leaving,
     )
 
 
@@ -296,10 +283,6 @@ def _one(block: Mapping[str, Sequence[str]], key: str, *, default: str | None = 
             return default
         raise ValueError(f"CCD block is missing required item {key!r}")
     return values[0]
-
-
-def _flag(value: str) -> bool:
-    return _optional_flag(value) is True
 
 
 def _optional_flag(value: str) -> bool | None:

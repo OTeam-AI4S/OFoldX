@@ -48,6 +48,7 @@ dependencies = [
   "chanfig>=0.0.117",
   "chembl-structure-pipeline",
   "danling>=0.4.3",
+  "gemmi",
   "huggingface-hub>=0.24",
   "multimolecule>=0.2",
   "numpy",

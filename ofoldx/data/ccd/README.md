@@ -7,10 +7,33 @@ resolver. It is the boundary-time counterpart to
 - `get_component` is **audited-only** and does **zero I/O** (Principle 7). It
   returns one of the package-audited standard components (the 34 audited IDs) and
   never guesses a chemical graph from a residue name.
-- `resolve_ccd_component` is the tool for the _other_ job: `read_structure` or a
-  family-specific input boundary calls it **once** to fetch the wwPDB CCD
-  snapshot and lower one component into a canonical `ChemicalComponent` value.
-  There is **no live registry lookup at tensor-compute time**.
+- `resolve_ccd_component` lowers one entry from a pinned wwPDB CCD snapshot into
+  a canonical `ChemicalComponent` value.
+- `prepare_structure` is the offline boundary that reads a source structure,
+  fills chemistry the source does not state, validates the completed graph, and
+  writes one exact `.structure.safetensors` artifact. Dataset workers only load
+  that artifact; they never access the CCD.
+
+Source-declared chemistry wins. CCD values fill missing atoms, bonds,
+leaving-atom facts, attachments, and reference coordinates, but never rewrite
+an explicit source charge or bond fact.
+
+Completion can expose an occurrence-level reaction that the source bond records
+state without naming every consumed template atom. `prepare_structure` removes
+such atoms only when they are unobserved and RDKit validation proves one unique
+chemical result: an ordinary terminal proton at an atom that forms a new
+covalent bond. Heavy-atom leaving groups must already be declared by the source
+or CCD and are realized while the structure graph is built. Missing evidence, a
+source contradiction, or multiple non-equivalent repairs remains an error; this
+is not a general bad-structure correction pass.
+
+An observed hydrogen absent from the generic CCD component is treated as an
+occurrence proton only when its coordinates identify one neutral nitrogen, the
+source does not assign that nitrogen's charge, the remaining component graph
+exactly matches the CCD, and no unobserved CCD hydrogen already occupies that
+valence. The parent charge is increased with the added proton; ambiguous
+geometry or contradictory source chemistry remains incomplete and therefore
+fails.
 
 ## Resolver signature
 
@@ -21,6 +44,14 @@ component = resolve_ccd_component("HEM", revision="2026-07-23")
 # Or resolve from an existing local Parquet snapshot without Hub access.
 local_component = resolve_ccd_component("HEM", snapshot_path="/data/ccd")
 # -> ofoldx.data.molecular.ChemicalComponent
+
+from ofoldx.data.ccd import prepare_structure
+
+prepare_structure(
+    "input.cif",
+    "input.structure.safetensors",
+    snapshot_path="/data/ccd",
+)
 ```
 
 - `component_id: str` — an exact wwPDB CCD code (for example `"HEM"`, `"ATP"`).
@@ -70,13 +101,16 @@ Each row is one component. List-valued columns for atoms are all aligned to
 | `bond_aromatic`            | `list[bool \| None]`                | Aromatic flag per bond; `None` when unspecified.                                                            |
 | `bond_stereo`              | `list[str \| None]`                 | Per-bond stereo config, `None` when unspecified.                                                            |
 | `reference_coordinates`    | `list[[float,float,float] \| None]` | Ideal reference coordinate per atom (aligned to `atom_ids`); `None` where absent.                           |
+| `leaving_atom_ids`         | `list[str]`                         | CCD atoms explicitly marked as leaving.                                                                     |
+| `non_leaving_atom_ids`     | `list[str]`                         | CCD atoms explicitly marked as non-leaving; atoms in neither list have an unknown flag.                     |
 | `previous_attachment_atom` | `str \| None`                       | Polymer previous-link anchor atom (e.g. protein `N`, nucleic `P`).                                          |
 | `previous_leaving_atoms`   | `list[str]`                         | Atoms removed on forming the previous link.                                                                 |
 | `next_attachment_atom`     | `str \| None`                       | Polymer next-link anchor atom (e.g. protein `C`, nucleic `O3'`).                                            |
 | `next_leaving_atoms`       | `list[str]`                         | Atoms removed on forming the next link.                                                                     |
 
 For `non-polymer` components the attachment columns are `None` / empty and the
-resolver omits polymer attachments.
+resolver omits polymer attachments. Their generic `leaving_atom_ids` are still
+retained for declared covalent reactions.
 
 ## Building the dataset
 

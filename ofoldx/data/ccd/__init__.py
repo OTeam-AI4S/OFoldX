@@ -7,6 +7,7 @@ and lowered to canonical ``ChemicalComponent`` values at an input boundary.
 
 from __future__ import annotations
 
+from .preprocess import prepare_structure
 from .resolver import CCD_DATASET_REPOSITORY, resolve_ccd_component
 
-__all__ = ["CCD_DATASET_REPOSITORY", "resolve_ccd_component"]
+__all__ = ["CCD_DATASET_REPOSITORY", "prepare_structure", "resolve_ccd_component"]

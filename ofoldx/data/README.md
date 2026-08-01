@@ -14,7 +14,9 @@ identity, a second atom layout, confidence, or a generic annotations bag.
 lowered once into that graph. `Molecule` retains the irreducible
 non-polymer/branched/water entity category; component count does not infer it.
 `ChemicalComponent.without_hydrogens()` is the exact H/D/T induced-subgraph
-operation shared by structure readers. `ComponentReference` and `AtomSite` are symbolic
+operation for component-definition inspection. Structure readers instead materialize
+the complete occurrence graph before `suppress_hydrogens()` folds the remaining
+hydrogen vertices into heavy-atom counts. `ComponentReference` and `AtomSite` are symbolic
 boundary addresses; model inputs carry canonical integer maps instead of object
 views. Low-level chemical values protect identity, topology, and referential
 closure. They do not perform generic plausibility, valence, or lifecycle

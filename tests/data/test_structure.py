@@ -64,6 +64,20 @@ class TestStructure:
         assert double.residue_id.dtype == torch.int64
         assert double.system.edge_index.dtype == torch.int64
 
+    def test_atom_subgraph(self) -> None:
+        structure = _structure("A")
+
+        selected, old_to_new = structure.atom_subgraph(torch.tensor([False, True]))
+
+        assert selected.system.atom_symbol.numel() == 1
+        assert selected.coordinates[:, 0].tolist() == [1.0]
+        assert selected.coordinate_mask.tolist() == [False]
+        assert old_to_new.tolist() == [-1, 0]
+        with pytest.raises(TypeError, match="bool dtype"):
+            structure.atom_subgraph(torch.ones(2))
+        with pytest.raises(ValueError, match="one value per atom"):
+            structure.atom_subgraph(torch.ones(1, dtype=torch.bool))
+
     def test_batch_round_trip(self) -> None:
         first = _structure("A").replace(
             system_resolution_ptr=torch.tensor([0, 1]),
