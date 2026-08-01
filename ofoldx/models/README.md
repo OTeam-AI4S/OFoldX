@@ -15,6 +15,7 @@ checkpoints, inputs and results.
 | [ESMFold2](esmfold2)         | `fold`, `design`  | Molecular input / binder target → structure / sequence | [Hub](https://huggingface.co/oteam/esmfold2) · [Convert](esmfold2/convert.py)                |
 | [Protenix](protenix)         | `fold`            | Molecular system + evidence → all-atom structure       | [Hub](https://huggingface.co/oteam/protenix) · [Convert](protenix/convert.py)                |
 | [RFdiffusion](rfdiffusion)   | `design`          | Contigs + optional motifs → protein backbone           | [Hub](https://huggingface.co/oteam/rfdiffusion-base) · [Convert](rfdiffusion/convert.py)     |
+| [ODesign](odesign)           | `design`          | Molecular context → polymer or ligand designs          | [Hub](https://huggingface.co/oteam/odesign-protein-flex) · [Convert](odesign/convert.py)     |
 | [PXDesign](pxdesign)         | `design`          | Target + binder specification → protein designs        | [Hub](https://huggingface.co/oteam/pxdesign) · [Convert](pxdesign/convert.py)                |
 | [BoltzGen](boltzgen)         | `design`          | Binder specification → ranked molecular designs        | [Hub](https://huggingface.co/oteam/boltzgen) · [Convert](boltzgen/convert.py)                |
 | [ProteinMPNN](proteinmpnn)   | `design`, `score` | Protein backbone → sequence or sequence NLL            | [Hub](https://huggingface.co/oteam/proteinmpnn) · [Convert](proteinmpnn/convert.py)          |

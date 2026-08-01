@@ -28,11 +28,17 @@ import pytest
 import torch
 
 from ofoldx.data.molecular import MolecularSystem, MonomerType
-from ofoldx.data.projection import project_atoms
+from ofoldx.data.projection import project_arrays, project_atoms
 from ofoldx.data.structure import CoordinateEvidence, ResolutionKind, Structure, replace_coordinates
 from ofoldx.data.tokenization import select_tokens
+from ofoldx.models.alphafold3 import AlphaFold3Processor
+from ofoldx.models.boltz1 import Boltz1Processor
+from ofoldx.models.boltz2 import Boltz2Processor
+from ofoldx.models.boltzgen import BoltzGenProcessor
 from ofoldx.models.layout import LayoutTable, slot_map, token_layout
+from ofoldx.models.odesign import ODesignProcessor
 from ofoldx.models.preparation import PreparationContext, PreparationRecord, PreparedInput, RegenerationScope
+from ofoldx.models.protenix import ProtenixProcessor
 from ofoldx.models.targets import SequenceTarget, SymmetryPolicy, TruthState, align_target_components, prepare_target
 from ofoldx.provenance import Basis, Records, Resolution, state
 
@@ -126,6 +132,44 @@ class TestPrepareTarget:
         np.testing.assert_array_equal(target.coordinates, expected)
         assert target.resolution == (2.5 if case == "unoccupied" else None)
         assert not prepared.context.structure.coordinate_mask.any()
+
+    @pytest.mark.parametrize(
+        "processor_type",
+        [AlphaFold3Processor, ProtenixProcessor, Boltz1Processor, Boltz2Processor, BoltzGenProcessor, ODesignProcessor],
+        ids=["af3", "protenix", "boltz1", "boltz2", "boltzgen", "odesign"],
+    )
+    def test_family_training(self, peptide, processor_type):
+        structure = peptide("ALA", "GLY", copies=2)
+        coordinates = structure.coordinates + [20, 30, 40]
+        truth, _ = replace_coordinates(
+            structure,
+            np.arange(len(coordinates)),
+            coordinates,
+            scope=np.ones(len(coordinates), dtype=bool),
+            evidence=CoordinateEvidence.OBSERVED,
+        )
+        system, observations, _ = project_arrays(
+            truth.system.build(), truth.build(), np.array([1, 0]), np.ones(len(coordinates), dtype=bool)
+        )
+        truth = Structure.from_arrays(MolecularSystem.from_arrays(system), observations)
+        processor = processor_type(dtype=torch.float64)
+        expected = processor.prepare_input(structure, generator=np.random.default_rng(0))
+        prepared, target = processor.prepare(structure, target=truth, generator=np.random.default_rng(0))
+        separate = processor.prepare_target(truth, prepared=expected)
+
+        torch.testing.assert_close(prepared.features.to_dict(), expected.features.to_dict())
+        torch.testing.assert_close(target.to_dict(), separate.to_dict())
+        assert prepared.context.structure is structure
+        mask = target.coordinate_mask.reshape(-1, target.coordinate_mask.shape[-1])[0]
+        points = target.coordinates.reshape(-1, target.coordinates.shape[-2], 3)[0]
+        if processor_type is ODesignProcessor:
+            rows = prepared.context.slots.atom[mask.cpu().numpy()]
+            expected_points = coordinates[rows].copy()
+            fixed = prepared.features.fixed_coordinate_mask[0, mask]
+            expected_points[fixed.cpu().numpy()] = prepared.features.observed_positions[0, mask][fixed].cpu().numpy()
+        else:
+            expected_points = coordinates[mask.cpu().numpy()]
+        torch.testing.assert_close(points[mask], torch.from_numpy(expected_points))
 
 
 class TestComponentAlignment:

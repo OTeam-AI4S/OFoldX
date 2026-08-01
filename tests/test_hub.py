@@ -37,6 +37,11 @@ from ofoldx.models.boltz1 import Boltz1Processor
 from ofoldx.models.boltz2 import Boltz2AffinityProcessor, Boltz2Processor
 from ofoldx.models.boltzgen import BoltzGenInverseFoldingProcessor, BoltzGenProcessor
 from ofoldx.models.esmfold2 import EsmFold2ExperimentalProcessor, EsmFold2Processor
+from ofoldx.models.odesign import (
+    ODesignLigandProcessor,
+    ODesignProcessor,
+    ODesignProcessorConfig,
+)
 from ofoldx.models.pxdesign import PxDesignProcessor
 from ofoldx.models.registry import MODELS
 
@@ -130,6 +135,8 @@ class TestLoadProcessor:
         BoltzGenInverseFoldingProcessor,
         EsmFold2Processor,
         EsmFold2ExperimentalProcessor,
+        ODesignProcessor,
+        ODesignLigandProcessor,
         PxDesignProcessor,
     ],
 )
@@ -152,8 +159,17 @@ def test_reference_seed_configuration_is_independent(processor_class):
 
 @pytest.mark.parametrize(
     ("architecture", "processor_class", "config", "artifact", "check_features"),
-    [("test_reference_seed_af3", AlphaFold3Processor, AlphaFold3ProcessorConfig(seed=7), None, True)],
-    ids=("seed-only",),
+    [
+        ("test_reference_seed_af3", AlphaFold3Processor, AlphaFold3ProcessorConfig(seed=7), None, True),
+        (
+            "test_reference_seed_odesign",
+            ODesignProcessor,
+            ODesignProcessorConfig(artifact="protein_rigid", seed=7),
+            "protein_rigid",
+            False,
+        ),
+    ],
+    ids=("seed-only", "seed-and-artifact"),
 )
 def test_reference_seed_repository_round_trip(
     tmp_path, repository_model, library, architecture, processor_class, config, artifact, check_features

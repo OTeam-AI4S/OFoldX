@@ -430,6 +430,7 @@ FodyWeavers.xsd
 **/*.tgz
 **/*.txz
 **/*.gz
+!tests/models/odesign/fixtures/inosine.cif.gz
 **/*.xz
 
 # Pickle
@@ -440,6 +441,7 @@ FodyWeavers.xsd
 **/*.onnx
 **/*.ckpt
 **/*.safetensors
+!ofoldx/models/odesign/reference.safetensors
 **/*.pth
 **/*.pt
 **/*.bin

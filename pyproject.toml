@@ -77,6 +77,7 @@ package-data.ofoldx = [
   "reference/*/README.md",
   "licenses/*.md",
   "models/*/README*.md",
+  "models/odesign/reference.safetensors",
   "modules/*/README.md",
   "py.typed",
 ]
