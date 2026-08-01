@@ -45,7 +45,7 @@ dependencies = [
   "abnumber>=0.4.4",
   "accelerate>=0.8",
   "anarci",
-  "biotite>=1.2",
+  "biotite>=2",
   "chanfig>=0.0.117",
   "chembl-structure-pipeline",
   "danling",
