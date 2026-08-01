@@ -84,6 +84,36 @@ def test_pair_local_calibration() -> None:
     assert not torch.isclose(global_ptm, pair_complex[0, 1])
 
 
+def test_ragged_sampling(peptide):
+    from ofoldx.models.protenix import ProtenixConfig, ProtenixModel, ProtenixProcessor
+    from ofoldx.runners.collate import collate_protenix_inputs
+
+    config = ProtenixConfig(
+        single_size=16,
+        pair_size=8,
+        trunk={"num_pairformer_blocks": 1, "num_msa_stages": 1},
+        denoiser={"num_token_encoder_blocks": 1, "num_atom_encoder_blocks": 1, "num_atom_decoder_blocks": 1},
+        confidence={"num_pairformer_blocks": 1},
+    )
+    model = ProtenixModel(config).eval().set_backend("eager")
+    processor = ProtenixProcessor()
+    inputs = [processor.prepare_input(peptide(*(["GLY"] * length))).features for length in (2, 3)]
+    for value, depth in zip(inputs, (2, 3), strict=True):
+        value.msa_tokens = value.msa_tokens.repeat(1, depth, 1)
+        value.msa_deletion_counts = value.msa_deletion_counts.repeat(1, depth, 1)
+    output = model.sample(
+        collate_protenix_inputs(inputs),
+        num_recycles=2,
+        num_samples=2,
+        num_sampling_steps=1,
+        generator=torch.Generator().manual_seed(899),
+    )
+    for index, value in enumerate(inputs):
+        assert output.coordinates[index].shape == (2, value.atom_mask.shape[-1], 3)
+        assert torch.isfinite(output.coordinates[index]).all()
+        assert output.pae_logits[index].shape[:3] == (2, value.token_mask.shape[-1], value.token_mask.shape[-1])
+
+
 def test_partner_frame_eligibility() -> None:
     from ofoldx.models.protenix.model import _protenix_tm_scores
 

@@ -18,6 +18,7 @@ nav:
   - Home: index.md
   - Models: []
   - Pipelines: []
+  - Examples: examples/index.md
   - Task API: []
   - Data: []
   - Chemistry: []
@@ -29,6 +30,7 @@ nav:
   - Metrics: []
   - Analysis: []
   - Results: []
+  - Runners: []
   - API Reference: []
   - About:
       - License: about/license.md
@@ -189,6 +191,7 @@ plugins:
             - https://chanfig.danling.org/objects.inv
             - https://danling.org/objects.inv
 watch:
+  - ../examples/
   - ../ofoldx/
   - ../README.md
   - ../README.zh.md

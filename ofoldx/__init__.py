@@ -66,6 +66,7 @@ if TYPE_CHECKING:
         ScoreResult,
         best,
     )
+    from .runners import Runner
     from .templates import Template
 
 
@@ -108,6 +109,7 @@ _EXPORTS = {
     "Scored": (".results", "Scored"),
     "ScoreResult": (".results", "ScoreResult"),
     "best": (".results", "best"),
+    "Runner": (".runners", "Runner"),
 }
 
 

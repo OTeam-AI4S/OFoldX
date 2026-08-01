@@ -33,7 +33,8 @@ print(nll.value, nll.unit)
 
 The result reports sequence negative log-likelihood in `nat/residue`. See the
 [model](ofoldx/models) and [pipeline](ofoldx/pipelines) guides for structure
-prediction, molecular design, scoring, and side-chain packing.
+prediction, molecular design, scoring, and side-chain packing. See the
+[runner guide](ofoldx/runners) for training.
 
 Install the latest source version when you need unreleased changes:
 

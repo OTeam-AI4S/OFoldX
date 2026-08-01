@@ -32,6 +32,7 @@ print(nll.value, nll.unit)
 
 结果给出序列负对数似然，单位为 `nat/residue`。
 [模型](ofoldx/models)和 [pipeline](ofoldx/pipelines) 指南介绍结构预测、分子设计、评分与侧链构象预测。
+训练请参阅 [runner 指南](ofoldx/runners)。
 
 如果需要未发布的最新修改，可以从源代码安装：
 
