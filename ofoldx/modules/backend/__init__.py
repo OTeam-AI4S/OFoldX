@@ -5,6 +5,7 @@ Dispatch across supported acceleration backends.
 from __future__ import annotations
 
 from .adaptive_norm import adaptive_layer_norm
+from .atom_window import atom_to_token_mean, token_pair_to_atom_window_gather, token_to_atom_broadcast
 from .factorized_pair_linear import factorized_pair_linear
 from .normalization import LayerNorm, layer_norm
 from .pair_norm_projection import pair_norm_projection
@@ -16,10 +17,13 @@ __all__ = [
     "Backend",
     "LayerNorm",
     "adaptive_layer_norm",
+    "atom_to_token_mean",
     "factorized_pair_linear",
     "layer_norm",
     "pair_norm_projection",
     "resolve_config_backend",
+    "token_pair_to_atom_window_gather",
+    "token_to_atom_broadcast",
     "transition",
     "triangle_multiplication",
 ]
