@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -28,7 +29,11 @@ import torch
 from safetensors.torch import load_file, save_file
 
 from ofoldx.artifacts import save_model
+from ofoldx.chemistry import Molecule, Recipe, build_system, read_smiles
+from ofoldx.data import Structure
 from ofoldx.hub import ResolvedRepository, load_model, load_processor, resolve_hub_repository, resolve_repository
+from ofoldx.models.alphafold3 import AlphaFold3Processor, AlphaFold3ProcessorConfig
+from ofoldx.models.registry import MODELS
 
 
 def test_dataset_snapshot_identity_survives_resolution(tmp_path, monkeypatch):
@@ -107,3 +112,67 @@ class TestLoadProcessor:
         assert type(processor) is type(repository_processor)
         assert processor.config.scale == 2
         assert processor.dtype == torch.float16
+
+
+@pytest.mark.parametrize(
+    "processor_class",
+    [AlphaFold3Processor],
+)
+def test_reference_seed_configuration_is_independent(processor_class):
+    config = processor_class.config_class(seed=7)
+    configured = processor_class(config)
+    assert configured.seed == 7
+    processor = processor_class(config, seed=0)
+    assert config.seed == 7
+    assert processor.seed == 0
+
+    config.seed = 13
+    assert configured.seed == 7
+    assert processor.seed == 0
+    processor.config.seed = 17
+    assert processor.seed == 17
+    processor.seed = 19
+    assert processor.config.seed == 19
+
+
+@pytest.mark.parametrize(
+    ("architecture", "processor_class", "config", "artifact", "check_features"),
+    [("test_reference_seed_af3", AlphaFold3Processor, AlphaFold3ProcessorConfig(seed=7), None, True)],
+    ids=("seed-only",),
+)
+def test_reference_seed_repository_round_trip(
+    tmp_path, repository_model, library, architecture, processor_class, config, artifact, check_features
+):
+    processor = processor_class(config, dtype=torch.float64)
+    MODELS.register(architecture, model=type(repository_model), processor=processor_class)
+    save_model(tmp_path, model=repository_model, processor=processor)
+    restored = load_processor(ResolvedRepository(tmp_path))
+    assert restored.seed == 7
+    assert restored.dtype == torch.float64
+    if artifact is not None:
+        assert restored.config.artifact == artifact
+
+    if check_features:
+        component = read_smiles("CCCOCC", component_id="LIG").component
+        system, _, _ = build_system(
+            Recipe({"ligand": Molecule(("LIG",))}, {"L": "ligand"}), library, components={"LIG": component}
+        )
+        target = Structure.unobserved(system)
+        expected = processor.prepare_input(target).features.reference_positions
+        actual = restored.prepare_input(target).features.reference_positions
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+    # Native repositories published before seed persistence contain no seed field.
+    metadata_path = tmp_path / "processor.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata.pop("seed")
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    legacy = load_processor(ResolvedRepository(tmp_path))
+    assert legacy.seed == 42
+    assert legacy.dtype == torch.float64
+    if artifact is not None:
+        assert legacy.config.artifact == artifact
+    if check_features:
+        expected = AlphaFold3Processor(dtype=torch.float64).prepare_input(target).features.reference_positions
+        actual = legacy.prepare_input(target).features.reference_positions
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)

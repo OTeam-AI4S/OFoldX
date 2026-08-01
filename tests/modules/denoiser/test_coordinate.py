@@ -32,6 +32,7 @@ from danling.tensors import NestedTensor
 from torch._dynamo.testing import CompileCounterWithBackend
 from torch.utils.checkpoint import checkpoint
 
+from ofoldx.models.alphafold3.model import ALPHAFOLD3_SOURCE_TOKENS, AlphaFold3CoordinateDenoiser
 from ofoldx.modules.denoiser import CoordinateDenoiser, DenoisingTokenRefiner
 from ofoldx.modules.diffusion import (
     CoordinateDenoiseContext,
@@ -40,10 +41,15 @@ from ofoldx.modules.diffusion import (
     EdmScheduler,
 )
 from ofoldx.modules.embedding.position import RelativePositionBuckets, generate_relative_position_features
+from tests.modules import require_oops
 
 
-def _coordinate_denoiser(backend: str = "eager") -> CoordinateDenoiser:
-    return CoordinateDenoiser(
+def _coordinate_denoiser(
+    backend: str = "eager",
+    denoiser_type: type[CoordinateDenoiser] | type[AlphaFold3CoordinateDenoiser] = CoordinateDenoiser,
+) -> CoordinateDenoiser | AlphaFold3CoordinateDenoiser:
+    features = {"token_feature_size": 2} if denoiser_type is CoordinateDenoiser else {}
+    return denoiser_type(
         num_encoder_blocks=1,
         num_encoder_attention_heads=2,
         sigma_data=1.0,
@@ -52,7 +58,6 @@ def _coordinate_denoiser(backend: str = "eager") -> CoordinateDenoiser:
         token_hidden_size=8,
         single_size=4,
         pair_size=3,
-        token_feature_size=2,
         atom_feature_size=5,
         num_atom_encoder_blocks=1,
         num_atom_encoder_attention_heads=2,
@@ -61,15 +66,17 @@ def _coordinate_denoiser(backend: str = "eager") -> CoordinateDenoiser:
         num_query_atoms=2,
         num_key_atoms=4,
         backend=backend,
+        **features,
     )
 
 
 def _coordinate_context(
-    model: CoordinateDenoiser,
+    model: CoordinateDenoiser | AlphaFold3CoordinateDenoiser,
     *,
     batch: int,
     atoms: int = 4,
     tokens: int = 2,
+    token_feature_size: int = 2,
     requires_grad: bool = False,
 ) -> CoordinateDenoiseContext:
     reference_positions = torch.randn(batch, atoms, 3)
@@ -95,7 +102,7 @@ def _coordinate_context(
             atoms,
             rounding_mode="floor",
         ).expand(batch, atoms),
-        token_embedding=torch.randn(batch, tokens, 2, requires_grad=requires_grad),
+        token_embedding=torch.randn(batch, tokens, token_feature_size, requires_grad=requires_grad),
         single=torch.randn(batch, tokens, 4, requires_grad=requires_grad),
         conditioning_single=torch.randn(batch, tokens, 4, requires_grad=requires_grad),
         conditioning_pair=torch.randn(batch, tokens, tokens, 3, requires_grad=requires_grad),
@@ -126,23 +133,29 @@ def _coordinate_inputs(
 
 class TestCoordinateDenoiser:
     @pytest.mark.parametrize(
-        "backend,device",
+        "denoiser_type,backend,device",
         [
-            ("eager", "cpu"),
-            ("eager", "cuda"),
-            ("oops", "cuda"),
+            (CoordinateDenoiser, "eager", "cpu"),
+            (CoordinateDenoiser, "eager", "cuda"),
+            (CoordinateDenoiser, "auto", "cuda"),
+            (CoordinateDenoiser, "oops", "cuda"),
+            (AlphaFold3CoordinateDenoiser, "eager", "cpu"),
+            (AlphaFold3CoordinateDenoiser, "eager", "cuda"),
         ],
-        ids=["shared-cpu", "shared-cuda", "shared-oops"],
+        ids=["shared-cpu", "shared-cuda", "shared-auto", "shared-oops", "af3-cpu", "af3-cuda"],
     )
-    def test_prepared_compile(self, backend: str, device: str) -> None:
+    def test_prepared_compile(self, denoiser_type, backend: str, device: str) -> None:
         if device == "cuda" and not torch.cuda.is_available():
             pytest.skip("Compiled CUDA denoising requires CUDA")
         if backend == "oops":
-            pytest.importorskip("oops")
+            require_oops("adaptive_layer_norm", "norm_projection", "transition")
         torch.manual_seed(23)
         with torch.device(device):
-            model = _coordinate_denoiser(backend).eval()
-            context = _coordinate_context(model, batch=1)
+            model = _coordinate_denoiser(backend, denoiser_type).eval()
+            token_feature_size = (
+                384 + 2 * len(ALPHAFOLD3_SOURCE_TOKENS) + 1 if denoiser_type is AlphaFold3CoordinateDenoiser else 2
+            )
+            context = _coordinate_context(model, batch=1, token_feature_size=token_feature_size)
             inputs = context.to_denoising_input(torch.randn(1, 2, 4, 3), torch.tensor([[0.5, 1.0]]))
         reference = deepcopy(model)
         sampler = CoordinateEdmSampler(
@@ -270,14 +283,17 @@ class TestCoordinateDenoiser:
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="OOps atom kernels require CUDA")
     @pytest.mark.parametrize("compiled", [False, True], ids=["eager", "fullgraph"])
-    def test_sampled_ragged_forward_and_backward(self, compiled: bool) -> None:
+    @pytest.mark.parametrize("backend", ["auto", "oops"])
+    def test_sampled_ragged_forward_and_backward(self, compiled: bool, backend: str) -> None:
         pytest.importorskip("oops")
+        if backend == "oops":
+            require_oops("adaptive_layer_norm", "norm_projection", "transition")
         torch.manual_seed(17)
         device = torch.device("cuda")
         atom_lengths = (4, 6)
         token_lengths = (2, 3)
         samples = 2
-        model = _coordinate_denoiser(backend="oops").to(device)
+        model = _coordinate_denoiser(backend=backend).to(device)
         reference_positions = NestedTensor(
             [torch.randn(atoms, 3, device=device) for atoms in atom_lengths],
         )
