@@ -5,6 +5,7 @@ Open biomolecular structure models.
 from __future__ import annotations
 
 from ._version import __version__, version
+from .artifacts import save_model
 from .data.conditions import Hotspot
 from .data.evidence import MSA, Template
 from .data.molecular import MolecularSystem, PolymerSequence
@@ -55,5 +56,6 @@ __all__ = [
     "Structure",
     "Template",
     "best",
+    "save_model",
     "version",
 ]
