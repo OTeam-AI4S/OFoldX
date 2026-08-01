@@ -22,6 +22,7 @@ checkpoints, inputs and results.
 | [MembraneMPNN](membranempnn) | `design`, `score` | Backbone + membrane labels → sequence or NLL           | [Hub](https://huggingface.co/oteam/membranempnn-global)  |
 | [NA-MPNN](nampnn)            | `design`, `score` | Protein/DNA/RNA backbone → sequence or NLL             | [Hub](https://huggingface.co/oteam/nampnn)               |
 | [MPNN Packer](mpnn_packer)   | `pack`            | Protein backbone + sequence → side-chain coordinates   | [Hub](https://huggingface.co/oteam/mpnn-packer)          |
+| [gRNAde](grnade)             | `design`          | RNA conformations + base pairs → RNA sequences         | [Hub](https://huggingface.co/oteam/grnade)               |
 
 The Hub links point to an official repository for each family. AlphaFold 3 and
 Protenix-v2 use locally converted parameters. Follow the family guide to select
