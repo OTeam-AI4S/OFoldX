@@ -8,6 +8,7 @@ checkpoints, inputs and results.
 
 | Family                       | Tasks             | Input → Output                                         | Weights                                                  |
 | ---------------------------- | ----------------- | ------------------------------------------------------ | -------------------------------------------------------- |
+| [AlphaFold 2](alphafold2)    | `fold`            | Protein system + MSA/templates → structure             | [Hub](https://huggingface.co/oteam/alphafold2)           |
 | [ProteinMPNN](proteinmpnn)   | `design`, `score` | Protein backbone → sequence or sequence NLL            | [Hub](https://huggingface.co/oteam/proteinmpnn)          |
 | [LigandMPNN](ligandmpnn)     | `design`, `score` | Backbone + atomic context → sequence or NLL            | [Hub](https://huggingface.co/oteam/ligandmpnn)           |
 | [MembraneMPNN](membranempnn) | `design`, `score` | Backbone + membrane labels → sequence or NLL           | [Hub](https://huggingface.co/oteam/membranempnn-global)  |
