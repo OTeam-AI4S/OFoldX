@@ -11,6 +11,7 @@ checkpoints, inputs and results.
 | [AlphaFold 2](alphafold2)    | `fold`            | Protein system + MSA/templates → structure           | [Hub](https://huggingface.co/oteam/alphafold2) · [Convert](alphafold2/convert.py)            |
 | [AlphaFold 3](alphafold3)    | `fold`            | Molecular system + evidence → all-atom structure     | [Convert](alphafold3/convert.py)                                                             |
 | [Protenix](protenix)         | `fold`            | Molecular system + evidence → all-atom structure     | [Hub](https://huggingface.co/oteam/protenix) · [Convert](protenix/convert.py)                |
+| [PXDesign](pxdesign)         | `design`          | Target + binder specification → protein designs      | [Hub](https://huggingface.co/oteam/pxdesign) · [Convert](pxdesign/convert.py)                |
 | [ProteinMPNN](proteinmpnn)   | `design`, `score` | Protein backbone → sequence or sequence NLL          | [Hub](https://huggingface.co/oteam/proteinmpnn) · [Convert](proteinmpnn/convert.py)          |
 | [LigandMPNN](ligandmpnn)     | `design`, `score` | Backbone + atomic context → sequence or NLL          | [Hub](https://huggingface.co/oteam/ligandmpnn) · [Convert](ligandmpnn/convert.py)            |
 | [MembraneMPNN](membranempnn) | `design`, `score` | Backbone + membrane labels → sequence or NLL         | [Hub](https://huggingface.co/oteam/membranempnn-global) · [Convert](membranempnn/convert.py) |
