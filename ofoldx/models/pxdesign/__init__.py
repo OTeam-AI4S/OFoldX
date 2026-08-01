@@ -1,0 +1,59 @@
+r"""
+PxDesign protein-structure design implementation.
+"""
+
+from __future__ import annotations
+
+from ...pipelines.registry import PIPELINES as _PIPELINES
+from ..registry import MODELS as _MODELS
+from .config import (
+    PxDesignConditionEmbeddingsConfig,
+    PxDesignConfig,
+    PxDesignDenoiserConfig,
+    PxDesignSamplerConfig,
+)
+from .model import (
+    PxDesignInput,
+    PxDesignModel,
+    PxDesignOutput,
+)
+from .pipeline import (
+    PxDesignBackbonePipeline,
+    PxDesignBackboneResult,
+    PxDesignCandidate,
+    PxDesignFilterResult,
+    PxDesignPipeline,
+    PxDesignResult,
+)
+from .processor import PxDesignProcessor, TargetChain, from_binder, to_binder
+
+__all__ = [
+    "PxDesignBackbonePipeline",
+    "PxDesignBackboneResult",
+    "PxDesignCandidate",
+    "PxDesignConditionEmbeddingsConfig",
+    "PxDesignConfig",
+    "PxDesignDenoiserConfig",
+    "PxDesignFilterResult",
+    "PxDesignInput",
+    "PxDesignModel",
+    "PxDesignOutput",
+    "PxDesignPipeline",
+    "PxDesignProcessor",
+    "PxDesignResult",
+    "PxDesignSamplerConfig",
+    "TargetChain",
+    "from_binder",
+    "to_binder",
+]
+
+_MODELS.register(
+    "pxdesign",
+    model=PxDesignModel,
+    processor=PxDesignProcessor,
+)
+_PIPELINES.register(
+    "pxdesign_backbone",
+    pipeline=PxDesignBackbonePipeline,
+)
+_PIPELINES.register("pxdesign", pipeline=PxDesignPipeline)
