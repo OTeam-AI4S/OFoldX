@@ -40,6 +40,74 @@ def floating_dtype(request: pytest.FixtureRequest) -> torch.dtype:
 
 
 @pytest.fixture
+def boltz2_config():
+    from ofoldx.models.boltz2 import Boltz2Config  # a family still to migrate (WU14) must not break collection
+
+    def make_config():
+        return Boltz2Config(
+            {
+                "single_size": 8,
+                "pair_size": 8,
+                "atom_hidden_size": 8,
+                "atom_pair_hidden_size": 4,
+                "fourier_embedding_size": 8,
+                "num_distogram_bins": 4,
+                "num_recycles": 1,
+                "input_embeddings": {"num_atom_encoder_blocks": 1, "num_atom_encoder_attention_heads": 1},
+                "trunk": {
+                    "num_pairformer_blocks": 1,
+                    "num_pair_attention_heads": 1,
+                    "num_msa_blocks": 1,
+                    "msa_size": 8,
+                    "msa_attention_head_size": 4,
+                    "num_msa_attention_heads": 1,
+                    "outer_product_hidden_size": 4,
+                    "msa_triangle_attention_head_size": 4,
+                    "num_msa_triangle_attention_heads": 1,
+                    "triangle_attention_head_size": 4,
+                    "num_triangle_attention_heads": 1,
+                    "pair_dropout": 0,
+                    "msa_dropout": 0,
+                    "msa_pair_dropout": 0,
+                },
+                "template": {
+                    "hidden_size": 8,
+                    "num_blocks": 1,
+                    "num_distogram_bins": 4,
+                    "triangle_attention_head_size": 4,
+                    "num_triangle_attention_heads": 1,
+                    "dropout": 0,
+                },
+                "denoiser": {
+                    "atom_hidden_size": 8,
+                    "atom_pair_hidden_size": 4,
+                    "num_query_atoms": 4,
+                    "num_key_atoms": 4,
+                    "num_atom_encoder_blocks": 1,
+                    "num_atom_decoder_blocks": 1,
+                    "num_token_encoder_blocks": 1,
+                    "num_atom_attention_heads": 1,
+                    "num_token_encoder_attention_heads": 1,
+                    "num_conditioning_transitions": 2,
+                },
+                "confidence": {
+                    "num_pairformer_blocks": 1,
+                    "num_pair_attention_heads": 1,
+                    "triangle_attention_head_size": 4,
+                    "num_triangle_attention_heads": 1,
+                    "num_distogram_bins": 4,
+                    "num_plddt_bins": 4,
+                    "num_pae_bins": 4,
+                    "num_pde_bins": 4,
+                    "pair_dropout": 0,
+                },
+            }
+        )
+
+    return make_config
+
+
+@pytest.fixture
 def mpnn_packer():
     from ofoldx.models.mpnn_packer import (
         MpnnPackerConfig,
