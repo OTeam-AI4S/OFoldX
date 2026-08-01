@@ -5,6 +5,14 @@ Public molecular data types.
 from __future__ import annotations
 
 from .components import get_component
+from .conditions import (
+    AllowedResidueIdentities,
+    AtomEndpoint,
+    Endpoint,
+    Hotspot,
+    ResidueEndpoint,
+    TiedResidueIdentities,
+)
 from .elements import ATOMIC_NUMBER_BY_ELEMENT
 from .molecular import (
     BOND_DIRECTION_ENDPOINT_0_DONOR,
@@ -52,6 +60,15 @@ from .molecular import (
     replace_components,
     water_component_mask,
 )
+from .placement import (
+    ExistingSpan,
+    GeneratedSegment,
+    PlacementMap,
+    PlacementSpec,
+    SymbolicAtomSite,
+    SymbolicResidueSite,
+    validate_placement,
+)
 from .structure import (
     RESOLUTION_KIND_EM_RECONSTRUCTION,
     RESOLUTION_KIND_PDB_REMARK_2,
@@ -66,6 +83,8 @@ from .structure import (
 
 __all__ = [
     "ATOMIC_NUMBER_BY_ELEMENT",
+    "AllowedResidueIdentities",
+    "AtomEndpoint",
     "AtomSite",
     "BOND_DIRECTION_ENDPOINT_0_DONOR",
     "BOND_DIRECTION_ENDPOINT_1_DONOR",
@@ -89,6 +108,10 @@ __all__ = [
     "ENTITY_PNA",
     "ENTITY_PROTEIN",
     "ENTITY_RNA",
+    "Endpoint",
+    "ExistingSpan",
+    "GeneratedSegment",
+    "Hotspot",
     "MOLECULE_BRANCHED",
     "MOLECULE_MACROLIDE",
     "MOLECULE_NON_POLYMER",
@@ -97,9 +120,12 @@ __all__ = [
     "Molecule",
     "MoleculeBond",
     "MoleculeType",
+    "PlacementMap",
+    "PlacementSpec",
     "PolymerAttachment",
     "PolymerSequence",
     "PolymerType",
+    "ResidueEndpoint",
     "RESOLUTION_KIND_EM_RECONSTRUCTION",
     "RESOLUTION_KIND_PDB_REMARK_2",
     "RESOLUTION_KIND_REFINEMENT",
@@ -108,7 +134,10 @@ __all__ = [
     "STANDARD_AMINO_ACID_IDS",
     "STRUCTURE_ARTIFACT_SUFFIX",
     "Structure",
+    "SymbolicAtomSite",
+    "SymbolicResidueSite",
     "SystemBond",
+    "TiedResidueIdentities",
     "component_boundary_atoms",
     "copy_components",
     "disjoint_union",
@@ -119,5 +148,6 @@ __all__ = [
     "load_structure",
     "replace_components",
     "save_structure",
+    "validate_placement",
     "water_component_mask",
 ]
