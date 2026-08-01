@@ -14,6 +14,7 @@ checkpoints, inputs and results.
 | [Boltz-2](boltz2)            | `fold`, `score`   | Molecular complex → structure or affinity              | [Hub](https://huggingface.co/oteam/boltz2)               |
 | [ESMFold2](esmfold2)         | `fold`, `design`  | Molecular input / binder target → structure / sequence | [Hub](https://huggingface.co/oteam/esmfold2)             |
 | [Protenix](protenix)         | `fold`            | Molecular system + evidence → all-atom structure       | [Hub](https://huggingface.co/oteam/protenix)             |
+| [RFdiffusion](rfdiffusion)   | `design`          | Contigs + optional motifs → protein backbone           | [Hub](https://huggingface.co/oteam/rfdiffusion-base)     |
 | [PXDesign](pxdesign)         | `design`          | Target + binder specification → protein designs        | [Hub](https://huggingface.co/oteam/pxdesign)             |
 | [BoltzGen](boltzgen)         | `design`          | Binder specification → ranked molecular designs        | [Hub](https://huggingface.co/oteam/boltzgen)             |
 | [ProteinMPNN](proteinmpnn)   | `design`, `score` | Protein backbone → sequence or sequence NLL            | [Hub](https://huggingface.co/oteam/proteinmpnn)          |
