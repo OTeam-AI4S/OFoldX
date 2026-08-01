@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from ._version import __version__, version
 from .artifacts import save_model
+from .auto import AutoModel, AutoProcessor
 from .data.conditions import Hotspot
 from .data.evidence import MSA, Template
 from .data.molecular import MolecularSystem, PolymerSequence
@@ -32,6 +33,8 @@ from .results import (
 )
 
 __all__ = [
+    "AutoModel",
+    "AutoProcessor",
     "Backend",
     "DesignAndPackResult",
     "DesignCandidate",
