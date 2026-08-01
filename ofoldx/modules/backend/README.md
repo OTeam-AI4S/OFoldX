@@ -18,7 +18,15 @@ output = layer(values)
 print(output.shape)
 ```
 
-On CPU, automatic tensor dispatch uses the operator's PyTorch default.
+On CPU, automatic tensor dispatch uses the operator's PyTorch default. For a model repository, choose a request
+when loading the pipeline, or change it on a loaded workflow:
+
+```python
+from ofoldx import pipeline
+
+scorer = pipeline("score", model="oteam/proteinmpnn", backend="eager")
+scorer.set_backend("auto")
+```
 
 ## Backend Requests
 

@@ -4,6 +4,9 @@
 > Fold molecules. Unfold possibilities.
 
 OFoldX is a PyTorch library for biomolecular structure prediction and design.
+Use pretrained models to predict structures, design sequences and backbones,
+score candidates, and pack side chains for proteins, nucleic acids, ligands,
+and their complexes.
 
 ## Get Started
 
@@ -12,6 +15,25 @@ Install OFoldX from PyPI:
 ```shell
 pip install ofoldx
 ```
+
+Set `OFOLDX_CCD_ARTIFACT` to an existing CCD artifact before reading a structure.
+
+Score a protein sequence with ProteinMPNN:
+
+```python
+from ofoldx import pipeline
+from ofoldx.io import read_structure
+
+structure, _ = read_structure("backbone.cif")
+scorer = pipeline("score", model="oteam/proteinmpnn")
+result = scorer(structure, seed=7)
+nll = result.scores["designed_sequence_nll"]
+print(nll.value, nll.unit)
+```
+
+The result reports sequence negative log-likelihood in `nat/residue`. See the
+[model](ofoldx/models) and [pipeline](ofoldx/pipelines) guides for structure
+prediction, molecular design, scoring, and side-chain packing.
 
 Install the latest source version when you need unreleased changes:
 
@@ -22,6 +44,7 @@ pip install git+https://github.com/OTeam-AI4S/OFoldX
 ## Community
 
 - [GitHub Issues](https://github.com/OTeam-AI4S/OFoldX/issues): bugs, usage questions, and feature requests.
+- [Hugging Face](https://huggingface.co/oteam): model checkpoints.
 
 ## Citation
 

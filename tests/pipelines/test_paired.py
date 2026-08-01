@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, ClassVar
@@ -28,10 +29,13 @@ from typing import Any, ClassVar
 import pytest
 import torch
 
+from ofoldx.conversion import SourceCheckpoint, save_repository
 from ofoldx.model import Model
 from ofoldx.models.registry import MODELS
 from ofoldx.pipelines import PIPELINES, PairedComponent, PairedPipeline
 from ofoldx.processor import Processor
+
+MODEL_DIR = Path(__file__).resolve().parents[2] / "ofoldx" / "models"
 
 
 class RepositoryPairedPipeline(PairedPipeline[Model, Processor]):
@@ -94,6 +98,159 @@ class RepositoryCustomPipeline(RepositoryScorePipeline):
 
 
 PIPELINES.register("test_repository_custom", pipeline=RepositoryCustomPipeline, model_architecture="test_repository")
+
+
+@pytest.mark.parametrize("sharded", [False, True])
+def test_conversion_sources_and_licenses(tmp_path, repository_model, repository_processor, sharded):
+    source = tmp_path / "source"
+    source.mkdir()
+    if sharded:
+        checkpoint = source / "model.safetensors.index.json"
+        checkpoint.write_text(json.dumps({"weight_map": {"a": "part1.safetensors", "b": "part2.safetensors"}}))
+        (source / "part1.safetensors").write_bytes(b"source first shard")
+        (source / "part2.safetensors").write_bytes(b"source second shard")
+    else:
+        checkpoint = source / "weights.ckpt"
+        checkpoint.write_bytes(b"original checkpoint bytes")
+    destination = tmp_path / "converted"
+    pipeline = RepositoryPairedPipeline(model=repository_model, processor=repository_processor)
+    save_repository(
+        pipeline,
+        destination,
+        sources={"checkpoint": SourceCheckpoint(checkpoint, revision="source-commit")},
+        converter="ofoldx.models.proteinmpnn.convert.convert_proteinmpnn_checkpoint",
+        options={"variant": "test-selected-variant"},
+    )
+    record = json.loads((destination / "conversion.json").read_text())
+    assert record["license"] == "AGPL-3.0-or-later"
+    assert record["options"]["variant"] == "test-selected-variant"
+    assert record["sources"]["checkpoint"]["revision"] == "source-commit"
+    recorded = {item["name"]: item["sha256"] for item in record["sources"]["checkpoint"]["files"]}
+    assert recorded == {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in source.iterdir()}
+    assert (
+        record["initial_artifacts"]["model.json"]["sha256"]
+        == hashlib.sha256((destination / "model.json").read_bytes()).hexdigest()
+    )
+    assert (destination / "README.md").read_bytes() == (MODEL_DIR / "proteinmpnn" / "README.md").read_bytes()
+    assert "GNU AFFERO GENERAL PUBLIC LICENSE" in (destination / "license.md").read_text()
+    assert "OFoldX" in (destination / "license-faq.md").read_text()
+    loaded = RepositoryPairedPipeline.from_pretrained(destination, backend="eager")
+    torch.testing.assert_close(loaded.model.weight, repository_model.weight)
+
+
+def test_conversion_before_upload(tmp_path, repository_model, repository_processor, monkeypatch):
+    destination = tmp_path / "converted"
+    destination.mkdir()
+    original = {"README.md": "# Caller model card\n", "license.md": "Caller AGPL notice\n"}
+    for name, content in original.items():
+        (destination / name).write_text(content)
+    checkpoint = tmp_path / "source.ckpt"
+    checkpoint.write_bytes(b"weights")
+    uploads = []
+
+    class Api:
+        def __init__(self, token=None):
+            pass
+
+        def create_repo(self, **kwargs):
+            pass
+
+        def upload_folder(self, *, folder_path, repo_id, **kwargs):
+            folder = Path(folder_path)
+            assert all(
+                (folder / name).is_file() for name in ("README.md", "license.md", "license-faq.md", "conversion.json")
+            )
+            assert (folder / "README.md").read_bytes() == (MODEL_DIR / "proteinmpnn" / "README.md").read_bytes()
+            assert json.loads((folder / "conversion.json").read_text())["sources"]["checkpoint"]["files"]
+            uploads.append(repo_id)
+
+    monkeypatch.setattr("huggingface_hub.HfApi", Api)
+    save_repository(
+        RepositoryPairedPipeline(model=repository_model, processor=repository_processor),
+        destination,
+        sources={"checkpoint": checkpoint},
+        converter="ofoldx.models.proteinmpnn.convert.convert_proteinmpnn_checkpoint",
+        repo_id="example/converted",
+    )
+    assert uploads == ["example/converted"]
+    assert (destination / "license.md").read_text() == original["license.md"]
+
+
+@pytest.mark.parametrize("source_kind", ["string", "path", "explicit"])
+def test_conversion_refuses_missing_local_source_before_writing(
+    tmp_path, repository_model, repository_processor, monkeypatch, source_kind
+):
+    monkeypatch.chdir(tmp_path)
+    reference = "weights/missing.ckpt"
+    source = {
+        "string": reference,
+        "path": Path(reference),
+        "explicit": SourceCheckpoint(reference),
+    }[source_kind]
+    destination = tmp_path / "converted"
+    with pytest.raises(FileNotFoundError):
+        save_repository(
+            RepositoryPairedPipeline(model=repository_model, processor=repository_processor),
+            destination,
+            sources={"checkpoint": source},
+            converter="ofoldx.models.proteinmpnn.convert.convert_proteinmpnn_checkpoint",
+        )
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize("compound", [False, True])
+@pytest.mark.parametrize("repo_id", [None, "example/current-variant"])
+def test_proteinmpnn_conversion(tmp_path, monkeypatch, compound, repo_id):
+    import ofoldx
+    from ofoldx.models.mpnn_packer import (
+        MpnnPackerConfig,
+        MpnnPackerModel,
+        MpnnPackerPipeline,
+        MpnnPackerProcessor,
+        MpnnPackerProcessorConfig,
+    )
+    from ofoldx.models.proteinmpnn import (
+        ProteinMpnnConfig,
+        ProteinMpnnDesignAndPackPipeline,
+        ProteinMpnnModel,
+        ProteinMpnnPipeline,
+        ProteinMpnnProcessor,
+    )
+
+    small = {"hidden_size": 8, "num_encoder_blocks": 1, "num_decoder_blocks": 1, "num_neighbors": 2, "dropout": 0.0}
+    designer = ProteinMpnnPipeline(model=ProteinMpnnModel(ProteinMpnnConfig(small)), processor=ProteinMpnnProcessor())
+    if compound:
+        packer = MpnnPackerPipeline(
+            model=MpnnPackerModel(MpnnPackerConfig({**small, "edge_size": 8, "num_context_atoms": 1})),
+            processor=MpnnPackerProcessor(MpnnPackerProcessorConfig(num_context_atoms=1)),
+        )
+        pipeline = ProteinMpnnDesignAndPackPipeline(designer=designer, packer=packer)
+    else:
+        pipeline = designer
+    source = tmp_path / "original.pt"
+    source.write_bytes(b"original")
+    notice = tmp_path / "UPSTREAM-LICENSE"
+    notice.write_text("Original upstream notice\n")
+    destination = tmp_path / "converted"
+    monkeypatch.setattr("ofoldx.conversion.upload_repository", lambda *args, **kwargs: None)
+    save_repository(
+        pipeline,
+        destination,
+        sources={"checkpoint": SourceCheckpoint(source, revision="source-commit", license_files=(notice,))},
+        converter="ofoldx.models.proteinmpnn.convert.convert_proteinmpnn_checkpoint",
+        repo_id=repo_id,
+    )
+    monkeypatch.chdir(destination)
+    loaded = ofoldx.pipeline("design", model=".", backend="eager")
+    assert type(loaded) is type(pipeline)
+    card = (destination / "README.md").read_text()
+    assert "license: agpl-3.0" in card
+    if not compound:
+        scorer = ofoldx.pipeline("score", model=destination, backend="eager")
+        assert scorer.task == "score"
+    record = json.loads((destination / "conversion.json").read_text())
+    assert record["sources"]["checkpoint"]["revision"] == "source-commit"
+    assert (destination / "licenses" / "checkpoint" / "UPSTREAM-LICENSE").read_text() == notice.read_text()
 
 
 class RepositoryPairedComponent(PairedComponent[Model, Processor]):
@@ -265,3 +422,132 @@ class TestPairedPipeline:
         torch.testing.assert_close(workflow(input), expected)
         with pytest.raises(KeyError):
             workflow.save(tmp_path)
+
+
+def test_conversion_records_hub_snapshot_shards_by_logical_path(tmp_path, repository_model, repository_processor):
+    cache = tmp_path / "models--example--model"
+    blobs = cache / "blobs"
+    blobs.mkdir(parents=True)
+    index_bytes = json.dumps(
+        {"weight_map": {"a": "first.safetensors", "b": "first.safetensors", "c": "alias.safetensors"}}
+    ).encode()
+    (blobs / "index-hash").write_bytes(index_bytes)
+    for revision, content in (("one", b"first revision"), ("two", b"second revision")):
+        snapshot = cache / "snapshots" / revision
+        snapshot.mkdir(parents=True)
+        (blobs / revision).write_bytes(content)
+        (snapshot / "model.safetensors.index.json").symlink_to("../../blobs/index-hash")
+        (snapshot / "first.safetensors").symlink_to(f"../../blobs/{revision}")
+        (snapshot / "alias.safetensors").symlink_to(f"../../blobs/{revision}")
+    sources = {
+        revision: SourceCheckpoint(cache / "snapshots" / revision / "model.safetensors.index.json")
+        for revision in ("one", "two")
+    }
+    destination = tmp_path / "converted"
+    save_repository(
+        RepositoryPairedPipeline(model=repository_model, processor=repository_processor),
+        destination,
+        sources=sources,
+        converter="ofoldx.models.proteinmpnn.convert.convert_proteinmpnn_checkpoint",
+    )
+    records = json.loads((destination / "conversion.json").read_text())["sources"]
+    for revision, content in (("one", b"first revision"), ("two", b"second revision")):
+        record = records[revision]
+        assert record["reference"] == str(sources[revision].path)
+        expected = {
+            "model.safetensors.index.json": index_bytes,
+            "first.safetensors": content,
+            "alias.safetensors": content,
+        }
+        assert {entry["name"]: (entry["size"], entry["sha256"]) for entry in record["files"]} == {
+            name: (len(value), hashlib.sha256(value).hexdigest()) for name, value in expected.items()
+        }
+        assert len(record["files"]) == len(expected)
+
+
+@pytest.mark.parametrize("shard", ["../outside", "/outside", "nested/../../outside", ""])
+def test_conversion_rejects_escaping_shard_names(tmp_path, repository_model, repository_processor, shard):
+    index = tmp_path / "model.safetensors.index.json"
+    index.write_text(json.dumps({"weight_map": {"weight": shard}}))
+    with pytest.raises(ValueError, match="repository-relative"):
+        save_repository(
+            RepositoryPairedPipeline(model=repository_model, processor=repository_processor),
+            tmp_path / "converted",
+            sources={"checkpoint": index},
+            converter="ofoldx.models.proteinmpnn.convert.convert_proteinmpnn_checkpoint",
+        )
+    assert not (tmp_path / "converted").exists()
+
+
+@pytest.mark.parametrize("kind", ["missing", "broken"])
+def test_conversion_rejects_missing_or_broken_shards(tmp_path, repository_model, repository_processor, kind):
+    source = tmp_path / "source"
+    source.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "weights.safetensors").write_bytes(b"outside")
+    shard = "weights.safetensors"
+    if kind == "broken":
+        (source / shard).symlink_to(outside / "missing")
+    index = source / "model.safetensors.index.json"
+    index.write_text(json.dumps({"weight_map": {"weight": shard}}))
+    with pytest.raises(FileNotFoundError):
+        save_repository(
+            RepositoryPairedPipeline(model=repository_model, processor=repository_processor),
+            tmp_path / "converted",
+            sources={"checkpoint": index},
+            converter="ofoldx.models.proteinmpnn.convert.convert_proteinmpnn_checkpoint",
+        )
+    assert not (tmp_path / "converted").exists()
+
+
+def test_conversion_records_ordinary_directory(tmp_path, repository_model, repository_processor):
+    source = tmp_path / "source"
+    (source / "nested").mkdir(parents=True)
+    (source / ".git").mkdir()
+    (source / "config.json").write_bytes(b"config")
+    (source / "nested" / "weights").write_bytes(b"weights")
+    (source / ".git" / "ignore").write_bytes(b"metadata")
+    destination = tmp_path / "converted"
+    save_repository(
+        RepositoryPairedPipeline(model=repository_model, processor=repository_processor),
+        destination,
+        sources={"checkpoint": source},
+        converter="ofoldx.models.proteinmpnn.convert.convert_proteinmpnn_checkpoint",
+    )
+    record = json.loads((destination / "conversion.json").read_text())["sources"]["checkpoint"]
+    assert record["kind"] == "directory" and record["reference"] == str(source)
+    assert {entry["name"]: (entry["size"], entry["sha256"]) for entry in record["files"]} == {
+        name: (len(content), hashlib.sha256(content).hexdigest())
+        for name, content in {"config.json": b"config", "nested/weights": b"weights"}.items()
+    }
+
+
+@pytest.mark.parametrize("directory_link", [False, True])
+def test_conversion_records_external_shard_symlink(tmp_path, repository_model, repository_processor, directory_link):
+    source = tmp_path / "source"
+    source.mkdir()
+    outside = tmp_path / "other_disk"
+    outside.mkdir()
+    payload = b"external shard"
+    (outside / "weights.safetensors").write_bytes(payload)
+    if directory_link:
+        (source / "linked").symlink_to(outside, target_is_directory=True)
+        name = "linked/weights.safetensors"
+    else:
+        (source / "weights.safetensors").symlink_to(outside / "weights.safetensors")
+        name = "weights.safetensors"
+    index = source / "model.safetensors.index.json"
+    index.write_text(json.dumps({"weight_map": {"weight": name}}))
+    destination = tmp_path / "converted"
+    save_repository(
+        RepositoryPairedPipeline(model=repository_model, processor=repository_processor),
+        destination,
+        sources={"checkpoint": index},
+        converter="ofoldx.models.proteinmpnn.convert.convert_proteinmpnn_checkpoint",
+    )
+    record = json.loads((destination / "conversion.json").read_text())["sources"]["checkpoint"]
+    shards = {entry["name"]: entry for entry in record["files"]}
+    assert set(shards) == {index.name, name}
+    assert shards[name]["size"] == len(payload)
+    assert shards[name]["sha256"] == hashlib.sha256(payload).hexdigest()

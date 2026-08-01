@@ -4,6 +4,8 @@
 > Fold molecules. Unfold possibilities.
 
 OFoldX 是用于生物分子结构预测与设计的 PyTorch 库。
+通过预训练模型，可以预测结构、设计序列和骨架、评价候选并预测侧链构象，
+处理蛋白质、核酸、配体及其复合物。
 
 ## 快速开始
 
@@ -12,6 +14,24 @@ OFoldX 是用于生物分子结构预测与设计的 PyTorch 库。
 ```shell
 pip install ofoldx
 ```
+
+读取结构前，将 `OFOLDX_CCD_ARTIFACT` 指向已有 CCD 文件。
+
+使用 ProteinMPNN 对蛋白质序列评分：
+
+```python
+from ofoldx import pipeline
+from ofoldx.io import read_structure
+
+structure, _ = read_structure("backbone.cif")
+scorer = pipeline("score", model="oteam/proteinmpnn")
+result = scorer(structure, seed=7)
+nll = result.scores["designed_sequence_nll"]
+print(nll.value, nll.unit)
+```
+
+结果给出序列负对数似然，单位为 `nat/residue`。
+[模型](ofoldx/models)和 [pipeline](ofoldx/pipelines) 指南介绍结构预测、分子设计、评分与侧链构象预测。
 
 如果需要未发布的最新修改，可以从源代码安装：
 
@@ -22,6 +42,7 @@ pip install git+https://github.com/OTeam-AI4S/OFoldX
 ## 社区
 
 - [GitHub Issues](https://github.com/OTeam-AI4S/OFoldX/issues)：错误报告、使用问题和功能请求。
+- [Hugging Face](https://huggingface.co/oteam)：模型检查点。
 
 ## 引用
 

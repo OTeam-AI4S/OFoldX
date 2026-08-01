@@ -6,14 +6,25 @@ these values with their own scientific records.
 
 ## Usage
 
-Describe a score and its ranking direction:
+Set `OFOLDX_CCD_ARTIFACT` to an existing CCD artifact before reading a structure.
+
+After a ProteinMPNN design call, select a candidate by sequence NLL and save its target:
 
 ```python
-from ofoldx.results import Score
+from ofoldx import pipeline
+from ofoldx.io import read_structure, save_structure
 
-score = Score(0.5, unit="nat/residue", preferred="lower")
-print(score.value, score.unit)
+structure, report = read_structure("backbone.cif")
+designer = pipeline("design", model="oteam/proteinmpnn")
+result = designer(structure, num_candidates=4, seed=7)
+candidate = result.best_by("designed_sequence_nll")
+print(candidate.scores["designed_sequence_nll"].value)
+save_structure(candidate.target, "candidate.safetensors")
 ```
+
+The official model is downloaded and cached on first use. A sequence
+design's target contains its designed chemistry and available guide coordinates. Use a packing workflow when the
+next step needs generated side-chain coordinates.
 
 ## Result Values
 
