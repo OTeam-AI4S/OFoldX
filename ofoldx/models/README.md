@@ -15,6 +15,7 @@ checkpoints, inputs and results.
 | [ESMFold2](esmfold2)         | `fold`, `design`  | Molecular input / binder target → structure / sequence | [Hub](https://huggingface.co/oteam/esmfold2) · [Convert](esmfold2/convert.py)                |
 | [Protenix](protenix)         | `fold`            | Molecular system + evidence → all-atom structure       | [Hub](https://huggingface.co/oteam/protenix) · [Convert](protenix/convert.py)                |
 | [PXDesign](pxdesign)         | `design`          | Target + binder specification → protein designs        | [Hub](https://huggingface.co/oteam/pxdesign) · [Convert](pxdesign/convert.py)                |
+| [BoltzGen](boltzgen)         | `design`          | Binder specification → ranked molecular designs        | [Hub](https://huggingface.co/oteam/boltzgen) · [Convert](boltzgen/convert.py)                |
 | [ProteinMPNN](proteinmpnn)   | `design`, `score` | Protein backbone → sequence or sequence NLL            | [Hub](https://huggingface.co/oteam/proteinmpnn) · [Convert](proteinmpnn/convert.py)          |
 | [LigandMPNN](ligandmpnn)     | `design`, `score` | Backbone + atomic context → sequence or NLL            | [Hub](https://huggingface.co/oteam/ligandmpnn) · [Convert](ligandmpnn/convert.py)            |
 | [MembraneMPNN](membranempnn) | `design`, `score` | Backbone + membrane labels → sequence or NLL           | [Hub](https://huggingface.co/oteam/membranempnn-global) · [Convert](membranempnn/convert.py) |
