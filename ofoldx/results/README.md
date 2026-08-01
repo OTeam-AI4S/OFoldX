@@ -50,8 +50,12 @@ Use `save_structure` and `load_structure` for the full canonical `Structure` val
 and PDB exchange. The latter returns a write report describing format limitations. Scores and metric arrays remain
 in the Result; include their names, units, scopes, and axes in any JSON, CSV, or NumPy export you create.
 
+A pipeline's `save` method persists its executable workflow and model components. Reload that repository for
+operations supported by its registered task and architecture.
+
 ## Related Modules
 
+- [Pipelines](../pipelines/README.md): complete calls, stages, and design-and-pack composition.
 - [I/O](../io/README.md): native structures and format-aware writes.
 - [Metrics](../metrics/README.md): scientific measurements on predictions.
 - [Analysis](../analysis/README.md): sequence, structure, and diversity analyses.

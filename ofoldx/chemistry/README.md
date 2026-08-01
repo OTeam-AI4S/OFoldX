@@ -58,3 +58,4 @@ require. A generated conformer does not become an experimental observation.
 
 - [Data](../data/README.md): molecular values, graph edits, projections, and coordinate evidence.
 - [I/O](../io/README.md): read source definitions and structure observations together.
+- [Models](../models/README.md): family-specific preparation and chemical capacity.

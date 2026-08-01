@@ -24,8 +24,11 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from pathlib import Path
 
+import chanfig
 import numpy as np
 import pytest
+import torch
+from torch import nn
 
 from ofoldx.chemistry.construction import Molecule, PolymerSequence, Recipe, build_system
 from ofoldx.chemistry.definitions import (
@@ -42,8 +45,57 @@ from ofoldx.data.structure import CoordinateEvidence, replace_coordinates
 from ofoldx.errors import InvalidRequestError
 from ofoldx.io.cif import read_cif
 from ofoldx.io.mmcif.decode import decode_components
+from ofoldx.model import Model
+from ofoldx.models.registry import MODELS
+from ofoldx.processor import Processor
 
 from .chemistry.builders import SUBSET, provenance
+
+
+class RepositoryConfig(chanfig.Config):
+    width: int = 3
+
+
+class RepositoryProcessorConfig(chanfig.Config):
+    scale: int = 1
+
+
+class RepositoryModel(Model):
+    config_class = RepositoryConfig
+
+    def __init__(self, config: RepositoryConfig | None = None) -> None:
+        config = RepositoryConfig() if config is None else config
+        super().__init__(config)
+        self.weight = nn.Parameter(torch.arange(config.width, dtype=torch.float32))
+        self.bias = nn.Parameter(torch.arange(config.width, dtype=torch.float32) + config.width)
+
+
+class RepositoryProcessor(Processor):
+    config_class = RepositoryProcessorConfig
+    config: RepositoryProcessorConfig
+
+    def __init__(
+        self,
+        config: RepositoryProcessorConfig | None = None,
+        *,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
+        super().__init__(device=device, dtype=dtype)
+        self.config = RepositoryProcessorConfig() if config is None else config
+
+
+MODELS.register("test_repository", model=RepositoryModel, processor=RepositoryProcessor)
+
+
+@pytest.fixture
+def repository_model() -> RepositoryModel:
+    return RepositoryModel()
+
+
+@pytest.fixture
+def repository_processor() -> RepositoryProcessor:
+    return RepositoryProcessor(RepositoryProcessorConfig({"scale": 2}), dtype=torch.float16)
 
 
 def _beta_backbone() -> np.ndarray:
@@ -172,7 +224,7 @@ def polymers():
             "transform_code": np.array([-1]),
             "transform_state": np.array([defined]),
         }
-        symbols = {name: () for name in ("chem_comp_type", "connection_type", "parent", "one_letter", "polymer_type")}
+        symbols = {name: () for name in ("connection_type", "parent", "polymer_type")}
         symbols |= {"entity": tuple(entities), "instance": tuple(name for name, _, _ in chains), "component": family}
         return MolecularSystem.from_arrays(SystemArrays(symbols | {"atom": ("CA", "CB")}, columns))
 

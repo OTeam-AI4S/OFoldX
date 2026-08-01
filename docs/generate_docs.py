@@ -33,11 +33,17 @@ ACRONYMS = {
 
 SECTION_PACKAGES = {
     "Analysis": ("analysis", PACKAGE_ROOT / "analysis", "ofoldx.analysis"),
+    "API Reference": ("reference", PACKAGE_ROOT, "ofoldx"),
+    "Chemistry": ("chemistry", PACKAGE_ROOT / "chemistry", "ofoldx.chemistry"),
     "Data": ("data", PACKAGE_ROOT / "data", "ofoldx.data"),
     "I/O": ("io", PACKAGE_ROOT / "io", "ofoldx.io"),
+    "MSA": ("msa", PACKAGE_ROOT / "msa", "ofoldx.msa"),
     "Modules": ("modules", PACKAGE_ROOT / "modules", "ofoldx.modules"),
     "Metrics": ("metrics", PACKAGE_ROOT / "metrics", "ofoldx.metrics"),
+    "Pipelines": ("pipelines", PACKAGE_ROOT / "pipelines", "ofoldx.pipelines"),
     "Results": ("results", PACKAGE_ROOT / "results", "ofoldx.results"),
+    "Task API": ("api", PACKAGE_ROOT / "api", "ofoldx.api"),
+    "Templates": ("templates", PACKAGE_ROOT / "templates", "ofoldx.templates"),
 }
 
 PACKAGE_DOC_TARGETS = {
@@ -48,11 +54,17 @@ PACKAGE_DOC_TARGETS = {
     ROOT / "privacy.md": "about/privacy.md",
     ROOT / "privacy.zh.md": "about/privacy.md",
     PACKAGE_ROOT / "analysis": "analysis/index.md",
+    PACKAGE_ROOT / "chemistry": "chemistry/index.md",
     PACKAGE_ROOT / "data": "data/index.md",
     PACKAGE_ROOT / "io": "io/index.md",
+    PACKAGE_ROOT / "msa": "msa/index.md",
+    PACKAGE_ROOT / "models": "models/index.md",
     PACKAGE_ROOT / "modules": "modules/index.md",
     PACKAGE_ROOT / "metrics": "metrics/index.md",
+    PACKAGE_ROOT / "pipelines": "pipelines/index.md",
     PACKAGE_ROOT / "results": "results/index.md",
+    PACKAGE_ROOT / "api": "api/index.md",
+    PACKAGE_ROOT / "templates": "templates/index.md",
 }
 
 ATTRIBUTE_MODULES = {
@@ -321,6 +333,7 @@ def generated_pages() -> list[Page]:
     pages = [
         ("index.md", render_page(home_title, body=home_body)),
         ("index.zh.md", render_page(chinese_title, body=chinese_body)),
+        *generated_model_pages(),
     ]
     for source in sorted((*ROOT.glob("license*.md"), *ROOT.glob("privacy*.md"))):
         pages.append((f"about/{source.name}", source.read_text(encoding="utf-8")))

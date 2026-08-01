@@ -66,5 +66,6 @@ absent from that mapping.
 
 ## Related Modules
 
+- [Models](../models/README.md): each family's accepted MSA evidence and sampling controls.
 - [Templates](../templates/README.md): aligned structural evidence.
 - [Data](../data/README.md): target instances, sequence classes, and token layouts.

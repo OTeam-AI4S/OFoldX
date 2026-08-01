@@ -21,18 +21,21 @@ pip install git+https://github.com/OTeam-AI4S/OFoldX
 
 ## Explore
 
-| Entry point                     | Use it for                                                        |
-| ------------------------------- | ----------------------------------------------------------------- |
-| [`models`](ofoldx/models)       | Choose a family, convert checkpoints and load model repositories. |
-| [`data`](ofoldx/data)           | Represent molecular identity, coordinates and observations.       |
-| [`io`](ofoldx/io)               | Read and write mmCIF, PDB and native artifacts.                   |
-| [`chemistry`](ofoldx/chemistry) | Define chemical components and construct molecules.               |
-| [`msa`](ofoldx/msa)             | Read, pair and prepare sequence alignments.                       |
-| [`templates`](ofoldx/templates) | Supply structural template evidence.                              |
-| [`modules`](ofoldx/modules)     | Reuse neural-network and geometry components.                     |
-| [`results`](ofoldx/results)     | Interpret candidates, scores and molecular metrics.               |
-| [`metrics`](ofoldx/metrics)     | Compute structural comparison metrics.                            |
-| [`analysis`](ofoldx/analysis)   | Filter and rank design candidates.                                |
+| Entry point                     | Use it for                                                          |
+| ------------------------------- | ------------------------------------------------------------------- |
+| [`models`](ofoldx/models)       | Choose a family, convert checkpoints and load model repositories.   |
+| [`pipelines`](ofoldx/pipelines) | Run and compose biological workflows.                               |
+| [`api`](ofoldx/api)             | Load task pipelines and call common scoring and packing operations. |
+| [`data`](ofoldx/data)           | Represent molecular identity, coordinates and observations.         |
+| [`io`](ofoldx/io)               | Read and write mmCIF, PDB and native artifacts.                     |
+| [`chemistry`](ofoldx/chemistry) | Define chemical components and construct molecules.                 |
+| [`msa`](ofoldx/msa)             | Read, pair and prepare sequence alignments.                         |
+| [`templates`](ofoldx/templates) | Supply structural template evidence.                                |
+| [`modules`](ofoldx/modules)     | Reuse neural-network and geometry components.                       |
+| [`results`](ofoldx/results)     | Interpret candidates, scores and molecular metrics.                 |
+| [`metrics`](ofoldx/metrics)     | Compute structural comparison metrics.                              |
+| [`analysis`](ofoldx/analysis)   | Filter and rank design candidates.                                  |
+| [`hub`](ofoldx/hub)             | Resolve, download and publish model or dataset repositories.        |
 
 ## Community
 

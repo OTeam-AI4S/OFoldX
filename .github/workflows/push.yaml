@@ -149,9 +149,21 @@ jobs:
           ofoldx_smoke_dir=$(mktemp -d)
           cd "$ofoldx_smoke_dir"
           /tmp/ofoldx-smoke/bin/python -I - <<'PY_SMOKE'
+          import os
           from importlib.resources import files
+          from pathlib import Path
+          from ofoldx import AutoModel, AutoProcessor
+          from ofoldx.conversion import save_repository
+          from ofoldx.hub import resolve_hub_repository
 
-          assert files("ofoldx").joinpath("reference/space_groups/space_group_operators.json").is_file()
+          package = files("ofoldx")
+          for resource in ("reference/space_groups/space_group_operators.json", "licenses/license.md", "licenses/license-faq.md"):
+              assert package.joinpath(resource).is_file(), resource
+          source = Path(os.environ["GITHUB_WORKSPACE"]) / "ofoldx"
+          for card in (source / "models").glob("*/README.md"):
+              relative = card.relative_to(source).as_posix()
+              assert package.joinpath(relative).is_file(), relative
+          assert all(callable(api) for api in (AutoModel, AutoProcessor, save_repository, resolve_hub_repository))
           PY_SMOKE
       - name: Upload distributions
         uses: actions/upload-artifact@v7
