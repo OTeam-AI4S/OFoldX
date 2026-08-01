@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, TypeAlias, cast
 
 import torch
 from torch import Tensor
@@ -14,6 +14,7 @@ from torch import Tensor
 from ...data.bonds import SymbolicBond
 from ...data.components import get_component
 from ...data.conditions import Endpoint, Hotspot
+from ...data.crop import Cropper, crop_token_layout, resolved_token_mask
 from ...data.evidence import (
     MSA,
     MSA_GAP_INDEX,
@@ -22,7 +23,6 @@ from ...data.evidence import (
     MsaCollection,
     Template,
     msa_bindings,
-    msa_component_index,
     msa_residue_index,
     resolve_msa_bindings,
 )
@@ -61,6 +61,13 @@ from ...data.placement import (
 from ...data.placement import instance_of as _placement_instance_of
 from ...data.placement import resolve
 from ...data.structure import Structure
+from ...data.tokenization import (
+    TOKEN_INDEX,
+    TOKEN_VOCAB_SIZE,
+    TokenLayout,
+    component_token_index,
+    tokenize_molecular_system,
+)
 from ...processor import Processor
 from .model import (
     CANONICAL_TOKENS,
@@ -158,6 +165,7 @@ class BoltzGenProcessor(Processor):
         conditions: Sequence[BoltzGenSchema] = (),
         msa: MSA | MsaCollection | None = None,
         templates: Sequence[Template] = (),
+        cropper: Cropper | None = None,
         generator: torch.Generator | None = None,
     ) -> tuple[BoltzGenInput, BoltzGenStructureTarget]:
         r"""
@@ -179,6 +187,7 @@ class BoltzGenProcessor(Processor):
             generated_references,
             msa,
             templates=templates,
+            cropper=cropper,
             generator=generator,
         )
         return processed, target
@@ -263,6 +272,7 @@ class BoltzGenProcessor(Processor):
         msa: MSA | MsaCollection | None,
         *,
         templates: Sequence[Template] = (),
+        cropper: Cropper | None = None,
         generator: torch.Generator | None = None,
     ) -> tuple[BoltzGenInput, BoltzGenStructureTarget]:
         r"""
@@ -274,7 +284,41 @@ class BoltzGenProcessor(Processor):
             raise ValueError("BoltzGen requires at least one molecular instance")
         msa = _validate_msa(msa, system)
         generated_components = frozenset(system.component_index(reference) for reference in generated_references)
-        tokens, _ = _build_tokens(system, generated_components=generated_components)
+        layout = _tokenize(system, generated_components=generated_components)
+        if cropper is not None:
+            design_positions = tuple(
+                reference
+                for condition in conditions
+                if isinstance(condition, BoltzGenDesignMask)
+                for reference in condition.positions
+            )
+            anchor = resolved_token_mask(structure, layout)
+            if design_positions:
+                anchor &= _endpoint_token_mask(system, layout, design_positions)
+            layout = crop_token_layout(
+                structure,
+                layout,
+                cropper,
+                required_token_mask=_condition_token_mask(system, layout, conditions),
+                anchor_token_mask=anchor,
+                generator=generator,
+            )
+            selected_components = frozenset(layout.token_component_index.tolist())
+            conditions = tuple(
+                (
+                    BoltzGenDesignMask(
+                        tuple(
+                            reference
+                            for reference in condition.positions
+                            if system.component_index(reference) in selected_components
+                        )
+                    )
+                    if isinstance(condition, BoltzGenDesignMask)
+                    else condition
+                )
+                for condition in conditions
+            )
+        tokens = _lower_token_layout(system, layout)
         token_count = len(tokens)
         system_atom_to_token = {
             atom_index: token_index
@@ -339,10 +383,10 @@ class BoltzGenProcessor(Processor):
             design_mask,
         )
         residue_types = torch.tensor([cast(int, token["residue_type"]) for token in tokens])
-        target_residue_type = torch.nn.functional.one_hot(residue_types, 33).float()
+        target_residue_type = torch.nn.functional.one_hot(residue_types, TOKEN_VOCAB_SIZE).float()
         residue_type_features = target_residue_type.clone()
         residue_type_features[design_mask] = 0
-        residue_type_features[design_mask, _UNKNOWN_RESIDUE_TYPES["protein"]] = 1
+        residue_type_features[design_mask, TOKEN_INDEX["X"]] = 1
         molecule_types = torch.tensor([cast(int, token["molecule_type"]) for token in tokens])
         cyclic_period = torch.tensor(
             [_cyclic_period(system, cast(int, token["instance_index"])) for token in tokens],
@@ -378,7 +422,7 @@ class BoltzGenProcessor(Processor):
         )
         token_distance_mask = _token_distance_mask(structure_group)
         # ``None`` leaves template fields unset so the trunk skips the template embedder.
-        template_values = _template_channels(tuple(templates), tokens, token_count)
+        template_values = _template_channels(system, tuple(templates), tokens, token_count)
 
         tensor_values: dict[str, Tensor] = {
             "token_mask": torch.ones(token_count, dtype=torch.bool),
@@ -554,6 +598,7 @@ class BoltzGenInverseFoldingProcessor(Processor):
         aa_constraints: Sequence[BoltzGenResidueConstraint] = (),
         symmetry: Sequence[Sequence[ComponentReference]] = (),
         msa: MSA | MsaCollection | None = None,
+        cropper: Cropper | None = None,
         generator: torch.Generator | None = None,
     ) -> tuple[BoltzGenInverseFoldingInput, Tensor]:
         r"""
@@ -575,6 +620,7 @@ class BoltzGenInverseFoldingProcessor(Processor):
             global_omit_tokens=tuple(global_omit_tokens),
             aa_constraints=tuple(aa_constraints),
             symmetry=tuple(tuple(unit) for unit in symmetry),
+            cropper=cropper,
             generator=generator,
         )
 
@@ -587,15 +633,37 @@ class BoltzGenInverseFoldingProcessor(Processor):
         global_omit_tokens: tuple[str, ...],
         aa_constraints: tuple[BoltzGenResidueConstraint, ...],
         symmetry: tuple[tuple[ComponentReference, ...], ...],
+        cropper: Cropper | None = None,
         generator: torch.Generator | None,
     ) -> tuple[BoltzGenInverseFoldingInput, Tensor]:
         system = structure.system
         # Generated ``UNK`` protein residues use backbone-only GLY reference coordinates.
         generated_components = frozenset(system.component_index(reference) for reference in design)
-        tokens, atom_indices = _build_tokens(
-            system,
-            generated_components=generated_components,
-        )
+        layout = _tokenize(system, generated_components=generated_components)
+        if cropper is not None:
+            anchor = None
+            if design:
+                anchor = structure.coordinate_mask[layout.token_center_atom_index]
+                anchor &= _endpoint_token_mask(system, layout, design)
+            layout = crop_token_layout(
+                structure,
+                layout,
+                cropper,
+                required_token_mask=_inverse_folding_token_mask(
+                    system,
+                    layout,
+                    aa_constraints,
+                    symmetry,
+                ),
+                anchor_token_mask=anchor,
+                generator=generator,
+            )
+            selected_components = frozenset(layout.token_component_index.tolist())
+            design = tuple(
+                reference for reference in design if system.component_index(reference) in selected_components
+            )
+        tokens = _lower_token_layout(system, layout)
+        atom_indices = tuple(layout.atom_index.detach().cpu().tolist())
         token_count = len(tokens)
         token_index_by_component = {
             cast(int, token["component_index"]): token_index
@@ -679,10 +747,10 @@ class BoltzGenInverseFoldingProcessor(Processor):
         designed_atom_mask = atom_mask & design_mask[atom_to_token]
         reference_positions[designed_atom_mask] = 0
         atom_features[designed_atom_mask, :3] = 0
-        target_residue_type = torch.nn.functional.one_hot(residue_types, 33).float()
+        target_residue_type = torch.nn.functional.one_hot(residue_types, TOKEN_VOCAB_SIZE).float()
         residue_type_features = target_residue_type.clone()
         residue_type_features[design_mask] = 0
-        residue_type_features[design_mask, _UNKNOWN_RESIDUE_TYPES["protein"]] = 1
+        residue_type_features[design_mask, TOKEN_INDEX["X"]] = 1
         token_center_atom_index = torch.tensor(
             [system_to_model_atom[cast(int, token["center"])] for token in tokens],
             dtype=torch.long,
@@ -758,7 +826,7 @@ class BoltzGenInverseFoldingProcessor(Processor):
 
 
 #: One designed polymer type or fixed source residue in a BoltzGen design mask.
-DesignMaskResidue = PolymerType | ComponentReference
+DesignMaskResidue: TypeAlias = PolymerType | ComponentReference
 
 
 def from_design_mask(
@@ -1363,136 +1431,204 @@ def _resolve_conditions(
     return tuple(output)
 
 
-def _build_tokens(
+def _endpoint_token_mask(
+    system: MolecularSystem,
+    layout: TokenLayout,
+    endpoints: Sequence[ComponentReference | AtomSite],
+) -> Tensor:
+    required = torch.zeros_like(layout.token_component_index, dtype=torch.bool)
+    counts = layout.token_atom_ptr[1:] - layout.token_atom_ptr[:-1]
+    token_indices = torch.repeat_interleave(torch.arange(required.numel(), device=required.device), counts)
+    atom_to_token = dict(zip(layout.atom_index.detach().cpu().tolist(), token_indices.detach().cpu().tolist()))
+    for endpoint in endpoints:
+        if isinstance(endpoint, AtomSite):
+            try:
+                atom_index = system.atom_index(endpoint)
+            except (KeyError, IndexError, ValueError):
+                continue
+            token_index = atom_to_token.get(atom_index)
+            if token_index is not None:
+                required[token_index] = True
+        else:
+            try:
+                component_index = system.component_index(endpoint)
+            except (KeyError, IndexError, ValueError):
+                continue
+            required |= layout.token_component_index == component_index
+    return required
+
+
+def _condition_token_mask(
+    system: MolecularSystem,
+    layout: TokenLayout,
+    conditions: tuple[BoltzGenSchema, ...],
+) -> Tensor | None:
+    endpoints: list[ComponentReference | AtomSite] = []
+    for condition in conditions:
+        if isinstance(condition, BoltzGenBinding):
+            endpoints.extend(cast(tuple[ComponentReference | AtomSite, ...], condition.binding.residues))
+            endpoints.extend(condition.not_binding)
+        elif isinstance(condition, BoltzGenSecondaryStructure):
+            endpoints.extend(reference for reference, _label in condition.assignments)
+        elif isinstance(condition, BoltzGenStructureGroup):
+            endpoints.extend(condition.members)
+        elif isinstance(condition, BoltzGenContact):
+            endpoints.extend(cast(tuple[ComponentReference | AtomSite, ...], condition.side_a))
+            endpoints.extend(cast(tuple[ComponentReference | AtomSite, ...], condition.side_b))
+        elif isinstance(condition, BoltzGenSymmetry):
+            endpoints.extend(reference for unit in condition.units for reference in unit)
+    return None if not endpoints else _endpoint_token_mask(system, layout, endpoints)
+
+
+def _inverse_folding_token_mask(
+    system: MolecularSystem,
+    layout: TokenLayout,
+    aa_constraints: tuple[BoltzGenResidueConstraint, ...],
+    symmetry: tuple[tuple[ComponentReference, ...], ...],
+) -> Tensor | None:
+    endpoints = [
+        *(constraint.position for constraint in aa_constraints),
+        *(reference for group in symmetry for reference in group),
+    ]
+    return None if not endpoints else _endpoint_token_mask(system, layout, endpoints)
+
+
+def _tokenize(
     system: MolecularSystem,
     *,
     generated_components: frozenset[int] = frozenset(),
-) -> tuple[list[dict[str, object]], tuple[int, ...]]:
-    r"""Build BoltzGen token rows directly from canonical graph indices."""
+) -> TokenLayout:
+    r"""Build the BoltzGen view of the canonical structural token axis."""
 
-    instance_components = system.instance_component_ptr.detach().cpu().tolist()
-    component_atoms = system.component_atom_ptr.detach().cpu().tolist()
+    entity_types = system.entity_type.detach().cpu().tolist()
+    atom_symbols = system.atom_symbol.detach().cpu().tolist()
+    atom_component = _atom_component_index(system).detach().cpu().tolist()
+    component_instance = (
+        torch.repeat_interleave(
+            torch.arange(system.instance_symbol.numel(), device=system.instance_component_ptr.device),
+            system.instance_component_ptr[1:] - system.instance_component_ptr[:-1],
+        )
+        .detach()
+        .cpu()
+        .tolist()
+    )
     instance_entities = system.instance_entity.detach().cpu().tolist()
+    atom_mask = torch.tensor(
+        [
+            (
+                entity_types[instance_entities[component_instance[atom_component[atom_index]]]] == ENTITY_MOLECULE
+                or system.symbols[atom_symbols[atom_index]] not in {"OXT", "OP3"}
+            )
+            and (
+                atom_component[atom_index] not in generated_components
+                or system.symbols[atom_symbols[atom_index]] in {"N", "CA", "C", "O"}
+            )
+            for atom_index in range(system.atom_symbol.numel())
+        ],
+        dtype=torch.bool,
+        device=system.atom_symbol.device,
+    )
+    return tokenize_molecular_system(
+        system,
+        atomize_nonstandard_polymers=False,
+        atom_mask=atom_mask,
+    )
+
+
+def _lower_token_layout(system: MolecularSystem, layout: TokenLayout) -> list[dict[str, object]]:
+    r"""Lower the shared structural partition into BoltzGen feature rows."""
+
     entity_types = system.entity_type.detach().cpu().tolist()
     component_symbols = system.component_symbol.detach().cpu().tolist()
     atom_symbols = system.atom_symbol.detach().cpu().tolist()
-    atomic_numbers = system.atomic_number.detach().cpu().tolist()
     polymer_type_by_entity = {
         ENTITY_PROTEIN: "protein",
         ENTITY_RNA: "rna",
         ENTITY_DNA: "dna",
     }
-    instance_count_by_entity: dict[int, int] = {}
+    token_components = layout.token_component_index.detach().cpu().tolist()
+    token_atoms = layout.token_atom_index.detach().cpu().tolist()
+    token_instances = layout.token_instance_index.detach().cpu().tolist()
+    token_entities = layout.token_entity_index.detach().cpu().tolist()
+    token_residues = layout.token_residue_index.detach().cpu().tolist()
+    token_symmetries = layout.token_symmetry_index.detach().cpu().tolist()
+    token_types = layout.token_type_index.detach().cpu().tolist()
+    token_atom_ptr = layout.token_atom_ptr.detach().cpu().tolist()
+    layout_atoms = layout.atom_index.detach().cpu().tolist()
     tokens: list[dict[str, object]] = []
 
-    for instance_index, entity_index in enumerate(instance_entities):
+    for token_index, component_index in enumerate(token_components):
+        instance_index = token_instances[token_index]
+        entity_index = token_entities[token_index]
         entity_type = entity_types[entity_index]
         instance_id = system.instance_id(instance_index)
         entity_id = system.entity_id(entity_index)
-        symmetry_index = instance_count_by_entity.get(entity_index, 0)
-        instance_count_by_entity[entity_index] = symmetry_index + 1
-        component_start = instance_components[instance_index]
-        component_stop = instance_components[instance_index + 1]
+        symmetry_index = token_symmetries[token_index]
+        monomer_index = token_residues[token_index]
+        component_id = system.symbols[component_symbols[component_index]]
+        atom_indices = tuple(layout_atoms[token_atom_ptr[token_index] : token_atom_ptr[token_index + 1]])
+        by_name = {system.symbols[atom_symbols[atom_index]]: atom_index for atom_index in atom_indices}
         if entity_type != ENTITY_MOLECULE:
             polymer_type = polymer_type_by_entity.get(entity_type)
             if polymer_type is None:
                 raise ValueError("BoltzGen supports protein, RNA, and DNA polymers")
-            standards = _STANDARD_COMPONENTS[polymer_type]
-            for component_index in range(component_start, component_stop):
-                monomer_index = component_index - component_start
-                component_id = system.symbols[component_symbols[component_index]]
-                atom_indices = tuple(
-                    atom_index
-                    for atom_index in range(
-                        component_atoms[component_index],
-                        component_atoms[component_index + 1],
-                    )
-                    if atomic_numbers[atom_index] != 1
-                    and system.symbols[atom_symbols[atom_index]] not in {"OXT", "OP3"}
-                    and (
-                        component_index not in generated_components
-                        or polymer_type != "protein"
-                        or system.symbols[atom_symbols[atom_index]] in {"N", "CA", "C", "O"}
-                    )
-                )
-                if not atom_indices:
-                    raise ValueError(f"component {component_id!r} has no model-visible heavy atoms")
-                by_name = {system.symbols[atom_symbols[atom_index]]: atom_index for atom_index in atom_indices}
-                if polymer_type == "protein":
-                    center_name = "CA"
-                    bb4_names = ("N", "CA", "C", "O")
-                    frame_names = ("N", "CA", "C")
-                else:
-                    center_name = "C1'"
-                    bb4_names = ("C1'", "C3'", "C4'", "C1'")
-                    frame_names = ("C1'", "C3'", "C4'")
-                center = by_name.get(center_name, atom_indices[0])
-                tokens.append(
-                    {
-                        "atoms": atom_indices,
-                        "atom_index": None,
-                        "component_index": component_index,
-                        "component_id": component_id,
-                        "instance_index": instance_index,
-                        "instance_id": instance_id,
-                        "entity_index": entity_index,
-                        "entity_id": entity_id,
-                        "monomer_index": monomer_index,
-                        "residue_index": monomer_index,
-                        "chain_index": instance_index,
-                        "symmetry_index": symmetry_index,
-                        "polymer_type": polymer_type,
-                        "molecule_type": _MOLECULE_TYPES[polymer_type],
-                        "residue_type": (
-                            _residue_type(component_id, polymer_type)
-                            if component_id in standards
-                            else _UNKNOWN_RESIDUE_TYPES[polymer_type]
-                        ),
-                        "center": center,
-                        "bb4": tuple(by_name.get(name, center) for name in bb4_names),
-                        "frame": tuple(by_name.get(name, center) for name in frame_names),
-                    }
-                )
-        else:
-            atom_indices = tuple(
-                atom_index
-                for component_index in range(component_start, component_stop)
-                for atom_index in range(
-                    component_atoms[component_index],
-                    component_atoms[component_index + 1],
-                )
-                if atomic_numbers[atom_index] != 1
+            if polymer_type == "protein":
+                center_name = "CA"
+                bb4_names = ("N", "CA", "C", "O")
+                frame_names = ("N", "CA", "C")
+            else:
+                center_name = "C1'"
+                bb4_names = ("C1'", "C3'", "C4'", "C1'")
+                frame_names = ("C1'", "C3'", "C4'")
+            center = by_name.get(center_name, atom_indices[0])
+            tokens.append(
+                {
+                    "atoms": atom_indices,
+                    "atom_index": None,
+                    "component_index": component_index,
+                    "component_id": component_id,
+                    "instance_index": instance_index,
+                    "instance_id": instance_id,
+                    "entity_index": entity_index,
+                    "entity_id": entity_id,
+                    "monomer_index": monomer_index,
+                    "residue_index": monomer_index,
+                    "chain_index": instance_index,
+                    "symmetry_index": symmetry_index,
+                    "polymer_type": polymer_type,
+                    "molecule_type": _MOLECULE_TYPES[polymer_type],
+                    "residue_type": token_types[token_index],
+                    "center": center,
+                    "bb4": tuple(by_name.get(name, center) for name in bb4_names),
+                    "frame": tuple(by_name.get(name, center) for name in frame_names),
+                }
             )
-            if not atom_indices:
-                raise ValueError(f"molecule {instance_id!r} has no model-visible heavy atoms")
-            atom_component = _atom_component_index(system).detach().cpu().tolist()
-            for atom_index in atom_indices:
-                component_index = atom_component[atom_index]
-                tokens.append(
-                    {
-                        "atoms": (atom_index,),
-                        "atom_index": atom_index,
-                        "component_index": component_index,
-                        "component_id": system.symbols[component_symbols[component_index]],
-                        "instance_index": instance_index,
-                        "instance_id": instance_id,
-                        "entity_index": entity_index,
-                        "entity_id": entity_id,
-                        "monomer_index": None,
-                        "residue_index": component_index - component_start,
-                        "chain_index": instance_index,
-                        "symmetry_index": symmetry_index,
-                        "polymer_type": None,
-                        "molecule_type": 3,
-                        "residue_type": 22,
-                        "center": atom_index,
-                        "bb4": (atom_index,) * 4,
-                        "frame": (atom_index,) * 3,
-                    }
-                )
+        else:
+            atom_index = token_atoms[token_index]
+            tokens.append(
+                {
+                    "atoms": atom_indices,
+                    "atom_index": atom_index,
+                    "component_index": component_index,
+                    "component_id": component_id,
+                    "instance_index": instance_index,
+                    "instance_id": instance_id,
+                    "entity_index": entity_index,
+                    "entity_id": entity_id,
+                    "monomer_index": None,
+                    "residue_index": monomer_index,
+                    "chain_index": instance_index,
+                    "symmetry_index": symmetry_index,
+                    "polymer_type": None,
+                    "molecule_type": 3,
+                    "residue_type": token_types[token_index],
+                    "center": atom_index,
+                    "bb4": (atom_index,) * 4,
+                    "frame": (atom_index,) * 3,
+                }
+            )
 
-    atom_indices = tuple(atom_index for token in tokens for atom_index in cast(tuple[int, ...], token["atoms"]))
-    return tokens, atom_indices
+    return tokens
 
 
 def _atom_component_index(system: MolecularSystem) -> Tensor:
@@ -2629,6 +2765,7 @@ def _template_atom(
 
 
 def _template_channels(
+    system: MolecularSystem,
     templates: tuple[Template, ...],
     tokens: list[dict[str, object]],
     token_count: int,
@@ -2640,7 +2777,7 @@ def _template_channels(
     Otherwise returns the nine per-template ``[T, N, ...]`` tensors consumed by
     ``BoltzGenTemplateEmbedder``:
     residue-type one-hot
-    (``num_tokens == 33``), ``compute_frame`` backbone frame (protein, all of N/CA/C resolved),
+    (``num_tokens == TOKEN_VOCAB_SIZE``), ``compute_frame`` backbone frame (protein, all of N/CA/C resolved),
     beta-carbon positions and mask, alpha-carbon positions, template mask, and visibility groups
     where the template covers a token, zeros everywhere else.
     """
@@ -2649,17 +2786,15 @@ def _template_channels(
         return None
 
     instance_residue: dict[tuple[int, int], int] = {}
-    entity_residue: dict[tuple[int, int], list[int]] = {}
-    instance_entities: dict[int, int] = {}
     for token_index, token in enumerate(tokens):
         monomer_index = cast("int | None", token["monomer_index"])
         if monomer_index is None:
             continue
         instance_index = cast(int, token["instance_index"])
-        entity_index = cast(int, token["entity_index"])
-        instance_entities[instance_index] = entity_index
         instance_residue[(instance_index, monomer_index)] = token_index
-        entity_residue.setdefault((entity_index, monomer_index), []).append(token_index)
+
+    target_instance_components = system.instance_component_ptr.detach().cpu().tolist()
+    target_instance_entities = system.instance_entity.detach().cpu().tolist()
 
     tdim = len(templates)
     residue_type_ids = torch.zeros(tdim, token_count, dtype=torch.long)
@@ -2677,16 +2812,12 @@ def _template_channels(
         template_instance_components = template_system.instance_component_ptr.detach().cpu().tolist()
         template_component_symbols = template_system.component_symbol.detach().cpu().tolist()
         for alignment in template.alignments:
-            target_entity_index = next(
-                (
-                    cast(int, token["entity_index"])
-                    for token in tokens
-                    if token["entity_id"] == alignment.target_entity_id
-                ),
-                -1,
-            )
-            if target_entity_index < 0:
-                raise ValueError(f"BoltzGen template targets unknown entity {alignment.target_entity_id!r}")
+            try:
+                target_entity_index = system.entity_index(alignment.target_entity_id)
+            except KeyError:
+                raise ValueError(f"BoltzGen template targets unknown entity {alignment.target_entity_id!r}") from None
+            if int(system.entity_type[target_entity_index]) == ENTITY_MOLECULE:
+                raise ValueError(f"BoltzGen template target {alignment.target_entity_id!r} is not a polymer entity")
             template_instance_index = template_system.instance_index(alignment.template_instance_id)
             template_entity_index = int(template_system.instance_entity[template_instance_index])
             template_entity_type = int(template_system.entity_type[template_entity_index])
@@ -2697,44 +2828,46 @@ def _template_channels(
             }.get(template_entity_type)
             if polymer_type is None:
                 raise ValueError("a BoltzGen template alignment must reference a polymer instance")
+            target_instances: tuple[int, ...]
             if alignment.target_instance_id is not None:
-                target_instance_index = next(
-                    (
-                        cast(int, token["instance_index"])
-                        for token in tokens
-                        if token["instance_id"] == alignment.target_instance_id
-                    ),
-                    -1,
-                )
-                if target_instance_index < 0 or instance_entities[target_instance_index] != target_entity_index:
+                try:
+                    target_instance_index = system.instance_index(alignment.target_instance_id)
+                except KeyError:
+                    raise ValueError(
+                        f"BoltzGen template targets unknown instance {alignment.target_instance_id!r}"
+                    ) from None
+                if target_instance_entities[target_instance_index] != target_entity_index:
                     raise ValueError(
                         f"BoltzGen template alignment instance {alignment.target_instance_id!r} belongs to entity "
                         f"other than {alignment.target_entity_id!r}"
                     )
+                target_instances = (target_instance_index,)
+            else:
+                target_instances = tuple(
+                    instance_index
+                    for instance_index, entity_index in enumerate(target_instance_entities)
+                    if entity_index == target_entity_index
+                )
+                if not target_instances:
+                    raise ValueError(
+                        f"BoltzGen template target {alignment.target_entity_id!r} does not resolve to an instance"
+                    )
             template_component_start = template_instance_components[template_instance_index]
             template_component_stop = template_instance_components[template_instance_index + 1]
             for target_component, template_component in alignment.residue_pairs:
-                targets: tuple[int, ...]
-                if alignment.target_instance_id is not None:
+                targets = []
+                for target_instance_index in target_instances:
+                    target_component_start = target_instance_components[target_instance_index]
+                    target_component_stop = target_instance_components[target_instance_index + 1]
+                    if target_component >= target_component_stop - target_component_start:
+                        raise ValueError(
+                            f"BoltzGen template alignment target "
+                            f"{system.instance_id(target_instance_index)!r}:{target_component} "
+                            "does not resolve to a component"
+                        )
                     hit = instance_residue.get((target_instance_index, target_component))
-                    if hit is None:
-                        raise ValueError(
-                            f"BoltzGen template alignment target {alignment.target_instance_id!r}:"
-                            f"{target_component} does not resolve to a token"
-                        )
-                    targets = (hit,)
-                else:
-                    targets = tuple(
-                        entity_residue.get(
-                            (target_entity_index, target_component),
-                            (),
-                        )
-                    )
-                    if not targets:
-                        raise ValueError(
-                            f"BoltzGen template alignment target {alignment.target_entity_id!r}:"
-                            f"{target_component} does not resolve to a token"
-                        )
+                    if hit is not None:
+                        targets.append(hit)
                 template_component_index = template_component_start + template_component
                 if template_component_index >= template_component_stop:
                     raise IndexError(
@@ -2774,7 +2907,7 @@ def _template_channels(
                 if has_frame:
                     rotation, translation = _template_frame(nitrogen, alpha, carbon)
 
-                residue_type = _residue_type(component_id, polymer_type)
+                residue_type = component_token_index(component_id, polymer_type)
                 for target_token in targets:
                     residue_type_ids[template_index, target_token] = residue_type
                     alpha_carbon_positions[template_index, target_token] = center_coord
@@ -2788,11 +2921,11 @@ def _template_channels(
                     template_mask[template_index, target_token] = 1.0
                     visibility_index[template_index, target_token] = 1.0
 
-        if not bool(template_mask[template_index].any()):
-            raise ValueError(f"BoltzGen template {template_index} does not cover any lowered target token")
-
     return {
-        "template_residue_type_features": torch.nn.functional.one_hot(residue_type_ids, 33),
+        "template_residue_type_features": torch.nn.functional.one_hot(
+            residue_type_ids,
+            TOKEN_VOCAB_SIZE,
+        ),
         "template_frame_rotations": frame_rotations,
         "template_frame_translations": frame_translations,
         "template_beta_carbon_positions": beta_carbon_positions,
@@ -2806,12 +2939,9 @@ def _template_channels(
 
 # Token, atom, and MSA features shared by the two BoltzGen processors.
 
-# The 33-token vocabulary uses protein tokens 2..21, unknown tokens 22/27/32,
-# RNA tokens 23..27, DNA tokens 28..32, and token 1 for the MSA gap.
-_PROTEIN_RESIDUE_TYPES = {
-    component_id: index
-    for index, component_id in enumerate(
-        (
+_STANDARD_COMPONENTS = {
+    "protein": frozenset(
+        {
             "ALA",
             "ARG",
             "ASN",
@@ -2832,37 +2962,13 @@ _PROTEIN_RESIDUE_TYPES = {
             "TRP",
             "TYR",
             "VAL",
-        ),
-        start=2,
-    )
-}
-_RNA_RESIDUE_TYPES = {"A": 23, "G": 24, "C": 25, "U": 26, "N": 27}
-_DNA_RESIDUE_TYPES = {"DA": 28, "DG": 29, "DC": 30, "DT": 31, "DN": 32}
-_STANDARD_COMPONENTS = {
-    "protein": frozenset(_PROTEIN_RESIDUE_TYPES),
-    "rna": frozenset(_RNA_RESIDUE_TYPES),
-    "dna": frozenset(_DNA_RESIDUE_TYPES),
+        }
+    ),
+    "rna": frozenset({"A", "G", "C", "U", "N"}),
+    "dna": frozenset({"DA", "DG", "DC", "DT", "DN"}),
 }
 _MOLECULE_TYPES = {"protein": 0, "dna": 1, "rna": 2}
-_UNKNOWN_RESIDUE_TYPES = {"protein": 22, "rna": 27, "dna": 32}
 _MSA_GAP = MSA_GAP_INDEX
-
-
-def _msa_symbol_restype(symbol: str, polymer_type: str) -> int:
-    r"""
-    Map one UPPERCASE one-letter MSA symbol (or ``-``) to a BoltzGen token.
-    """
-
-    return msa_residue_index(symbol, polymer_type)
-
-
-def _token_msa_restype(token: dict[str, object], system: MolecularSystem) -> int:
-    polymer_type = cast(str | None, token["polymer_type"])
-    if polymer_type is None:
-        return msa_residue_index("X", None)
-    component_index = cast(int, token["component_index"])
-    component_id = system.symbols[int(system.component_symbol[component_index])]
-    return msa_component_index(component_id, polymer_type)
 
 
 def _token_bond_indicator(
@@ -2919,7 +3025,7 @@ def _msa_features(
     tokens: list[dict[str, object]],
     system: MolecularSystem,
 ) -> dict[str, Tensor]:
-    residue_types = [_token_msa_restype(token, system) for token in tokens]
+    residue_types = [cast(int, token["residue_type"]) for token in tokens]
     if msa is None:
         rows = torch.tensor([residue_types])
         deletion_counts = torch.zeros(1, len(tokens))
@@ -2983,7 +3089,7 @@ def _msa_features(
                     ):
                         continue
                     monomer_index = cast(int, token["monomer_index"])
-                    row[token_index] = _msa_symbol_restype(aligned[monomer_index], polymer_type)
+                    row[token_index] = msa_residue_index(aligned[monomer_index], polymer_type)
                     deletion_row[token_index] = float(deletion_source[monomer_index])
                     paired_row[token_index] = float(taxonomic_pair)
             row_values.append(row)
@@ -3338,14 +3444,6 @@ def _cyclic_period(system: MolecularSystem, instance_index: int) -> int:
     ):
         return component_count
     return 0
-
-
-def _residue_type(component_id: str, polymer_type: str) -> int:
-    if polymer_type == "protein":
-        return _PROTEIN_RESIDUE_TYPES.get(component_id, 22)
-    if polymer_type == "rna":
-        return _RNA_RESIDUE_TYPES.get(component_id, 27)
-    return _DNA_RESIDUE_TYPES.get(component_id, 32)
 
 
 def _validate_msa(

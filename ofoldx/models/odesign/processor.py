@@ -5,13 +5,26 @@ Tensor-native input processing for ODesign structure generation.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import cast, get_args
+from typing import TypeAlias, cast, get_args
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from ...data import MSA_GAP_INDEX, MSA_OTHER_INDEX, MSA_VOCAB_SIZE, msa_component_index, msa_residue_index
+from ...data import (
+    MSA_GAP_INDEX,
+    MSA_OTHER_INDEX,
+    MSA_VOCAB_SIZE,
+    TOKEN_OTHER_INDEX,
+    TOKEN_VOCAB_SIZE,
+    Cropper,
+    TokenLayout,
+    crop_token_layout,
+    msa_component_index,
+    msa_residue_index,
+    resolved_token_mask,
+    tokenize_molecular_system,
+)
 from ...data.bonds import SymbolicBond
 from ...data.components import get_component
 from ...data.conditions import Hotspot
@@ -63,47 +76,8 @@ from .model import (
 _CORE_POLYMER_TYPES: frozenset[str] = frozenset(get_args(PolymerType))
 
 #: One designed polymer type or fixed source residue in an ODesign mask.
-ODesignResidueSpec = PolymerType | ComponentReference
+ODesignResidueSpec: TypeAlias = PolymerType | ComponentReference
 
-_RESIDUE_TYPE_INDEX: dict[str, int] = {
-    "ALA": 0,
-    "ARG": 1,
-    "ASN": 2,
-    "ASP": 3,
-    "CYS": 4,
-    "GLN": 5,
-    "GLU": 6,
-    "GLY": 7,
-    "HIS": 8,
-    "ILE": 9,
-    "LEU": 10,
-    "LYS": 11,
-    "MET": 12,
-    "PHE": 13,
-    "PRO": 14,
-    "SER": 15,
-    "THR": 16,
-    "TRP": 17,
-    "TYR": 18,
-    "VAL": 19,
-    "UNK": 20,
-    "A": 21,
-    "G": 22,
-    "C": 23,
-    "U": 24,
-    "N": 25,
-    "DA": 26,
-    "DG": 27,
-    "DC": 28,
-    "DT": 29,
-    "DN": 30,
-    "-": 31,
-    "-P": 32,
-    "-N": 33,
-    "-L": 34,
-}
-
-_STANDARD_POLYMER_COMPONENTS: frozenset[str] = frozenset(_RESIDUE_TYPE_INDEX) - {"-", "-P", "-N", "-L"}
 _GENERATED_COMPONENT_ID = {"protein": "UNK", "rna": "N", "dna": "DN"}
 _PLACEHOLDER_COMPONENT_ID = {
     **_GENERATED_COMPONENT_ID,
@@ -173,6 +147,8 @@ class ODesignProcessor(Processor):
             constraint_atoms=constraint_atoms,
             filter_by_occupancy=filter_by_occupancy,
             generator=generator,
+            cropper=None,
+            training_target=None,
         )
         return model_input
 
@@ -190,10 +166,13 @@ class ODesignProcessor(Processor):
         constraint_atoms: Sequence[AtomSite] = (),
         filter_by_occupancy: bool = True,
         generator: torch.Generator | None = None,
+        cropper: Cropper | None = None,
     ) -> tuple[ODesignInput, ODesignStructureTarget]:
         r"""
         Lower one polymer problem and gather truth onto its Model atom axis, applying
         the same requested occupancy policy to conditioning and target coordinates.
+        A training-only ``cropper`` retains every explicit condition and anchors its
+        selection in tokens with resolved target coordinates.
         """
 
         if target is None:
@@ -211,25 +190,16 @@ class ODesignProcessor(Processor):
             constraint_atoms=constraint_atoms,
             filter_by_occupancy=filter_by_occupancy,
             generator=generator,
+            cropper=cropper,
+            training_target=target,
         )
-        target_rows: list[int] = []
-        target_system = target.system
-        for output_atom in model_input.atom_index[0].detach().cpu().tolist():
-            output_site = model_input.system.atom_site(output_atom)
-            try:
-                target_row = target_system.atom_index(output_site)
-            except KeyError:
-                source_atom = output_to_source.get(output_atom)
-                if source_atom is None:
-                    target_row = -1
-                else:
-                    try:
-                        target_row = target_system.atom_index(
-                            cast(MolecularSystem, _source_system(input)).atom_site(source_atom)
-                        )
-                    except KeyError:
-                        target_row = -1
-            target_rows.append(target_row)
+        target_rows = _target_atom_rows(
+            target.system,
+            model_input.system,
+            _source_system(input),
+            output_to_source,
+            model_input.atom_index[0],
+        )
         coordinates, coordinate_mask = _gather_target(
             target,
             target_rows,
@@ -261,6 +231,8 @@ class ODesignProcessor(Processor):
         constraint_atoms: Sequence[AtomSite],
         filter_by_occupancy: bool,
         generator: torch.Generator | None,
+        cropper: Cropper | None,
+        training_target: Structure | None,
     ) -> tuple[ODesignInput, dict[int, int]]:
         structure = input if isinstance(input, Structure) else None
         source = _source_system(input)
@@ -324,15 +296,49 @@ class ODesignProcessor(Processor):
                 f"ODesign {self.config.artifact} artifact cannot generate {sorted(generated_types - allowed)!r}"
             )
 
+        output_to_source = {
+            output: source_atom for source_atom, outputs in source_atom_outputs.items() for output in outputs
+        }
         model_atom_index = _model_atom_index(system, design_component_mask)
         if model_atom_index.numel() == 0:
             raise ValueError("ODesign requires at least one heavy atom")
-        (
-            token_component_index,
-            token_atom_index,
-            token_instance_index,
-            atom_to_token,
-        ) = _token_axes(system, model_atom_index)
+        layout, atom_to_token = _tokenize(system, model_atom_index)
+        if cropper is not None:
+            assert training_target is not None
+            canonical_atom_to_token = _canonical_atom_to_token(system, layout, atom_to_token)
+            required_token_mask = _required_crop_tokens(
+                system,
+                source,
+                source_component_outputs,
+                source_atom_outputs,
+                fixed_atoms,
+                constraint_atoms,
+                hotspots,
+                cyclic_pairs,
+                layout,
+                atom_to_token,
+                canonical_atom_to_token,
+            )
+            aligned_target = _aligned_target_structure(
+                training_target,
+                system,
+                source,
+                output_to_source,
+                filter_by_occupancy=filter_by_occupancy,
+            )
+            layout = crop_token_layout(
+                aligned_target,
+                layout,
+                cropper,
+                required_token_mask=required_token_mask,
+                anchor_token_mask=resolved_token_mask(aligned_target, layout),
+                generator=generator,
+            )
+            atom_to_token = _layout_atom_to_token(layout)
+        model_atom_index = layout.atom_index
+        token_component_index = layout.token_component_index
+        token_atom_index = layout.token_atom_index
+        token_instance_index = layout.token_instance_index
         representative_atom_index = _representative_atom_index(
             system,
             model_atom_index,
@@ -342,17 +348,7 @@ class ODesignProcessor(Processor):
             design_component_mask,
         )
         token_count = token_component_index.numel()
-        canonical_atom_to_token = torch.full(
-            (system.atom_symbol.numel(),),
-            -1,
-            dtype=torch.int64,
-            device=system.atom_symbol.device,
-        )
-        canonical_atom_to_token[model_atom_index] = atom_to_token
-
-        output_to_source = {
-            output: source_atom for source_atom, outputs in source_atom_outputs.items() for output in outputs
-        }
+        canonical_atom_to_token = _canonical_atom_to_token(system, layout, atom_to_token)
         observed_positions, observed_mask = _observed_coordinates(
             structure,
             model_atom_index,
@@ -410,10 +406,11 @@ class ODesignProcessor(Processor):
             token_instance_index,
             design_component_mask,
         )
-        token_features = _token_features(
+        token_features, design_features = _token_features(
             system,
             token_component_index,
             token_atom_index,
+            layout.token_type_index,
             design_component_mask,
             profile,
             deletion_mean,
@@ -429,6 +426,7 @@ class ODesignProcessor(Processor):
             system,
             model_atom_index,
             token_component_index,
+            token_atom_index,
             canonical_atom_to_token,
             observed_positions,
             constraint_coordinate_mask,
@@ -439,6 +437,7 @@ class ODesignProcessor(Processor):
             token_instance_index,
         )
         cyclic_period = _cyclic_period(
+            system,
             token_instance_index,
             cyclic_instances,
         )
@@ -461,6 +460,10 @@ class ODesignProcessor(Processor):
             ).unsqueeze(0),
             cyclic_period=cyclic_period.unsqueeze(0).to(self.device),
             token_features=token_features.unsqueeze(0).to(
+                device=self.device,
+                dtype=self.dtype,
+            ),
+            design_features=design_features.unsqueeze(0).to(
                 device=self.device,
                 dtype=self.dtype,
             ),
@@ -677,12 +680,11 @@ class ODesignLigandProcessor(Processor):
             system,
             context_design_mask,
         )
-        (
-            context_token_component,
-            context_token_atom,
-            context_token_instance,
-            context_atom_to_token,
-        ) = _token_axes(system, context_atom_index)
+        context_layout, context_atom_to_token = _tokenize(system, context_atom_index)
+        context_atom_index = context_layout.atom_index
+        context_token_component = context_layout.token_component_index
+        context_token_atom = context_layout.token_atom_index
+        context_token_instance = context_layout.token_instance_index
         context_atom_count = context_atom_index.numel()
         context_token_count = context_token_component.numel()
         atom_count = context_atom_count + num_slots
@@ -923,10 +925,17 @@ class ODesignLigandProcessor(Processor):
                 context_deletion_mean.new_zeros(num_slots),
             ]
         )
-        token_features = _token_features(
+        slot_type_index = torch.full(
+            (num_slots,),
+            TOKEN_OTHER_INDEX,
+            dtype=torch.int64,
+            device=system.atom_symbol.device,
+        )
+        token_features, design_features = _token_features(
             system,
             token_component_index,
             token_atom_index,
+            torch.cat((context_layout.token_type_index, slot_type_index)),
             context_design_mask,
             profile,
             deletion_mean,
@@ -958,6 +967,7 @@ class ODesignLigandProcessor(Processor):
             system,
             context_atom_index,
             context_token_component,
+            context_token_atom,
             canonical_atom_to_token,
             observed_positions[:context_atom_count],
             constraint_coordinate_mask[:context_atom_count],
@@ -1048,6 +1058,10 @@ class ODesignLigandProcessor(Processor):
                 device=self.device,
             ),
             token_features=token_features.unsqueeze(0).to(
+                device=self.device,
+                dtype=self.dtype,
+            ),
+            design_features=design_features.unsqueeze(0).to(
                 device=self.device,
                 dtype=self.dtype,
             ),
@@ -1768,61 +1782,80 @@ def _model_atom_index(
     return model_mask.nonzero(as_tuple=False).flatten()
 
 
-def _token_axes(
+def _tokenize(
     system: MolecularSystem,
     model_atom_index: Tensor,
-) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    model_row = {atom: row for row, atom in enumerate(model_atom_index.detach().cpu().tolist())}
-    token_component: list[int] = []
-    token_atom: list[int] = []
-    token_instance: list[int] = []
-    atom_to_token = torch.empty(
-        model_atom_index.numel(),
+) -> tuple[TokenLayout, Tensor]:
+    atom_mask = torch.zeros_like(system.atom_symbol, dtype=torch.bool)
+    atom_mask[model_atom_index] = True
+    layout = tokenize_molecular_system(system, atom_mask=atom_mask)
+    return layout, _layout_atom_to_token(layout)
+
+
+def _layout_atom_to_token(layout: TokenLayout) -> Tensor:
+    return torch.repeat_interleave(
+        torch.arange(
+            layout.token_component_index.numel(),
+            dtype=torch.int64,
+            device=layout.token_component_index.device,
+        ),
+        layout.token_atom_ptr[1:] - layout.token_atom_ptr[:-1],
+    )
+
+
+def _canonical_atom_to_token(
+    system: MolecularSystem,
+    layout: TokenLayout,
+    atom_to_token: Tensor,
+) -> Tensor:
+    canonical = torch.full(
+        (system.atom_symbol.numel(),),
+        -1,
         dtype=torch.int64,
         device=system.atom_symbol.device,
     )
-    for instance in range(system.instance_symbol.numel()):
-        entity = int(system.instance_entity[instance])
-        is_polymer = int(system.entity_type[entity]) != ENTITY_MOLECULE
-        start = int(system.instance_component_ptr[instance])
-        stop = int(system.instance_component_ptr[instance + 1])
-        for component in range(start, stop):
-            atom_start = int(system.component_atom_ptr[component])
-            atom_stop = int(system.component_atom_ptr[component + 1])
-            atoms = [atom for atom in range(atom_start, atom_stop) if atom in model_row]
-            component_id = system.symbols[int(system.component_symbol[component])]
-            if is_polymer and component_id in _STANDARD_POLYMER_COMPONENTS:
-                token = len(token_component)
-                token_component.append(component)
-                token_atom.append(-1)
-                token_instance.append(instance)
-                for atom in atoms:
-                    atom_to_token[model_row[atom]] = token
-            else:
-                for atom in atoms:
-                    token = len(token_component)
-                    token_component.append(component)
-                    token_atom.append(atom)
-                    token_instance.append(instance)
-                    atom_to_token[model_row[atom]] = token
-    return (
-        torch.tensor(
-            token_component,
-            dtype=torch.int64,
-            device=system.atom_symbol.device,
-        ),
-        torch.tensor(
-            token_atom,
-            dtype=torch.int64,
-            device=system.atom_symbol.device,
-        ),
-        torch.tensor(
-            token_instance,
-            dtype=torch.int64,
-            device=system.atom_symbol.device,
-        ),
-        atom_to_token,
+    canonical[layout.atom_index] = atom_to_token
+    return canonical
+
+
+def _required_crop_tokens(
+    system: MolecularSystem,
+    source: MolecularSystem | None,
+    source_component_outputs: dict[int, tuple[int, ...]],
+    source_atom_outputs: dict[int, tuple[int, ...]],
+    fixed_atoms: Sequence[AtomSite],
+    constraint_atoms: Sequence[AtomSite],
+    hotspots: Sequence[Hotspot],
+    cyclic_pairs: Sequence[tuple[int, int]],
+    layout: TokenLayout,
+    atom_to_token: Tensor,
+    canonical_atom_to_token: Tensor,
+) -> Tensor:
+    required = _hotspot_tokens(
+        hotspots,
+        source,
+        source_component_outputs,
+        source_atom_outputs,
+        layout.token_component_index,
+        canonical_atom_to_token,
     )
+    condition_atom_mask = _condition_atom_mask(
+        (*fixed_atoms, *constraint_atoms),
+        source,
+        source_atom_outputs,
+        layout.atom_index,
+    )
+    required[atom_to_token[condition_atom_mask]] = True
+    for atom_a, atom_b in cyclic_pairs:
+        tokens = canonical_atom_to_token[
+            torch.tensor(
+                (atom_a, atom_b),
+                dtype=torch.int64,
+                device=canonical_atom_to_token.device,
+            )
+        ]
+        required[tokens[tokens >= 0]] = True
+    return required
 
 
 def _representative_atom_index(
@@ -2104,40 +2137,57 @@ def _token_features(
     system: MolecularSystem,
     token_component_index: Tensor,
     token_atom_index: Tensor,
+    token_type_index: Tensor,
     design_component_mask: Tensor,
     profile: Tensor,
     deletion_mean: Tensor,
     hotspot: Tensor,
-) -> Tensor:
+) -> tuple[Tensor, Tensor]:
     features = torch.zeros(
         token_component_index.numel(),
-        75,
+        TOKEN_VOCAB_SIZE + MSA_VOCAB_SIZE + 2,
         dtype=torch.float32,
         device=token_component_index.device,
     )
     component_instance = _component_instance_index(system)
-    for token, (component, atom) in enumerate(
-        zip(
-            token_component_index.detach().cpu().tolist(),
-            token_atom_index.detach().cpu().tolist(),
-            strict=True,
-        )
-    ):
-        if component < 0 or atom >= 0:
-            residue_type = "-L"
-        elif bool(design_component_mask[component]):
-            entity = int(system.instance_entity[component_instance[component]])
-            residue_type = "-P" if int(system.entity_type[entity]) == ENTITY_PROTEIN else "-N"
-        else:
-            residue_type = system.symbols[int(system.component_symbol[component])]
-        features[
-            token,
-            _RESIDUE_TYPE_INDEX.get(residue_type, 20),
-        ] = 1
-    features[:, 35:73] = profile
-    features[:, 73] = deletion_mean
-    features[:, 74] = hotspot.to(torch.float32)
-    return features
+    valid_component = token_component_index >= 0
+    generated = torch.zeros_like(valid_component)
+    generated[valid_component] = design_component_mask[token_component_index[valid_component]]
+    atom_token = (token_atom_index >= 0) | ~valid_component
+    type_index = token_type_index.clone()
+    type_index[atom_token] = TOKEN_OTHER_INDEX
+    features[
+        torch.arange(token_component_index.numel(), device=token_component_index.device),
+        type_index,
+    ] = 1
+
+    profile_start = TOKEN_VOCAB_SIZE
+    features[:, profile_start : profile_start + MSA_VOCAB_SIZE] = profile
+    features[:, -2] = deletion_mean
+    features[:, -1] = hotspot.to(torch.float32)
+
+    design_features = torch.zeros(
+        token_component_index.numel(),
+        4,
+        dtype=torch.float32,
+        device=token_component_index.device,
+    )
+    generated_rows = generated.nonzero(as_tuple=False).flatten()
+    generated_components = token_component_index[generated_rows]
+    generated_instances = component_instance[generated_components]
+    generated_entities = system.instance_entity[generated_instances]
+    entity_type = system.entity_type[generated_entities]
+    state = torch.full(
+        entity_type.shape,
+        2,
+        dtype=torch.int64,
+        device=entity_type.device,
+    )
+    state[entity_type == ENTITY_PROTEIN] = 0
+    state[entity_type == ENTITY_RNA] = 1
+    design_features[generated_rows, state] = 1
+    design_features[atom_token, 3] = 1
+    return features, design_features
 
 
 def _token_bonds(
@@ -2169,6 +2219,7 @@ def _constraint_distogram(
     system: MolecularSystem,
     model_atom_index: Tensor,
     token_component_index: Tensor,
+    token_atom_index: Tensor,
     canonical_atom_to_token: Tensor,
     observed_positions: Tensor,
     constraint_coordinate_mask: Tensor,
@@ -2190,13 +2241,13 @@ def _constraint_distogram(
         component = int(atom_component[atom])
         instance = int(component_instance[component])
         entity = int(system.instance_entity[instance])
-        component_id = system.symbols[int(system.component_symbol[component])]
         atom_name = system.symbols[int(system.atom_symbol[atom])]
-        if int(system.entity_type[entity]) != ENTITY_MOLECULE and component_id in _STANDARD_POLYMER_COMPONENTS:
+        token = int(canonical_atom_to_token[atom])
+        if token_atom_index[token] < 0:
             center = "CA" if int(system.entity_type[entity]) == ENTITY_PROTEIN else "C1'"
             if atom_name != center:
                 continue
-        selected[int(canonical_atom_to_token[atom])] = model_row
+        selected[token] = model_row
     if selected:
         tokens = torch.tensor(
             tuple(selected),
@@ -2247,18 +2298,24 @@ def _token_indices(
 
 
 def _cyclic_period(
+    system: MolecularSystem,
     token_instance_index: Tensor,
     cyclic_instances: frozenset[int],
 ) -> Tensor:
+    r"""
+    Project each complete cyclic instance period onto the selected token rows.
+
+    >>> from types import SimpleNamespace
+    >>> system = SimpleNamespace(instance_component_ptr=torch.tensor([0, 4]))
+    >>> _cyclic_period(system, torch.tensor([0, 0]), frozenset({0}))
+    tensor([4, 4])
+    """
+
     period = torch.zeros_like(token_instance_index)
     for instance in cyclic_instances:
         mask = token_instance_index == instance
-        period[mask] = mask.sum()
+        period[mask] = system.instance_component_ptr[instance + 1] - system.instance_component_ptr[instance]
     return period
-
-
-def _msa_symbol_token(symbol: str, polymer_type: str) -> int:
-    return msa_residue_index(symbol, polymer_type)
 
 
 def _component_msa_token(system: MolecularSystem, component: int, entity: int) -> int:
@@ -2374,7 +2431,7 @@ def _msa_features(
                 if targets[column] is not None and instance != targets[column]:
                     continue
                 polymer_type = _component_msa_polymer_type(system, component, polymer_types[column])
-                token_row[token] = _msa_symbol_token(
+                token_row[token] = msa_residue_index(
                     sequences[source_row][local],
                     polymer_type,
                 )
@@ -2404,6 +2461,89 @@ def _msa_features(
         torch.ones_like(tokens, dtype=torch.bool),
         profile,
         deletion_mean,
+    )
+
+
+def _target_atom_rows(
+    target_system: MolecularSystem,
+    output_system: MolecularSystem,
+    source_system: MolecularSystem | None,
+    output_to_source: dict[int, int],
+    output_atom_index: Tensor,
+) -> list[int]:
+    rows = []
+    for output_atom in output_atom_index.detach().cpu().tolist():
+        try:
+            target_atom = target_system.atom_index(output_system.atom_site(output_atom))
+        except KeyError:
+            source_atom = output_to_source.get(output_atom)
+            if source_atom is None or source_system is None:
+                target_atom = -1
+            else:
+                try:
+                    target_atom = target_system.atom_index(source_system.atom_site(source_atom))
+                except KeyError:
+                    target_atom = -1
+        rows.append(target_atom)
+    return rows
+
+
+def _aligned_target_structure(
+    target: Structure,
+    output_system: MolecularSystem,
+    source_system: MolecularSystem | None,
+    output_to_source: dict[int, int],
+    *,
+    filter_by_occupancy: bool,
+) -> Structure:
+    output_atom_index = torch.arange(
+        output_system.atom_symbol.numel(),
+        dtype=torch.int64,
+        device=output_system.atom_symbol.device,
+    )
+    coordinates, coordinate_mask = _gather_target(
+        target,
+        _target_atom_rows(
+            target.system,
+            output_system,
+            source_system,
+            output_to_source,
+            output_atom_index,
+        ),
+        filter_by_occupancy=filter_by_occupancy,
+    )
+    coordinates = coordinates.squeeze(0).to(output_system.atom_symbol.device)
+    coordinate_mask = coordinate_mask.squeeze(0).to(output_system.atom_symbol.device)
+    atom_count = output_system.atom_symbol.numel()
+    component_count = output_system.component_symbol.numel()
+    return Structure(  # type: ignore[call-arg]
+        system=output_system,
+        coordinates=coordinates,
+        coordinate_mask=coordinate_mask,
+        occupancy=coordinates.new_zeros(atom_count),
+        occupancy_mask=torch.zeros(atom_count, dtype=torch.bool, device=coordinates.device),
+        b_factor=coordinates.new_zeros(atom_count),
+        b_factor_mask=torch.zeros(atom_count, dtype=torch.bool, device=coordinates.device),
+        source_symbols=(),
+        residue_id=torch.full(
+            (component_count,),
+            -1,
+            dtype=torch.int64,
+            device=coordinates.device,
+        ),
+        insertion_code=torch.full(
+            (component_count,),
+            -1,
+            dtype=torch.int64,
+            device=coordinates.device,
+        ),
+        standard_component_id=torch.full(
+            (component_count,),
+            -1,
+            dtype=torch.int64,
+            device=coordinates.device,
+        ),
+        batch_size=[],
     )
 
 

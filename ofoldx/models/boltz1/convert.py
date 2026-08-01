@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import argparse
 import re
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from os import PathLike
 from pathlib import Path
 from typing import Any, cast
@@ -19,6 +19,7 @@ import torch
 from torch import Tensor
 
 from ...data.evidence import MSA_ALPHABET
+from ...data.tokenization import TOKEN_ALPHABET
 from .config import Boltz1Config
 from .model import Boltz1Model
 from .processor import Boltz1Processor
@@ -28,7 +29,7 @@ Rule = tuple[re.Pattern[str], str | None]
 
 Converter = list[Rule] | Callable[[str], str | None]
 
-_SOURCE_MSA_INDEX = {
+_SOURCE_TOKEN_INDEX = {
     "OTHER": 0,
     "-": 1,
     "A": 2,
@@ -65,23 +66,23 @@ _SOURCE_MSA_INDEX = {
 }
 
 
-def _convert_msa_values(tensor: Tensor) -> Tensor:
-    old_size = len(_SOURCE_MSA_INDEX)
-    converted = tensor.new_zeros(*tensor.shape[:-1], len(MSA_ALPHABET) + tensor.shape[-1] - old_size)
-    for target, symbol in enumerate(MSA_ALPHABET):
+def _convert_source_token_values(tensor: Tensor, alphabet: Sequence[str]) -> Tensor:
+    old_size = len(_SOURCE_TOKEN_INDEX)
+    converted = tensor.new_zeros(*tensor.shape[:-1], len(alphabet) + tensor.shape[-1] - old_size)
+    for target, symbol in enumerate(alphabet):
         if symbol == "B":
-            converted[..., target] = (tensor[..., _SOURCE_MSA_INDEX["D"]] + tensor[..., _SOURCE_MSA_INDEX["N"]]) / 2
+            converted[..., target] = (tensor[..., _SOURCE_TOKEN_INDEX["D"]] + tensor[..., _SOURCE_TOKEN_INDEX["N"]]) / 2
         elif symbol == "Z":
-            converted[..., target] = (tensor[..., _SOURCE_MSA_INDEX["E"]] + tensor[..., _SOURCE_MSA_INDEX["Q"]]) / 2
+            converted[..., target] = (tensor[..., _SOURCE_TOKEN_INDEX["E"]] + tensor[..., _SOURCE_TOKEN_INDEX["Q"]]) / 2
         elif symbol == "J":
-            converted[..., target] = (tensor[..., _SOURCE_MSA_INDEX["I"]] + tensor[..., _SOURCE_MSA_INDEX["L"]]) / 2
+            converted[..., target] = (tensor[..., _SOURCE_TOKEN_INDEX["I"]] + tensor[..., _SOURCE_TOKEN_INDEX["L"]]) / 2
         elif symbol == "U":
-            converted[..., target] = tensor[..., _SOURCE_MSA_INDEX["C"]]
+            converted[..., target] = tensor[..., _SOURCE_TOKEN_INDEX["C"]]
         elif symbol == "O":
-            converted[..., target] = tensor[..., _SOURCE_MSA_INDEX["K"]]
+            converted[..., target] = tensor[..., _SOURCE_TOKEN_INDEX["K"]]
         else:
-            converted[..., target] = tensor[..., _SOURCE_MSA_INDEX[symbol]]
-    converted[..., len(MSA_ALPHABET) :] = tensor[..., old_size:]
+            converted[..., target] = tensor[..., _SOURCE_TOKEN_INDEX[symbol]]
+    converted[..., len(alphabet) :] = tensor[..., old_size:]
     return converted
 
 
@@ -107,27 +108,35 @@ _INPUT_SIZE_KEYS = {
 }
 
 
-def _convert_msa_vocabulary_axes(
+def _convert_vocabulary_axes(
     state_dict: dict[str, Tensor],
     *,
     pocket_feature_size: int,
 ) -> None:
-    source_profile_size = len(_SOURCE_MSA_INDEX)
+    source_vocab_size = len(_SOURCE_TOKEN_INDEX)
     suffix_size = pocket_feature_size + 1
     for key in _INPUT_SIZE_KEYS & state_dict.keys():
         tensor = state_dict[key]
-        profile_start = tensor.shape[-1] - source_profile_size - suffix_size
+        profile_start = tensor.shape[-1] - source_vocab_size - suffix_size
+        residue_start = profile_start - source_vocab_size
         state_dict[key] = torch.cat(
             (
-                tensor[..., :profile_start],
-                _convert_msa_values(tensor[..., profile_start : profile_start + source_profile_size]),
-                tensor[..., profile_start + source_profile_size :],
+                tensor[..., :residue_start],
+                _convert_source_token_values(
+                    tensor[..., residue_start:profile_start],
+                    TOKEN_ALPHABET,
+                ),
+                _convert_source_token_values(
+                    tensor[..., profile_start : profile_start + source_vocab_size],
+                    MSA_ALPHABET,
+                ),
+                tensor[..., profile_start + source_vocab_size :],
             ),
             dim=-1,
         )
     for key in ("msa_trunk.msa_projection.weight", "confidence_head.msa_trunk.msa_projection.weight"):
         if key in state_dict:
-            state_dict[key] = _convert_msa_values(state_dict[key])
+            state_dict[key] = _convert_source_token_values(state_dict[key], MSA_ALPHABET)
 
 
 TIED_OUTPUT_PROJECTION = re.compile(
@@ -507,7 +516,7 @@ def convert_boltz1_state_dict(
                     target_value = target_value.to(dtype=dtype)
                 converted[target_key] = target_value
     _pack_conditioned_adaptive_norms(converted)
-    _convert_msa_vocabulary_axes(
+    _convert_vocabulary_axes(
         converted,
         pocket_feature_size=config.input_embeddings.pocket_feature_size,
     )

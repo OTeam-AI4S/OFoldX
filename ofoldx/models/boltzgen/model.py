@@ -19,6 +19,7 @@ from ...data.bonds import SymbolicBond
 from ...data.conditions import Endpoint, Hotspot
 from ...data.evidence import MSA_VOCAB_SIZE
 from ...data.molecular import ComponentReference, MolecularSystem
+from ...data.tokenization import TOKEN_VOCAB_SIZE
 from ...model import Model, _OptionalTensor, _TensorCollection
 from ...modules.atom import (
     PackedAtomAttention,
@@ -75,35 +76,35 @@ _NUM_BOND_TYPES = 6
 # Molecular categories are protein, DNA, RNA, and non-polymer.
 _NUM_MOLECULE_TYPES = 4
 
-_NUM_RESIDUE_TYPES = 33  # const.num_tokens
+_NUM_RESIDUE_TYPES = TOKEN_VOCAB_SIZE
 
-_CANONICALS_OFFSET = 2  # const.canonicals_offset: the 20 canonical amino acids occupy ids [2, 22)
+_CANONICALS_OFFSET = 0
 
 NUM_CANONICAL_TOKENS = 20  # len(const.canonical_tokens)
 
-# The 20 canonical amino acids (three-letter CCD codes) in vocabulary order (residue-token ids ``[2, 22)``);
-# matches ``const.canonical_tokens`` and is indexed by ``aa_constraint_mask``.
+# The 20 canonical amino acids (three-letter CCD codes) in the shared token-vocabulary order;
+# this tuple also defines the ``aa_constraint_mask`` column order.
 CANONICAL_TOKENS: tuple[str, ...] = (
     "ALA",
-    "ARG",
-    "ASN",
-    "ASP",
     "CYS",
-    "GLN",
+    "ASP",
     "GLU",
+    "PHE",
     "GLY",
     "HIS",
     "ILE",
-    "LEU",
     "LYS",
+    "LEU",
     "MET",
-    "PHE",
+    "ASN",
     "PRO",
+    "GLN",
+    "ARG",
     "SER",
     "THR",
+    "VAL",
     "TRP",
     "TYR",
-    "VAL",
 )
 
 
@@ -1241,7 +1242,7 @@ class BoltzGenInverseFoldingModel(Model):
         >>> model = BoltzGenInverseFoldingModel(config).eval()
         >>> output = model.design(input, temperature=None)
         >>> tuple(output.logits.shape)
-        (1, 2, 33)
+        (1, 2, 38)
         >>> tuple(output.tokens.shape)
         (1, 2)
     """
@@ -1433,7 +1434,7 @@ class BoltzGenInputEmbeddings(nn.Module):
         num_key_atoms: int = 128,
         num_atom_encoder_blocks: int = 3,
         num_atom_encoder_attention_heads: int = 4,
-        vocab_size: int = 33,
+        vocab_size: int = TOKEN_VOCAB_SIZE,
         num_method_types: int = 12,
         num_molecule_types: int = 4,
         add_method_conditioning: bool = True,
@@ -1602,7 +1603,7 @@ class BoltzGenTemplateEmbedder(nn.Module):
         pair_size: int = 128,
         template_size: int = 64,
         num_blocks: int = 2,
-        vocab_size: int = 33,
+        vocab_size: int = TOKEN_VOCAB_SIZE,
         num_bins: int = 38,
         min_dist: float = 3.25,
         max_dist: float = 50.75,
@@ -1717,7 +1718,7 @@ class BoltzGenMiniformerTemplateEmbedder(nn.Module):
         pair_size: int = 128,
         template_size: int = 64,
         num_blocks: int = 2,
-        vocab_size: int = 33,
+        vocab_size: int = TOKEN_VOCAB_SIZE,
         num_bins: int = 38,
         min_dist: float = 3.25,
         max_dist: float = 50.75,

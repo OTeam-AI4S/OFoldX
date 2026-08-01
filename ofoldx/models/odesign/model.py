@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from tensordict import tensorclass
 from torch import Tensor, nn
 
-from ...data import MSA_VOCAB_SIZE
+from ...data import MSA_VOCAB_SIZE, TOKEN_VOCAB_SIZE
 from ...data.molecular import MolecularSystem
 from ...model import Model, _TensorCollection
 from ...modules.atom import (
@@ -39,8 +39,9 @@ from ...modules.trunk import MsaTrunk, PairformerStack, TrianglePairUpdateStack
 from .config import ODesignConfig
 
 _ATOM_FEATURE_SIZE = 386
-# Target residue type + canonical MSA profile + deletion mean + hotspot.
-_TOKEN_FEATURE_SIZE = 35 + MSA_VOCAB_SIZE + 2
+# Canonical residue identity + MSA profile + deletion mean + hotspot.
+_TOKEN_FEATURE_SIZE = TOKEN_VOCAB_SIZE + MSA_VOCAB_SIZE + 2
+_DESIGN_FEATURE_SIZE = 4
 _NUM_BOND_CLASSES = 2
 _DEFAULT_RECYCLING_STEPS = 10
 
@@ -109,7 +110,7 @@ class ODesignModel(Model):
         self.input_embeddings = ODesignInputEmbeddings(
             single_size=config.single_size,
         )
-        token_embedding_size = config.single_size + _TOKEN_FEATURE_SIZE
+        token_embedding_size = config.single_size + _TOKEN_FEATURE_SIZE + _DESIGN_FEATURE_SIZE
         self.single_init_projection = nn.Linear(token_embedding_size, config.single_size, bias=False)
         self.pair_left_projection = nn.Linear(config.single_size, config.pair_size, bias=False)
         self.pair_right_projection = nn.Linear(config.single_size, config.pair_size, bias=False)
@@ -447,6 +448,7 @@ class ODesignModel(Model):
             reference_charges=input.reference_charges,
             reference_mask=input.reference_mask,
             token_features=input.token_features,
+            design_features=input.design_features,
             atom_to_token=input.atom_to_token,
             num_tokens=input.token_features.shape[-2],
             atom_mask=input.atom_mask,
@@ -567,6 +569,7 @@ class ODesignInputEmbeddings(nn.Module):
         reference_charges: Tensor,
         reference_mask: Tensor,
         token_features: Tensor,
+        design_features: Tensor,
         atom_to_token: Tensor,
         num_tokens: int,
         atom_mask: Tensor,
@@ -584,7 +587,7 @@ class ODesignInputEmbeddings(nn.Module):
             local_geometry=local_geometry,
         ).token_hidden
         output = torch.cat(
-            [encoded, token_features.to(encoded)],
+            [encoded, token_features.to(encoded), design_features.to(encoded)],
             dim=-1,
         )
         return output * token_mask.unsqueeze(-1).to(output.dtype)
@@ -760,8 +763,11 @@ class ODesignInput:
         symmetry_index: Copy indices within each entity with shape ``(B, N)``.
         token_index: Token indices within each residue with shape ``(B, N)``.
         cyclic_period: Optional cyclic-position periods with shape ``(B, N)``.
-        token_features: Raw residue, MSA-profile, deletion, and hotspot features
-            with shape ``(B, N, 75)``. The Model prepends its atom embedding.
+        token_features: Canonical residue, MSA-profile, deletion, and hotspot
+            features with shape ``(B, N, 78)``.
+        design_features: Generated-protein, generated-RNA, generated-DNA, and
+            atom-token indicators with shape ``(B, N, 4)``. The Model prepends
+            its atom embedding to both feature tensors.
         token_bonds: Token-level bond adjacency with shape ``(B, N, N)``.
         atom_features: Reference atom features with shape ``(B, A, 386)``.
         atom_to_token: Token index for each atom with shape ``(B, A)``.
@@ -800,6 +806,7 @@ class ODesignInput:
     token_index: Tensor
     cyclic_period: Tensor
     token_features: Tensor
+    design_features: Tensor
     token_bonds: Tensor
     atom_features: Tensor
     atom_to_token: Tensor
@@ -841,6 +848,7 @@ class ODesignLigandInput:
     token_index: Tensor
     cyclic_period: Tensor
     token_features: Tensor
+    design_features: Tensor
     token_bonds: Tensor
     atom_features: Tensor
     atom_to_token: Tensor

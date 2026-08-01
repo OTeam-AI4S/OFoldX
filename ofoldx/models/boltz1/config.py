@@ -6,6 +6,8 @@ from __future__ import annotations
 
 from chanfig import Config
 
+from ...data.tokenization import TOKEN_VOCAB_SIZE
+
 
 class Boltz1InputEmbeddingsConfig(Config):
     r"""
@@ -21,7 +23,7 @@ class Boltz1InputEmbeddingsConfig(Config):
 
     num_atom_encoder_blocks: int = 3
     num_atom_encoder_attention_heads: int = 4
-    vocab_size: int = 33
+    vocab_size: int = TOKEN_VOCAB_SIZE
     pocket_feature_size: int = 4
     use_atom_encoder: bool = True
 

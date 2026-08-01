@@ -6,6 +6,8 @@ from __future__ import annotations
 
 from chanfig import Config
 
+from ...data import TOKEN_VOCAB_SIZE
+
 
 class PxDesignConditionEmbeddingsConfig(Config):
     r"""
@@ -16,6 +18,7 @@ class PxDesignConditionEmbeddingsConfig(Config):
         atom_pair_hidden_size: Width of atom pair features.
         token_hidden_size: Width of token condition features.
         vocab_size: Number of token types.
+        design_feature_size: Width of generated-token conditions.
         plddt_size: Width of per-token pLDDT conditions.
         hotspot_size: Width of hotspot conditions.
         add_feature_size: Width of additional design conditions.
@@ -28,7 +31,8 @@ class PxDesignConditionEmbeddingsConfig(Config):
     atom_hidden_size: int = 128
     atom_pair_hidden_size: int = 16
     token_hidden_size: int = 384
-    vocab_size: int = 36
+    vocab_size: int = TOKEN_VOCAB_SIZE
+    design_feature_size: int = 1
     plddt_size: int = 1
     hotspot_size: int = 1
     add_feature_size: int = 4

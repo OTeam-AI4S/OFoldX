@@ -24,6 +24,7 @@ from ...data.molecular import (
     MolecularSystem,
 )
 from ...data.structure import Structure
+from ...data.tokenization import TOKEN_VOCAB_SIZE
 from ...model import Model, _OptionalTensor, _TensorCollection
 from ...modules.atom import (
     AtomToTokenEncoder,
@@ -79,7 +80,7 @@ from ...results import FoldPrediction, FoldResult, Metric, PairMetric, Score
 from .config import AlphaFold3Config
 
 # Atom-derived token state + target residue type + canonical MSA profile + deletion mean.
-_TOKEN_FEATURE_SIZE = 384 + 31 + MSA_VOCAB_SIZE + 1
+_TOKEN_FEATURE_SIZE = 384 + TOKEN_VOCAB_SIZE + MSA_VOCAB_SIZE + 1
 
 
 class AlphaFold3Model(Model):
@@ -1229,7 +1230,7 @@ class AlphaFold3DenoisingConditioner(nn.Module):
         self,
         pair_input_size: int = 267,
         pair_size: int = 128,
-        single_conditioning_size: int = 833,
+        single_conditioning_size: int = 384 + _TOKEN_FEATURE_SIZE,
         single_size: int = 384,
         noise_embedding_size: int = 256,
         sigma_data: float = 16.0,
@@ -1389,7 +1390,7 @@ class AlphaFold3TemplateEmbedder(nn.Module):
         pair_size: int = 128,
         hidden_size: int = 64,
         num_blocks: int = 0,
-        vocab_size: int = 32,
+        vocab_size: int = TOKEN_VOCAB_SIZE,
         num_distogram_bins: int = 39,
         triangle_attention_hidden_size: int = 32,
         num_triangle_attention_heads: int = 4,

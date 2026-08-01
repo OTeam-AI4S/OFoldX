@@ -14,6 +14,7 @@ from typing import Any, TypeAlias, cast
 import torch
 from torch import Tensor, nn
 
+from ...data import TOKEN_ALPHABET
 from .config import PxDesignConfig
 from .model import PxDesignModel
 
@@ -436,9 +437,64 @@ def _transform_reference_value(model_key: str, reference_value: _ReferenceValue)
             return torch.cat(reference_value, dim=0)
         raise RuntimeError(f"unexpected multi-tensor reference mapping for {model_key}")
 
+    if model_key == "condition_embeddings.input_projection.weight":
+        return _convert_condition_input_axis(reference_value)
     if model_key.endswith(".noise_embedding.projection.weight") and reference_value.dim() == 1:
         return reference_value.unsqueeze(-1)
     return reference_value
+
+
+_SOURCE_TOKEN_INDEX = {
+    **{
+        symbol: index
+        for index, symbol in enumerate(
+            ("A", "R", "N", "D", "C", "Q", "E", "G", "H", "I", "L", "K", "M", "F", "P", "S", "T", "W", "Y", "V")
+        )
+    },
+    "X": 20,
+    "RNA_A": 21,
+    "RNA_G": 22,
+    "RNA_C": 23,
+    "RNA_U": 24,
+    "RNA_N": 25,
+    "DNA_A": 26,
+    "DNA_G": 27,
+    "DNA_C": 28,
+    "DNA_T": 29,
+    "DNA_N": 30,
+    "-": 31,
+    "OTHER": 20,
+}
+
+
+def _convert_condition_input_axis(source: Tensor) -> Tensor:
+    prefix = source[..., :-46]
+    residue = source[..., -46:-10]
+    suffix = source[..., -10:]
+    converted_residue = []
+    for symbol in TOKEN_ALPHABET:
+        if symbol == "B":
+            value = (residue[..., _SOURCE_TOKEN_INDEX["D"]] + residue[..., _SOURCE_TOKEN_INDEX["N"]]) / 2
+        elif symbol == "Z":
+            value = (residue[..., _SOURCE_TOKEN_INDEX["E"]] + residue[..., _SOURCE_TOKEN_INDEX["Q"]]) / 2
+        elif symbol == "J":
+            value = (residue[..., _SOURCE_TOKEN_INDEX["I"]] + residue[..., _SOURCE_TOKEN_INDEX["L"]]) / 2
+        elif symbol == "U":
+            value = residue[..., _SOURCE_TOKEN_INDEX["C"]]
+        elif symbol == "O":
+            value = residue[..., _SOURCE_TOKEN_INDEX["K"]]
+        else:
+            value = residue[..., _SOURCE_TOKEN_INDEX[symbol]]
+        converted_residue.append(value)
+    return torch.cat(
+        (
+            prefix,
+            torch.stack(converted_residue, dim=-1),
+            residue[..., 32:33] - residue[..., _SOURCE_TOKEN_INDEX["X"] : _SOURCE_TOKEN_INDEX["X"] + 1],
+            suffix,
+        ),
+        dim=-1,
+    )
 
 
 def _translate_reference_state(

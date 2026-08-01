@@ -19,6 +19,7 @@ from torch import Tensor, nn
 from ...data.evidence import MSA_VOCAB_SIZE, Template
 from ...data.molecular import AtomSite, ComponentReference, MolecularSystem
 from ...data.structure import Structure
+from ...data.tokenization import TOKEN_VOCAB_SIZE
 from ...model import Model, _OptionalTensor, _TensorCollection
 from ...modules.atom import (
     AtomPairEncoding,
@@ -1502,7 +1503,7 @@ class Boltz2InputEmbeddings(nn.Module):
         num_key_atoms: int = 128,
         num_atom_encoder_blocks: int = 3,
         num_atom_encoder_attention_heads: int = 4,
-        vocab_size: int = 33,
+        vocab_size: int = TOKEN_VOCAB_SIZE,
         num_method_types: int = 12,
         num_molecule_types: int = 4,
         add_method_conditioning: bool = True,
@@ -1612,7 +1613,7 @@ class Boltz2TemplateEmbedder(nn.Module):
         pair_size: int = 128,
         hidden_size: int = 64,
         num_blocks: int = 2,
-        vocab_size: int = 33,
+        vocab_size: int = TOKEN_VOCAB_SIZE,
         num_bins: int = 38,
         min_distance: float = 3.25,
         max_distance: float = 50.75,
@@ -5293,7 +5294,7 @@ class Boltz2Input:
         msa_paired: Optional paired-MSA flags.
         msa_mask: Optional MSA validity mask.
         template_residue_type_features: Optional template residue one-hot features with
-            shape ``(B, T, N, 33)``.
+            shape ``(B, T, N, vocab_size)``.
         template_frame_rotations: Optional template frame rotations with shape
             ``(B, T, N, 3, 3)``.
         template_frame_translations: Optional template frame origins with shape

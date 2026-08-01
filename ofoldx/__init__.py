@@ -32,6 +32,7 @@ from .results import (
     ScoreResult,
     best,
 )
+from .runners import Runner
 
 __all__ = [
     "AutoModel",
@@ -54,6 +55,7 @@ __all__ = [
     "PairMetric",
     "PolymerSequence",
     "Processor",
+    "Runner",
     "Score",
     "ScoreResult",
     "Scored",

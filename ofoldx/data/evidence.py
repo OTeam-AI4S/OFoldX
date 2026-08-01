@@ -22,105 +22,23 @@ from .molecular import (
     one_letter_to_component,
 )
 from .structure import Structure
-
-# One model-side MSA vocabulary, shared by every family. RNA and DNA names are
-# explicit because their one-letter spellings overlap the protein alphabet.
-MSA_ALPHABET: tuple[str, ...] = (
-    "A",
-    "C",
-    "D",
-    "E",
-    "F",
-    "G",
-    "H",
-    "I",
-    "K",
-    "L",
-    "M",
-    "N",
-    "P",
-    "Q",
-    "R",
-    "S",
-    "T",
-    "V",
-    "W",
-    "Y",
-    "X",
-    "Z",
-    "B",
-    "J",
-    "U",
-    "O",
-    "-",
-    "RNA_A",
-    "RNA_G",
-    "RNA_C",
-    "RNA_U",
-    "RNA_N",
-    "DNA_A",
-    "DNA_G",
-    "DNA_C",
-    "DNA_T",
-    "DNA_N",
-    "OTHER",
+from .tokenization import (
+    TOKEN_ALPHABET,
+    TOKEN_GAP_INDEX,
+    TOKEN_INDEX,
+    TOKEN_OTHER_INDEX,
+    TOKEN_VOCAB_SIZE,
+    component_token_index,
+    residue_token_index,
 )
-MSA_INDEX: dict[str, int] = {symbol: index for index, symbol in enumerate(MSA_ALPHABET)}
-MSA_VOCAB_SIZE = len(MSA_ALPHABET)
-MSA_GAP_INDEX = MSA_INDEX["-"]
-MSA_OTHER_INDEX = MSA_INDEX["OTHER"]
 
-_RNA_MSA_INDEX = {symbol: MSA_INDEX[f"RNA_{symbol}"] for symbol in "AGCU"}
-_DNA_MSA_INDEX = {symbol: MSA_INDEX[f"DNA_{symbol}"] for symbol in "AGCT"}
-_PROTEIN_MSA_SYMBOL_BY_COMPONENT = {
-    **{component: symbol for symbol, component in _STANDARD_COMPONENTS["protein"].items()},
-    "UNK": "X",
-    "ASX": "B",
-    "GLX": "Z",
-    "XLE": "J",
-    "SEC": "U",
-    "PYL": "O",
-}
-_RNA_MSA_SYMBOL_BY_COMPONENT = {component: symbol for symbol, component in _STANDARD_COMPONENTS["rna"].items()}
-_DNA_MSA_SYMBOL_BY_COMPONENT = {component: symbol for symbol, component in _STANDARD_COMPONENTS["dna"].items()}
-
-
-def msa_residue_index(symbol: str, polymer_type: str | None) -> int:
-    r"""Resolve one aligned symbol under its bound polymer chemistry.
-
-    Protein letters retain all IUPAC ambiguity and rare-residue identities.
-    Unknown RNA/DNA letters use their chemistry-specific ``N`` class, and a
-    non-polymer token uses ``OTHER``. The alignment gap is shared.
-    """
-
-    if symbol == "-":
-        return MSA_GAP_INDEX
-    if polymer_type == "protein":
-        return MSA_INDEX.get(symbol, MSA_INDEX["X"])
-    if polymer_type == "rna":
-        return _RNA_MSA_INDEX.get(symbol, MSA_INDEX["RNA_N"])
-    if polymer_type == "dna":
-        return _DNA_MSA_INDEX.get(symbol, MSA_INDEX["DNA_N"])
-    return MSA_OTHER_INDEX
-
-
-def msa_component_index(component_id: str, polymer_type: str | None) -> int:
-    r"""Resolve one chemical component into the canonical MSA vocabulary.
-
-    Protein ASX/GLX/XLE retain the IUPAC ambiguity classes B/Z/J, while SEC and
-    PYL retain U and O. Unknown polymer components use the chemistry-specific
-    unknown class; non-polymers use ``OTHER``.
-    """
-
-    if polymer_type == "protein":
-        symbol = _PROTEIN_MSA_SYMBOL_BY_COMPONENT.get(component_id, "X")
-    elif polymer_type == "rna":
-        symbol = _RNA_MSA_SYMBOL_BY_COMPONENT.get(component_id, "N")
-    elif polymer_type == "dna":
-        symbol = _DNA_MSA_SYMBOL_BY_COMPONENT.get(component_id, "N")
-    else:
-        return MSA_OTHER_INDEX
-    return msa_residue_index(symbol, polymer_type)
+MSA_ALPHABET = TOKEN_ALPHABET
+MSA_INDEX = TOKEN_INDEX
+MSA_VOCAB_SIZE = TOKEN_VOCAB_SIZE
+MSA_GAP_INDEX = TOKEN_GAP_INDEX
+MSA_OTHER_INDEX = TOKEN_OTHER_INDEX
+msa_residue_index = residue_token_index
+msa_component_index = component_token_index
 
 _MSA_ASCII_INDEX = {
     polymer_type: np.fromiter(

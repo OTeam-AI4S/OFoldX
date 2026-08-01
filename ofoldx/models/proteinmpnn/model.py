@@ -1532,10 +1532,16 @@ class ProteinMpnnCaFeatures(nn.Module):
             residue_mask,
             self.num_neighbors,
         )
+        adjacent = (
+            residue_mask[:, :-1]
+            & residue_mask[:, 1:]
+            & (chain_index[:, :-1] == chain_index[:, 1:])
+            & (residue_index[:, 1:] - residue_index[:, :-1] == 1)
+        )
         previous = torch.zeros_like(backbone_coordinates)
-        previous[:, 1:] = backbone_coordinates[:, :-1]
+        previous[:, 1:] = backbone_coordinates[:, :-1] * adjacent.unsqueeze(-1)
         following = torch.zeros_like(backbone_coordinates)
-        following[:, :-1] = backbone_coordinates[:, 1:]
+        following[:, :-1] = backbone_coordinates[:, 1:] * adjacent.unsqueeze(-1)
         orientation = self._orientations(backbone_coordinates, neighbor_indices)
         distance_features = torch.cat(
             (

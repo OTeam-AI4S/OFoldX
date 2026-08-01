@@ -14,14 +14,13 @@ from torch import Tensor
 
 from ...data.ccd import resolve_ccd_component
 from ...data.components import complete_component
+from ...data.crop import Cropper, crop_token_layout, resolved_token_mask
 from ...data.evidence import (
     MSA,
-    MSA_OTHER_INDEX,
     MSA_VOCAB_SIZE,
     MsaCollection,
     Template,
     TemplateAlignment,
-    msa_component_index,
     msa_residue_index,
     resolve_msa_bindings,
 )
@@ -33,61 +32,25 @@ from ...data.molecular import (
     ENTITY_PNA,
     ENTITY_PROTEIN,
     ENTITY_RNA,
+    STANDARD_AMINO_ACID_IDS,
     ChemicalComponent,
     MolecularSystem,
     PolymerSequence,
 )
 from ...data.structure import Structure
+from ...data.tokenization import (
+    TOKEN_GAP_INDEX,
+    TOKEN_VOCAB_SIZE,
+    TokenLayout,
+    component_token_index,
+    tokenize_molecular_system,
+)
 from ...processor import Processor
 from .config import AlphaFold3ProcessorConfig
 from .model import AlphaFold3Input, AlphaFold3StructureTarget, TemplateFeatures
 
-# AlphaFold 3 target residue-type vocabulary (POLYMER_TYPES_WITH_UNKNOWN_AND_GAP, 31 classes):
-# 20 standard amino acids, UNK, the gap, then A G C U (RNA) DA DG DC DT (DNA) and the shared
-# unknown-nucleic N. This remains the one-hot alphabet of the target residue-type block.
-_TARGET_RESIDUE_TYPE = {
-    name: index
-    for index, name in enumerate(
-        (
-            "ALA",
-            "ARG",
-            "ASN",
-            "ASP",
-            "CYS",
-            "GLN",
-            "GLU",
-            "GLY",
-            "HIS",
-            "ILE",
-            "LEU",
-            "LYS",
-            "MET",
-            "PHE",
-            "PRO",
-            "SER",
-            "THR",
-            "TRP",
-            "TYR",
-            "VAL",
-            "UNK",
-            "-",
-            "A",
-            "G",
-            "C",
-            "U",
-            "DA",
-            "DG",
-            "DC",
-            "DT",
-            "N",
-        )
-    )
-}
-_TARGET_VOCAB_SIZE = len(_TARGET_RESIDUE_TYPE)  # 31
-_UNKNOWN = _TARGET_RESIDUE_TYPE["UNK"]
-_GAP = _TARGET_RESIDUE_TYPE["-"]
 _STANDARD = {
-    "protein": frozenset(tuple(_TARGET_RESIDUE_TYPE)[:21]),
+    "protein": STANDARD_AMINO_ACID_IDS | {"UNK"},
     "rna": frozenset(("A", "G", "C", "U", "N")),
     "dna": frozenset(("DA", "DG", "DC", "DT", "DN")),
 }
@@ -98,43 +61,17 @@ _STANDARD_BY_ENTITY_TYPE = {
     ENTITY_DNA_RNA_HYBRID: _STANDARD["rna"] | _STANDARD["dna"],
     ENTITY_PNA: frozenset(),
 }
-
-
-def _token_msa_residue_type(token: dict[str, object], system: MolecularSystem) -> int:
-    entity_index = cast(int, token["entity_index"])
-    entity_type = int(system.entity_type[entity_index])
-    if entity_type == ENTITY_MOLECULE:
-        return MSA_OTHER_INDEX
-    component_index = cast(int, token["component_index"])
-    component_id = system.symbols[int(system.component_symbol[component_index])]
-    if entity_type == ENTITY_PROTEIN:
-        polymer_type = "protein"
-    elif entity_type == ENTITY_RNA:
-        polymer_type = "rna"
-    elif entity_type == ENTITY_DNA:
-        polymer_type = "dna"
-    elif entity_type == ENTITY_DNA_RNA_HYBRID:
-        polymer_type = "rna" if component_id in {"A", "G", "C", "U", "N"} else "dna"
-    else:
-        return MSA_OTHER_INDEX
-    return msa_component_index(component_id, polymer_type)
+_POLYMER_TYPE_BY_ENTITY_TYPE = {
+    ENTITY_PROTEIN: "protein",
+    ENTITY_RNA: "rna",
+    ENTITY_DNA: "dna",
+    ENTITY_DNA_RNA_HYBRID: "dna_rna_hybrid",
+}
 
 
 # AlphaFold 3 template distogram bins: 39 lower breaks over [3.25, 50.75] (squared).
 _TEMPLATE_DISTOGRAM_MIN = 3.25
 _TEMPLATE_DISTOGRAM_MAX = 50.75
-
-
-def _residue_type_index(component_id: str, standard: bool) -> int:
-    r"""
-    Target residue-type index; unknown DNA folds onto the shared unknown-nucleic class N.
-    """
-
-    if not standard:
-        return _UNKNOWN
-    if component_id == "DN":
-        component_id = "N"
-    return _TARGET_RESIDUE_TYPE.get(component_id, _UNKNOWN)
 
 
 class AlphaFold3Processor(Processor):
@@ -148,7 +85,7 @@ class AlphaFold3Processor(Processor):
         dtype: Floating-point dtype for produced tensors.
 
     Examples:
-        >>> from ofoldx.data import MolecularSystem, Molecule, get_component
+        >>> from ofoldx.data import MolecularSystem, Molecule, PolymerSequence, get_component
         >>> molecule = Molecule((get_component("GLY"), get_component("ALA")))
         >>> system = MolecularSystem.from_entities({"ligand": molecule}, {"L": "ligand"})
         >>> input = AlphaFold3Processor()(system)
@@ -156,7 +93,15 @@ class AlphaFold3Processor(Processor):
         [0, 1]
         >>> input.reference_space_id.unique().tolist()
         [0, 1]
+        >>> bool((input.token_atom_index >= 0).all())
+        True
         >>> protein = AlphaFold3Processor()(PolymerSequence.from_one_letter("GA"))
+        >>> protein.token_atom_index.tolist()
+        [[-1, -1]]
+        >>> protein.token_features.shape[-1]
+        461
+        >>> protein.token_features[0, :, 384:422].argmax(dim=-1).tolist()
+        [5, 0]
         >>> protein.msa_tokens.shape
         torch.Size([1, 1, 2])
         >>> protein.msa_deletion_counts.dtype
@@ -202,6 +147,17 @@ class AlphaFold3Processor(Processor):
             This method performs no random sampling.
         """
 
+        return self._lower(input, msa=msa, templates=tuple(templates))
+
+    def _lower(
+        self,
+        input: PolymerSequence | Sequence[PolymerSequence] | MolecularSystem | Structure,
+        *,
+        msa: MSA | MsaCollection | None,
+        templates: tuple[Template, ...],
+        cropper: Cropper | None = None,
+        generator: torch.Generator | None = None,
+    ) -> AlphaFold3Input:
         system = molecular_system_from_input(input, revision=self.config.ccd_revision)
         resolved_msa = () if msa is None else resolve_msa_bindings(msa, system)
         for column, (_value, _target_instance_index, entity_index) in enumerate(resolved_msa):
@@ -214,13 +170,22 @@ class AlphaFold3Processor(Processor):
                 and bool(((msa.row_pairing[1:, column] >= 0) & msa.row_is_paired[1:, column]).any())
             ):
                 raise ValueError("AlphaFold 3 accepts RNA only through unpaired MSA rows")
-        tokens = _tokenize(system)
+        layout = _tokenize(system)
+        if cropper is not None:
+            layout = crop_token_layout(
+                cast(Structure, input),
+                layout,
+                cropper,
+                anchor_token_mask=resolved_token_mask(cast(Structure, input), layout),
+                generator=generator,
+            )
+        tokens = _lower_token_layout(system, layout)
         return _features(
             system,
             tokens=tokens,
             msa=msa,
             resolved_msa=resolved_msa,
-            templates=tuple(templates),
+            templates=templates,
             max_msa_rows=self.config.max_msa_rows,
             device=self.device,
             dtype=self.dtype,
@@ -232,15 +197,19 @@ class AlphaFold3Processor(Processor):
         *,
         msa: MSA | MsaCollection | None = None,
         templates: Sequence[Template] = (),
+        cropper: Cropper | None = None,
+        generator: torch.Generator | None = None,
     ) -> tuple[AlphaFold3Input, AlphaFold3StructureTarget]:
         r"""
         Lower one structure into model input and separate coordinate truth.
         """
 
-        processed = self(
+        processed = self._lower(
             input,
             msa=msa,
-            templates=templates,
+            templates=tuple(templates),
+            cropper=cropper,
+            generator=generator,
         )
         return processed, _structure_target(
             input,
@@ -388,69 +357,60 @@ def _is_standard(system: MolecularSystem, component_index: int, entity_type: int
     return component_id in _STANDARD_BY_ENTITY_TYPE.get(entity_type, frozenset())
 
 
-def _tokenize(system: MolecularSystem) -> list[dict[str, object]]:
-    tokens: list[dict[str, object]] = []
+def _tokenize(system: MolecularSystem) -> TokenLayout:
+    atom_mask = _af3_visible_atom_mask(system)
+    return tokenize_molecular_system(system, atom_mask=atom_mask)
+
+
+def _af3_visible_atom_mask(system: MolecularSystem) -> Tensor:
+    r"""Drop the placeholder nitrogen carried by unknown nucleic components."""
+
+    visible = torch.ones_like(system.atomic_number, dtype=torch.bool)
     component_atom_ptr = system.component_atom_ptr.detach().cpu().tolist()
-    instance_component_ptr = system.instance_component_ptr.detach().cpu().tolist()
-    instance_entity = system.instance_entity.detach().cpu().tolist()
+    component_symbol = system.component_symbol.detach().cpu().tolist()
+    atom_symbol = system.atom_symbol.detach().cpu().tolist()
+    for component_index, component in enumerate(component_symbol):
+        if system.symbols[int(component)] not in {"N", "DN"}:
+            continue
+        for atom_index in range(component_atom_ptr[component_index], component_atom_ptr[component_index + 1]):
+            if system.symbols[int(atom_symbol[atom_index])] == "N":
+                visible[atom_index] = False
+    return visible
+
+
+def _lower_token_layout(system: MolecularSystem, layout: TokenLayout) -> list[dict[str, object]]:
+    r"""Lower the shared structural partition into AlphaFold 3 feature rows."""
+
+    token_atom_ptr = layout.token_atom_ptr.detach().cpu().tolist()
+    atom_index = layout.atom_index.detach().cpu().tolist()
+    token_component_index = layout.token_component_index.detach().cpu().tolist()
+    token_atom_index = layout.token_atom_index.detach().cpu().tolist()
+    token_type_index = layout.token_type_index.detach().cpu().tolist()
+    token_instance_index = layout.token_instance_index.detach().cpu().tolist()
+    token_entity_index = layout.token_entity_index.detach().cpu().tolist()
+    token_residue_index = layout.token_residue_index.detach().cpu().tolist()
+    token_symmetry_index = layout.token_symmetry_index.detach().cpu().tolist()
     entity_type = system.entity_type.detach().cpu().tolist()
     component_symbol = system.component_symbol.detach().cpu().tolist()
     atom_symbol = system.atom_symbol.detach().cpu().tolist()
-    atomic_number = system.atomic_number.detach().cpu().tolist()
-    entity_copies: dict[int, int] = {}
+    tokens: list[dict[str, object]] = []
 
-    for instance_index, entity_index in enumerate(instance_entity):
+    for token_index, component_index in enumerate(token_component_index):
+        group = tuple(atom_index[token_atom_ptr[token_index] : token_atom_ptr[token_index + 1]])
+        instance_index = int(token_instance_index[token_index])
+        entity_index = int(token_entity_index[token_index])
         current_entity_type = int(entity_type[entity_index])
-        symmetry_index = entity_copies.get(entity_index, 0)
-        entity_copies[entity_index] = symmetry_index + 1
-        component_start = int(instance_component_ptr[instance_index])
-        component_stop = int(instance_component_ptr[instance_index + 1])
-        molecule_has_atoms = False
-        for component_index in range(component_start, component_stop):
-            local_component = component_index - component_start
-            component_id = system.symbols[int(component_symbol[component_index])]
-            atoms = tuple(
-                atom_index
-                for atom_index in range(
-                    int(component_atom_ptr[component_index]),
-                    int(component_atom_ptr[component_index + 1]),
-                )
-                if int(atomic_number[atom_index]) != 1
-                and not (component_id in {"N", "DN"} and system.symbols[int(atom_symbol[atom_index])] == "N")
-            )
-            if not atoms:
-                if current_entity_type == ENTITY_MOLECULE:
-                    continue
-                raise ValueError(
-                    f"AlphaFold 3 component {component_id!r} at canonical component "
-                    f"{component_index} has no model-visible heavy atoms"
-                )
-
-            if current_entity_type == ENTITY_MOLECULE:
-                molecule_has_atoms = True
-                for atom_index in atoms:
-                    tokens.append(
-                        {
-                            "atoms": (atom_index,),
-                            "component_index": component_index,
-                            "token_atom_index": atom_index,
-                            "instance_index": instance_index,
-                            "entity_index": entity_index,
-                            "monomer_index": None,
-                            "residue_index": local_component,
-                            "symmetry_index": symmetry_index,
-                            "residue_type": _UNKNOWN,
-                            "center": atom_index,
-                            "representative": atom_index,
-                            "standard": False,
-                        }
-                    )
-                continue
-
-            standard = _is_standard(system, component_index, current_entity_type)
-            groups = tuple((atom_index,) for atom_index in atoms) if not standard else (atoms,)
-            by_name = {system.symbols[int(atom_symbol[atom_index])]: atom_index for atom_index in atoms}
+        local_component = int(token_residue_index[token_index])
+        component_id = system.symbols[int(component_symbol[component_index])]
+        canonical_atom = int(token_atom_index[token_index])
+        atom_token = canonical_atom >= 0
+        standard = _is_standard(system, component_index, current_entity_type)
+        if atom_token:
+            center = representative = canonical_atom
+        else:
+            by_name = {system.symbols[int(atom_symbol[atom])]: atom for atom in group}
             center_name = "CA" if current_entity_type == ENTITY_PROTEIN else "C1'"
+            center = by_name[center_name]
             if current_entity_type == ENTITY_PROTEIN:
                 representative_name = "CA" if component_id == "GLY" else "CB"
             elif component_id in {"A", "G", "DA", "DG"}:
@@ -459,30 +419,23 @@ def _tokenize(system: MolecularSystem) -> list[dict[str, object]]:
                 representative_name = "C2"
             else:
                 representative_name = "C1'"
-            for group in groups:
-                atom_token = not standard
-                center = group[0] if atom_token else by_name[center_name]
-                representative = group[0] if atom_token else by_name.get(representative_name, center)
-                tokens.append(
-                    {
-                        "atoms": group,
-                        "component_index": component_index,
-                        "token_atom_index": group[0] if atom_token else -1,
-                        "instance_index": instance_index,
-                        "entity_index": entity_index,
-                        "monomer_index": local_component,
-                        "residue_index": local_component,
-                        "symmetry_index": symmetry_index,
-                        "residue_type": _residue_type_index(component_id, standard),
-                        "center": center,
-                        "representative": representative,
-                        "standard": standard,
-                    }
-                )
-        if current_entity_type == ENTITY_MOLECULE and not molecule_has_atoms:
-            raise ValueError(
-                f"AlphaFold 3 molecule at canonical instance {instance_index} has no model-visible heavy atoms"
-            )
+            representative = by_name.get(representative_name, center)
+        tokens.append(
+            {
+                "atoms": group,
+                "component_index": component_index,
+                "token_atom_index": canonical_atom,
+                "instance_index": instance_index,
+                "entity_index": entity_index,
+                "monomer_index": None if current_entity_type == ENTITY_MOLECULE else local_component,
+                "residue_index": local_component,
+                "symmetry_index": int(token_symmetry_index[token_index]),
+                "token_type_index": int(token_type_index[token_index]),
+                "center": center,
+                "representative": representative,
+                "standard": standard,
+            }
+        )
     return tokens
 
 
@@ -541,11 +494,11 @@ def _features(
     )
 
     profile, deletion_mean = _profile_features(resolved_msa, tokens, system)
-    residue_type = torch.tensor([cast(int, token["residue_type"]) for token in tokens])
+    token_type = torch.tensor([cast(int, token["token_type_index"]) for token in tokens])
     token_features = torch.cat(
         (
             torch.zeros(len(tokens), 384),
-            F.one_hot(residue_type, num_classes=_TARGET_VOCAB_SIZE).float(),
+            F.one_hot(token_type, num_classes=TOKEN_VOCAB_SIZE).float(),
             profile,
             deletion_mean[:, None],
         ),
@@ -757,7 +710,7 @@ def _msa_rows_and_deletions(
             selected = bindings.get(key)
             current_entity_type = int(system.entity_type[entity_index])
             if query:
-                rows[row_index, token_index] = _token_msa_residue_type(token, system)
+                rows[row_index, token_index] = cast(int, token["token_type_index"])
             elif selected is None or current_entity_type not in {ENTITY_PROTEIN, ENTITY_RNA} or key not in descriptor:
                 rows[row_index, token_index] = msa_residue_index("-", "protein")
             else:
@@ -795,7 +748,7 @@ def _profile_features(
         selected = bindings.get(key)
         current_entity_type = int(system.entity_type[entity_index])
         if selected is None or current_entity_type not in {ENTITY_PROTEIN, ENTITY_RNA}:
-            profile[token_index, _token_msa_residue_type(token, system)] = 1
+            profile[token_index, cast(int, token["token_type_index"])] = 1
             continue
         column = cast(int, monomer_index)
         polymer_type = "protein" if current_entity_type == ENTITY_PROTEIN else "rna"
@@ -935,7 +888,7 @@ def _template_features(
     for template in templates:
         positions = torch.zeros(token_count, 4, 3)
         atom_mask = torch.zeros(token_count, 4)
-        residue_type = torch.full((token_count,), float(_GAP)).to(torch.long)
+        residue_type = torch.full((token_count,), TOKEN_GAP_INDEX, dtype=torch.long)
         template_system = template.structure.system
         for alignment in template.alignments:
             template_instance_index = template_system.instance_index(alignment.template_instance_id)
@@ -955,13 +908,9 @@ def _template_features(
                     template_component_index,
                 )
                 component_id = template_system.symbols[int(template_system.component_symbol[template_component_index])]
-                residue_type_index = _residue_type_index(
+                residue_type_index = component_token_index(
                     component_id,
-                    _is_standard(
-                        template_system,
-                        template_component_index,
-                        template_entity_type,
-                    ),
+                    _POLYMER_TYPE_BY_ENTITY_TYPE.get(template_entity_type),
                 )
                 for target_token in targets:
                     positions[target_token] = backbone
@@ -1005,6 +954,8 @@ def _alignment_targets(
         target_entity_index = system.entity_index(alignment.target_entity_id)
     except KeyError:
         raise ValueError(f"template alignment targets unknown entity {alignment.target_entity_id!r}") from None
+    if int(system.entity_type[target_entity_index]) == ENTITY_MOLECULE:
+        raise ValueError(f"template alignment target {alignment.target_entity_id!r} is not a polymer entity")
     if alignment.target_instance_id is not None:
         try:
             target_instance_index = system.instance_index(alignment.target_instance_id)
@@ -1018,27 +969,36 @@ def _alignment_targets(
             )
         start = int(system.instance_component_ptr[target_instance_index])
         stop = int(system.instance_component_ptr[target_instance_index + 1])
-        component_index = start + target_component
-        token_index = None if component_index >= stop else component_token.get(component_index)
-        if token_index is None:
+        if target_component >= stop - start:
             raise ValueError(
                 f"template alignment target {alignment.target_instance_id!r}:"
-                f"{target_component} does not resolve to a token"
+                f"{target_component} does not resolve to a component"
             )
+        component_index = start + target_component
+        token_index = component_token.get(component_index)
+        if token_index is None:
+            return []
         return [token_index]
     targets = []
-    for target_instance_index in (
+    target_instances = (
         (system.instance_entity == target_entity_index).nonzero(as_tuple=False).flatten().detach().cpu().tolist()
-    ):
+    )
+    if not target_instances:
+        raise ValueError(
+            f"template alignment target {alignment.target_entity_id!r}:{target_component} "
+            "does not resolve to an instance"
+        )
+    for target_instance_index in target_instances:
         start = int(system.instance_component_ptr[target_instance_index])
         stop = int(system.instance_component_ptr[target_instance_index + 1])
+        if target_component >= stop - start:
+            raise ValueError(
+                f"template alignment target {alignment.target_entity_id!r}:"
+                f"{target_component} does not resolve to a component"
+            )
         component_index = start + target_component
-        if component_index < stop and component_index in component_token:
+        if component_index in component_token:
             targets.append(component_token[component_index])
-    if not targets:
-        raise ValueError(
-            f"template alignment target {alignment.target_entity_id!r}:{target_component} does not resolve to a token"
-        )
     return targets
 
 

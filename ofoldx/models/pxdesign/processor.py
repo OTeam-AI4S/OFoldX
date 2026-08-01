@@ -8,20 +8,29 @@ from collections.abc import Sequence
 from typing import cast
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 from ...data import (
+    TOKEN_INDEX,
+    TOKEN_VOCAB_SIZE,
     ExistingSpan,
     GeneratedSegment,
     PlacementSpec,
+    TokenLayout,
+    tokenize_molecular_system,
     validate_placement,
 )
 from ...data.components import get_component
 from ...data.conditions import Hotspot
 from ...data.molecular import (
     BOND_ROLE_COMPONENT,
+    ENTITY_DNA,
+    ENTITY_DNA_RNA_HYBRID,
     ENTITY_MOLECULE,
     ENTITY_PROTEIN,
+    ENTITY_RNA,
+    STANDARD_AMINO_ACID_IDS,
     MolecularSystem,
     Molecule,
     PolymerSequence,
@@ -32,41 +41,20 @@ from ...data.structure import Structure
 from ...processor import Processor
 from .model import PxDesignInput
 
-_RESIDUE_TYPE_INDEX = {
-    "ALA": 0,
-    "ARG": 1,
-    "ASN": 2,
-    "ASP": 3,
-    "CYS": 4,
-    "GLN": 5,
-    "GLU": 6,
-    "GLY": 7,
-    "HIS": 8,
-    "ILE": 9,
-    "LEU": 10,
-    "LYS": 11,
-    "MET": 12,
-    "PHE": 13,
-    "PRO": 14,
-    "SER": 15,
-    "THR": 16,
-    "TRP": 17,
-    "TYR": 18,
-    "VAL": 19,
-    "UNK": 20,
-    "A": 21,
-    "G": 22,
-    "C": 23,
-    "U": 24,
-    "N": 25,
-    "DA": 26,
-    "DG": 27,
-    "DC": 28,
-    "DT": 29,
-    "DN": 30,
-}
-_GENERATED_RESIDUE_TYPE = 32
 _GENERATED_ATOM_IDS = frozenset(atom.atom_id for atom in get_component("GLY").atoms if atom.element != "H")
+_STANDARD_POLYMER_COMPONENT_IDS = STANDARD_AMINO_ACID_IDS | {
+    "UNK",
+    "A",
+    "G",
+    "C",
+    "U",
+    "N",
+    "DA",
+    "DG",
+    "DC",
+    "DT",
+    "DN",
+}
 
 
 class PxDesignProcessor(Processor):
@@ -118,13 +106,15 @@ class PxDesignProcessor(Processor):
             structure,
             source_component_index,
         )
-        (
-            token_component_index,
-            token_atom_index,
-            representative_atom_index,
-            atom_to_token,
-            residue_type_features,
-        ) = _tokenize(system, atom_index, source_component_index)
+        layout, atom_to_token, residue_type_features, design_features = _tokenize(
+            system,
+            atom_index,
+            source_component_index,
+        )
+        atom_index = layout.atom_index
+        token_component_index = layout.token_component_index
+        token_atom_index = layout.token_atom_index
+        representative_atom_index = layout.token_center_atom_index
 
         hotspot = _hotspot_features(
             tuple(conditions),
@@ -190,6 +180,10 @@ class PxDesignProcessor(Processor):
                 1,
             ).to(device=self.device, dtype=self.dtype),
             residue_type_features=residue_type_features.unsqueeze(0).to(
+                device=self.device,
+                dtype=self.dtype,
+            ),
+            design_features=design_features.unsqueeze(0).to(
                 device=self.device,
                 dtype=self.dtype,
             ),
@@ -628,7 +622,7 @@ def _model_atom_index(
     standard_representative = torch.tensor(
         [
             int(component_type[int(component)].item()) != ENTITY_MOLECULE
-            and component_ids[int(component)] in _RESIDUE_TYPE_INDEX
+            and component_ids[int(component)] in _STANDARD_POLYMER_COMPONENT_IDS
             and name == ("CA" if int(component_type[int(component)].item()) == ENTITY_PROTEIN else "C1'")
             for component, name in zip(
                 atom_component.tolist(),
@@ -650,103 +644,49 @@ def _tokenize(
     system: MolecularSystem,
     atom_index: Tensor,
     source_component_index: Tensor,
-) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-    atom_component = _atom_component(system)
+) -> tuple[TokenLayout, Tensor, Tensor, Tensor]:
+    atom_mask = torch.zeros_like(system.atom_symbol, dtype=torch.bool)
+    atom_mask[atom_index] = True
+    layout = tokenize_molecular_system(system, atom_mask=atom_mask)
+
     component_instance = _component_instance(system)
     component_entity = system.instance_entity[component_instance]
-    component_type = system.entity_type[component_entity]
-    model_component = atom_component[atom_index]
-    model_rows_by_component: dict[int, list[int]] = {}
-    for model_atom, component in enumerate(model_component.tolist()):
-        model_rows_by_component.setdefault(component, []).append(model_atom)
-
-    token_components = []
-    token_atoms = []
-    representatives = []
-    token_model_atoms = []
-    residue_feature_indices = []
-    for component in range(system.component_symbol.numel()):
-        model_rows = model_rows_by_component.get(component)
-        if not model_rows:
-            continue
-        component_id = system.symbols[int(system.component_symbol[component].item())]
-        generated = int(source_component_index[component].item()) < 0
-        standard_polymer = int(component_type[component].item()) != ENTITY_MOLECULE and (
-            generated or component_id in _RESIDUE_TYPE_INDEX
+    token_components = layout.token_component_index
+    token_entities = component_entity[token_components]
+    token_entity_types = system.entity_type[token_entities]
+    generated = source_component_index[token_components] < 0
+    type_index = layout.token_type_index.clone()
+    atom_token = layout.token_atom_index >= 0
+    type_index[atom_token & (token_entity_types == ENTITY_MOLECULE)] = TOKEN_INDEX["OTHER"]
+    type_index[atom_token & (token_entity_types == ENTITY_PROTEIN)] = TOKEN_INDEX["X"]
+    type_index[atom_token & (token_entity_types == ENTITY_RNA)] = TOKEN_INDEX["RNA_N"]
+    type_index[
+        atom_token
+        & torch.isin(
+            token_entity_types,
+            torch.tensor((ENTITY_DNA, ENTITY_DNA_RNA_HYBRID), device=type_index.device),
         )
-        representative_id = "CA" if int(component_type[component].item()) == ENTITY_PROTEIN else "C1'"
-        representative = next(
-            (
-                int(atom_index[model_row].item())
-                for model_row in model_rows
-                if system.symbols[int(system.atom_symbol[int(atom_index[model_row].item())].item())]
-                == representative_id
-            ),
-            None,
-        )
-        if standard_polymer:
-            if representative is None:
-                raise ValueError(f"standard polymer component {component_id!r} has no {representative_id} atom")
-            token_components.append(component)
-            token_atoms.append(-1)
-            representatives.append(representative)
-            token_model_atoms.append(model_rows)
-            residue_feature_indices.append(_GENERATED_RESIDUE_TYPE if generated else _RESIDUE_TYPE_INDEX[component_id])
-            continue
-
-        unknown = _unknown_residue_type(int(component_type[component].item()))
-        for model_row in model_rows:
-            canonical_atom = int(atom_index[model_row].item())
-            token_components.append(component)
-            token_atoms.append(canonical_atom)
-            representatives.append(canonical_atom)
-            token_model_atoms.append([model_row])
-            residue_feature_indices.append(unknown)
-
-    token_count = len(token_components)
-    atom_to_token = torch.empty_like(atom_index)
-    for token, model_atoms in enumerate(token_model_atoms):
-        atom_to_token[torch.tensor(model_atoms, device=atom_index.device)] = token
-    residue_type_features = torch.zeros(
-        token_count,
-        36,
-        dtype=torch.float32,
-        device=atom_index.device,
+    ] = TOKEN_INDEX["DNA_N"]
+    other_atom = atom_token & ~torch.isin(
+        token_entity_types,
+        torch.tensor(
+            (ENTITY_MOLECULE, ENTITY_PROTEIN, ENTITY_RNA, ENTITY_DNA, ENTITY_DNA_RNA_HYBRID),
+            device=type_index.device,
+        ),
     )
-    residue_type_features[
-        torch.arange(token_count, device=atom_index.device),
-        torch.tensor(residue_feature_indices, device=atom_index.device),
-    ] = 1
-    return (
-        torch.tensor(
-            token_components,
+    type_index[other_atom] = TOKEN_INDEX["X"]
+
+    residue_type_features = F.one_hot(type_index, TOKEN_VOCAB_SIZE).to(torch.float32)
+    design_features = generated.to(torch.float32).unsqueeze(-1)
+    atom_to_token = torch.repeat_interleave(
+        torch.arange(
+            token_components.numel(),
             dtype=torch.int64,
             device=atom_index.device,
         ),
-        torch.tensor(
-            token_atoms,
-            dtype=torch.int64,
-            device=atom_index.device,
-        ),
-        torch.tensor(
-            representatives,
-            dtype=torch.int64,
-            device=atom_index.device,
-        ),
-        atom_to_token,
-        residue_type_features,
+        layout.token_atom_ptr[1:] - layout.token_atom_ptr[:-1],
     )
-
-
-def _unknown_residue_type(entity_type: int) -> int:
-    if entity_type == ENTITY_PROTEIN:
-        return _RESIDUE_TYPE_INDEX["UNK"]
-    # Canonical tensor entity codes are stable: RNA=2, DNA=3, hybrid=4.
-    if entity_type == 2:
-        return _RESIDUE_TYPE_INDEX["N"]
-    if entity_type in (3, 4):
-        return _RESIDUE_TYPE_INDEX["DN"]
-    return _RESIDUE_TYPE_INDEX["UNK"]
+    return layout, atom_to_token, residue_type_features, design_features
 
 
 def _hotspot_features(
@@ -791,15 +731,10 @@ def _reference_features(
         if coordinate is not None
     }
     atom_component = _atom_component(system)
-    component_instance = _component_instance(system)
     positions = system.reference_coordinates[atom_index].clone()
     mask = system.reference_coordinate_mask[atom_index].clone()
-    spaces: dict[tuple[int, int], int] = {}
-    space_ids = []
     for model_atom, canonical_atom in enumerate(atom_index.tolist()):
         component = int(atom_component[canonical_atom].item())
-        instance = int(component_instance[component].item())
-        entity = int(system.instance_entity[instance].item())
         if int(source_component_index[component].item()) < 0:
             atom_id = system.symbols[int(system.atom_symbol[canonical_atom].item())]
             coordinate = glycine_coordinates.get(atom_id)
@@ -808,17 +743,8 @@ def _reference_features(
             else:
                 positions[model_atom] = positions.new_tensor(coordinate)
                 mask[model_atom] = True
-        space = (instance, -1) if int(system.entity_type[entity].item()) == ENTITY_MOLECULE else (instance, component)
-        if space not in spaces:
-            spaces[space] = len(spaces)
-        space_ids.append(spaces[space])
-
-    space_id = torch.tensor(
-        space_ids,
-        dtype=torch.int64,
-        device=atom_index.device,
-    )
-    for value in range(len(spaces)):
+    space_id = atom_component[atom_index]
+    for value in space_id.unique().tolist():
         selected = (space_id == value) & mask
         if selected.any():
             positions[selected] -= positions[selected].mean(dim=0)

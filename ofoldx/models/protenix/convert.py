@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import argparse
 import re
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from os import PathLike
 from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO, TypeAlias, cast, get_args
@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, BinaryIO, TypeAlias, cast, get_args
 import torch
 from torch import Tensor, nn
 
-from ...data import MSA_ALPHABET
+from ...data import MSA_ALPHABET, TOKEN_ALPHABET
 from .config import ProtenixVariant
 
 if TYPE_CHECKING:
@@ -558,6 +558,8 @@ def _transform_reference_value(model_key: str, reference_value: _ReferenceValue)
     if model_key == "msa_trunk.msa_projection.weight":
         residue, deletion = reference_value[:, :-2], reference_value[:, -2:]
         return torch.cat([_convert_msa_axis(residue), deletion], dim=1)
+    if model_key == "template_embedder.template_projection.weight":
+        return _convert_template_pair_axis(reference_value)
     if model_key == "esm_projection.weight":
         return _convert_token_feature_axis(reference_value, dim=0)
     if model_key in _TOKEN_FEATURE_INPUT_KEYS:
@@ -576,7 +578,7 @@ _TOKEN_FEATURE_INPUT_KEYS = {
     "confidence_head.pair_embedder.left_token_projection.weight",
     "confidence_head.pair_embedder.right_token_projection.weight",
 }
-_SOURCE_MSA_INDEX = {
+_SOURCE_TOKEN_INDEX = {
     **{
         symbol: index
         for index, symbol in enumerate(
@@ -597,37 +599,87 @@ _SOURCE_MSA_INDEX = {
     "-": 31,
     "OTHER": 20,
 }
+_SOURCE_SINGLE_FEATURE_SIZE = 384
+_SOURCE_STRUCTURAL_VOCAB_SIZE = 32
+_SOURCE_MSA_VOCAB_SIZE = 32
+_SOURCE_TOKEN_FEATURE_SIZE = _SOURCE_SINGLE_FEATURE_SIZE + _SOURCE_STRUCTURAL_VOCAB_SIZE + _SOURCE_MSA_VOCAB_SIZE + 1
+_SOURCE_TEMPLATE_PAIR_PREFIX_SIZE = 40
+_SOURCE_TEMPLATE_PAIR_SUFFIX_SIZE = 4
 
 
 def _convert_trailing_token_feature_axis(source: Tensor, *, dim: int) -> Tensor:
     source = source.movedim(dim, -1)
-    prefix, token_feature = source[..., :-449], source[..., -449:]
+    prefix, token_feature = (
+        source[..., :-_SOURCE_TOKEN_FEATURE_SIZE],
+        source[..., -_SOURCE_TOKEN_FEATURE_SIZE:],
+    )
     converted = torch.cat([prefix, _convert_token_feature_axis(token_feature, dim=-1)], dim=-1)
     return converted.movedim(-1, dim).contiguous()
 
 
 def _convert_token_feature_axis(source: Tensor, *, dim: int) -> Tensor:
     source = source.movedim(dim, -1)
-    prefix, profile, deletion = source[..., :416], source[..., 416:448], source[..., 448:]
-    converted = torch.cat([prefix, _convert_msa_axis(profile), deletion], dim=-1)
+    structural_start = _SOURCE_SINGLE_FEATURE_SIZE
+    profile_start = structural_start + _SOURCE_STRUCTURAL_VOCAB_SIZE
+    deletion_start = profile_start + _SOURCE_MSA_VOCAB_SIZE
+    single = source[..., :structural_start]
+    structural = source[..., structural_start:profile_start]
+    profile = source[..., profile_start:deletion_start]
+    deletion = source[..., deletion_start:]
+    converted = torch.cat(
+        [
+            single,
+            _convert_structural_axis(structural),
+            _convert_msa_axis(profile),
+            deletion,
+        ],
+        dim=-1,
+    )
     return converted.movedim(-1, dim).contiguous()
 
 
+def _convert_template_pair_axis(source: Tensor) -> Tensor:
+    left_start = _SOURCE_TEMPLATE_PAIR_PREFIX_SIZE
+    right_start = left_start + _SOURCE_STRUCTURAL_VOCAB_SIZE
+    suffix_start = right_start + _SOURCE_STRUCTURAL_VOCAB_SIZE
+    prefix = source[..., :left_start]
+    left = source[..., left_start:right_start]
+    right = source[..., right_start:suffix_start]
+    suffix = source[..., -_SOURCE_TEMPLATE_PAIR_SUFFIX_SIZE:]
+    return torch.cat(
+        [
+            prefix,
+            _convert_structural_axis(left),
+            _convert_structural_axis(right),
+            suffix,
+        ],
+        dim=-1,
+    )
+
+
+def _convert_structural_axis(source: Tensor) -> Tensor:
+    return _convert_source_token_axis(source, TOKEN_ALPHABET)
+
+
 def _convert_msa_axis(source: Tensor) -> Tensor:
+    return _convert_source_token_axis(source, MSA_ALPHABET)
+
+
+def _convert_source_token_axis(source: Tensor, alphabet: Sequence[str]) -> Tensor:
     converted = []
-    for symbol in MSA_ALPHABET:
+    for symbol in alphabet:
         if symbol == "B":
-            value = (source[..., _SOURCE_MSA_INDEX["D"]] + source[..., _SOURCE_MSA_INDEX["N"]]) / 2
+            value = (source[..., _SOURCE_TOKEN_INDEX["D"]] + source[..., _SOURCE_TOKEN_INDEX["N"]]) / 2
         elif symbol == "Z":
-            value = (source[..., _SOURCE_MSA_INDEX["E"]] + source[..., _SOURCE_MSA_INDEX["Q"]]) / 2
+            value = (source[..., _SOURCE_TOKEN_INDEX["E"]] + source[..., _SOURCE_TOKEN_INDEX["Q"]]) / 2
         elif symbol == "J":
-            value = (source[..., _SOURCE_MSA_INDEX["I"]] + source[..., _SOURCE_MSA_INDEX["L"]]) / 2
+            value = (source[..., _SOURCE_TOKEN_INDEX["I"]] + source[..., _SOURCE_TOKEN_INDEX["L"]]) / 2
         elif symbol == "U":
-            value = source[..., _SOURCE_MSA_INDEX["C"]]
+            value = source[..., _SOURCE_TOKEN_INDEX["C"]]
         elif symbol == "O":
-            value = source[..., _SOURCE_MSA_INDEX["K"]]
+            value = source[..., _SOURCE_TOKEN_INDEX["K"]]
         else:
-            value = source[..., _SOURCE_MSA_INDEX[symbol]]
+            value = source[..., _SOURCE_TOKEN_INDEX[symbol]]
         converted.append(value)
     return torch.stack(converted, dim=-1)
 

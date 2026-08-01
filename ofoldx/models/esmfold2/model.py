@@ -15,9 +15,10 @@ from multimolecule import EsmCConfig, EsmCForMaskedLM, EsmCModel
 from tensordict import tensorclass
 from torch import Tensor
 
-from ...data.evidence import MSA_INDEX, MSA_VOCAB_SIZE
+from ...data.evidence import MSA_VOCAB_SIZE
 from ...data.molecular import MolecularSystem
 from ...data.structure import Structure
+from ...data.tokenization import TOKEN_OTHER_INDEX, TOKEN_VOCAB_SIZE
 from ...model import Model, _TensorCollection
 from ...modules.adaptive_norm import AdaptiveLayerNorm
 from ...modules.atom import AtomToTokenMean, TokenToAtomBroadcast
@@ -54,7 +55,7 @@ class EsmFold2Model(Model):
         ...         "pair_size": 16,
         ...         "recycling_steps": 1,
         ...         "input_embeddings": {
-        ...             "input_size": 80,
+        ...             "input_size": 85,
         ...             "atom_encoder": {
         ...                 "atom_hidden_size": 8,
         ...                 "token_hidden_size": 16,
@@ -82,7 +83,7 @@ class EsmFold2Model(Model):
         ...                 "atom_hidden_size": 8,
         ...                 "token_hidden_size": 8,
         ...                 "pair_size": 16,
-        ...                 "input_size": 80,
+        ...                 "input_size": 85,
         ...                 "fourier_embedding_size": 8,
         ...                 "num_atom_blocks": 1,
         ...                 "num_atom_attention_heads": 1,
@@ -770,9 +771,9 @@ class EsmFold2Model(Model):
         token_atom_index = input.token_atom_index[0].detach().cpu()
         token_axis = tuple(
             (
-                system.component_reference(int(component_index))
-                if int(component_index) >= 0
-                else system.atom_site(int(atom_index))
+                system.atom_site(int(atom_index))
+                if int(atom_index) >= 0
+                else system.component_reference(int(component_index))
             )
             for component_index, atom_index in zip(token_component_index, token_atom_index)
         )
@@ -1011,7 +1012,7 @@ class EsmFold2ExperimentalModel(Model):
         ...         "pair_size": 16,
         ...         "recycling_steps": 1,
         ...         "input_embeddings": {
-        ...             "input_size": 80,
+        ...             "input_size": 85,
         ...             "atom_encoder": {
         ...                 "atom_hidden_size": 8,
         ...                 "token_hidden_size": 16,
@@ -1037,7 +1038,7 @@ class EsmFold2ExperimentalModel(Model):
         ...                 "atom_hidden_size": 8,
         ...                 "token_hidden_size": 8,
         ...                 "pair_size": 16,
-        ...                 "input_size": 80,
+        ...                 "input_size": 85,
         ...                 "fourier_embedding_size": 8,
         ...                 "num_atom_blocks": 1,
         ...                 "num_atom_attention_heads": 1,
@@ -1405,7 +1406,7 @@ class EsmFold2ExperimentalModel(Model):
         Args:
             input: Processed target-binder input.
             residue_type_probabilities: Optional soft residue-type probabilities with
-                shape ``(B, N, 33)``. Gradients from ``distogram_logits`` propagate to
+                shape ``(B, N, 38)``. Gradients from ``distogram_logits`` propagate to
                 this tensor.
             recycling_steps: Number of recurrent trunk passes. ``None`` uses the
                 configured value.
@@ -1446,7 +1447,7 @@ class EsmFold2ExperimentalModel(Model):
         Args:
             input: Processed target-binder input.
             residue_type_probabilities: Optional soft residue-type probabilities with
-                shape ``(B, N, 33)``.
+                shape ``(B, N, 38)``.
             recycling_steps: Number of recurrent trunk passes. ``None`` uses the
                 configured value.
             num_samples: Number of coordinate samples.
@@ -1502,7 +1503,7 @@ class EsmFold2ExperimentalModel(Model):
         Args:
             input: Processed target-binder input.
             residue_type_probabilities: Optional soft residue-type probabilities with
-                shape ``(B, N, 33)``.
+                shape ``(B, N, 38)``.
             recycling_steps: Number of recurrent trunk passes. ``None`` uses the
                 configured value.
             num_samples: Number of coordinate samples.
@@ -2407,7 +2408,7 @@ class EsmFold2Denoiser(nn.Module):
         atom_hidden_size: int = 128,
         token_hidden_size: int = 768,
         pair_size: int = 256,
-        input_size: int = 456,
+        input_size: int = 461,
         sigma_data: float = 16.0,
         fourier_embedding_size: int = 256,
         num_atom_blocks: int = 3,
@@ -3245,7 +3246,7 @@ class EsmFold2DiffusionConditioning(nn.Module):
         backend: str = "auto",
         pair_size: int = 256,
         single_size: int = 768,
-        input_size: int = 456,
+        input_size: int = 461,
         sigma_data: float = 16.0,
         fourier_embedding_size: int = 256,
         expansion: int = 2,
@@ -4158,33 +4159,17 @@ _MAX_ATOMIC_NUMBER: int = 128
 _ATOM_FEATURE_DIM: int = _XYZ_DIMS + 1 + 1 + _MAX_ATOMIC_NUMBER + _CHAR_VOCAB_SIZE * _MAX_CHARS
 
 
-_NUM_RESIDUE_TYPES: int = 33
-
-_TARGET_TO_MSA_INDEX = (
-    MSA_INDEX["OTHER"],
-    MSA_INDEX["-"],
-    *(MSA_INDEX[symbol] for symbol in "ARNDCQEGHILKMFPSTWYV"),
-    MSA_INDEX["X"],
-    *(MSA_INDEX[f"RNA_{symbol}"] for symbol in "AGCUN"),
-    *(MSA_INDEX[f"DNA_{symbol}"] for symbol in "AGCTN"),
-)
+_NUM_RESIDUE_TYPES: int = TOKEN_VOCAB_SIZE
 
 
 def _target_features_to_msa_profile(
     residue_type_features: Tensor,
     molecule_type: Tensor | None = None,
 ) -> Tensor:
-    mapping = F.one_hot(
-        torch.tensor(_TARGET_TO_MSA_INDEX, device=residue_type_features.device),
-        num_classes=MSA_VOCAB_SIZE,
-    ).to(dtype=residue_type_features.dtype)
-    profile = residue_type_features @ mapping
+    profile = residue_type_features
     if molecule_type is not None:
-        other_profile = F.one_hot(
-            torch.full_like(molecule_type, MSA_INDEX["OTHER"]),
-            num_classes=MSA_VOCAB_SIZE,
-        ).to(dtype=profile.dtype)
-        other_profile = other_profile * residue_type_features.sum(dim=-1, keepdim=True)
+        other_profile = torch.zeros_like(profile)
+        other_profile[..., TOKEN_OTHER_INDEX] = residue_type_features.sum(dim=-1)
         profile = torch.where((molecule_type == 3).unsqueeze(-1), other_profile, profile)
     return profile
 
@@ -4525,8 +4510,8 @@ class EsmFold2Input:
         system: Canonical molecular system represented by the family tensors.
         atom_index: Canonical system-atom index aligned to the model atom axis with
             shape ``(B, A)``; ``-1`` marks padding.
-        token_component_index: Canonical component index for residue tokens with
-            shape ``(B, N)``; ``-1`` marks atom tokens.
+        token_component_index: Canonical component index for every token with
+            shape ``(B, N)``.
         token_atom_index: Canonical atom index for atom tokens with shape ``(B, N)``;
             ``-1`` marks residue tokens.
         deletion_mean: Optional per-token mean deletion values with shape ``(B, N)``.

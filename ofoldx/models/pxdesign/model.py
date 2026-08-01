@@ -278,6 +278,7 @@ class PxDesignConditionEmbeddings(nn.Module):
         input_size = (
             embedder.token_hidden_size
             + embedder.vocab_size
+            + embedder.design_feature_size
             + embedder.plddt_size
             + embedder.hotspot_size
             + 2 * embedder.add_feature_size
@@ -317,6 +318,7 @@ class PxDesignConditionEmbeddings(nn.Module):
                 (
                     atom_output.token_hidden,
                     input.residue_type_features.to(atom_output.token_hidden),
+                    input.design_features.to(atom_output.token_hidden),
                     input.plddt.to(atom_output.token_hidden),
                     input.hotspot.to(atom_output.token_hidden),
                     add_feature,
@@ -571,7 +573,8 @@ class PxDesignInput:
         reference_mask: Reference-coordinate validity mask with shape ``(B, A)``.
         reference_charges: Reference formal charges with shape ``(B, A, 1)``.
         residue_type_features: One-hot residue-type features with shape
-            ``(B, N, 36)``.
+            ``(B, N, 38)``.
+        design_features: Generated-token indicator with shape ``(B, N, 1)``.
         plddt: Per-token confidence condition with shape ``(B, N, 1)``.
         hotspot: Per-token hotspot condition with shape ``(B, N, 1)``.
         template_distance_bins: Template distance features aligned to token pairs.
@@ -601,6 +604,7 @@ class PxDesignInput:
     reference_mask: Tensor
     reference_charges: Tensor
     residue_type_features: Tensor
+    design_features: Tensor
     plddt: Tensor
     hotspot: Tensor
     template_distance_bins: Tensor

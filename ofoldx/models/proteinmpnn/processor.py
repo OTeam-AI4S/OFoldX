@@ -12,14 +12,17 @@ from torch import Tensor
 
 from ...data.components import get_component
 from ...data.conditions import AllowedResidueIdentities, TiedResidueIdentities
+from ...data.crop import Cropper, crop_token_layout
 from ...data.molecular import (
     AMINO_ACID_ONE_TO_THREE,
     ENTITY_PROTEIN,
     ComponentReference,
+    MolecularSystem,
     instance_subgraph,
     replace_components,
 )
 from ...data.structure import Structure
+from ...data.tokenization import TokenLayout, select_tokens, tokenize_molecular_system
 from ...model import Model
 from ...modules.mpnn import (
     AMINO_ACID_COMPONENT_IDS,
@@ -93,6 +96,8 @@ class ProteinMpnnProcessor(Processor):
         pssm_probabilities: Mapping[ComponentReference, Tensor] | None = None,
         pssm_log_odds: Mapping[ComponentReference, Tensor] | None = None,
         filter_by_occupancy: bool = True,
+        cropper: Cropper | None = None,
+        generator: torch.Generator | None = None,
     ) -> ProteinMpnnInput:
         r"""
         Prepare a ``Structure`` for ProteinMPNN.
@@ -113,6 +118,8 @@ class ProteinMpnnProcessor(Processor):
             pssm_probabilities: Per-residue probability vectors over the 21-token vocabulary.
             pssm_log_odds: Per-residue log-odds vectors over the 21-token vocabulary.
             filter_by_occupancy: Whether zero-occupancy atoms are treated as unobserved.
+            cropper: Optional training-time crop policy over protein residue tokens.
+            generator: Optional crop random generator.
 
         Returns:
             A single-example ``ProteinMpnnInput`` whose residue axes align with
@@ -134,6 +141,45 @@ class ProteinMpnnProcessor(Processor):
             positions,
             filter_by_occupancy,
         )
+        if cropper is not None:
+            layout = _protein_token_layout(structure.system, rows.component_index)
+            full_token_count = layout.token_component_index.numel()
+            scoreable_by_component = {
+                component: valid and design
+                for component, valid, design in zip(
+                    rows.component_index,
+                    rows.valid,
+                    rows.design,
+                    strict=True,
+                )
+                if component >= 0
+            }
+            layout = crop_token_layout(
+                structure,
+                layout,
+                cropper,
+                required_token_mask=_protein_required_token_mask(
+                    structure.system,
+                    layout,
+                    conditions=conditions,
+                    tied_weights=tied_weights,
+                    residue_logit_bias=residue_logit_bias,
+                    pssm_coefficients=pssm_coefficients,
+                    pssm_probabilities=pssm_probabilities,
+                    pssm_log_odds=pssm_log_odds,
+                ),
+                anchor_token_mask=torch.tensor(
+                    [
+                        scoreable_by_component[component]
+                        for component in layout.token_component_index.detach().cpu().tolist()
+                    ],
+                    dtype=torch.bool,
+                    device=layout.token_component_index.device,
+                ),
+                generator=generator,
+            )
+            if layout.token_component_index.numel() < full_token_count:
+                rows = _retain_protein_rows(rows, set(layout.token_component_index.detach().cpu().tolist()))
         return self._finalize(
             structure,
             rows,
@@ -700,6 +746,85 @@ class ProteinMpnnProcessor(Processor):
             pssm_log_odds=pssm_log_odds_values,
             batch_size=[],
         )
+
+
+def _protein_token_layout(system: MolecularSystem, row_components: Sequence[int]) -> TokenLayout:
+    r"""Build one canonical component token for every protein occurrence."""
+
+    component_mask = torch.zeros_like(system.component_symbol, dtype=torch.bool)
+    component_mask[[component for component in row_components if component >= 0]] = True
+    layout = tokenize_molecular_system(
+        system,
+        atomize_nonstandard_polymers=False,
+        component_mask=component_mask,
+    )
+    token_by_component = {
+        component: token for token, component in enumerate(layout.token_component_index.detach().cpu().tolist())
+    }
+    return select_tokens(
+        layout,
+        layout.token_component_index.new_tensor(
+            [token_by_component[component] for component in row_components if component >= 0]
+        ),
+    )
+
+
+def _protein_required_token_mask(
+    system: MolecularSystem,
+    layout: TokenLayout,
+    *,
+    conditions: Sequence[AllowedResidueIdentities | TiedResidueIdentities],
+    tied_weights: Mapping[ComponentReference, float] | None,
+    residue_logit_bias: Mapping[ComponentReference, Tensor] | None,
+    pssm_coefficients: Mapping[ComponentReference, float] | None,
+    pssm_probabilities: Mapping[ComponentReference, Tensor] | None,
+    pssm_log_odds: Mapping[ComponentReference, Tensor] | None,
+) -> Tensor:
+    r"""Retain every residue named by a ProteinMPNN training constraint."""
+
+    references: list[ComponentReference] = []
+    for condition in conditions:
+        if isinstance(condition, TiedResidueIdentities):
+            references.extend(reference for group in condition.groups for reference in group)
+        else:
+            references.extend(condition.positions)
+    for values in (
+        tied_weights,
+        residue_logit_bias,
+        pssm_coefficients,
+        pssm_probabilities,
+        pssm_log_odds,
+    ):
+        if values:
+            references.extend(values)
+
+    required = {system.component_index(reference) for reference in references}
+    layout_components = layout.token_component_index.detach().cpu().tolist()
+    missing = required - set(layout_components)
+    if missing:
+        reference = system.component_reference(next(iter(missing)))
+        raise ValueError(f"ProteinMPNN constraint references a residue outside the protein layout: {reference!r}")
+    return torch.tensor(
+        [component in required for component in layout_components],
+        dtype=torch.bool,
+        device=layout.token_component_index.device,
+    )
+
+
+def _retain_protein_rows(rows: _LoweredRows, retained_components: set[int]) -> _LoweredRows:
+    r"""Filter the released row axis while retaining its canonical indices."""
+
+    retained = [index for index, component in enumerate(rows.component_index) if component in retained_components]
+    return _LoweredRows(
+        tuple(rows.component_index[index] for index in retained),
+        tuple(rows.coordinates[index] for index in retained),
+        tuple(rows.tokens[index] for index in retained),
+        tuple(rows.valid[index] for index in retained),
+        tuple(rows.residue_index[index] for index in retained),
+        tuple(rows.chain_index[index] for index in retained),
+        tuple(rows.design[index] for index in retained),
+        tuple(rows.model_component_ids[index] for index in retained),
+    )
 
 
 def _select_protein_instances(

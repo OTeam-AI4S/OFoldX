@@ -45,7 +45,7 @@ class EsmFold2InputEmbeddingsConfig(Config):
         atom_encoder: Sliding-window atom encoder configuration.
     """
 
-    input_size: int = 456
+    input_size: int = 461
     atom_encoder: EsmFold2AtomEncoderConfig = EsmFold2AtomEncoderConfig()
 
 
@@ -189,7 +189,7 @@ class EsmFold2DenoiserConfig(Config):
     atom_hidden_size: int = 128
     token_hidden_size: int = 768
     pair_size: int = 256
-    input_size: int = 456
+    input_size: int = 461
     fourier_embedding_size: int = 256
     num_atom_blocks: int = 3
     num_atom_attention_heads: int = 4

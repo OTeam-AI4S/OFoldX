@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from chanfig import Config
 
+from ...data.tokenization import TOKEN_VOCAB_SIZE
 from ..config import (
     DenoiserConfig,
     DistogramConfig,
@@ -29,7 +30,7 @@ class AlphaFold3TemplateConfig(Config):
 
     hidden_size: int = 64
     num_blocks: int = 2
-    vocab_size: int = 31
+    vocab_size: int = TOKEN_VOCAB_SIZE
     num_distogram_bins: int = 39
     triangle_attention_hidden_size: int = 16
     num_triangle_attention_heads: int = 4
@@ -95,7 +96,7 @@ class AlphaFold3Config(Config):
         pair_size: Width of the pair representation.
         atom_feature_size: Width of raw atom features.
         relative_position_size: Width of relative-position features.
-        template: Two-block template stack with the 31-token AlphaFold 3 vocabulary and four 16-wide triangle heads.
+        template: Two-block template stack with the canonical structural vocabulary and four 16-wide triangle heads.
         trunk: Pairformer trunk configuration.
         recycling_steps: Number of complete trunk passes.
         msa_max_depth: Maximum MSA depth realized independently for each trunk pass.

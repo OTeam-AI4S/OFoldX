@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import argparse
 import re
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from os import PathLike
 from pathlib import Path
 from typing import Any, cast
@@ -15,6 +15,7 @@ import torch
 from torch import Tensor
 
 from ...data.evidence import MSA_ALPHABET
+from ...data.tokenization import TOKEN_ALPHABET
 from ..boltz2.config import Boltz2AffinityConfig, Boltz2Config
 from ..boltz2.convert import convert_boltz2_affinity_model, convert_boltz2_model
 from ..boltz2.processor import Boltz2AffinityProcessor, Boltz2Processor
@@ -41,7 +42,7 @@ Rule = tuple[re.Pattern[str], str | None]
 
 Converter = list[Rule] | Callable[[str], str | None]
 
-_SOURCE_MSA_INDEX = {
+_SOURCE_TOKEN_INDEX = {
     "OTHER": 0,
     "-": 1,
     "A": 2,
@@ -78,30 +79,70 @@ _SOURCE_MSA_INDEX = {
 }
 
 
-def _convert_msa_input_axis(tensor: Tensor) -> Tensor:
-    old_size = len(_SOURCE_MSA_INDEX)
-    converted = tensor.new_zeros(*tensor.shape[:-1], len(MSA_ALPHABET) + tensor.shape[-1] - old_size)
-    for target, symbol in enumerate(MSA_ALPHABET):
+def _convert_source_token_values(tensor: Tensor, alphabet: Sequence[str]) -> Tensor:
+    old_size = len(_SOURCE_TOKEN_INDEX)
+    converted = tensor.new_zeros(*tensor.shape[:-1], len(alphabet) + tensor.shape[-1] - old_size)
+    for target, symbol in enumerate(alphabet):
         if symbol == "B":
-            converted[..., target] = (tensor[..., _SOURCE_MSA_INDEX["D"]] + tensor[..., _SOURCE_MSA_INDEX["N"]]) / 2
+            converted[..., target] = (tensor[..., _SOURCE_TOKEN_INDEX["D"]] + tensor[..., _SOURCE_TOKEN_INDEX["N"]]) / 2
         elif symbol == "Z":
-            converted[..., target] = (tensor[..., _SOURCE_MSA_INDEX["E"]] + tensor[..., _SOURCE_MSA_INDEX["Q"]]) / 2
+            converted[..., target] = (tensor[..., _SOURCE_TOKEN_INDEX["E"]] + tensor[..., _SOURCE_TOKEN_INDEX["Q"]]) / 2
         elif symbol == "J":
-            converted[..., target] = (tensor[..., _SOURCE_MSA_INDEX["I"]] + tensor[..., _SOURCE_MSA_INDEX["L"]]) / 2
+            converted[..., target] = (tensor[..., _SOURCE_TOKEN_INDEX["I"]] + tensor[..., _SOURCE_TOKEN_INDEX["L"]]) / 2
         elif symbol == "U":
-            converted[..., target] = tensor[..., _SOURCE_MSA_INDEX["C"]]
+            converted[..., target] = tensor[..., _SOURCE_TOKEN_INDEX["C"]]
         elif symbol == "O":
-            converted[..., target] = tensor[..., _SOURCE_MSA_INDEX["K"]]
+            converted[..., target] = tensor[..., _SOURCE_TOKEN_INDEX["K"]]
         else:
-            converted[..., target] = tensor[..., _SOURCE_MSA_INDEX[symbol]]
-    converted[..., len(MSA_ALPHABET) :] = tensor[..., old_size:]
+            converted[..., target] = tensor[..., _SOURCE_TOKEN_INDEX[symbol]]
+    converted[..., len(alphabet) :] = tensor[..., old_size:]
     return converted
 
 
-def _convert_msa_vocabulary_axes(state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+def _convert_source_token_axis(tensor: Tensor, alphabet: Sequence[str], axis: int) -> Tensor:
+    axis %= tensor.ndim
+    converted = _convert_source_token_values(tensor.movedim(axis, -1), alphabet)
+    return converted.movedim(-1, axis).contiguous()
+
+
+def _convert_vocabulary_axes(state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+    structural_input_keys = (
+        "input_embeddings.residue_type_projection.weight",
+        "inverse_folding_decoder.residue_type_projection.weight",
+    )
+    structural_output_keys = (
+        "coordinate_diffusion.denoiser.atom_attention_decoder.residue_type_projection.weight",
+        "coordinate_diffusion.denoiser.atom_attention_decoder.residue_type_projection.bias",
+        "inverse_folding_decoder.residue_type_head.weight",
+    )
+    for key in structural_input_keys:
+        if key in state_dict:
+            state_dict[key] = _convert_source_token_axis(state_dict[key], TOKEN_ALPHABET, -1)
+    for key in structural_output_keys:
+        if key in state_dict:
+            state_dict[key] = _convert_source_token_axis(state_dict[key], TOKEN_ALPHABET, 0)
     for key in ("input_embeddings.msa_profile_projection.weight", "msa_trunk.msa_projection.weight"):
         if key in state_dict:
-            state_dict[key] = _convert_msa_input_axis(state_dict[key])
+            state_dict[key] = _convert_source_token_axis(state_dict[key], MSA_ALPHABET, -1)
+    template_key = "template_embedder.template_feature_projection.weight"
+    if template_key in state_dict:
+        tensor = state_dict[template_key]
+        source_vocab_size = len(_SOURCE_TOKEN_INDEX)
+        residue_start = tensor.shape[-1] - 2 * source_vocab_size
+        state_dict[template_key] = torch.cat(
+            (
+                tensor[..., :residue_start],
+                _convert_source_token_values(
+                    tensor[..., residue_start : residue_start + source_vocab_size],
+                    TOKEN_ALPHABET,
+                ),
+                _convert_source_token_values(
+                    tensor[..., residue_start + source_vocab_size :],
+                    TOKEN_ALPHABET,
+                ),
+            ),
+            dim=-1,
+        )
     return state_dict
 
 
@@ -1114,7 +1155,7 @@ def convert_inverse_folding(state: Mapping[str, torch.Tensor]) -> dict[str, torc
         for unpacked_key, unpacked_value in _unpack_triple_product_projection(new_key, value):
             out[unpacked_key] = unpacked_value
     _pack_conditioned_adaptive_norms(out)
-    return _convert_msa_vocabulary_axes(out)
+    return _convert_vocabulary_axes(out)
 
 
 def convert_structure_design(state: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
@@ -1202,7 +1243,7 @@ def convert_structure_design(state: Mapping[str, torch.Tensor]) -> dict[str, tor
                 for new_key, new_value in _unpack_triple_product_projection(packed_key, packed_value):
                     out[new_key] = new_value
     _pack_conditioned_adaptive_norms(out)
-    return _convert_msa_vocabulary_axes(out)
+    return _convert_vocabulary_axes(out)
 
 
 def boltzgen_config_from_checkpoint(

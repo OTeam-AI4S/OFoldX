@@ -8,6 +8,7 @@ from typing import Literal
 
 from chanfig import Config
 
+from ...data import TOKEN_VOCAB_SIZE
 from ..config import (
     DenoiserConfig,
     DistogramConfig,
@@ -85,11 +86,16 @@ class ProtenixTemplateConfig(Config):
         num_triangle_attention_heads: Number of template triangle-attention heads.
         expansion: Feed-forward expansion factor inside the template transition.
         dropout: Dropout probability applied inside the template stack.
+
+    Examples:
+        >>> from ofoldx.models.protenix import ProtenixTemplateConfig
+        >>> ProtenixTemplateConfig().vocab_size
+        38
     """
 
     hidden_size: int = 64
     num_blocks: int = 2
-    vocab_size: int = 32
+    vocab_size: int = TOKEN_VOCAB_SIZE
     num_distogram_bins: int = 39
     triangle_multiplication_hidden_size: int = 128
     triangle_attention_hidden_size: int = 32

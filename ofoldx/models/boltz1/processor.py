@@ -11,12 +11,12 @@ from typing import TYPE_CHECKING, Any, cast
 import torch
 from torch import Tensor
 
+from ...data.crop import Cropper, crop_token_layout, resolved_token_mask
 from ...data.evidence import (
     MSA,
     MSA_GAP_INDEX,
     MSA_VOCAB_SIZE,
     MsaCollection,
-    msa_component_index,
     msa_residue_index,
     resolve_msa_bindings,
 )
@@ -36,6 +36,7 @@ from ...data.molecular import (
     component_boundary_atoms,
 )
 from ...data.structure import Structure
+from ...data.tokenization import TOKEN_VOCAB_SIZE, TokenLayout, tokenize_molecular_system
 from ...processor import Processor
 from .model import (
     Boltz1Input,
@@ -53,12 +54,9 @@ _POCKET_POCKET = 2
 _POCKET_BINDER = 3
 _POCKET_SIZE = 4
 
-# The 33-token residue vocabulary places proteins at 2..21, UNKNOWN tokens at
-# 22/27/32, RNA at 23..27, DNA at 28..32, and the MSA gap at 1.
-_PROTEIN_RESIDUE_TYPES = {
-    component_id: index
-    for index, component_id in enumerate(
-        (
+_STANDARD_COMPONENTS = {
+    "protein": frozenset(
+        {
             "ALA",
             "ARG",
             "ASN",
@@ -79,16 +77,10 @@ _PROTEIN_RESIDUE_TYPES = {
             "TRP",
             "TYR",
             "VAL",
-        ),
-        start=2,
-    )
-}
-_RNA_RESIDUE_TYPES = {"A": 23, "G": 24, "C": 25, "U": 26, "N": 27}
-_DNA_RESIDUE_TYPES = {"DA": 28, "DG": 29, "DC": 30, "DT": 31, "DN": 32}
-_STANDARD_COMPONENTS = {
-    "protein": frozenset(_PROTEIN_RESIDUE_TYPES),
-    "rna": frozenset(_RNA_RESIDUE_TYPES),
-    "dna": frozenset(_DNA_RESIDUE_TYPES),
+        }
+    ),
+    "rna": frozenset({"A", "G", "C", "U", "N"}),
+    "dna": frozenset({"DA", "DG", "DC", "DT", "DN"}),
 }
 _STANDARD_BY_ENTITY_TYPE = {
     ENTITY_PROTEIN: _STANDARD_COMPONENTS["protein"],
@@ -101,12 +93,11 @@ _STANDARD_BY_ENTITY_TYPE = {
 # therefore does not emit physical-potential constraints for them. MSE is
 # normalized to MET before that decision.
 _CONSTRAINT_FREE_COMPONENTS = {
-    "protein": frozenset((*_PROTEIN_RESIDUE_TYPES, "UNK", "MSE")),
-    "rna": frozenset(_RNA_RESIDUE_TYPES),
-    "dna": frozenset(_DNA_RESIDUE_TYPES),
+    "protein": _STANDARD_COMPONENTS["protein"] | {"UNK", "MSE"},
+    "rna": _STANDARD_COMPONENTS["rna"],
+    "dna": _STANDARD_COMPONENTS["dna"],
 }
 _MOLECULE_TYPES = {"protein": 0, "dna": 1, "rna": 2}
-_UNKNOWN_RESIDUE_TYPES = {"protein": 22, "rna": 27, "dna": 32}
 _POLYMER_TYPE = {
     ENTITY_PROTEIN: "protein",
     ENTITY_RNA: "rna",
@@ -133,32 +124,6 @@ _STANDARD_LOCAL_SYMMETRY = {
     "DC": (("OP1", "OP2"), ("OP2", "OP1")),
     "DT": (("OP1", "OP2"), ("OP2", "OP1")),
 }
-
-
-def _msa_symbol_restype(symbol: str, polymer_type: str | None) -> int:
-    r"""
-    Map one UPPERCASE one-letter MSA symbol (or ``-``) to a Boltz-1 token.
-    """
-
-    return msa_residue_index(symbol, polymer_type)
-
-
-def _token_msa_restype(token: dict[str, object], system: MolecularSystem) -> int:
-    entity_index = cast(int, token["entity_index"])
-    entity_type = int(system.entity_type[entity_index])
-    if entity_type == ENTITY_MOLECULE:
-        return msa_residue_index("X", None)
-    component_index = cast(int, token["component_index"])
-    component_id = system.symbols[int(system.component_symbol[component_index])]
-    if entity_type == ENTITY_PROTEIN:
-        polymer_type = "protein"
-    elif entity_type == ENTITY_RNA:
-        polymer_type = "rna"
-    elif entity_type == ENTITY_DNA:
-        polymer_type = "dna"
-    else:
-        return msa_residue_index("X", None)
-    return msa_component_index(component_id, polymer_type)
 
 
 class Boltz1Processor(Processor):
@@ -202,6 +167,22 @@ class Boltz1Processor(Processor):
             and token axes to ``system``.
         """
 
+        return self._lower(
+            input,
+            msa=msa,
+            pocket=pocket,
+            generator=generator,
+        )
+
+    def _lower(
+        self,
+        input: MolecularSystem | Structure,
+        *,
+        msa: MSA | MsaCollection | None,
+        pocket: Boltz1Pocket | None,
+        cropper: Cropper | None = None,
+        generator: torch.Generator | None = None,
+    ) -> Boltz1Input:
         if isinstance(input, Structure):
             structure = input
             system = input.system
@@ -214,8 +195,19 @@ class Boltz1Processor(Processor):
             raise ValueError("Boltz-1 requires at least one molecular instance")
 
         resolved_msa = () if msa is None else resolve_msa_bindings(msa, system)
+        layout = _tokenize(system)
+        if cropper is not None:
+            layout = crop_token_layout(
+                cast(Structure, input),
+                layout,
+                cropper,
+                required_token_mask=_pocket_required_token_mask(system, layout, pocket),
+                anchor_token_mask=resolved_token_mask(cast(Structure, input), layout),
+                generator=generator,
+            )
         return _prepare_boltz1_features(
             system,
+            tokens=_lower_token_layout(system, layout),
             structure=structure,
             msa=msa,
             msa_bindings=resolved_msa,
@@ -231,16 +223,18 @@ class Boltz1Processor(Processor):
         *,
         msa: MSA | MsaCollection | None = None,
         pocket: Boltz1Pocket | None = None,
+        cropper: Cropper | None = None,
         generator: torch.Generator | None = None,
     ) -> tuple[Boltz1Input, Boltz1StructureTarget]:
         r"""
         Lower one complete structure into model input and separate truth.
         """
 
-        processed = self(
+        processed = self._lower(
             input,
             msa=msa,
             pocket=pocket,
+            cropper=cropper,
             generator=generator,
         )
         return processed, _prepare_boltz1_target(
@@ -251,9 +245,118 @@ class Boltz1Processor(Processor):
         )
 
 
+def _tokenize(system: MolecularSystem) -> TokenLayout:
+    r"""Build the Boltz-1 view of the canonical structural token axis."""
+
+    instance_components = system.instance_component_ptr.detach().cpu().tolist()
+    instance_entities = system.instance_entity.detach().cpu().tolist()
+    entity_types = system.entity_type.detach().cpu().tolist()
+    component_symbols = system.component_symbol.detach().cpu().tolist()
+    component_atoms = system.component_atom_ptr.detach().cpu().tolist()
+    atom_symbols = system.atom_symbol.detach().cpu().tolist()
+    atom_mask = torch.ones_like(system.atomic_number, dtype=torch.bool)
+    expanded_components: list[int] = []
+
+    for instance_index, entity_index in enumerate(instance_entities):
+        entity_type = int(entity_types[entity_index])
+        if entity_type == ENTITY_MOLECULE:
+            continue
+        standards = _STANDARD_BY_ENTITY_TYPE.get(entity_type, frozenset())
+        for component_index in range(
+            int(instance_components[instance_index]),
+            int(instance_components[instance_index + 1]),
+        ):
+            component_id = system.symbols[int(component_symbols[component_index])]
+            if component_id not in standards:
+                expanded_components.append(component_index)
+            for atom_index in range(
+                int(component_atoms[component_index]),
+                int(component_atoms[component_index + 1]),
+            ):
+                if system.symbols[int(atom_symbols[atom_index])] in {"OXT", "OP3"}:
+                    atom_mask[atom_index] = False
+
+    return tokenize_molecular_system(
+        system,
+        expanded_components=expanded_components,
+        atom_mask=atom_mask,
+    )
+
+
+def _lower_token_layout(system: MolecularSystem, layout: TokenLayout) -> list[dict[str, object]]:
+    r"""Lower the shared structural partition into Boltz-1 feature rows."""
+
+    token_atom_ptr = layout.token_atom_ptr.detach().cpu().tolist()
+    atom_indices = layout.atom_index.detach().cpu().tolist()
+    token_component_indices = layout.token_component_index.detach().cpu().tolist()
+    token_atom_indices = layout.token_atom_index.detach().cpu().tolist()
+    token_instance_indices = layout.token_instance_index.detach().cpu().tolist()
+    token_entity_indices = layout.token_entity_index.detach().cpu().tolist()
+    token_residue_indices = layout.token_residue_index.detach().cpu().tolist()
+    token_symmetry_indices = layout.token_symmetry_index.detach().cpu().tolist()
+    entity_types = system.entity_type.detach().cpu().tolist()
+    component_symbols = system.component_symbol.detach().cpu().tolist()
+    atom_symbols = system.atom_symbol.detach().cpu().tolist()
+    tokens: list[dict[str, object]] = []
+
+    for token_index, component_index in enumerate(token_component_indices):
+        start = int(token_atom_ptr[token_index])
+        stop = int(token_atom_ptr[token_index + 1])
+        group = tuple(int(atom_index) for atom_index in atom_indices[start:stop])
+        atom_index = int(token_atom_indices[token_index])
+        instance_index = int(token_instance_indices[token_index])
+        entity_index = int(token_entity_indices[token_index])
+        entity_type = int(entity_types[entity_index])
+        component_id = system.symbols[int(component_symbols[component_index])]
+        polymer_type = _component_polymer_type(entity_type, component_id)
+        common = {
+            "atoms": group,
+            "atom_index": None if atom_index < 0 else atom_index,
+            "component_index": int(component_index),
+            "instance_index": instance_index,
+            "entity_index": entity_index,
+            "monomer_index": None if entity_type == ENTITY_MOLECULE else int(token_residue_indices[token_index]),
+            "residue_index": 0 if entity_type == ENTITY_MOLECULE else int(token_residue_indices[token_index]),
+            "chain_index": instance_index,
+            "symmetry_index": int(token_symmetry_indices[token_index]),
+            "molecule_type": 3 if polymer_type is None else _MOLECULE_TYPES[polymer_type],
+            "residue_type": int(layout.token_type_index[token_index]),
+        }
+        if atom_index >= 0:
+            tokens.append(
+                {
+                    **common,
+                    "center": atom_index,
+                    "distogram": atom_index,
+                    "frame": (atom_index, atom_index, atom_index),
+                }
+            )
+            continue
+
+        by_name = {system.symbols[int(atom_symbols[index])]: index for index in group}
+        center_name = "CA" if polymer_type == "protein" else "C1'"
+        if polymer_type == "protein":
+            distogram_name = "CA" if component_id == "GLY" else "CB"
+            frame_names = ("N", "CA", "C")
+        else:
+            distogram_name = "C4" if component_id in {"A", "G", "DA", "DG"} else "C2"
+            frame_names = ("C1'", "C3'", "C4'")
+        center = by_name.get(center_name, group[0])
+        tokens.append(
+            {
+                **common,
+                "center": center,
+                "distogram": by_name.get(distogram_name, center),
+                "frame": tuple(by_name.get(name, center) for name in frame_names),
+            }
+        )
+    return tokens
+
+
 def _prepare_boltz1_features(
     system: MolecularSystem,
     *,
+    tokens: list[dict[str, object]],
     structure: Structure | None,
     msa: MSA | MsaCollection | None,
     msa_bindings: tuple[tuple[MSA, int | None, int], ...],
@@ -266,126 +369,7 @@ def _prepare_boltz1_features(
     Build Boltz-1 tensors directly from the canonical molecular graph.
     """
 
-    instance_components = system.instance_component_ptr.detach().cpu().tolist()
-    component_atoms = system.component_atom_ptr.detach().cpu().tolist()
-    instance_entities = system.instance_entity.detach().cpu().tolist()
-    entity_types = system.entity_type.detach().cpu().tolist()
-    component_symbols = system.component_symbol.detach().cpu().tolist()
-    atom_symbols = system.atom_symbol.detach().cpu().tolist()
-    atomic_numbers = system.atomic_number.detach().cpu().tolist()
     atom_component_index = _atom_component_index(system)
-    atom_components = atom_component_index.detach().cpu().tolist()
-    instance_count_by_entity: dict[int, int] = {}
-    tokens: list[dict[str, object]] = []
-
-    for instance_index, entity_index in enumerate(instance_entities):
-        entity_type = entity_types[entity_index]
-        symmetry_index = instance_count_by_entity.get(entity_index, 0)
-        instance_count_by_entity[entity_index] = symmetry_index + 1
-        component_start = instance_components[instance_index]
-        component_stop = instance_components[instance_index + 1]
-        if entity_type != ENTITY_MOLECULE:
-            standards = _STANDARD_BY_ENTITY_TYPE.get(entity_type, frozenset())
-            for component_index in range(component_start, component_stop):
-                monomer_index = component_index - component_start
-                component_id = system.symbols[component_symbols[component_index]]
-                atom_indices = tuple(
-                    atom_index
-                    for atom_index in range(
-                        component_atoms[component_index],
-                        component_atoms[component_index + 1],
-                    )
-                    if atomic_numbers[atom_index] != 1
-                    and system.symbols[atom_symbols[atom_index]] not in {"OXT", "OP3"}
-                )
-                if not atom_indices:
-                    raise ValueError(f"component {component_id!r} has no model-visible heavy atoms")
-                is_standard = component_id in standards
-                polymer_type = _component_polymer_type(
-                    entity_type,
-                    component_id,
-                )
-                common = {
-                    "component_index": component_index,
-                    "instance_index": instance_index,
-                    "entity_index": entity_index,
-                    "monomer_index": monomer_index,
-                    "residue_index": monomer_index,
-                    "chain_index": instance_index,
-                    "symmetry_index": symmetry_index,
-                    "molecule_type": (3 if polymer_type is None else _MOLECULE_TYPES[polymer_type]),
-                }
-                if not is_standard:
-                    residue_type = 22 if polymer_type is None else _UNKNOWN_RESIDUE_TYPES[polymer_type]
-                    for atom_index in atom_indices:
-                        tokens.append(
-                            {
-                                **common,
-                                "atoms": (atom_index,),
-                                "atom_index": atom_index,
-                                "residue_type": residue_type,
-                                "center": atom_index,
-                                "distogram": atom_index,
-                                "frame": (atom_index, atom_index, atom_index),
-                            }
-                        )
-                    continue
-
-                by_name = {system.symbols[atom_symbols[atom_index]]: atom_index for atom_index in atom_indices}
-                center_name = "CA" if polymer_type == "protein" else "C1'"
-                if polymer_type == "protein":
-                    distogram_name = "CA" if component_id == "GLY" else "CB"
-                    frame_names = ("N", "CA", "C")
-                else:
-                    distogram_name = "C4" if component_id in {"A", "G", "DA", "DG"} else "C2"
-                    frame_names = ("C1'", "C3'", "C4'")
-                center = by_name.get(center_name, atom_indices[0])
-                distogram = by_name.get(distogram_name, center)
-                tokens.append(
-                    {
-                        **common,
-                        "atoms": atom_indices,
-                        "atom_index": None,
-                        "residue_type": _residue_type(
-                            component_id,
-                            cast(str, polymer_type),
-                        ),
-                        "center": center,
-                        "distogram": distogram,
-                        "frame": tuple(by_name.get(name, center) for name in frame_names),
-                    }
-                )
-        else:
-            atom_indices = tuple(
-                atom_index
-                for component_index in range(component_start, component_stop)
-                for atom_index in range(
-                    component_atoms[component_index],
-                    component_atoms[component_index + 1],
-                )
-                if atomic_numbers[atom_index] != 1
-            )
-            if not atom_indices:
-                raise ValueError(f"molecule {system.instance_id(instance_index)!r} has no model-visible heavy atoms")
-            for atom_index in atom_indices:
-                tokens.append(
-                    {
-                        "atoms": (atom_index,),
-                        "atom_index": atom_index,
-                        "component_index": atom_components[atom_index],
-                        "instance_index": instance_index,
-                        "entity_index": entity_index,
-                        "monomer_index": None,
-                        "residue_index": 0,
-                        "chain_index": instance_index,
-                        "symmetry_index": symmetry_index,
-                        "molecule_type": 3,
-                        "residue_type": 22,
-                        "center": atom_index,
-                        "distogram": atom_index,
-                        "frame": (atom_index, atom_index, atom_index),
-                    }
-                )
 
     atom_indices = tuple(atom_index for token in tokens for atom_index in cast(tuple[int, ...], token["atoms"]))
     system_to_model_atom = {atom_index: model_atom_index for model_atom_index, atom_index in enumerate(atom_indices)}
@@ -509,7 +493,7 @@ def _prepare_boltz1_features(
         "atom_token_index": atom_token_index,
         "token_center_atom_index": token_center_atom_index,
         "token_distogram_atom_index": token_distogram_atom_index,
-        "residue_type_features": torch.nn.functional.one_hot(residue_types, 33).float(),
+        "residue_type_features": torch.nn.functional.one_hot(residue_types, TOKEN_VOCAB_SIZE).float(),
         "msa_profile": msa_values.pop("msa_profile"),
         "deletion_mean": msa_values.pop("deletion_mean"),
         "token_bonds": token_bonds,
@@ -782,6 +766,32 @@ def _rdkit_symmetry_group(
         return None
     ordered = (identity, *sorted(permutations - {identity}))
     return identity, ordered
+
+
+def _pocket_required_token_mask(
+    system: MolecularSystem,
+    layout: TokenLayout,
+    pocket: Boltz1Pocket | None,
+) -> Tensor | None:
+    if pocket is None:
+        return None
+
+    required = torch.zeros_like(layout.token_component_index, dtype=torch.bool)
+    try:
+        binder_instance = system.instance_index(pocket.binder)
+    except (KeyError, ValueError):
+        pass
+    else:
+        required |= layout.token_instance_index == binder_instance
+
+    for reference in pocket.pocket:
+        try:
+            component_index = system.component_index(reference)
+        except (KeyError, IndexError, ValueError):
+            continue
+        required |= layout.token_component_index == component_index
+    return required
+
 
 def _pocket_feature(
     pocket: Boltz1Pocket | None,
@@ -1218,7 +1228,7 @@ def _msa_features(
     tokens: list[dict[str, object]],
     system: MolecularSystem,
 ) -> dict[str, Tensor]:
-    residue_types = [_token_msa_restype(token, system) for token in tokens]
+    residue_types = [cast(int, token["residue_type"]) for token in tokens]
     if msa is None:
         rows = torch.tensor([residue_types])
         deletion_counts = torch.zeros(1, len(tokens))
@@ -1271,7 +1281,7 @@ def _msa_features(
                     component_index = cast(int, token["component_index"])
                     component_id = system.symbols[int(system.component_symbol[component_index])]
                     polymer_type = _component_polymer_type(int(system.entity_type[entity_index]), component_id)
-                    row[token_index] = _msa_symbol_restype(aligned[monomer_index], polymer_type)
+                    row[token_index] = msa_residue_index(aligned[monomer_index], polymer_type)
                     deletion_row[token_index] = float(deletion_source[monomer_index])
                     paired_row[token_index] = float(taxonomic_pair)
             row_values.append(row)
@@ -1654,11 +1664,3 @@ def _component_polymer_type(
         if component_id in _STANDARD_COMPONENTS["dna"]:
             return "dna"
     return None
-
-
-def _residue_type(component_id: str, polymer_type: str) -> int:
-    if polymer_type == "protein":
-        return _PROTEIN_RESIDUE_TYPES.get(component_id, 22)
-    if polymer_type == "rna":
-        return _RNA_RESIDUE_TYPES.get(component_id, 27)
-    return _DNA_RESIDUE_TYPES.get(component_id, 32)

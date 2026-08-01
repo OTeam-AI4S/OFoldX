@@ -66,6 +66,7 @@ from .processor import (
     ProtenixProcessor,
     ProtenixStructureConditionProcessor,
     ProtenixTemplateProcessor,
+    protenix_token_layout,
 )
 
 __all__ = [
@@ -122,6 +123,7 @@ __all__ = [
     "ProtenixVinaStericTerm",
     "protenix_confidence_summary",
     "protenix_contact_probability",
+    "protenix_token_layout",
 ]
 
 _MODELS.register(

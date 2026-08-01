@@ -23,7 +23,7 @@ from typing import Any
 import torch
 from torch import Tensor
 
-from ....data import MSA_ALPHABET
+from ....data import MSA_ALPHABET, TOKEN_ALPHABET
 from ._schema import resolve
 
 _RECORD_HEADER = struct.Struct("<5i")
@@ -344,9 +344,10 @@ _MSA_TOP_LEVEL = {
     "token_projection.weight": ("diffuser/evoformer/extra_msa_target_feat", "target_feat_linear"),
 }
 
-# DeepMind's source checkpoint uses 31 profile channels and 32 raw-MSA channels. Keep this source
-# layout local to the converter: the native model exposes the repository-wide canonical MSA alphabet.
-_OFFICIAL_PROFILE_INDEX = {
+# DeepMind's source checkpoint uses the same 31-class ordering for structural target and profile
+# channels, plus one additional DNA-unknown row in raw MSA inputs. Keep source layouts local to the
+# converter: the native model exposes the repository-wide canonical structural and MSA alphabets.
+_OFFICIAL_STRUCTURAL_INDEX = {
     **{
         symbol: index
         for index, symbol in enumerate(
@@ -367,7 +368,7 @@ _OFFICIAL_PROFILE_INDEX = {
     "DNA_N": 30,
     "OTHER": 20,
 }
-_OFFICIAL_RAW_MSA_INDEX = {**_OFFICIAL_PROFILE_INDEX, "DNA_N": 31}
+_OFFICIAL_RAW_MSA_INDEX = {**_OFFICIAL_STRUCTURAL_INDEX, "DNA_N": 31}
 
 
 def _official_ref_for_model_key(model_key: str) -> _OfficialParamRef | None:
@@ -897,7 +898,7 @@ def _apply_official_transform(ref: _OfficialParamRef, tensors: tuple[Tensor, ...
         return torch.cat([_convert_msa_axis(residue, _OFFICIAL_RAW_MSA_INDEX), deletion], dim=1).contiguous()
     if ref.transform == "target_feat_linear":
         # DeepMind orders target_feat as [restype/profile/deletion, atom single]. Rotate the atom features
-        # to the front and expand only the profile block to the canonical native alphabet.
+        # to the front and expand both vocabulary blocks to the canonical native alphabet.
         weight = _linear_weight(selected[0], None)
         source_tail = weight[:, : weight.shape[1] - 384]
         atom = weight[:, weight.shape[1] - 384 :]
@@ -939,8 +940,20 @@ def _apply_official_transform(ref: _OfficialParamRef, tensors: tuple[Tensor, ...
         return source.reshape(-1, source.shape[-1]).t().contiguous()
     if ref.transform == "template_projection":
         # Official features project residue j before residue i; the native packed layout stores i then j.
-        ordered = (*selected[:2], selected[3], selected[2], *selected[4:])
-        return torch.cat([_linear_weight(tensor, None) for tensor in ordered], dim=1)
+        ordered = (
+            _linear_weight(selected[0], None),
+            _linear_weight(selected[1], None),
+            _convert_structural_axis(_linear_weight(selected[3], None)),
+            _convert_structural_axis(_linear_weight(selected[2], None)),
+            *(_linear_weight(tensor, None) for tensor in selected[4:]),
+        )
+        converted = torch.cat(ordered, dim=1)
+        if converted.shape != target.shape:
+            raise RuntimeError(
+                "converted official AF3 template projection has shape "
+                f"{tuple(converted.shape)}, expected {tuple(target.shape)}"
+            )
+        return converted
     if ref.transform == "atom_feature_projection":
         return torch.cat([_linear_weight(tensor, None) for tensor in selected], dim=1)
     if ref.transform == "atom_confidence_weight":
@@ -967,12 +980,31 @@ def _select_indices(tensor: Tensor, indices: tuple[int, ...]) -> Tensor:
 
 def _convert_target_feat_axis(source_tail: Tensor) -> Tensor:
     target, profile, deletion = source_tail[..., :31], source_tail[..., 31:62], source_tail[..., 62:]
-    return torch.cat([target, _convert_msa_axis(profile, _OFFICIAL_PROFILE_INDEX), deletion], dim=-1)
+    return torch.cat(
+        [
+            _convert_structural_axis(target),
+            _convert_alphabet_axis(profile, MSA_ALPHABET, _OFFICIAL_STRUCTURAL_INDEX),
+            deletion,
+        ],
+        dim=-1,
+    )
 
 
 def _convert_msa_axis(source: Tensor, source_index: Mapping[str, int]) -> Tensor:
+    return _convert_alphabet_axis(source, MSA_ALPHABET, source_index)
+
+
+def _convert_structural_axis(source: Tensor) -> Tensor:
+    return _convert_alphabet_axis(source, TOKEN_ALPHABET, _OFFICIAL_STRUCTURAL_INDEX)
+
+
+def _convert_alphabet_axis(
+    source: Tensor,
+    alphabet: Sequence[str],
+    source_index: Mapping[str, int],
+) -> Tensor:
     converted = []
-    for symbol in MSA_ALPHABET:
+    for symbol in alphabet:
         if symbol == "B":
             value = (source[..., source_index["D"]] + source[..., source_index["N"]]) / 2
         elif symbol == "Z":

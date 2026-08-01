@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from ...data.crop import Cropper
 from ...data.evidence import (
     MSA,
     MSA_VOCAB_SIZE,
@@ -23,6 +24,7 @@ from ...data.evidence import (
 )
 from ...data.molecular import ENTITY_PROTEIN, MolecularSystem, PolymerSequence
 from ...data.structure import Structure
+from ...data.tokenization import select_tokens, tokenize_molecular_system
 from ...modules import residue_constants
 from ...modules.geometry import virtual_beta_carbon
 from ...processor import Processor
@@ -91,6 +93,8 @@ class AlphaFold2Processor(Processor):
         *,
         msa: MSA | MsaCollection | None = None,
         templates: Sequence[Template] = (),
+        cropper: Cropper | None = None,
+        generator: torch.Generator | None = None,
     ) -> AlphaFold2Input:
         r"""
         Prepare model features for one protein monomer.
@@ -100,10 +104,13 @@ class AlphaFold2Processor(Processor):
                 containing exactly one protein instance.
             msa: Optional monomer MSA value.
             templates: Template structures with explicit target alignments.
+            cropper: Optional training crop over the bound target residue axis.
+            generator: Optional random generator used by ``cropper``.
 
         Returns:
             Batched target, MSA, and template tensors. Atom coordinates in template
-            features are in angstroms. This method performs no random sampling.
+            features are in angstroms. Without a cropper, this method performs no
+            random sampling.
         """
 
         topology = input.system if isinstance(input, Structure) else input
@@ -123,6 +130,13 @@ class AlphaFold2Processor(Processor):
             target_length=component_index.numel(),
             max_templates=self.config.max_templates,
         )
+        selection = _target_crop_selection(
+            input,
+            system,
+            component_index,
+            cropper,
+            generator=generator,
+        )
         return _prepare_alphafold2_features(
             system,
             component_index=component_index,
@@ -130,6 +144,7 @@ class AlphaFold2Processor(Processor):
             target_instance_index=instance_index,
             msa=msa,
             templates=normalized_templates,
+            selection=selection,
             device=self.device,
             dtype=self.dtype,
         )
@@ -165,6 +180,8 @@ class AlphaFold2InitialGuessProcessor(Processor):
         input: Structure,
         *,
         binder_instance_id: str,
+        cropper: Cropper | None = None,
+        generator: torch.Generator | None = None,
     ) -> AlphaFold2InitialGuessInput:
         r"""
         Prepare the released target--binder pTM evaluation input.
@@ -172,6 +189,9 @@ class AlphaFold2InitialGuessProcessor(Processor):
         Args:
             input: In-memory structure containing the target and designed binder.
             binder_instance_id: Exact protein instance to treat as the binder.
+            cropper: Optional training crop. One target residue and one binder residue
+                are required before applying the configured policy.
+            generator: Optional random generator used by ``cropper`` and role anchors.
 
         Returns:
             Concatenated monomer/pTM features in target-then-binder order.
@@ -201,22 +221,12 @@ class AlphaFold2InitialGuessProcessor(Processor):
         if any(component_index.numel() == 0 for component_index in chain_components):
             raise ValueError("AlphaFold 2 initial guess requires nonempty protein chains")
         component_index = torch.cat(chain_components)
-        base = _prepare_alphafold2_features(
-            system,
-            component_index=component_index,
-            target_entity_index=int(system.instance_entity[chain_instance_indices[0]]),
-            target_instance_index=chain_instance_indices[0],
-            msa=None,
-            templates=(),
-            device=self.device,
-            dtype=self.dtype,
-        )
-
         residue_indices: list[int] = []
         next_index = 0
         for chain_component_index in chain_components:
             residue_indices.extend(range(next_index, next_index + chain_component_index.numel()))
             next_index = residue_indices[-1] + 50
+        residue_index = torch.tensor(residue_indices, dtype=torch.long)
         binder_mask = torch.cat(
             [
                 torch.full(
@@ -231,6 +241,38 @@ class AlphaFold2InitialGuessProcessor(Processor):
                 )
             ]
         )
+        required_token_mask = None
+        if cropper is not None:
+            required_token_mask = torch.zeros_like(binder_mask)
+            for role_mask in (~binder_mask, binder_mask):
+                candidates = torch.nonzero(role_mask, as_tuple=False).flatten()
+                device = candidates.device if generator is None else generator.device
+                offset = torch.randint(candidates.numel(), (), device=device, generator=generator)
+                required_token_mask[candidates[offset.to(candidates.device)]] = True
+        selection = _target_crop_selection(
+            input,
+            system,
+            component_index,
+            cropper,
+            required_token_mask=required_token_mask,
+            generator=generator,
+        )
+        base = _prepare_alphafold2_features(
+            system,
+            component_index=component_index,
+            residue_index=residue_index,
+            target_entity_index=int(system.instance_entity[chain_instance_indices[0]]),
+            target_instance_index=chain_instance_indices[0],
+            msa=None,
+            templates=(),
+            selection=selection,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        if selection is not None:
+            component_index = component_index[selection.to(component_index.device)]
+            residue_index = residue_index[selection]
+            binder_mask = binder_mask[selection]
 
         atom37_index = _atom37_indices(system, component_index)
         safe_atom_index = atom37_index.clamp_min(0)
@@ -268,11 +310,7 @@ class AlphaFold2InitialGuessProcessor(Processor):
 
         values = {field.name: getattr(base, field.name) for field in fields(base)}  # type: ignore[arg-type]
         values.update(
-            residue_index=torch.tensor(
-                residue_indices,
-                dtype=torch.long,
-                device=self.device,
-            ).unsqueeze(0),
+            residue_index=residue_index.to(device=self.device).unsqueeze(0),
             template_mask=torch.ones(
                 1,
                 1,
@@ -377,6 +415,45 @@ def _atom37_indices(system: MolecularSystem, component_index: Tensor) -> Tensor:
     return indices
 
 
+def _target_crop_selection(
+    input: object,
+    system: MolecularSystem,
+    component_index: Tensor,
+    cropper: Cropper | None,
+    *,
+    required_token_mask: Tensor | None = None,
+    generator: torch.Generator | None = None,
+) -> Tensor | None:
+    r"""Crop a bound component-token target and return its original axis indices."""
+
+    if cropper is None:
+        return None
+    if not isinstance(input, Structure):
+        raise TypeError("AlphaFold 2 cropping requires a Structure input")
+
+    component_mask = torch.zeros_like(system.component_symbol, dtype=torch.bool)
+    component_mask[component_index] = True
+    layout = tokenize_molecular_system(
+        system,
+        atomize_nonstandard_polymers=False,
+        component_mask=component_mask,
+    )
+    layout_row_by_component = torch.full_like(system.component_symbol, -1)
+    layout_row_by_component[layout.token_component_index] = torch.arange(
+        layout.token_component_index.numel(),
+        device=layout.token_component_index.device,
+    )
+    target_layout_rows = layout_row_by_component[component_index]
+    layout = select_tokens(layout, target_layout_rows)
+    selection = cropper(
+        input,
+        layout,
+        required_token_mask=required_token_mask,
+        generator=generator,
+    )
+    return selection.to(device="cpu", dtype=torch.long)
+
+
 def _normalize_templates(
     templates: Sequence[Template],
     *,
@@ -453,57 +530,82 @@ def _prepare_alphafold2_features(
     templates: tuple[Template, ...],
     device: torch.device,
     dtype: torch.dtype,
+    residue_index: Tensor | None = None,
+    selection: Tensor | None = None,
 ) -> AlphaFold2Input:
     r"""
     Build the monomer AlphaFold 2 raw MSA pool, profile, and semantic axes.
 
-    The Model samples and masks MSA rows for each prediction. This function
-    preserves the full query-projected alignment pool, per-cell deletion counts,
-    and full-pool HHblits profile.
+    The Model samples and masks MSA rows for each prediction. This function keeps
+    every bound alignment row, its per-cell deletion counts, and the full-row-pool
+    HHblits profile on the selected target columns.
     """
 
     component_ids = _component_ids(system, component_index)
     num_residues = len(component_ids)
-    residue_type_ids = torch.tensor(
-        [RESIDUE_TYPE_INDEX_BY_COMPONENT[component_id] for component_id in component_ids],
-        dtype=torch.long,
-    )
-    token_features = torch.cat(
-        [
-            torch.zeros(num_residues, 1),
-            F.one_hot(residue_type_ids, num_classes=residue_constants.NUM_AMINO_ACID_TYPES + 1),
-        ],
-        dim=-1,
-    ).to(torch.float32)
-    msa_tokens, msa_deletions, msa_profile = _msa_pool_features(component_ids, msa)
-    template_values = _template_features(
+    (
+        template_residue_type_ids,
+        template_mask,
+        template_all_atom_positions,
+        template_all_atom_mask,
+        template_torsion_angles_sin_cos,
+        template_alternative_torsion_angles_sin_cos,
+        template_torsion_angles_mask,
+    ) = _template_features(
         templates,
         target_system=system,
         target_length=num_residues,
         target_entity_index=target_entity_index,
         target_instance_index=target_instance_index,
     )
+    if residue_index is None:
+        residue_index = torch.arange(num_residues)
+    msa_column_index = None
+    if selection is not None:
+        msa_column_index = selection.tolist()
+        component_ids = tuple(component_ids[index] for index in msa_column_index)
+        template_residue_type_ids = template_residue_type_ids[:, selection]
+        template_all_atom_positions = template_all_atom_positions[:, selection]
+        template_all_atom_mask = template_all_atom_mask[:, selection]
+        # Torsions depend on sequence neighbours, so compute them on the complete
+        # template axis before selecting possibly non-contiguous crop columns.
+        template_torsion_angles_sin_cos = template_torsion_angles_sin_cos[:, selection]
+        template_alternative_torsion_angles_sin_cos = template_alternative_torsion_angles_sin_cos[:, selection]
+        template_torsion_angles_mask = template_torsion_angles_mask[:, selection]
+        residue_index = residue_index[selection.to(residue_index.device)]
+        component_index = component_index[selection.to(component_index.device)]
+    residue_type_ids = torch.tensor(
+        [RESIDUE_TYPE_INDEX_BY_COMPONENT[component_id] for component_id in component_ids],
+        dtype=torch.long,
+    )
+    token_features = torch.cat(
+        [
+            torch.zeros(residue_type_ids.shape[0], 1),
+            F.one_hot(residue_type_ids, num_classes=residue_constants.NUM_AMINO_ACID_TYPES + 1),
+        ],
+        dim=-1,
+    ).to(torch.float32)
+    msa_tokens, msa_deletions, msa_profile = _msa_pool_features(
+        component_ids,
+        msa,
+        column_index=msa_column_index,
+    )
     floating = {
         "token_features": token_features,
-        "sequence_mask": torch.ones(num_residues),
+        "sequence_mask": torch.ones(residue_type_ids.shape[0]),
         "msa_deletions": msa_deletions,
         "msa_profile": msa_profile,
+        "template_mask": template_mask,
+        "template_all_atom_positions": template_all_atom_positions,
+        "template_all_atom_mask": template_all_atom_mask,
+        "template_torsion_angles_sin_cos": template_torsion_angles_sin_cos,
+        "template_alternative_torsion_angles_sin_cos": template_alternative_torsion_angles_sin_cos,
+        "template_torsion_angles_mask": template_torsion_angles_mask,
     }
-    names = (
-        "template_mask",
-        "template_all_atom_positions",
-        "template_all_atom_mask",
-        "template_torsion_angles_sin_cos",
-        "template_alternative_torsion_angles_sin_cos",
-        "template_torsion_angles_mask",
-    )
-    for name, value in zip(names, template_values[1:], strict=True):
-        floating[name] = value
     placed = {name: value.to(device=device, dtype=dtype).unsqueeze(0) for name, value in floating.items()}
-    template_residue_type_ids = template_values[0]
     return AlphaFold2Input(  # type: ignore[call-arg]
         residue_type_ids=residue_type_ids.to(device=device).unsqueeze(0),
-        residue_index=torch.arange(num_residues, device=device).unsqueeze(0),
+        residue_index=residue_index.to(device=device).unsqueeze(0),
         msa_tokens=msa_tokens.to(device=device).unsqueeze(0),
         system=system,
         component_index=component_index.to(device=device).unsqueeze(0),
@@ -517,6 +619,8 @@ def _prepare_alphafold2_features(
 def _msa_pool_features(
     component_ids: tuple[str, ...],
     msa: MSA | None,
+    *,
+    column_index: Sequence[int] | None = None,
 ) -> tuple[Tensor, Tensor, Tensor]:
     r"""
     Build the query-projected alignment pool and its HHblits profile.
@@ -537,11 +641,24 @@ def _msa_pool_features(
     else:
         # The pool is query-width, row 0 is the ungapped query, and column ``i``
         # addresses the i-th target component. Deletions are per-cell insertion counts.
-        tokens = torch.tensor(
-            [[msa_residue_index(symbol, "protein") for symbol in row] for row in msa.unpaired_sequences],
-            dtype=torch.long,
-        )
-        deletion_counts = torch.tensor(msa.unpaired_deletion_counts, dtype=torch.float32)
+        if column_index is None:
+            tokens = torch.tensor(
+                [[msa_residue_index(symbol, "protein") for symbol in row] for row in msa.unpaired_sequences],
+                dtype=torch.long,
+            )
+            deletion_counts = torch.tensor(msa.unpaired_deletion_counts, dtype=torch.float32)
+        else:
+            tokens = torch.tensor(
+                [
+                    [msa_residue_index(row[index], "protein") for index in column_index]
+                    for row in msa.unpaired_sequences
+                ],
+                dtype=torch.long,
+            )
+            deletion_counts = torch.tensor(
+                msa.unpaired_deletion_counts[:, list(column_index)],
+                dtype=torch.float32,
+            )
         tokens[0] = query
     msa_profile = F.one_hot(tokens, num_classes=MSA_VOCAB_SIZE).to(torch.float32).mean(dim=0)
     return tokens, deletion_counts, msa_profile

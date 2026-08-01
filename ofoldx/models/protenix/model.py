@@ -15,7 +15,7 @@ from tensordict import tensorclass
 from torch import Tensor, nn
 from transformers import EsmConfig, EsmModel
 
-from ...data import MSA_VOCAB_SIZE
+from ...data import MSA_VOCAB_SIZE, TOKEN_VOCAB_SIZE
 from ...data.molecular import (
     ENTITY_MOLECULE,
     AtomSite,
@@ -65,7 +65,7 @@ from .config import (
 )
 
 # Atom-derived token state + target residue type + canonical MSA profile + deletion mean.
-_TOKEN_FEATURE_SIZE = 384 + 32 + MSA_VOCAB_SIZE + 1
+_TOKEN_FEATURE_SIZE = 384 + TOKEN_VOCAB_SIZE + MSA_VOCAB_SIZE + 1
 
 
 class ProtenixModel(Model):
@@ -1795,7 +1795,7 @@ class ProtenixTemplateEmbedder(nn.Module):
         pair_size: int = 128,
         hidden_size: int = 64,
         num_blocks: int = 2,
-        vocab_size: int = 32,
+        vocab_size: int = TOKEN_VOCAB_SIZE,
         num_distogram_bins: int = 39,
         triangle_multiplication_hidden_size: int = 128,
         triangle_attention_hidden_size: int = 32,

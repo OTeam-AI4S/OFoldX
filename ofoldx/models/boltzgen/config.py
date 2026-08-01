@@ -6,6 +6,8 @@ from __future__ import annotations
 
 from chanfig import Config
 
+from ...data.tokenization import TOKEN_VOCAB_SIZE
+
 
 class BoltzGenInputEmbeddingsConfig(Config):
     r"""
@@ -28,7 +30,7 @@ class BoltzGenInputEmbeddingsConfig(Config):
 
     num_atom_encoder_blocks: int = 3
     num_atom_encoder_attention_heads: int = 4
-    vocab_size: int = 33
+    vocab_size: int = TOKEN_VOCAB_SIZE
     num_method_types: int = 12
     num_molecule_types: int = 4
     add_method_conditioning: bool = True

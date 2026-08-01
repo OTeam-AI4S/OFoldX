@@ -11,8 +11,10 @@ from torch import Tensor
 
 from ...data import ENTITY_PROTEIN, water_component_mask
 from ...data.conditions import AllowedResidueIdentities, TiedResidueIdentities
+from ...data.crop import Cropper, crop_token_layout
 from ...data.molecular import ComponentReference, MolecularSystem
 from ...data.structure import Structure
+from ...data.tokenization import TokenLayout, select_tokens, tokenize_molecular_system
 from ...modules.geometry import virtual_beta_carbon
 from ...modules.mpnn import (
     AMINO_ACID_COMPONENT_IDS,
@@ -119,6 +121,8 @@ class LigandMpnnProcessor(Processor):
         use_atom_context: bool = True,
         ligand_interface_cutoff: float = 8.0,
         filter_by_occupancy: bool = True,
+        cropper: Cropper | None = None,
+        generator: torch.Generator | None = None,
     ) -> LigandMpnnInput:
         r"""
         Prepare a ``Structure`` for LigandMPNN.
@@ -134,6 +138,8 @@ class LigandMpnnProcessor(Processor):
             use_atom_context: Whether nonwater, nonprotein heavy-atom context is visible to the model.
             ligand_interface_cutoff: Distance cutoff in angstroms used to mark interface residues.
             filter_by_occupancy: Whether zero-occupancy atoms are treated as unobserved.
+            cropper: Optional training-time crop policy over protein residue tokens.
+            generator: Optional crop random generator.
 
         Returns:
             A single-example ``LigandMpnnInput`` whose residue axes align with
@@ -150,6 +156,44 @@ class LigandMpnnProcessor(Processor):
         observed = structure.coordinate_mask
         if filter_by_occupancy:
             observed = observed & (~structure.occupancy_mask | (structure.occupancy > 0))
+        rows = self._lower_structure_rows(structure, system, observed)
+        row_components = rows[0].detach().cpu().tolist()
+        row_design = self._lower_design(
+            system,
+            row_components,
+            rows[5].detach().cpu().tolist(),
+            positions,
+        )
+        if cropper is not None:
+            layout = _ligand_protein_token_layout(system, rows[0])
+            design_by_component = dict(zip(row_components, row_design, strict=True))
+            layout = crop_token_layout(
+                structure,
+                layout,
+                cropper,
+                required_token_mask=_ligand_required_token_mask(
+                    system,
+                    layout,
+                    conditions=conditions,
+                    tied_weights=tied_weights,
+                    residue_logit_bias=residue_logit_bias,
+                ),
+                anchor_token_mask=torch.tensor(
+                    [
+                        design_by_component[component]
+                        for component in layout.token_component_index.detach().cpu().tolist()
+                    ],
+                    dtype=torch.bool,
+                    device=layout.token_component_index.device,
+                ),
+                generator=generator,
+            )
+            retained_components = set(layout.token_component_index.detach().cpu().tolist())
+            retained_rows = [
+                index for index, component in enumerate(row_components) if component in retained_components
+            ]
+            rows = _retain_ligand_rows(rows, retained_rows)
+            row_design = [row_design[index] for index in retained_rows]
 
         (
             row_component_index,
@@ -161,16 +205,10 @@ class LigandMpnnProcessor(Processor):
             row_residue_index,
             row_chain_index,
             row_component_ids,
-        ) = self._lower_structure_rows(structure, system, observed)
+        ) = rows
         length = row_component_index.numel()
         row_components = row_component_index.detach().cpu().tolist()
         row_by_component = {component: row for row, component in enumerate(row_components)}
-        row_design = self._lower_design(
-            system,
-            row_components,
-            row_valid.detach().cpu().tolist(),
-            positions,
-        )
         tied_group_ids, tied_groups, restrictions = self._close_conditions(
             conditions,
             system,
@@ -671,3 +709,75 @@ class LigandMpnnProcessor(Processor):
                 raise ValueError("LigandMPNN tied weights require a tied residue")
             tied_weight_values[0, row] = value
         return tied_weight_values
+
+
+def _ligand_protein_token_layout(system: MolecularSystem, row_component: Tensor) -> TokenLayout:
+    r"""Build the canonical LigandMPNN protein residue axis without ligand atom tokens."""
+
+    component_mask = torch.zeros_like(system.component_symbol, dtype=torch.bool)
+    component_mask[row_component] = True
+    layout = tokenize_molecular_system(
+        system,
+        atomize_nonstandard_polymers=False,
+        component_mask=component_mask,
+    )
+    token_by_component = {
+        component: token for token, component in enumerate(layout.token_component_index.detach().cpu().tolist())
+    }
+    return select_tokens(
+        layout,
+        layout.token_component_index.new_tensor(
+            [token_by_component[component] for component in row_component.detach().cpu().tolist()]
+        ),
+    )
+
+
+def _ligand_required_token_mask(
+    system: MolecularSystem,
+    layout: TokenLayout,
+    *,
+    conditions: Sequence[AllowedResidueIdentities | TiedResidueIdentities],
+    tied_weights: Mapping[ComponentReference, float] | None,
+    residue_logit_bias: Mapping[ComponentReference, Tensor] | None,
+) -> Tensor:
+    r"""Retain every protein residue named by a LigandMPNN training constraint."""
+
+    references: list[ComponentReference] = []
+    for condition in conditions:
+        if isinstance(condition, TiedResidueIdentities):
+            references.extend(reference for group in condition.groups for reference in group)
+        else:
+            references.extend(condition.positions)
+    if tied_weights:
+        references.extend(tied_weights)
+    if residue_logit_bias:
+        references.extend(residue_logit_bias)
+
+    required = {system.component_index(reference) for reference in references}
+    layout_components = layout.token_component_index.detach().cpu().tolist()
+    missing = required - set(layout_components)
+    if missing:
+        reference = system.component_reference(next(iter(missing)))
+        raise ValueError(f"LigandMPNN constraint references a residue outside the protein layout: {reference!r}")
+    return torch.tensor(
+        [component in required for component in layout_components],
+        dtype=torch.bool,
+        device=layout.token_component_index.device,
+    )
+
+
+def _retain_ligand_rows(rows: _LoweredRows, retained: list[int]) -> _LoweredRows:
+    r"""Filter the LigandMPNN protein axis before context-neighbour selection."""
+
+    index = torch.tensor(retained, dtype=torch.int64, device=rows[0].device)
+    return (
+        rows[0][index],
+        rows[1][index],
+        rows[2][index],
+        rows[3][index],
+        rows[4][index],
+        rows[5][index],
+        rows[6][index],
+        rows[7][index],
+        [rows[8][row] for row in retained],
+    )

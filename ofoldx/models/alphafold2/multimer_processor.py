@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from ...data.crop import Cropper
 from ...data.evidence import (
     MSA,
     MSA_GAP_INDEX,
@@ -33,6 +34,7 @@ from .processor import (
     UNKNOWN_RESIDUE_TYPE_INDEX,
     _atom37_indices,
     _component_ids,
+    _target_crop_selection,
     select_template_alignment,
 )
 
@@ -67,6 +69,8 @@ class AlphaFold2MultimerProcessor(Processor):
         *,
         msa: MsaCollection | None = None,
         templates: Sequence[Template] = (),
+        cropper: Cropper | None = None,
+        generator: torch.Generator | None = None,
     ) -> AlphaFold2MultimerInput:
         r"""
         Prepare model features for one protein assembly.
@@ -76,11 +80,13 @@ class AlphaFold2MultimerProcessor(Processor):
                 forming one assembly.
             msa: Optional paired and unpaired MSA evidence.
             templates: Template structures with explicit target alignments.
+            cropper: Optional training crop over the bound concatenated residue axis.
+            generator: Optional random generator used by ``cropper``.
 
         Returns:
             Batched target, paired-MSA, and template tensors. Atom coordinates in
-            template features are in angstroms. This method performs no random
-            sampling.
+            template features are in angstroms. Without a cropper, this method
+            performs no random sampling.
         """
 
         system = input.system if isinstance(input, Structure) else input
@@ -97,6 +103,9 @@ class AlphaFold2MultimerProcessor(Processor):
             msa=msa,
             msa_bindings=msa_bindings,
             templates=normalized_templates,
+            crop_input=input,
+            cropper=cropper,
+            generator=generator,
             device=self.device,
             dtype=self.dtype,
         )
@@ -219,6 +228,9 @@ def prepare_multimer_features(
     msa: MsaCollection | None,
     msa_bindings: tuple[tuple[MSA, int | None, int], ...],
     templates: tuple[Template, ...],
+    crop_input: object,
+    cropper: Cropper | None,
+    generator: torch.Generator | None,
     device: torch.device,
     dtype: torch.dtype,
 ) -> AlphaFold2MultimerInput:
@@ -228,14 +240,6 @@ def prepare_multimer_features(
 
     total_length = chains[-1].stop
     component_index = torch.cat([chain.component_index for chain in chains])
-    residue_type_ids = torch.tensor(
-        [RESIDUE_TYPE_INDEX_BY_COMPONENT[component_id] for component_id in _component_ids(system, component_index)],
-        dtype=torch.long,
-    )
-    token_features = F.one_hot(residue_type_ids, num_classes=residue_constants.NUM_AMINO_ACID_TYPES + 1).to(
-        torch.float32
-    )
-
     residue_index = torch.cat([torch.arange(chain.stop - chain.start) for chain in chains]).long()
     chain_index = torch.cat([torch.full((chain.stop - chain.start,), chain.chain_index) for chain in chains]).long()
     entity_index = torch.cat(
@@ -245,8 +249,31 @@ def prepare_multimer_features(
         [torch.full((chain.stop - chain.start,), chain.symmetry_index) for chain in chains]
     ).long()
 
+    selection = _target_crop_selection(
+        crop_input,
+        system,
+        component_index,
+        cropper,
+        generator=generator,
+    )
+    msa_column_index = None
+    if selection is not None:
+        msa_column_index = selection.tolist()
+        residue_index = residue_index[selection]
+        chain_index = chain_index[selection]
+        entity_index = entity_index[selection]
+        symmetry_index = symmetry_index[selection]
+        component_index = component_index[selection.to(component_index.device)]
+    component_ids = _component_ids(system, component_index)
+    residue_type_ids = torch.tensor(
+        [RESIDUE_TYPE_INDEX_BY_COMPONENT[component_id] for component_id in component_ids],
+        dtype=torch.long,
+    )
+    token_features = F.one_hot(residue_type_ids, num_classes=residue_constants.NUM_AMINO_ACID_TYPES + 1).to(
+        torch.float32
+    )
     query_tokens = torch.tensor(
-        [msa_component_index(component_id, "protein") for component_id in _component_ids(system, component_index)],
+        [msa_component_index(component_id, "protein") for component_id in component_ids],
         dtype=torch.long,
     )
     tokens, deletions = materialize_collection(
@@ -255,6 +282,7 @@ def prepare_multimer_features(
         chains,
         total_length,
         query_tokens,
+        column_index=msa_column_index,
     )
     # The Processor emits the raw paired alignment pool and its full-pool profile.
     # The Model samples clustered and extra rows once per recycle. ``msa_profile``
@@ -265,11 +293,12 @@ def prepare_multimer_features(
         system=system,
         chains=chains,
         total_length=total_length,
+        column_index=msa_column_index,
     )
 
     floating = {
         "token_features": token_features,
-        "sequence_mask": torch.ones(total_length),
+        "sequence_mask": torch.ones(residue_type_ids.shape[0]),
         "msa_deletions": deletions,
         "msa_profile": msa_profile,
         "template_mask": template_values["template_mask"],
@@ -307,13 +336,15 @@ def materialize_collection(
     chains: tuple[MultimerChain, ...],
     total_length: int,
     query_tokens: Tensor,
+    *,
+    column_index: Sequence[int] | None = None,
 ) -> tuple[Tensor, Tensor]:
     r"""
     Expand the paired MsaCollection row plan onto the concatenated token axis.
 
-    Each plan row is materialized into one full-width token row: every chain's
-    token range receives the symbols selected for its entity's column (paired or
-    unpaired pool), and gap cells leave the ungapped-elsewhere range as
+    Each plan row is materialized directly on ``column_index``, or on the complete
+    target axis when no selection is supplied. Every chain's selected columns
+    receive the symbols from its paired or unpaired pool; gap cells remain
     ``MSA_GAP_INDEX``.
     Row 0 is the concatenated query. Paired and unpaired rows retain the explicit
     order encoded by the collection's row plan.
@@ -325,12 +356,21 @@ def materialize_collection(
         return tokens, deletions
 
     columns_for_chain = _columns_for_chain(msa_bindings, chains)
+    selected_columns = range(total_length) if column_index is None else column_index
+    selected_by_chain = {
+        chain.instance_index: tuple(
+            (output_column, target_column - chain.start)
+            for output_column, target_column in enumerate(selected_columns)
+            if chain.start <= target_column < chain.stop
+        )
+        for chain in chains
+    }
     row_count = msa.row_pairing.shape[0]
     token_rows: list[list[int]] = []
     deletion_rows: list[list[float]] = []
     for row in range(row_count):
-        token_row = [MSA_GAP_INDEX] * total_length
-        deletion_row = [0.0] * total_length
+        token_row = [MSA_GAP_INDEX] * query_tokens.numel()
+        deletion_row = [0.0] * query_tokens.numel()
         for chain in chains:
             column = columns_for_chain.get(chain.instance_index)
             if column is None:
@@ -342,9 +382,9 @@ def materialize_collection(
             entry = msa.msas[column]
             sequence = entry.paired_sequences[source] if paired else entry.unpaired_sequences[source]
             counts = entry.paired_deletion_counts[source] if paired else entry.unpaired_deletion_counts[source]
-            for offset, symbol in enumerate(sequence):
-                token_row[chain.start + offset] = msa_residue_index(symbol, "protein")
-                deletion_row[chain.start + offset] = float(counts[offset])
+            for output_column, chain_column in selected_by_chain[chain.instance_index]:
+                token_row[output_column] = msa_residue_index(sequence[chain_column], "protein")
+                deletion_row[output_column] = float(counts[chain_column])
         token_rows.append(token_row)
         deletion_rows.append(deletion_row)
     tokens = torch.tensor(token_rows, dtype=torch.long)
@@ -374,26 +414,28 @@ def multimer_template_features(
     system: MolecularSystem,
     chains: tuple[MultimerChain, ...],
     total_length: int,
+    column_index: Sequence[int] | None,
 ) -> dict[str, Tensor]:
     r"""
-    Project aligned template coordinates onto the concatenated residue axis.
+    Bind templates on the complete target and project the selected columns.
 
     Produces atom37 positions/masks plus the multimer pseudo-beta and backbone-frame
-    projections. The model recomputes template geometry from atom37; the derived
-    pseudo-beta and backbone-frame fields retain the processor-level representation.
+    projections. These geometries are residue-local, so unlike monomer template
+    torsions they do not require unselected neighbours.
     """
 
     atom_type_num = residue_constants.atom_type_num
+    output_length = total_length if column_index is None else len(column_index)
     if not templates:
         return {
-            "template_residue_type_ids": torch.full((1, total_length), GAP_RESIDUE_TYPE_INDEX, dtype=torch.long),
+            "template_residue_type_ids": torch.full((1, output_length), GAP_RESIDUE_TYPE_INDEX, dtype=torch.long),
             "template_mask": torch.zeros(1),
-            "template_all_atom_positions": torch.zeros(1, total_length, atom_type_num, 3),
-            "template_all_atom_mask": torch.zeros(1, total_length, atom_type_num),
-            "template_pseudo_beta": torch.zeros(1, total_length, 3),
-            "template_pseudo_beta_mask": torch.zeros(1, total_length),
-            "template_backbone_frame": torch.zeros(1, total_length, 4, 4),
-            "template_backbone_frame_mask": torch.zeros(1, total_length),
+            "template_all_atom_positions": torch.zeros(1, output_length, atom_type_num, 3),
+            "template_all_atom_mask": torch.zeros(1, output_length, atom_type_num),
+            "template_pseudo_beta": torch.zeros(1, output_length, 3),
+            "template_pseudo_beta_mask": torch.zeros(1, output_length),
+            "template_backbone_frame": torch.zeros(1, output_length, 4, 4),
+            "template_backbone_frame_mask": torch.zeros(1, output_length),
         }
 
     instance_to_chain = {chain.instance_index: chain for chain in chains}
@@ -401,13 +443,14 @@ def multimer_template_features(
     for chain in chains:
         entity_to_chains.setdefault(chain.system_entity_index, []).append(chain)
 
+    output_column = None if column_index is None else {target: output for output, target in enumerate(column_index)}
     template_residue_type_ids: list[Tensor] = []
     positions_list: list[Tensor] = []
     masks_list: list[Tensor] = []
     for template in templates:
-        residue_type_ids = torch.full((total_length,), GAP_RESIDUE_TYPE_INDEX, dtype=torch.long)
-        positions = torch.zeros(total_length, atom_type_num, 3)
-        masks = torch.zeros(total_length, atom_type_num)
+        residue_type_ids = torch.full((output_length,), GAP_RESIDUE_TYPE_INDEX, dtype=torch.long)
+        positions = torch.zeros(output_length, atom_type_num, 3)
+        masks = torch.zeros(output_length, atom_type_num)
         projected_instances: set[int] = set()
         for alignment in template.alignments:
             try:
@@ -441,6 +484,7 @@ def multimer_template_features(
                     residue_type_ids,
                     positions,
                     masks,
+                    output_column=output_column,
                 )
                 projected_instances.add(chain.instance_index)
         template_residue_type_ids.append(residue_type_ids)
@@ -471,6 +515,8 @@ def _project_template_chain(
     residue_type_ids: Tensor,
     positions: Tensor,
     masks: Tensor,
+    *,
+    output_column: dict[int, int] | None,
 ) -> None:
     structure = template.structure
     system = structure.system
@@ -480,17 +526,25 @@ def _project_template_chain(
         raise ValueError("AlphaFold-Multimer templates must align a protein instance")
     component_start = int(system.instance_component_ptr[template_instance_index])
     for target_index, template_index in alignment.residue_pairs:
-        global_index = chain.start + target_index
+        target_column = chain.start + target_index
+        if output_column is not None:
+            selected_column = output_column.get(target_column)
+            if selected_column is None:
+                continue
+            target_column = selected_column
         component = component_start + template_index
         component_id = system.symbols[int(system.component_symbol[component])]
-        residue_type_ids[global_index] = RESIDUE_TYPE_INDEX_BY_COMPONENT.get(component_id, UNKNOWN_RESIDUE_TYPE_INDEX)
+        residue_type_ids[target_column] = RESIDUE_TYPE_INDEX_BY_COMPONENT.get(
+            component_id,
+            UNKNOWN_RESIDUE_TYPE_INDEX,
+        )
         atom_start = int(system.component_atom_ptr[component])
         atom_stop = int(system.component_atom_ptr[component + 1])
         for atom in range(atom_start, atom_stop):
             atom_index = residue_constants.atom_order.get(system.symbols[int(system.atom_symbol[atom])])
             if atom_index is None or not bool(structure.coordinate_mask[atom]):
                 continue
-            positions[global_index, atom_index] = (
+            positions[target_column, atom_index] = (
                 structure.coordinates[atom]
                 .detach()
                 .to(
@@ -498,7 +552,7 @@ def _project_template_chain(
                     dtype=positions.dtype,
                 )
             )
-            masks[global_index, atom_index] = 1.0
+            masks[target_column, atom_index] = 1.0
 
 
 def _template_pseudo_beta(residue_type_ids: Tensor, positions: Tensor, masks: Tensor) -> tuple[Tensor, Tensor]:

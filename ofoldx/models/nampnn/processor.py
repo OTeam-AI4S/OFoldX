@@ -12,6 +12,7 @@ from torch import Tensor
 
 from ...data.components import get_component
 from ...data.conditions import AllowedResidueIdentities, TiedResidueIdentities
+from ...data.crop import Cropper, crop_token_layout
 from ...data.molecular import (
     BOND_ROLE_COMPONENT,
     BOND_ROLE_POLYMER,
@@ -27,6 +28,7 @@ from ...data.molecular import (
     replace_components,
 )
 from ...data.structure import Structure
+from ...data.tokenization import TokenLayout, select_tokens, tokenize_molecular_system
 from ...processor import Processor
 from .config import NaMpnnProcessorConfig
 from .model import (
@@ -113,6 +115,8 @@ class NaMpnnProcessor(Processor):
         residue_logit_bias: Mapping[ComponentReference, Tensor] | None = None,
         pair_logit_bias: Tensor | None = None,
         global_omit_tokens: Sequence[str] = (),
+        cropper: Cropper | None = None,
+        generator: torch.Generator | None = None,
     ) -> NaMpnnInput:
         r"""
         Prepare one mixed-polymer structure for scoring or sequence design.
@@ -131,6 +135,8 @@ class NaMpnnProcessor(Processor):
             pair_logit_bias: Optional adjacent-token bias matrix with shape ``(33, 33)``.
             global_omit_tokens: Case-sensitive official one-letter tokens excluded from generation:
                 uppercase protein, lowercase nucleic acid, ``-`` for mask, and ``+`` for padding.
+            cropper: Optional training-time crop policy over polymer residue tokens.
+            generator: Optional crop random generator.
 
         Returns:
             A single-example ``NaMpnnInput`` with aligned structure, residue, and condition axes.
@@ -138,12 +144,65 @@ class NaMpnnProcessor(Processor):
 
         if sequence is not None:
             structure = self._resolve_score_target(structure, sequence)
+        rows = self._lower_rows(structure)
+        if cropper is not None:
+            system = structure.system
+            components = {row.component_index for row in rows}
+            selected = None if positions is None else {system.component_index(reference) for reference in positions}
+            if selected is not None:
+                missing = selected - components
+                if missing:
+                    references = [system.component_reference(component) for component in missing]
+                    raise ValueError(f"NA-MPNN positions are not polymer residues: {references!r}")
+            bonded = self._bonded_rows(system)
+            scoreable_by_component = {
+                row.component_index: bool(
+                    row.backbone_complete
+                    and (sequence is not None or row.component_index not in bonded)
+                    and (selected is None or row.component_index in selected)
+                    and (
+                        sequence is not None
+                        or not nucleic_acid_only
+                        or row.polymer_type_index != _POLYMER_TYPE_INDEX["protein"]
+                    )
+                )
+                for row in rows
+            }
+            layout = _na_token_layout(system, rows)
+            layout = crop_token_layout(
+                structure,
+                layout,
+                cropper,
+                required_token_mask=_na_required_token_mask(
+                    system,
+                    layout,
+                    conditions=() if sequence is not None else conditions,
+                    symmetry_groups=() if sequence is not None else symmetry_groups,
+                    tied_weights=None if sequence is not None else tied_weights,
+                    residue_logit_bias=None if sequence is not None else residue_logit_bias,
+                ),
+                anchor_token_mask=torch.tensor(
+                    [
+                        scoreable_by_component[component]
+                        for component in layout.token_component_index.detach().cpu().tolist()
+                    ],
+                    dtype=torch.bool,
+                    device=layout.token_component_index.device,
+                ),
+                generator=generator,
+            )
+            retained_components = set(layout.token_component_index.detach().cpu().tolist())
+            rows = [row for row in rows if row.component_index in retained_components]
+            if positions is not None:
+                positions = tuple(
+                    reference for reference in positions if system.component_index(reference) in retained_components
+                )
+        if sequence is not None:
             return self._process_score(
                 structure,
-                self._lower_rows(structure),
+                rows,
                 positions=positions,
             )
-        rows = self._lower_rows(structure)
         return self._process_design(
             structure,
             rows,
@@ -877,3 +936,57 @@ class NaMpnnProcessor(Processor):
             + lower_mask[:, None, :, None] * matrix.transpose(0, 1)[None, :, None, :]
         )
         return pair.reshape(1, length, _VOCAB_SIZE, length, _VOCAB_SIZE)
+
+
+def _na_token_layout(system: MolecularSystem, rows: Sequence[_Row]) -> TokenLayout:
+    r"""Build one canonical component token for each NA-MPNN polymer row."""
+
+    component_mask = torch.zeros_like(system.component_symbol, dtype=torch.bool)
+    component_mask[[row.component_index for row in rows]] = True
+    layout = tokenize_molecular_system(
+        system,
+        atomize_nonstandard_polymers=False,
+        component_mask=component_mask,
+    )
+    token_by_component = {
+        component: token for token, component in enumerate(layout.token_component_index.detach().cpu().tolist())
+    }
+    return select_tokens(
+        layout,
+        layout.token_component_index.new_tensor([token_by_component[row.component_index] for row in rows]),
+    )
+
+
+def _na_required_token_mask(
+    system: MolecularSystem,
+    layout: TokenLayout,
+    *,
+    conditions: Sequence[AllowedResidueIdentities | TiedResidueIdentities],
+    symmetry_groups: Sequence[Sequence[ComponentReference]],
+    tied_weights: Mapping[ComponentReference, float] | None,
+    residue_logit_bias: Mapping[ComponentReference, Tensor] | None,
+) -> Tensor:
+    r"""Retain every residue participating in an NA-MPNN condition or symmetry group."""
+
+    references = [reference for group in symmetry_groups for reference in group]
+    for condition in conditions:
+        if isinstance(condition, TiedResidueIdentities):
+            references.extend(reference for group in condition.groups for reference in group)
+        else:
+            references.extend(condition.positions)
+    if tied_weights:
+        references.extend(tied_weights)
+    if residue_logit_bias:
+        references.extend(residue_logit_bias)
+
+    required = {system.component_index(reference) for reference in references}
+    layout_components = layout.token_component_index.detach().cpu().tolist()
+    missing = required - set(layout_components)
+    if missing:
+        reference = system.component_reference(next(iter(missing)))
+        raise ValueError(f"NA-MPNN constraint references a residue outside the polymer layout: {reference!r}")
+    return torch.tensor(
+        [component in required for component in layout_components],
+        dtype=torch.bool,
+        device=layout.token_component_index.device,
+    )

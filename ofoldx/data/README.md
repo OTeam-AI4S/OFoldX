@@ -23,6 +23,21 @@ closure. They do not perform generic plausibility, valence, or lifecycle
 validation. Their module-like `.to(dtype=...)` casts floating values and preserves
 the integer and Boolean graph schema; it does not infer or repair a floating dtype.
 
+`tokenization.py` owns the canonical biological vocabulary and the one shared
+atom-to-token partition operation. A `TokenLayout` retains canonical component
+and atom indices; architecture metadata may choose component or atom tokens, but
+families do not implement another graph traversal. `crop.py` owns replaceable
+training views over that layout. A Cropper selects token rows while the complete
+`Structure` remains the coordinate truth; it does not parse files, lower model
+features, or know family condition types. Configure an included policy with
+`functools.partial`, or pass any callable with the same signature. The family
+adapter supplies two distinct masks: every `required_token_mask` row must remain,
+while the selected view only needs one row from `anchor_token_mask`. Resolved
+coordinates are therefore a diffusion-family anchor, not a universal crop rule.
+The included policies never split the atom tokens of one canonical component;
+when the next complete component does not fit, a crop may contain fewer than the
+configured maximum number of tokens.
+
 There is no global `Condition` class or registry. The currently frozen shared
 records are:
 
@@ -53,5 +68,7 @@ released capability.
   axis.
 - `components.py` — package-audited standard component access.
 - `evidence.py` — MSA and template evidence.
+- `tokenization.py` — canonical token vocabulary and structural partition.
+- `crop.py` — injectable continuous, spatial, and interface crop policies.
 - `conditions.py` — the two frozen plain identity-condition records above.
 - `placement.py` — the frozen placement core (generation-topology identity).

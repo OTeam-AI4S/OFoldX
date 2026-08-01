@@ -6,6 +6,8 @@ from __future__ import annotations
 
 from chanfig import Config
 
+from ...data.tokenization import TOKEN_VOCAB_SIZE
+
 
 class Boltz2InputEmbeddingsConfig(Config):
     r"""
@@ -25,7 +27,7 @@ class Boltz2InputEmbeddingsConfig(Config):
 
     num_atom_encoder_blocks: int = 3
     num_atom_encoder_attention_heads: int = 4
-    vocab_size: int = 33
+    vocab_size: int = TOKEN_VOCAB_SIZE
     num_method_types: int = 12
     num_molecule_types: int = 4
     add_method_conditioning: bool = True
@@ -95,7 +97,7 @@ class Boltz2TemplateConfig(Config):
     hidden_size: int = 64
     num_blocks: int = 2
     num_distogram_bins: int = 38
-    vocab_size: int = 33
+    vocab_size: int = TOKEN_VOCAB_SIZE
     expansion: int = 4
     triangle_attention_hidden_size: int = 32
     num_triangle_attention_heads: int = 4

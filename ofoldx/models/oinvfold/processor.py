@@ -12,6 +12,7 @@ from numpy.typing import NDArray
 from torch import Tensor
 from torch.nn import functional as F
 
+from ...data import Cropper, crop_token_layout, tokenize_molecular_system
 from ...data.molecular import (
     AMINO_ACID_THREE_TO_ONE,
     ENTITY_DNA,
@@ -48,6 +49,45 @@ class OInvFoldPolymerProcessor(Processor):
         config: Polymer modality stored with the paired repository.
         device: Device for produced tensors.
         dtype: Floating-point dtype for produced tensors.
+
+    Examples:
+        Non-contiguous crops retain canonical component indices, filter the
+        design mask, and do not treat residues across a gap as neighbours.
+
+        >>> structure = Structure.from_sequence("ACDEF")
+        >>> system = structure.system
+        >>> atom_component = torch.repeat_interleave(
+        ...     torch.arange(system.component_symbol.numel()),
+        ...     system.component_atom_ptr[1:] - system.component_atom_ptr[:-1],
+        ... )
+        >>> component_offset = torch.tensor([0.0, 4.0, -4.0, 8.0, 12.0])
+        >>> structure = structure.replace(
+        ...     coordinates=(
+        ...         system.reference_coordinates
+        ...         + component_offset[atom_component, None] * torch.tensor([1.0, 0.0, 0.0])
+        ...     ),
+        ...     coordinate_mask=torch.ones(system.atom_symbol.numel(), dtype=torch.bool),
+        ... )
+        >>> complete = OInvFoldPolymerProcessor()(structure)
+        >>> def take_alternating(
+        ...     _structure,
+        ...     _layout,
+        ...     **_kwargs,
+        ... ):
+        ...     return torch.tensor([0, 2, 4])
+        >>> value = OInvFoldPolymerProcessor()(
+        ...     structure,
+        ...     design_positions=(("A", 0), ("A", 1), ("A", 4)),
+        ...     cropper=take_alternating,
+        ... )
+        >>> value.component_index.tolist(), value.design_mask.tolist()
+        ([0, 2, 4], [True, False, True])
+        >>> bool(value.graph.node_features[1:, :3].eq(0).all())
+        True
+        >>> torch.testing.assert_close(
+        ...     value.graph.node_features[:, 19:22],
+        ...     complete.graph.node_features[[0, 2, 4], 19:22],
+        ... )
     """
 
     config_class = OInvFoldPolymerProcessorConfig
@@ -70,6 +110,8 @@ class OInvFoldPolymerProcessor(Processor):
         instance_id: str | None = None,
         design_positions: Sequence[ComponentReference] | None = None,
         filter_by_occupancy: bool = True,
+        cropper: Cropper | None = None,
+        generator: torch.Generator | None = None,
     ) -> OInvFoldPolymerInput:
         r"""
         Lower one complete polymer chain while retaining its design mask.
@@ -81,9 +123,11 @@ class OInvFoldPolymerProcessor(Processor):
             design_positions: Component occurrences whose decoded identities may
                 replace the input. ``None`` selects every complete row.
             filter_by_occupancy: Whether zero-occupancy atoms are unobserved.
+            cropper: Optional structural crop policy applied to complete rows.
+            generator: Random generator forwarded to ``cropper``.
 
         Returns:
-            One full-chain OInvFold input.
+            One OInvFold input aligned to the complete chain or selected crop.
         """
 
         component_axis = self._component_axis(structure, instance_id)
@@ -128,7 +172,7 @@ class OInvFoldPolymerProcessor(Processor):
             )
 
         if len(component_indices) < 2:
-            raise ValueError("OInvFold polymer inference requires at least two complete coordinate rows")
+            raise ValueError("OInvFold polymer graph requires at least two complete coordinate rows")
 
         if design_positions is None:
             selected = set(component_indices)
@@ -137,12 +181,71 @@ class OInvFoldPolymerProcessor(Processor):
             if selected - set(component_indices):
                 raise ValueError("OInvFold design positions must be complete rows of the selected polymer instance")
 
+        component_index = torch.tensor(
+            component_indices,
+            dtype=torch.long,
+            device=self.device,
+        )
+        coordinate_atom_index = torch.tensor(
+            coordinate_atom_indices,
+            dtype=torch.long,
+            device=self.device,
+        )
         coordinate_tensor = torch.stack(coordinates).to(
             dtype=self.dtype,
             device=self.device,
         )
+        direction = _sequence_direction(coordinate_tensor)
+        design_mask = torch.tensor(
+            [component in selected for component in component_indices],
+            dtype=torch.bool,
+            device=self.device,
+        )
+        sequence_token_tensor = (
+            torch.tensor(
+                [token for token in sequence_tokens if token is not None],
+                dtype=torch.long,
+                device=self.device,
+            )
+            if all(token is not None for token in sequence_tokens)
+            else None
+        )
+        if cropper is not None:
+            component_mask = torch.zeros_like(system.component_symbol, dtype=torch.bool)
+            component_mask[component_index.to(component_mask.device)] = True
+            atom_mask = torch.zeros_like(system.atom_symbol, dtype=torch.bool)
+            atom_mask[coordinate_atom_index.flatten().to(atom_mask.device)] = True
+            layout = tokenize_molecular_system(
+                system,
+                atomize_nonstandard_polymers=False,
+                component_mask=component_mask,
+                atom_mask=atom_mask,
+            )
+            cropped = crop_token_layout(
+                structure,
+                layout,
+                cropper,
+                anchor_token_mask=design_mask,
+                generator=generator,
+            )
+            row_by_component = torch.full_like(system.component_symbol, -1, dtype=torch.int64)
+            row_by_component[component_index.to(row_by_component.device)] = torch.arange(
+                component_index.numel(),
+                device=row_by_component.device,
+            )
+            rows = row_by_component[cropped.token_component_index].to(self.device)
+            component_index = component_index[rows]
+            coordinate_atom_index = coordinate_atom_index[rows]
+            coordinate_tensor = coordinate_tensor[rows]
+            design_mask = design_mask[rows]
+            if sequence_token_tensor is not None:
+                sequence_token_tensor = sequence_token_tensor[rows]
+        if component_index.numel() < 2:
+            raise ValueError("OInvFold polymer graph requires at least two selected coordinate rows")
         graph = _lower_polymer_graph(
             coordinate_tensor,
+            position_index=component_index,
+            direction=direction,
             num_neighbors=32,
             node_feature_size=133,
             edge_feature_size=310,
@@ -151,35 +254,15 @@ class OInvFoldPolymerProcessor(Processor):
         return OInvFoldPolymerInput(  # type: ignore[call-arg]
             graph=graph,
             structure=structure,
-            component_index=torch.tensor(
-                component_indices,
-                dtype=torch.long,
-                device=self.device,
-            ),
-            coordinate_atom_index=torch.tensor(
-                coordinate_atom_indices,
-                dtype=torch.long,
-                device=self.device,
-            ),
-            design_mask=torch.tensor(
-                [component_index in selected for component_index in component_indices],
-                dtype=torch.bool,
-                device=self.device,
-            ),
+            component_index=component_index,
+            coordinate_atom_index=coordinate_atom_index,
+            design_mask=design_mask,
             chain_index=torch.zeros(
-                len(component_indices),
+                component_index.numel(),
                 dtype=torch.long,
                 device=self.device,
             ),
-            sequence_tokens=(
-                torch.tensor(
-                    [token for token in sequence_tokens if token is not None],
-                    dtype=torch.long,
-                    device=self.device,
-                )
-                if all(token is not None for token in sequence_tokens)
-                else None
-            ),
+            sequence_tokens=sequence_token_tensor,
             batch_size=[],
         )
 
@@ -395,6 +478,8 @@ def _ligand_local_slots(coordinates: Tensor) -> Tensor:
 def _lower_polymer_graph(
     coordinates: Tensor,
     *,
+    position_index: Tensor,
+    direction: int,
     num_neighbors: int,
     node_feature_size: int,
     edge_feature_size: int,
@@ -402,6 +487,8 @@ def _lower_polymer_graph(
 ) -> OInvFoldGraph:
     graph = _lower_graph(
         coordinates,
+        position_index=position_index,
+        direction=direction,
         num_neighbors=num_neighbors,
         node_feature_size=node_feature_size,
         edge_feature_size=edge_feature_size,
@@ -432,12 +519,16 @@ def _lower_polymer_graph(
 def _lower_graph(
     coordinates: Tensor,
     *,
+    position_index: Tensor | None = None,
+    direction: int | None = None,
     num_neighbors: int,
     node_feature_size: int,
     edge_feature_size: int,
     dtype: torch.dtype,
 ) -> OInvFoldGraph:
     num_nodes = coordinates.shape[0]
+    if position_index is None:
+        position_index = torch.arange(num_nodes, device=coordinates.device)
     centers = coordinates[:, 1]
     distances = torch.cdist(centers, centers)
     distances.fill_diagonal_(torch.inf)
@@ -470,6 +561,8 @@ def _lower_graph(
         edge_rotations,
         edge_translations,
         edge_index,
+        position_index,
+        direction,
     )
     node_features = F.pad(node_features, (0, node_feature_size - node_features.shape[-1]))
     edge_features = F.pad(edge_features, (0, edge_feature_size - edge_features.shape[-1]))
@@ -597,14 +690,17 @@ def _interaction_features(
     edge_rotations: Tensor,
     edge_translations: Tensor,
     edge_index: Tensor,
+    position_index: Tensor,
+    direction: int | None,
 ) -> tuple[Tensor, Tensor]:
     differences = F.pad(
         coordinates.reshape(-1, 3).diff(dim=0),
         (0, 0, 1, 0),
     ).reshape_as(coordinates)
-    first_n, first_c = coordinates[0, 0], coordinates[0, 2]
-    second_n, second_c = coordinates[1, 0], coordinates[1, 2]
-    direction = 1 if (first_n - second_c).norm() > (first_c - second_n).norm() else -1
+    consecutive = position_index[1:] == position_index[:-1] + 1
+    differences[1:, 0] *= consecutive.unsqueeze(-1)
+    if direction is None:
+        direction = _sequence_direction(coordinates)
     local_differences = torch.einsum(
         "nij,naj->nai",
         node_rotations.transpose(-1, -2),
@@ -630,6 +726,7 @@ def _interaction_features(
         edge_index,
         16,
         dtype=coordinates.dtype,
+        position_index=position_index,
     )
     edge_features = torch.cat(
         (
@@ -641,6 +738,12 @@ def _interaction_features(
         dim=-1,
     )
     return node_features, edge_features
+
+
+def _sequence_direction(coordinates: Tensor) -> int:
+    first_n, first_c = coordinates[0, 0], coordinates[0, 2]
+    second_n, second_c = coordinates[1, 0], coordinates[1, 2]
+    return 1 if (first_n - second_c).norm() > (first_c - second_n).norm() else -1
 
 
 def _global_frames(
@@ -693,8 +796,9 @@ def _positional_embeddings(
     num_embeddings: int,
     *,
     dtype: torch.dtype,
+    position_index: Tensor,
 ) -> Tensor:
-    differences = edge_index[0] - edge_index[1]
+    differences = position_index[edge_index[0]] - position_index[edge_index[1]]
     frequencies = torch.exp(
         torch.arange(
             0,

@@ -24,6 +24,7 @@ from ...data.molecular import (
     PolymerSequence,
 )
 from ...data.structure import Structure
+from ...data.tokenization import TOKEN_INDEX, TOKEN_VOCAB_SIZE
 from ...io import read_fasta_records, read_msa
 from ...pipelines import CompositePair, CompositePipeline, PairedPipeline, resolve_generator
 from ...references import classify_reference
@@ -46,10 +47,7 @@ from .processor import (
     is_antibody_sequence,
 )
 
-# 20-dim design amino-acid space, ordered ALA..VAL (residue-type ids 2..21 minus 2), the
-# offset used by the experimental trunk's residue-type features. ``F.pad(design, (2, 11))``
-# lifts it to the 33-class ``residue_type`` space (2 leading pad/gap slots, 11 trailing
-# nucleic slots).
+# 20-dimensional design amino-acid space, ordered ALA..VAL.
 _AA3_ORDER = (
     "ALA",
     "ARG",
@@ -72,6 +70,7 @@ _AA3_ORDER = (
     "TYR",
     "VAL",
 )
+_DESIGN_TOKEN_INDICES = tuple(TOKEN_INDEX[AMINO_ACID_THREE_TO_ONE[component]] for component in _AA3_ORDER)
 _AMINO_ACID_TO_INDEX = {AMINO_ACID_THREE_TO_ONE[three]: index for index, three in enumerate(_AA3_ORDER)}
 _INDEX_TO_AMINO_ACID = {index: AMINO_ACID_THREE_TO_ONE[three] for index, three in enumerate(_AA3_ORDER)}
 _AA_DIMS = 20
@@ -980,14 +979,16 @@ class EsmFold2DesignPipeline(CompositePipeline):
                 for binder_sequence in binder_sequences
             )
             batch = _stack_design_inputs(individual_inputs)
+            binder_probabilities = design.new_zeros(*design.shape[:-1], TOKEN_VOCAB_SIZE)
+            binder_probabilities[..., list(_DESIGN_TOKEN_INDICES)] = design
             residue_type_probabilities = torch.cat(
-                [
+                (
                     F.one_hot(
                         batch.residue_type_ids[:, :target_length].long(),
-                        num_classes=33,
+                        num_classes=TOKEN_VOCAB_SIZE,
                     ).float(),
-                    F.pad(design, (2, 11)),
-                ],
+                    binder_probabilities,
+                ),
                 dim=1,
             )
 
@@ -1198,9 +1199,9 @@ def _experimental_fold_prediction(
     token_atom_index = input.token_atom_index[0].detach().cpu()
     token_axis = tuple(
         (
-            system.component_reference(int(component_index))
-            if int(component_index) >= 0
-            else system.atom_site(int(atom_index))
+            system.atom_site(int(atom_index))
+            if int(atom_index) >= 0
+            else system.component_reference(int(component_index))
         )
         for component_index, atom_index in zip(token_component_index, token_atom_index)
     )

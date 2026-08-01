@@ -707,9 +707,9 @@ def _transform_reference_value(model_key: str, reference_value: _ReferenceValue)
         residue, deletion = reference_value[:, :-2], reference_value[:, -2:]
         return torch.cat([_convert_msa_axis(residue), deletion], dim=1)
     if model_key in _TOKEN_FEATURE_INPUT_KEYS:
-        return _convert_trailing_profile_axis(reference_value, dim=-1)
+        return _convert_token_feature_axis(reference_value, dim=-1)
     if model_key == "coordinate_denoiser.conditioner.single_conditioning_norm.weight":
-        return _convert_trailing_profile_axis(reference_value, dim=0)
+        return _convert_token_feature_axis(reference_value, dim=0)
     if model_key.endswith(".noise_embedding.projection.weight") and reference_value.dim() == 1:
         return reference_value.unsqueeze(-1)
     return reference_value
@@ -743,10 +743,32 @@ _SOURCE_MSA_INDEX = {
 }
 
 
-def _convert_trailing_profile_axis(source: Tensor, *, dim: int) -> Tensor:
+def _convert_token_feature_axis(source: Tensor, *, dim: int) -> Tensor:
     source = source.movedim(dim, -1)
-    prefix, profile, suffix = source[..., :-34], source[..., -34:-2], source[..., -2:]
-    converted = torch.cat([prefix, _convert_msa_axis(profile), suffix], dim=-1)
+    prefix = source[..., :-69]
+    residue = source[..., -69:-34]
+    profile = source[..., -34:-2]
+    suffix = source[..., -2:]
+    canonical_residue = _convert_msa_axis(residue[..., :32])
+    design = torch.stack(
+        (
+            residue[..., 32] - residue[..., _SOURCE_MSA_INDEX["X"]],
+            residue[..., 33] - residue[..., _SOURCE_MSA_INDEX["RNA_N"]],
+            residue[..., 33] - residue[..., _SOURCE_MSA_INDEX["DNA_N"]],
+            residue[..., 34] - residue[..., _SOURCE_MSA_INDEX["OTHER"]],
+        ),
+        dim=-1,
+    )
+    converted = torch.cat(
+        [
+            prefix,
+            canonical_residue,
+            _convert_msa_axis(profile),
+            suffix,
+            design,
+        ],
+        dim=-1,
+    )
     return converted.movedim(-1, dim).contiguous()
 
 

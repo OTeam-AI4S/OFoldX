@@ -18,6 +18,7 @@ from safetensors.torch import load_file
 from torch import Tensor
 
 from ...data.evidence import MSA_ALPHABET, MSA_VOCAB_SIZE
+from ...data.tokenization import TOKEN_ALPHABET, TOKEN_VOCAB_SIZE
 from ...references import classify_reference
 from .config import (
     EsmFold2Config,
@@ -95,7 +96,7 @@ _DTYPES = {
     "float32": torch.float32,
     "bfloat16": torch.bfloat16,
 }
-_BIOHUB_MSA_ALPHABET = (
+_BIOHUB_TOKEN_ALPHABET = (
     "OTHER",
     "-",
     *tuple("ARNDCQEGHILKMFPSTWYV"),
@@ -103,7 +104,7 @@ _BIOHUB_MSA_ALPHABET = (
     *tuple(f"RNA_{symbol}" for symbol in "AGCUN"),
     *tuple(f"DNA_{symbol}" for symbol in "AGCTN"),
 )
-_MSA_VOCAB_EXPANSION = MSA_VOCAB_SIZE - len(_BIOHUB_MSA_ALPHABET)
+_TOKEN_FEATURE_VOCAB_EXPANSION = TOKEN_VOCAB_SIZE + MSA_VOCAB_SIZE - 2 * len(_BIOHUB_TOKEN_ALPHABET)
 
 
 def convert_esmfold2_checkpoint(
@@ -304,19 +305,23 @@ def load_esmfold2_state_dict(checkpoint_path: str | PathLike[str]) -> dict[str, 
 
     _move_final_msa_block(translated)
     _pack_adaptive_norms(translated)
-    return _convert_esmfold2_msa_state_dict(translated)
+    return _convert_esmfold2_vocabulary_state_dict(translated)
 
 
-def _convert_biohub_msa_axis(tensor: Tensor, axis: int) -> Tensor:
+def _convert_biohub_token_axis(
+    tensor: Tensor,
+    axis: int,
+    alphabet: tuple[str, ...],
+) -> Tensor:
     axis %= tensor.ndim
     source = tensor.movedim(axis, 0)
-    if source.shape[0] != len(_BIOHUB_MSA_ALPHABET):
+    if source.shape[0] != len(_BIOHUB_TOKEN_ALPHABET):
         raise RuntimeError(
-            f"Biohub ESMFold2 MSA axis has {source.shape[0]} entries; expected {len(_BIOHUB_MSA_ALPHABET)}"
+            f"Biohub ESMFold2 token axis has {source.shape[0]} entries; " f"expected {len(_BIOHUB_TOKEN_ALPHABET)}"
         )
-    source_by_symbol = {symbol: source[index] for index, symbol in enumerate(_BIOHUB_MSA_ALPHABET)}
+    source_by_symbol = {symbol: source[index] for index, symbol in enumerate(_BIOHUB_TOKEN_ALPHABET)}
     converted: list[Tensor] = []
-    for symbol in MSA_ALPHABET:
+    for symbol in alphabet:
         if symbol in source_by_symbol:
             value = source_by_symbol[symbol]
         elif symbol == "B":
@@ -338,20 +343,30 @@ def _convert_biohub_msa_axis(tensor: Tensor, axis: int) -> Tensor:
 def _convert_token_feature_axis(tensor: Tensor, axis: int) -> Tensor:
     axis %= tensor.ndim
     source = tensor.movedim(axis, 0)
-    source_tail_size = len(_BIOHUB_MSA_ALPHABET) + 1
+    source_vocab_size = len(_BIOHUB_TOKEN_ALPHABET)
+    source_tail_size = 2 * source_vocab_size + 1
     if source.shape[0] < source_tail_size:
         raise RuntimeError(f"Biohub ESMFold2 token-feature axis is too short: {source.shape[0]}")
     prefix = source[:-source_tail_size]
-    msa_profile = source[-source_tail_size:-1]
+    residue_type = source[-source_tail_size : -source_vocab_size - 1]
+    msa_profile = source[-source_vocab_size - 1 : -1]
     deletion_mean = source[-1:]
     return (
-        torch.cat((prefix, _convert_biohub_msa_axis(msa_profile, 0), deletion_mean), dim=0)
+        torch.cat(
+            (
+                prefix,
+                _convert_biohub_token_axis(residue_type, 0, TOKEN_ALPHABET),
+                _convert_biohub_token_axis(msa_profile, 0, MSA_ALPHABET),
+                deletion_mean,
+            ),
+            dim=0,
+        )
         .movedim(0, axis)
         .contiguous()
     )
 
 
-def _convert_esmfold2_msa_state_dict(state_dict: Mapping[str, Tensor]) -> dict[str, Tensor]:
+def _convert_esmfold2_vocabulary_state_dict(state_dict: Mapping[str, Tensor]) -> dict[str, Tensor]:
     converted = dict(state_dict)
     token_weight_keys = (
         "left_pair_projection.weight",
@@ -379,13 +394,20 @@ def _convert_esmfold2_msa_state_dict(state_dict: Mapping[str, Tensor]) -> dict[s
     msa_projection_key = "msa_encoder.msa_projection.weight"
     if msa_projection_key in converted:
         source = converted[msa_projection_key]
-        expected = len(_BIOHUB_MSA_ALPHABET) + 2
+        expected = len(_BIOHUB_TOKEN_ALPHABET) + 2
         if source.ndim != 2 or source.shape[1] != expected:
             raise RuntimeError(
                 f"Biohub ESMFold2 MSA projection has shape {tuple(source.shape)}; expected (*, {expected})"
             )
         converted[msa_projection_key] = torch.cat(
-            (_convert_biohub_msa_axis(source[:, : len(_BIOHUB_MSA_ALPHABET)], 1), source[:, -2:]),
+            (
+                _convert_biohub_token_axis(
+                    source[:, : len(_BIOHUB_TOKEN_ALPHABET)],
+                    1,
+                    MSA_ALPHABET,
+                ),
+                source[:, -2:],
+            ),
             dim=1,
         ).contiguous()
     return converted
@@ -928,7 +950,7 @@ def _translate_biohub_config(raw_config: Mapping[str, Any]) -> dict[str, Any]:
         "language_model_mask_probability": language_model_mask_probability,
         "msa_encoder_overwrite": raw_config["msa_encoder_overwrite"],
         "input_embeddings": {
-            "input_size": inputs["d_inputs"] + _MSA_VOCAB_EXPANSION,
+            "input_size": inputs["d_inputs"] + _TOKEN_FEATURE_VOCAB_EXPANSION,
             "atom_encoder": {
                 "atom_hidden_size": atom_encoder["d_atom"],
                 "token_hidden_size": atom_encoder["d_token"],
@@ -951,7 +973,7 @@ def _translate_biohub_config(raw_config: Mapping[str, Any]) -> dict[str, Any]:
                 "atom_hidden_size": diffusion["c_atom"],
                 "token_hidden_size": diffusion["c_token"],
                 "pair_size": diffusion["c_z"],
-                "input_size": diffusion["c_s_inputs"] + _MSA_VOCAB_EXPANSION,
+                "input_size": diffusion["c_s_inputs"] + _TOKEN_FEATURE_VOCAB_EXPANSION,
                 "fourier_embedding_size": diffusion["fourier_dim"],
                 "num_atom_blocks": diffusion["atom_num_blocks"],
                 "num_atom_attention_heads": diffusion["atom_num_heads"],
@@ -1027,7 +1049,7 @@ def experimental_config_from_biohub(raw_config: Mapping[str, Any]) -> EsmFold2Ex
 
     inputs = raw_config["inputs"]
     atom_encoder = inputs["atom_encoder"]
-    config.input_embeddings.input_size = inputs["d_inputs"] + _MSA_VOCAB_EXPANSION
+    config.input_embeddings.input_size = inputs["d_inputs"] + _TOKEN_FEATURE_VOCAB_EXPANSION
     atom_encoder_config = config.input_embeddings.atom_encoder
     atom_encoder_config.atom_hidden_size = atom_encoder["d_atom"]
     atom_encoder_config.token_hidden_size = atom_encoder["d_token"]
@@ -1059,7 +1081,7 @@ def experimental_config_from_biohub(raw_config: Mapping[str, Any]) -> EsmFold2Ex
     denoiser_config.atom_hidden_size = diffusion["c_atom"]
     denoiser_config.token_hidden_size = diffusion["c_token"]
     denoiser_config.pair_size = diffusion["c_z"]
-    denoiser_config.input_size = diffusion["c_s_inputs"] + _MSA_VOCAB_EXPANSION
+    denoiser_config.input_size = diffusion["c_s_inputs"] + _TOKEN_FEATURE_VOCAB_EXPANSION
     denoiser_config.fourier_embedding_size = diffusion["fourier_dim"]
     denoiser_config.num_atom_blocks = diffusion["atom_num_blocks"]
     denoiser_config.num_atom_attention_heads = diffusion["atom_num_heads"]
