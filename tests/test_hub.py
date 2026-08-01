@@ -35,6 +35,7 @@ from ofoldx.hub import ResolvedRepository, load_model, load_processor, resolve_h
 from ofoldx.models.alphafold3 import AlphaFold3Processor, AlphaFold3ProcessorConfig
 from ofoldx.models.boltz1 import Boltz1Processor
 from ofoldx.models.boltz2 import Boltz2AffinityProcessor, Boltz2Processor
+from ofoldx.models.boltzgen import BoltzGenInverseFoldingProcessor, BoltzGenProcessor
 from ofoldx.models.esmfold2 import EsmFold2ExperimentalProcessor, EsmFold2Processor
 from ofoldx.models.pxdesign import PxDesignProcessor
 from ofoldx.models.registry import MODELS
@@ -125,6 +126,8 @@ class TestLoadProcessor:
         Boltz1Processor,
         Boltz2Processor,
         Boltz2AffinityProcessor,
+        BoltzGenProcessor,
+        BoltzGenInverseFoldingProcessor,
         EsmFold2Processor,
         EsmFold2ExperimentalProcessor,
         PxDesignProcessor,

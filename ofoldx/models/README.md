@@ -15,6 +15,7 @@ checkpoints, inputs and results.
 | [ESMFold2](esmfold2)         | `fold`, `design`  | Molecular input / binder target → structure / sequence | [Hub](https://huggingface.co/oteam/esmfold2)             |
 | [Protenix](protenix)         | `fold`            | Molecular system + evidence → all-atom structure       | [Hub](https://huggingface.co/oteam/protenix)             |
 | [PXDesign](pxdesign)         | `design`          | Target + binder specification → protein designs        | [Hub](https://huggingface.co/oteam/pxdesign)             |
+| [BoltzGen](boltzgen)         | `design`          | Binder specification → ranked molecular designs        | [Hub](https://huggingface.co/oteam/boltzgen)             |
 | [ProteinMPNN](proteinmpnn)   | `design`, `score` | Protein backbone → sequence or sequence NLL            | [Hub](https://huggingface.co/oteam/proteinmpnn)          |
 | [LigandMPNN](ligandmpnn)     | `design`, `score` | Backbone + atomic context → sequence or NLL            | [Hub](https://huggingface.co/oteam/ligandmpnn)           |
 | [MembraneMPNN](membranempnn) | `design`, `score` | Backbone + membrane labels → sequence or NLL           | [Hub](https://huggingface.co/oteam/membranempnn-global)  |
