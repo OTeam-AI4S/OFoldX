@@ -6,7 +6,13 @@ checkpoints, inputs and results.
 
 ## Choose a Model
 
-Model families provide their own task pipelines and checkpoints.
+| Family                     | Tasks  | Input → Output                                       | Weights                                                                             |
+| -------------------------- | ------ | ---------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| [MPNN Packer](mpnn_packer) | `pack` | Protein backbone + sequence → side-chain coordinates | [Hub](https://huggingface.co/oteam/mpnn-packer) · [Convert](mpnn_packer/convert.py) |
+
+The Hub links point to an official repository for each family. Follow the family guide to select
+a variant and its task-specific inputs. Composite workflows package their
+required child models together.
 
 ## Processor Data Preparation
 

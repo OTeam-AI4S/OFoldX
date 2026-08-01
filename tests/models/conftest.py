@@ -39,6 +39,30 @@ def floating_dtype(request: pytest.FixtureRequest) -> torch.dtype:
     return request.param
 
 
+@pytest.fixture
+def mpnn_packer():
+    from ofoldx.models.mpnn_packer import (
+        MpnnPackerConfig,
+        MpnnPackerModel,
+        MpnnPackerPipeline,
+        MpnnPackerProcessor,
+        MpnnPackerProcessorConfig,
+    )
+
+    values = {
+        "hidden_size": 8,
+        "edge_size": 8,
+        "num_encoder_blocks": 1,
+        "num_decoder_blocks": 1,
+        "num_neighbors": 3,
+        "num_context_atoms": 1,
+    }
+    return MpnnPackerPipeline(
+        model=MpnnPackerModel(MpnnPackerConfig(values)).cuda().eval(),
+        processor=MpnnPackerProcessor(MpnnPackerProcessorConfig(num_context_atoms=1), device="cuda"),
+    )
+
+
 _SOURCE_COLUMNS = [TOKEN_INDEX[token] for token in FOLDING_SOURCE_TOKEN_INDEX]
 
 
