@@ -41,7 +41,7 @@ def floating_dtype(request: pytest.FixtureRequest) -> torch.dtype:
 
 @pytest.fixture
 def boltz2_config():
-    from ofoldx.models.boltz2 import Boltz2Config  # a family still to migrate (WU14) must not break collection
+    from ofoldx.models.boltz2 import Boltz2Config  # a family still to migrate must not break collection
 
     def make_config():
         return Boltz2Config(
@@ -100,6 +100,70 @@ def boltz2_config():
                     "num_pae_bins": 4,
                     "num_pde_bins": 4,
                     "pair_dropout": 0,
+                },
+            }
+        )
+
+    return make_config
+
+
+@pytest.fixture
+def esm_config():
+    from ofoldx.models.esmfold2 import EsmFold2Config, EsmFold2ExperimentalConfig
+
+    def make_config(experimental):
+        config_type = EsmFold2ExperimentalConfig if experimental else EsmFold2Config
+        return config_type(
+            {
+                "single_size": 16,
+                "pair_size": 16,
+                "num_recycles": 1,
+                "input_embeddings": {
+                    "input_size": 8 + 2 * len(TOKENS) + 1,
+                    "atom_encoder": {
+                        "atom_hidden_size": 8,
+                        "token_hidden_size": 16,
+                        "num_blocks": 1,
+                        "num_attention_heads": 1,
+                        "sliding_window_size": 8,
+                        "num_spatial_rope_pairs_per_axis": 1,
+                        "num_reference_space_rope_pairs": 1,
+                    },
+                },
+                "esmc": {
+                    "hidden_size": 8,
+                    "num_hidden_layers": 1,
+                    "num_attention_heads": 1,
+                    "intermediate_size": 16,
+                    "max_position_embeddings": 16,
+                },
+                "language_model_encoder": {"enabled": False, "dropout": 0},
+                "language_model_dropout": 0,
+                "force_language_model_dropout": False,
+                "use_msa_features": False,
+                "msa_encoder": {"enabled": False},
+                "folding_stack": {"num_blocks": 1},
+                "parcae": {"num_coda_blocks": 0},
+                "diffusion_structure_head": {
+                    "num_distogram_bins": 4,
+                    "denoiser": {
+                        "atom_hidden_size": 8,
+                        "token_hidden_size": 8,
+                        "pair_size": 16,
+                        "input_size": 8 + 2 * len(TOKENS) + 1,
+                        "fourier_embedding_size": 8,
+                        "num_atom_blocks": 1,
+                        "num_atom_attention_heads": 1,
+                        "num_token_encoder_blocks": 1,
+                        "num_token_encoder_attention_heads": 1,
+                    },
+                },
+                "confidence": {
+                    "num_plddt_bins": 4,
+                    "num_pae_bins": 4,
+                    "num_pde_bins": 4,
+                    "num_distogram_bins": 4,
+                    "folding_stack": {"num_blocks": 1},
                 },
             }
         )

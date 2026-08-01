@@ -12,6 +12,7 @@ checkpoints, inputs and results.
 | [AlphaFold 3](alphafold3)    | `fold`            | Molecular system + evidence → all-atom structure       | [Model card](alphafold3)                                 |
 | [Boltz-1](boltz1)            | `fold`            | Molecular complex → structure + confidence             | [Hub](https://huggingface.co/oteam/boltz1)               |
 | [Boltz-2](boltz2)            | `fold`, `score`   | Molecular complex → structure or affinity              | [Hub](https://huggingface.co/oteam/boltz2)               |
+| [ESMFold2](esmfold2)         | `fold`, `design`  | Molecular input / binder target → structure / sequence | [Hub](https://huggingface.co/oteam/esmfold2)             |
 | [Protenix](protenix)         | `fold`            | Molecular system + evidence → all-atom structure       | [Hub](https://huggingface.co/oteam/protenix)             |
 | [PXDesign](pxdesign)         | `design`          | Target + binder specification → protein designs        | [Hub](https://huggingface.co/oteam/pxdesign)             |
 | [ProteinMPNN](proteinmpnn)   | `design`, `score` | Protein backbone → sequence or sequence NLL            | [Hub](https://huggingface.co/oteam/proteinmpnn)          |
