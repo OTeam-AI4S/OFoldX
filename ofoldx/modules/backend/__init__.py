@@ -7,6 +7,7 @@ from __future__ import annotations
 from .adaptive_norm import adaptive_layer_norm
 from .atom_window import atom_to_token_mean, token_pair_to_atom_window_gather, token_to_atom_broadcast
 from .categorical_msa_projection import categorical_msa_projection
+from .equivariant import Se3Basis, SegmentSoftmaxCsr, SegmentSumCsr, WeightedTensorProduct
 from .factorized_pair_linear import factorized_pair_linear
 from .normalization import LayerNorm, layer_norm
 from .outer_product_mean import outer_product_mean
@@ -19,6 +20,10 @@ from .triangle_multiplication import triangle_multiplication
 __all__ = [
     "Backend",
     "LayerNorm",
+    "Se3Basis",
+    "SegmentSoftmaxCsr",
+    "SegmentSumCsr",
+    "WeightedTensorProduct",
     "adaptive_layer_norm",
     "atom_to_token_mean",
     "categorical_msa_projection",
