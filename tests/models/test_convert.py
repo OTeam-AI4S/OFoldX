@@ -192,3 +192,24 @@ def test_template_projection() -> None:
     reference = torch.autograd.grad((expected * cotangent).sum(), (pair, token))
     for gradient, wanted in zip(gradients, reference, strict=True):
         torch.testing.assert_close(gradient, wanted, atol=1e-12, rtol=1e-12)
+
+
+def test_token_accumulator() -> None:
+    from ofoldx.models.boltz1.convert import convert_boltz1_state_dict
+
+    weight = torch.randn(8, 3, dtype=torch.float64)
+    hidden = torch.randn(2, 5, 3, dtype=torch.float64, requires_grad=True)
+    state = convert_boltz1_state_dict(
+        {"structure_module.out_token_feat_update.transition_block.swish_gate.0.weight": weight}
+    )
+    prefix = "coordinate_diffusion.output_token_feature_update.transition."
+    value = F.linear(hidden, state[prefix + "value_projection.weight"])
+    gate = F.linear(hidden, state[prefix + "gate_projection.weight"])
+    actual = F.silu(gate) * value
+    source_value, source_gate = F.linear(hidden, weight).chunk(2, dim=-1)
+    expected = F.silu(source_gate) * source_value
+    torch.testing.assert_close(actual, expected, atol=1e-13, rtol=1e-13)
+    cotangent = torch.randn_like(actual)
+    gradient = torch.autograd.grad((actual * cotangent).sum(), hidden, retain_graph=True)[0]
+    reference = torch.autograd.grad((expected * cotangent).sum(), hidden)[0]
+    torch.testing.assert_close(gradient, reference, atol=1e-13, rtol=1e-13)
