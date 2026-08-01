@@ -19,6 +19,7 @@ hooks:
 
 nav:
   - Home: index.md
+  - Modules: []
   - About:
       - License: about/license.md
       - License FAQ: about/license-faq.md

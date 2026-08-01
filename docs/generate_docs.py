@@ -31,7 +31,9 @@ ACRONYMS = {
     "tm": "TM",
 }
 
-SECTION_PACKAGES = {}
+SECTION_PACKAGES = {
+    "Modules": ("modules", PACKAGE_ROOT / "modules", "ofoldx.modules"),
+}
 
 PACKAGE_DOC_TARGETS = {
     ROOT / "license.md": "about/license.md",
@@ -40,6 +42,7 @@ PACKAGE_DOC_TARGETS = {
     ROOT / "license-faq.zh.md": "about/license-faq.md",
     ROOT / "privacy.md": "about/privacy.md",
     ROOT / "privacy.zh.md": "about/privacy.md",
+    PACKAGE_ROOT / "modules": "modules/index.md",
 }
 
 ATTRIBUTE_MODULES = {

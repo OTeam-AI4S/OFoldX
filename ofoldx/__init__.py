@@ -31,11 +31,13 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ._version import __version__ as __version__  # noqa: F401
     from ._version import version
+    from .modules.backend import Backend
 
 
 _EXPORTS = {
     "__version__": ("._version", "__version__"),
     "version": ("._version", "version"),
+    "Backend": (".modules.backend", "Backend"),
 }
 
 

@@ -21,8 +21,9 @@ pip install git+https://github.com/OTeam-AI4S/OFoldX
 
 ## 浏览
 
-| 入口 | 用途 |
-| ---- | ---- |
+| 入口                        | 用途                     |
+| --------------------------- | ------------------------ |
+| [`modules`](ofoldx/modules) | 复用神经网络与几何组件。 |
 
 ## 社区
 

@@ -21,8 +21,9 @@ pip install git+https://github.com/OTeam-AI4S/OFoldX
 
 ## Explore
 
-| Entry point | Use it for |
-| ----------- | ---------- |
+| Entry point                 | Use it for                                    |
+| --------------------------- | --------------------------------------------- |
+| [`modules`](ofoldx/modules) | Reuse neural-network and geometry components. |
 
 ## Community
 
