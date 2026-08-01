@@ -23,13 +23,17 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 
 import numpy as np
 import pytest
 
+from ofoldx.chemistry.construction import PolymerSequence, Recipe, build_system
 from ofoldx.data.molecular import EndpointState, MolecularSystem, MonomerType
 from ofoldx.data.structure import CoordinateEvidence, Structure
+from ofoldx.data.tokenization import TOKEN_INDEX, TOKENS
 from ofoldx.errors import ContradictionError, InsufficientInformationError, InvalidRequestError
+from ofoldx.models.alphafold3 import AlphaFold3Processor
 from ofoldx.models.layout import LayoutTable, slot_map, token_layout
 from ofoldx.models.preparation import (
     ConformerSource,
@@ -43,6 +47,8 @@ from ofoldx.models.preparation import (
     missing_reference,
     reference_conformers,
 )
+from ofoldx.models.protenix import ProtenixProcessor
+from ofoldx.msa import MSA, IndexedMsaLoader
 
 PROTEIN = MonomerType.PROTEIN
 TABLE = LayoutTable(
@@ -71,6 +77,76 @@ def rebuilt(structure: Structure, **cells) -> Structure:
     for column, (index, value) in cells.items():
         arrays.columns[column][index] = value
     return Structure.from_arrays(MolecularSystem.from_arrays(arrays), structure.build())
+
+
+class TestMsaPreparation:
+    @pytest.fixture(params=[AlphaFold3Processor, ProtenixProcessor], ids=["af3", "protenix"])
+    def processor(self, request):
+        return request.param()
+
+    @pytest.fixture
+    def structure(self, library, placed):
+        def build(length):
+            system, _, _ = build_system(
+                Recipe(
+                    {
+                        "P": PolymerSequence("polypeptide(L)", ("ALA",) * 5),
+                        "Q": PolymerSequence("polypeptide(L)", ("GLY",) * length),
+                    },
+                    {"A": "P", "B": "Q"},
+                ),
+                library,
+            )
+            return placed(system)
+
+        return build
+
+    @pytest.mark.parametrize(
+        "length,cropped,read",
+        [(2, False, False), (5, True, False), (5, False, True)],
+        ids=["short-chain", "cropped-chain", "fed-chain"],
+    )
+    def test_lazy_pools(self, structure, tmp_path, processor, length, cropped, read):
+        target = structure(length)
+        directory = tmp_path / "active"
+        directory.mkdir()
+        (directory / "pairing.a3m").write_text(">query\nAAAAA\n")
+        (directory / "non_pairing.a3m").write_text(">query\nAAAAA\n>hit\nGAAAA\n")
+        pools = IndexedMsaLoader({"AAAAA": "active", "G" * length: "missing"}, tmp_path)(target)
+        cropper = (lambda structure, layout, **kwargs: layout.token_component < 5) if cropped else None
+        with pytest.raises(FileNotFoundError) if read else nullcontext():
+            prepared = processor.prepare_input(target, msa=pools, cropper=cropper, generator=np.random.default_rng(0))
+            assert prepared.features.msa_tokens[0, 1, 0] == TOKEN_INDEX["G"]
+            profile = prepared.features.token_features[0, 0, 384 + len(TOKENS) : 384 + 2 * len(TOKENS)]
+            assert profile[TOKEN_INDEX["A"]] == profile[TOKEN_INDEX["G"]] == 0.5
+
+    @pytest.mark.parametrize("length,paired", [(2, False), (4, False), (5, True)])
+    def test_pairing_admission(self, structure, processor, length, paired):
+        target = structure(length)
+        pools = {}
+        for name, entity, query, unpaired, paired_row in (
+            ("A", "P", "AAAAA", "DDDDD", "CCCCC"),
+            ("B", "Q", "G" * length, "V" * length, "T" * length),
+        ):
+            counts = np.zeros((2, len(query)), dtype=np.uint32)
+            counts[1, 0] = 3
+            pools[name] = MSA(
+                entity,
+                (query, unpaired),
+                counts,
+                (query, paired_row),
+                counts.copy(),
+                ("query", "UniRef100_A_9606"),
+            )
+        reference = processor.prepare_input(target, msa={"A": pools["A"]}).features
+        actual = processor.prepare_input(target, msa=pools).features
+        rows = ["AAAAA", "CCCCC", "DDDDD"] if paired else ["AAAAA", "DDDDD"]
+        assert actual.msa_tokens[0, :, :5].tolist() == [[TOKEN_INDEX[letter] for letter in row] for row in rows]
+        profile = slice(384 + len(TOKENS), 384 + 2 * len(TOKENS) + 1)
+        assert actual.token_features[0, :5, profile].tolist() == reference.token_features[0, :5, profile].tolist()
+        if not paired:
+            assert actual.msa_tokens.tolist() == reference.msa_tokens.tolist()
+            assert actual.msa_deletion_counts.tolist() == reference.msa_deletion_counts.tolist()
 
 
 class TestRegenerationScope:
