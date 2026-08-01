@@ -1,0 +1,7 @@
+markdown-callouts
+markdown-gfm-admonition
+mkdocs
+mkdocs-material
+mkdocs-section-index
+mkdocstrings[python]
+python-markdown-math
