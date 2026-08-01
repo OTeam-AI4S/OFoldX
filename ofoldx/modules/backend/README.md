@@ -48,4 +48,6 @@ Install the optional OOps dependency with `pip install "ofoldx[oops]"`.
 ## Related Modules
 
 - [Modules](../README.md): shared neural-network mathematics and compilation regions.
+- [Pipelines](../../pipelines/README.md): workflow placement and backend selection.
+- [Models](../../models/README.md): scientific architectures and converted repositories.
 - [OOps](https://github.com/OTeam-AI4S/OOps): the independent optimized operator package.

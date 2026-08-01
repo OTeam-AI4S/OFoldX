@@ -6,6 +6,7 @@ copyright: All rights reserved &copy; 2026-Present, OFoldX Contributors
 docs_dir: docs
 site_dir: build/docs
 exclude_docs: |
+  !/templates/
   /generate_docs.py
   /site/
   /__pycache__/
@@ -19,12 +20,19 @@ hooks:
 
 nav:
   - Home: index.md
+  - Models: []
+  - Pipelines: []
+  - Task API: []
   - Data: []
+  - Chemistry: []
+  - MSA: []
+  - Templates: []
   - I/O: []
   - Modules: []
   - Metrics: []
   - Analysis: []
   - Results: []
+  - API Reference: []
   - About:
       - License: about/license.md
       - License FAQ: about/license-faq.md

@@ -56,3 +56,4 @@ evidence; model processors build their own template features from it.
 - [I/O](../io/README.md): read template structures, choose assemblies, and retain source reports.
 - [MSA](../msa/README.md): sequence alignments and row plans.
 - [Data](../data/README.md): canonical identities and coordinate evidence.
+- [Models](../models/README.md): family-specific template inputs and capacity.

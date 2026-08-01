@@ -57,5 +57,6 @@ For coordinate-generation models, the denoiser can be compiled separately:
 
 ## Related Modules
 
+- [Models](../models/README.md): complete architectures and scientific workflows.
 - [Metrics](../metrics/README.md): independent score formulas and confidence reductions.
 - [Operator Backends](backend/README.md): provider selection and accelerated implementations.

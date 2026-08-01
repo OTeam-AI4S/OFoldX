@@ -25,7 +25,7 @@ Common lifecycle for registered OFoldX models.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from functools import partial
 from typing import TYPE_CHECKING, Any, ClassVar, NotRequired, Protocol, Self, TypeAlias, cast
 
@@ -113,6 +113,21 @@ class Model(nn.Module):
         The default implementation leaves module constructors' initialization
         unchanged. Subclasses may override it for architecture-specific rules.
         """
+
+    def repository_config(self) -> dict[str, Any]:
+        r"""Return the configuration stored in a model repository."""
+
+        return dict(self.config)
+
+    def repository_state_dict(self) -> dict[str, Tensor]:
+        r"""Return parameters owned by this repository, excluding separately referenced models."""
+
+        return self.state_dict()
+
+    def load_repository_state_dict(self, state_dict: Mapping[str, Tensor], *, token: str | None = None) -> None:
+        r"""Strictly restore repository parameters and any explicitly referenced models."""
+
+        self.load_state_dict(state_dict, strict=True, assign=True)
 
     def compilation_region_groups(self) -> CompilationRegionGroups:
         r"""Collect and validate regions declared explicitly by module owners."""

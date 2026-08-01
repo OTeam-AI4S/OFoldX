@@ -71,7 +71,12 @@ urls.repository = "https://github.com/OTeam-AI4S/OFoldX"
 
 [tool.setuptools]
 packages.find.include = [ "ofoldx*" ]
-package-data.ofoldx = [ "reference/space_groups/space_group_operators.json", "py.typed" ]
+package-data.ofoldx = [
+  "reference/space_groups/space_group_operators.json",
+  "licenses/*.md",
+  "models/*/README*.md",
+  "py.typed",
+]
 
 [tool.setuptools_scm]
 write_to = "ofoldx/_version.py"

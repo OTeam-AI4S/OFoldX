@@ -72,14 +72,19 @@ FROZEN_WRITES = (("dataclasses", "replace"), ("copy", "replace"))
 #: fails, so the list only shrinks.
 EXEMPT: dict[str, dict[str, str]] = {
     "L6-no-local-imports": {
+        "ofoldx/artifacts.py": "huggingface_hub and safetensors.torch deferred to save_model",
         "ofoldx/metrics/structure.py": "the torch geometry module (ofoldx.modules.geometry) deferred to the alignment",
         "ofoldx/modules/backend/_apex.py": "optional accelerator backend (apex) imported only when selected",
         "ofoldx/modules/backend/_cueq.py": "optional accelerator backend (cuequivariance) imported only when selected",
         "ofoldx/modules/backend/_deepspeed.py": "optional accelerator backend (deepspeed) imported only when selected",
         "ofoldx/modules/backend/attention.py": "breaks the cycle with modules.attention.multihead, which imports it",
         "ofoldx/modules/backend/knn.py": "sibling modules functional and geometry deferred to the eager reference path",
+        "ofoldx/pipelines/composite.py": "ofoldx.hub (huggingface_hub) deferred to save",
+        "ofoldx/pipelines/paired.py": "ofoldx.hub (huggingface_hub) deferred to save",
     },
-    "L9-typed-failures": {},
+    "L9-typed-failures": {
+        "ofoldx/models/registry.py": "family registration raises ValueError for an empty or duplicate id",
+    },
 }
 
 

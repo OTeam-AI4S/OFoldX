@@ -31,12 +31,23 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ._version import __version__ as __version__  # noqa: F401
     from ._version import version
+    from .api import pack, pipeline, score
+    from .artifacts import save_model
+    from .auto import (
+        AutoModel,
+        AutoPipelineForDesign,
+        AutoPipelineForFold,
+        AutoPipelineForPack,
+        AutoPipelineForScore,
+        AutoProcessor,
+    )
     from .chemistry import PolymerSequence
     from .data import MolecularSystem, Structure
     from .model import Model
     from .models.conditions import Hotspot, SymbolicBond
     from .modules.backend import Backend
     from .msa import MSA
+    from .pipelines import Pipeline
     from .processor import Processor
     from .results import (
         AutoregressiveProbabilityResult,
@@ -61,6 +72,16 @@ if TYPE_CHECKING:
 _EXPORTS = {
     "__version__": ("._version", "__version__"),
     "version": ("._version", "version"),
+    "pack": (".api", "pack"),
+    "pipeline": (".api", "pipeline"),
+    "score": (".api", "score"),
+    "save_model": (".artifacts", "save_model"),
+    "AutoPipelineForFold": (".auto", "AutoPipelineForFold"),
+    "AutoPipelineForDesign": (".auto", "AutoPipelineForDesign"),
+    "AutoPipelineForScore": (".auto", "AutoPipelineForScore"),
+    "AutoPipelineForPack": (".auto", "AutoPipelineForPack"),
+    "AutoModel": (".auto", "AutoModel"),
+    "AutoProcessor": (".auto", "AutoProcessor"),
     "MSA": (".msa", "MSA"),
     "Hotspot": (".models.conditions", "Hotspot"),
     "MolecularSystem": (".data", "MolecularSystem"),
@@ -68,6 +89,7 @@ _EXPORTS = {
     "Structure": (".data", "Structure"),
     "SymbolicBond": (".models.conditions", "SymbolicBond"),
     "Template": (".templates", "Template"),
+    "Pipeline": (".pipelines", "Pipeline"),
     "Model": (".model", "Model"),
     "Backend": (".modules.backend", "Backend"),
     "Processor": (".processor", "Processor"),

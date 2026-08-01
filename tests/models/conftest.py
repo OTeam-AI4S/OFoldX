@@ -28,6 +28,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from ofoldx import AutoModel, AutoProcessor, save_model
 from ofoldx.data.structure import CoordinateEvidence, Structure, replace_coordinates
 from ofoldx.data.tokenization import TOKEN_INDEX, TOKENS
 from ofoldx.models.vocabulary import FOLDING_SOURCE_TOKEN_INDEX
@@ -90,3 +91,22 @@ def placed() -> Callable[..., Structure]:
         return structure
 
     return build
+
+
+@pytest.fixture
+def native_repository_roundtrip():
+    def roundtrip(model, processor, directory):
+        # Synthetic state validates public save and the real meta/assign loader.
+        # Released source weights remain a separate acceptance gate.
+        save_model(directory, model=model, processor=processor)
+        loaded = AutoModel.from_pretrained(directory, device="cpu", dtype=torch.float64, backend="eager")
+        loaded_processor = AutoProcessor.from_pretrained(directory, device="cpu", dtype=torch.float64)
+        assert type(loaded) is type(model)
+        assert type(loaded_processor) is type(processor)
+        expected_state, loaded_state = model.state_dict(), loaded.state_dict()
+        assert expected_state.keys() == loaded_state.keys()
+        for name, expected in expected_state.items():
+            torch.testing.assert_close(loaded_state[name], expected, rtol=0, atol=0)
+        return loaded, loaded_processor
+
+    return roundtrip
