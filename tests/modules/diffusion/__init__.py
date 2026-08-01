@@ -1,0 +1,3 @@
+r"""
+Denoiser module tests.
+"""
