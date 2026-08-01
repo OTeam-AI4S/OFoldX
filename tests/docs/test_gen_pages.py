@@ -121,6 +121,7 @@ class TestModelDocumentation:
             ),
             ("boltzgen", {"BoltzGenPipeline", "diffusion_loss"}),
             ("membranempnn", {"MembraneMpnnPipeline", "ProteinMpnnInput", "ProteinMpnnOutput"}),
+            ("oinvfold", {"OInvFoldPolymerPipeline", "OInvFoldLigandPipeline", "OInvFoldLoss"}),
             ("protenix", {"ProtenixPipeline", "ProtenixTfgGuidance"}),
         ],
     )
