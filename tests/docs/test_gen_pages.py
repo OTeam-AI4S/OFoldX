@@ -120,6 +120,7 @@ class TestModelDocumentation:
                 {"ProteinMpnnModel", "ProteinMpnnProcessor", "ProteinMpnnPipeline", "ProteinMpnnDesignAndPackPipeline"},
             ),
             ("membranempnn", {"MembraneMpnnPipeline", "ProteinMpnnInput", "ProteinMpnnOutput"}),
+            ("protenix", {"ProtenixPipeline", "ProtenixTfgGuidance"}),
         ],
     )
     def test_model_page_documents_user_interfaces(self, family, public_members):

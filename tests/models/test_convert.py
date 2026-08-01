@@ -159,3 +159,36 @@ def test_gate_value_projection_gradients(projection_names: tuple[str, str]) -> N
     torch.testing.assert_close(actual, expected)
     for actual_gradient, expected_gradient in zip(actual_vjp, expected_vjp):
         torch.testing.assert_close(actual_gradient, expected_gradient)
+
+
+def test_template_projection() -> None:
+    from ofoldx.data.tokenization import TOKEN_INDEX, TOKENS
+    from ofoldx.models.protenix.convert import translate_reference_state
+    from ofoldx.models.protenix.model import PROTENIX_SOURCE_TOKENS
+    from ofoldx.modules.embedding import FactorizedPairLinear
+
+    size = len(PROTENIX_SOURCE_TOKENS)
+    weight = torch.randn(7, 44 + 2 * size, dtype=torch.float64)
+    pair = torch.randn(2, 5, 5, 44, dtype=torch.float64, requires_grad=True)
+    token = torch.randn(2, 5, size, dtype=torch.float64, requires_grad=True)
+    owner = nn.Module()
+    owner.template_embedder = nn.Module()
+    owner.template_embedder.template_projection = FactorizedPairLinear(
+        44, len(TOKENS), 7, pair_prefix_size=40, bias=False, backend="eager"
+    ).double()
+    source_key = "template_embedder.linear_no_bias_a.weight"
+    owner.load_state_dict(translate_reference_state(owner, {source_key: weight}, lambda _: source_key), strict=True)
+    rows = torch.tensor([TOKEN_INDEX[t] for t in PROTENIX_SOURCE_TOKENS])
+    canonical = token.new_zeros(2, 5, len(TOKENS)).index_copy(-1, rows, token)
+    actual = owner.template_embedder.template_projection(pair, canonical)
+    packed = torch.cat(
+        [pair[..., :40], token[:, None].expand(-1, 5, -1, -1), token[:, :, None].expand(-1, -1, 5, -1), pair[..., 40:]],
+        dim=-1,
+    )
+    expected = F.linear(packed, weight)
+    torch.testing.assert_close(actual, expected, atol=1e-12, rtol=1e-12)
+    cotangent = torch.randn_like(actual)
+    gradients = torch.autograd.grad((actual * cotangent).sum(), (pair, token), retain_graph=True)
+    reference = torch.autograd.grad((expected * cotangent).sum(), (pair, token))
+    for gradient, wanted in zip(gradients, reference, strict=True):
+        torch.testing.assert_close(gradient, wanted, atol=1e-12, rtol=1e-12)
