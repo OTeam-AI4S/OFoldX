@@ -9,6 +9,7 @@ checkpoints, inputs and results.
 | Family                       | Tasks             | Input → Output                                       | Weights                                                                                      |
 | ---------------------------- | ----------------- | ---------------------------------------------------- | -------------------------------------------------------------------------------------------- |
 | [ProteinMPNN](proteinmpnn)   | `design`, `score` | Protein backbone → sequence or sequence NLL          | [Hub](https://huggingface.co/oteam/proteinmpnn) · [Convert](proteinmpnn/convert.py)          |
+| [LigandMPNN](ligandmpnn)     | `design`, `score` | Backbone + atomic context → sequence or NLL          | [Hub](https://huggingface.co/oteam/ligandmpnn) · [Convert](ligandmpnn/convert.py)            |
 | [MembraneMPNN](membranempnn) | `design`, `score` | Backbone + membrane labels → sequence or NLL         | [Hub](https://huggingface.co/oteam/membranempnn-global) · [Convert](membranempnn/convert.py) |
 | [MPNN Packer](mpnn_packer)   | `pack`            | Protein backbone + sequence → side-chain coordinates | [Hub](https://huggingface.co/oteam/mpnn-packer) · [Convert](mpnn_packer/convert.py)          |
 
