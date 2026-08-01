@@ -19,7 +19,7 @@
 # For additional terms and clarifications, please refer to our License FAQ at:
 # <https://ofoldx.valtech.ai/about/license-faq/>.
 
-"""Gate G1: the dependency rule L1–L9 of design §2.1, read from the source tree.
+"""The dependency rules L1–L9, read from the source tree.
 
 Each rule is one row: a check returning its violations and a counterexample the check must reject. The rules govern
 every module; a package that does not exist yet obeys them trivially.
@@ -66,13 +66,13 @@ TYPED = (
 )
 FROZEN_WRITES = (("dataclasses", "replace"), ("copy", "replace"))
 
-#: Interim exemptions from the design scope of L6 (no function-local import, all of OFoldX) and L9 (typed failures, the
-#: core packages and ``models``), one reason per module, until the maintainer rules on reading 3 of
-#: ``wu0/B-architecture.md``. A module leaves when it is fixed or rewritten; an entry that no longer excuses a violation
-#: fails, so the list only shrinks.
+#: Interim exemptions from the scope of L6 (no function-local import, all of OFoldX) and L9 (typed failures, the core
+#: packages and ``models``), one reason per module. A module leaves when it is fixed or rewritten; an entry that no
+#: longer excuses a violation fails, so the list only shrinks.
 EXEMPT: dict[str, dict[str, str]] = {
     "L6-no-local-imports": {
         "ofoldx/artifacts.py": "huggingface_hub and safetensors.torch deferred to save_model",
+        "ofoldx/models/alphafold2/relax.py": "optional openmm and pdbfixer imported only when relaxing",
         "ofoldx/metrics/structure.py": "the torch geometry module (ofoldx.modules.geometry) deferred to the alignment",
         "ofoldx/modules/backend/_apex.py": "optional accelerator backend (apex) imported only when selected",
         "ofoldx/modules/backend/_cueq.py": "optional accelerator backend (cuequivariance) imported only when selected",
