@@ -52,6 +52,17 @@ from .molecular import (
     replace_components,
     water_component_mask,
 )
+from .structure import (
+    RESOLUTION_KIND_EM_RECONSTRUCTION,
+    RESOLUTION_KIND_PDB_REMARK_2,
+    RESOLUTION_KIND_REFINEMENT,
+    RESOLUTION_KIND_REFLECTIONS,
+    RESOLUTION_KIND_UNKNOWN,
+    STRUCTURE_ARTIFACT_SUFFIX,
+    Structure,
+    load_structure,
+    save_structure,
+)
 
 __all__ = [
     "ATOMIC_NUMBER_BY_ELEMENT",
@@ -89,7 +100,14 @@ __all__ = [
     "PolymerAttachment",
     "PolymerSequence",
     "PolymerType",
+    "RESOLUTION_KIND_EM_RECONSTRUCTION",
+    "RESOLUTION_KIND_PDB_REMARK_2",
+    "RESOLUTION_KIND_REFINEMENT",
+    "RESOLUTION_KIND_REFLECTIONS",
+    "RESOLUTION_KIND_UNKNOWN",
     "STANDARD_AMINO_ACID_IDS",
+    "STRUCTURE_ARTIFACT_SUFFIX",
+    "Structure",
     "SystemBond",
     "component_boundary_atoms",
     "copy_components",
@@ -98,6 +116,8 @@ __all__ = [
     "get_component",
     "instance_subgraph",
     "is_water_component",
+    "load_structure",
     "replace_components",
+    "save_structure",
     "water_component_mask",
 ]
