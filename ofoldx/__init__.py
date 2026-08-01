@@ -33,8 +33,11 @@ if TYPE_CHECKING:
     from ._version import version
     from .chemistry import PolymerSequence
     from .data import MolecularSystem, Structure
+    from .model import Model
+    from .models.conditions import Hotspot, SymbolicBond
     from .modules.backend import Backend
     from .msa import MSA
+    from .processor import Processor
     from .results import (
         AutoregressiveProbabilityResult,
         DesignAndPackResult,
@@ -59,11 +62,15 @@ _EXPORTS = {
     "__version__": ("._version", "__version__"),
     "version": ("._version", "version"),
     "MSA": (".msa", "MSA"),
+    "Hotspot": (".models.conditions", "Hotspot"),
     "MolecularSystem": (".data", "MolecularSystem"),
     "PolymerSequence": (".chemistry", "PolymerSequence"),
     "Structure": (".data", "Structure"),
+    "SymbolicBond": (".models.conditions", "SymbolicBond"),
     "Template": (".templates", "Template"),
+    "Model": (".model", "Model"),
     "Backend": (".modules.backend", "Backend"),
+    "Processor": (".processor", "Processor"),
     "AutoregressiveProbabilityResult": (".results", "AutoregressiveProbabilityResult"),
     "DesignAndPackResult": (".results", "DesignAndPackResult"),
     "DesignCandidate": (".results", "DesignCandidate"),

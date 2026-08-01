@@ -53,3 +53,4 @@ in the Result; include their names, units, scopes, and axes in any JSON, CSV, or
 ## Related Modules
 
 - [I/O](../io/README.md): native structures and format-aware writes.
+- [Metrics](../metrics/README.md): scientific measurements on predictions.
