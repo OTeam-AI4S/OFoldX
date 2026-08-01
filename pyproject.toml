@@ -56,7 +56,7 @@ dependencies = [
   "rdkit",
   "safetensors>=0.2.8",
   "scipy",
-  "tensordict",
+  "tensordict>=0.13",
   "torch",
   "transformers",
   "typing-extensions>=4",
