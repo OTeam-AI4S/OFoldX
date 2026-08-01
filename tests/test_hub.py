@@ -33,6 +33,7 @@ from ofoldx.chemistry import Molecule, Recipe, build_system, read_smiles
 from ofoldx.data import Structure
 from ofoldx.hub import ResolvedRepository, load_model, load_processor, resolve_hub_repository, resolve_repository
 from ofoldx.models.alphafold3 import AlphaFold3Processor, AlphaFold3ProcessorConfig
+from ofoldx.models.boltz1 import Boltz1Processor
 from ofoldx.models.pxdesign import PxDesignProcessor
 from ofoldx.models.registry import MODELS
 
@@ -117,7 +118,7 @@ class TestLoadProcessor:
 
 @pytest.mark.parametrize(
     "processor_class",
-    [AlphaFold3Processor, PxDesignProcessor],
+    [AlphaFold3Processor, Boltz1Processor, PxDesignProcessor],
 )
 def test_reference_seed_configuration_is_independent(processor_class):
     config = processor_class.config_class(seed=7)
