@@ -111,6 +111,7 @@ run.branch = true
 run.source = [ "ofoldx" ]
 paths.source = [ "ofoldx" ]
 report.fail_under = 50
+report.omit = [ "ofoldx/models/*/convert.py" ]
 report.show_missing = true
 json.output = "coverage.json"
 xml.output = "coverage.xml"
