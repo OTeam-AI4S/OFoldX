@@ -1,0 +1,3 @@
+r"""
+Embedding module tests.
+"""
