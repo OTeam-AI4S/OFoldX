@@ -6,7 +6,33 @@ Load and run folding, design, scoring and side-chain packing workflows through
 
 ## Usage
 
-Use `pipeline` to load a registered model repository for a task.
+Set `OFOLDX_CCD_ARTIFACT` to an existing CCD artifact before reading a structure.
+
+Read the protein backbone in `backbone.cif`, load ProteinMPNN and inspect its
+sequence score:
+
+```python
+from ofoldx import pipeline
+from ofoldx.io import read_structure
+
+structure, report = read_structure("backbone.cif")
+scorer = pipeline("score", model="oteam/proteinmpnn")
+result = scorer(structure, seed=7)
+nll = result.scores["designed_sequence_nll"]
+print(nll.value, nll.unit)
+```
+
+Keep `scorer` to evaluate more structures with the same model. For one call,
+`score` reads the file, loads the workflow and returns its result:
+
+```python
+from ofoldx import score
+
+result = score("backbone.cif", model="oteam/proteinmpnn", seed=7)
+print(result.scores["designed_sequence_nll"].value)
+```
+
+Model files are downloaded and cached on first use.
 
 ## Tasks and Inputs
 
@@ -18,7 +44,8 @@ Use `pipeline` to load a registered model repository for a task.
 | `pack`   | Generate side-chain coordinates           | A structure and selected packing positions |
 
 The repository and task select a concrete pipeline. Each family guide explains
-its inputs, controls and result type. Call the loaded pipeline with the arguments for its task.
+its inputs, controls and result type. For options such as ProteinMPNN's number
+of decoding orders, call the loaded pipeline with those arguments.
 
 ## Reading Structures
 

@@ -5,14 +5,27 @@ paths, and publish repository files on the Hugging Face Hub.
 
 ## Usage
 
-Resolve an existing local repository:
+Set `OFOLDX_CCD_ARTIFACT` to an existing CCD artifact before reading a structure.
+
+Resolve the official ProteinMPNN repository, then use its local snapshot to score
+the protein backbone in `backbone.cif`:
 
 ```python
+from ofoldx import pipeline
 from ofoldx.hub import resolve_repository
+from ofoldx.io import read_structure
 
-repository = resolve_repository("./model")
-print(repository.path)
+repository = resolve_repository("oteam/proteinmpnn")
+structure, report = read_structure("backbone.cif")
+scorer = pipeline("score", model=repository.path)
+result = scorer(structure, seed=7)
+print(repository.commit)
+print(result.scores["designed_sequence_nll"].value)
 ```
+
+The returned `ResolvedRepository` contains the local path and the Hub commit.
+Keep the commit with your run configuration to identify the snapshot you used.
+For a local directory, the result contains that path and `commit=None`.
 
 ## Select a Snapshot
 
@@ -43,7 +56,7 @@ namespace:
 ```python
 from ofoldx.hub import upload_repository
 
-commit = upload_repository("./model", "YOUR_NAMESPACE/model")
+commit = upload_repository("./models/proteinmpnn", "YOUR_NAMESPACE/proteinmpnn")
 print(commit.oid)
 ```
 

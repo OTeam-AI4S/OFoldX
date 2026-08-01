@@ -33,6 +33,13 @@ from ofoldx.models.registry import MODELS
 
 
 class TestAutoModel:
+    def test_constructs_registered_builtin_from_config(self) -> None:
+        from ofoldx.models.proteinmpnn import ProteinMpnnConfig, ProteinMpnnModel
+
+        model = AutoModel(ProteinMpnnConfig())
+        assert isinstance(model, ProteinMpnnModel)
+        assert model.training
+
     def test_custom_model_reuses_config_without_changing_default(
         self, tmp_path: Path, repository_model, repository_processor
     ) -> None:
