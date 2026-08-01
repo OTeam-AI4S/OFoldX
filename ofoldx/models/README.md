@@ -6,19 +6,20 @@ checkpoints, inputs and results.
 
 ## Choose a Model
 
-| Family                       | Tasks             | Input → Output                                       | Weights                                                                                      |
-| ---------------------------- | ----------------- | ---------------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| [AlphaFold 2](alphafold2)    | `fold`            | Protein system + MSA/templates → structure           | [Hub](https://huggingface.co/oteam/alphafold2) · [Convert](alphafold2/convert.py)            |
-| [AlphaFold 3](alphafold3)    | `fold`            | Molecular system + evidence → all-atom structure     | [Convert](alphafold3/convert.py)                                                             |
-| [Boltz-1](boltz1)            | `fold`            | Molecular complex → structure + confidence           | [Hub](https://huggingface.co/oteam/boltz1) · [Convert](boltz1/convert.py)                    |
-| [Boltz-2](boltz2)            | `fold`, `score`   | Molecular complex → structure or affinity            | [Hub](https://huggingface.co/oteam/boltz2) · [Convert](boltz2/convert.py)                    |
-| [Protenix](protenix)         | `fold`            | Molecular system + evidence → all-atom structure     | [Hub](https://huggingface.co/oteam/protenix) · [Convert](protenix/convert.py)                |
-| [PXDesign](pxdesign)         | `design`          | Target + binder specification → protein designs      | [Hub](https://huggingface.co/oteam/pxdesign) · [Convert](pxdesign/convert.py)                |
-| [ProteinMPNN](proteinmpnn)   | `design`, `score` | Protein backbone → sequence or sequence NLL          | [Hub](https://huggingface.co/oteam/proteinmpnn) · [Convert](proteinmpnn/convert.py)          |
-| [LigandMPNN](ligandmpnn)     | `design`, `score` | Backbone + atomic context → sequence or NLL          | [Hub](https://huggingface.co/oteam/ligandmpnn) · [Convert](ligandmpnn/convert.py)            |
-| [MembraneMPNN](membranempnn) | `design`, `score` | Backbone + membrane labels → sequence or NLL         | [Hub](https://huggingface.co/oteam/membranempnn-global) · [Convert](membranempnn/convert.py) |
-| [NA-MPNN](nampnn)            | `design`, `score` | Protein/DNA/RNA backbone → sequence or NLL           | [Hub](https://huggingface.co/oteam/nampnn) · [Convert](nampnn/convert.py)                    |
-| [MPNN Packer](mpnn_packer)   | `pack`            | Protein backbone + sequence → side-chain coordinates | [Hub](https://huggingface.co/oteam/mpnn-packer) · [Convert](mpnn_packer/convert.py)          |
+| Family                       | Tasks             | Input → Output                                         | Weights                                                                                      |
+| ---------------------------- | ----------------- | ------------------------------------------------------ | -------------------------------------------------------------------------------------------- |
+| [AlphaFold 2](alphafold2)    | `fold`            | Protein system + MSA/templates → structure             | [Hub](https://huggingface.co/oteam/alphafold2) · [Convert](alphafold2/convert.py)            |
+| [AlphaFold 3](alphafold3)    | `fold`            | Molecular system + evidence → all-atom structure       | [Convert](alphafold3/convert.py)                                                             |
+| [Boltz-1](boltz1)            | `fold`            | Molecular complex → structure + confidence             | [Hub](https://huggingface.co/oteam/boltz1) · [Convert](boltz1/convert.py)                    |
+| [Boltz-2](boltz2)            | `fold`, `score`   | Molecular complex → structure or affinity              | [Hub](https://huggingface.co/oteam/boltz2) · [Convert](boltz2/convert.py)                    |
+| [ESMFold2](esmfold2)         | `fold`, `design`  | Molecular input / binder target → structure / sequence | [Hub](https://huggingface.co/oteam/esmfold2) · [Convert](esmfold2/convert.py)                |
+| [Protenix](protenix)         | `fold`            | Molecular system + evidence → all-atom structure       | [Hub](https://huggingface.co/oteam/protenix) · [Convert](protenix/convert.py)                |
+| [PXDesign](pxdesign)         | `design`          | Target + binder specification → protein designs        | [Hub](https://huggingface.co/oteam/pxdesign) · [Convert](pxdesign/convert.py)                |
+| [ProteinMPNN](proteinmpnn)   | `design`, `score` | Protein backbone → sequence or sequence NLL            | [Hub](https://huggingface.co/oteam/proteinmpnn) · [Convert](proteinmpnn/convert.py)          |
+| [LigandMPNN](ligandmpnn)     | `design`, `score` | Backbone + atomic context → sequence or NLL            | [Hub](https://huggingface.co/oteam/ligandmpnn) · [Convert](ligandmpnn/convert.py)            |
+| [MembraneMPNN](membranempnn) | `design`, `score` | Backbone + membrane labels → sequence or NLL           | [Hub](https://huggingface.co/oteam/membranempnn-global) · [Convert](membranempnn/convert.py) |
+| [NA-MPNN](nampnn)            | `design`, `score` | Protein/DNA/RNA backbone → sequence or NLL             | [Hub](https://huggingface.co/oteam/nampnn) · [Convert](nampnn/convert.py)                    |
+| [MPNN Packer](mpnn_packer)   | `pack`            | Protein backbone + sequence → side-chain coordinates   | [Hub](https://huggingface.co/oteam/mpnn-packer) · [Convert](mpnn_packer/convert.py)          |
 
 The Hub links point to an official repository for each family. AlphaFold 3 and
 Protenix-v2 use locally converted parameters. Follow the family guide to select
