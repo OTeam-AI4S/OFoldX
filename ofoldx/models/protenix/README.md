@@ -169,6 +169,29 @@ distogram, and all four confidence logits. `model.denoise(...)` retains the
 explicit noisy-coordinate operation, while `model.sample(...)` exposes raw
 reverse-diffusion output and `model.fold(...)` decodes it.
 
+The built-in Runner accepts training crop controls directly under the split.
+Spatial modes require cluster sampling because the sampled chain/interface row
+provides the exact canonical instance IDs eligible as crop centres:
+
+```yaml
+model:
+  name: protenix
+data:
+  train:
+    source: /path/to/asymmetric-unit-cifs
+    max_tokens: 384
+    # continuous, spatial, interface-spatial
+    crop_method_weights: [0.2, 0.4, 0.4]
+    cluster_sampling:
+      enabled: true
+      cluster_file: /path/to/rcsb_entity_clusters.txt
+```
+
+Cropping runs only when tokenization exceeds `max_tokens`. Use
+`crop_method_weights: [1.0, 0.0, 0.0]` for continuous-only cropping without
+cluster-row metadata. The cropped `ProtenixInput.atom_index` remains a canonical
+gather mapping into the complete, uncropped `ProtenixStructureTarget`.
+
 OFoldX reproduces the complete released Model graph, not Protenix's complete
 four-stage training program. Dataset policy, objectives, stage weights,
 condition-dropout curriculum, optimizer, and training runner remain the

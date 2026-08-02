@@ -1,17 +1,20 @@
 r"""
-Resolve chemical components from the Hub-hosted CCD dataset.
+Resolve chemical components from a Hub-hosted or local CCD dataset.
 
-The dataset stores one component per Parquet row. ``revision`` pins the wwPDB
-snapshot used for resolution.
+The dataset stores one component per Parquet row. A Hub ``revision`` or a local
+``snapshot_path`` pins the wwPDB snapshot used for resolution.
 """
 
 from __future__ import annotations
 
+from functools import cache
 from pathlib import Path
 
 from ..components import component_from_rows
+from ..elements import ATOMIC_NUMBER_BY_ELEMENT
 from ..molecular import (
     ChemicalComponent,
+    HYDROGEN_ELEMENTS,
     PolymerAttachment,
 )
 
@@ -21,34 +24,78 @@ CCD_DATASET_REPOSITORY = "ofoldx/ccd"
 _POLYMER_CHEM_TYPES = frozenset({"protein", "rna", "dna", "dna_rna_hybrid"})
 
 
-def resolve_ccd_component(component_id: str, *, revision: str) -> ChemicalComponent:
+def resolve_ccd_component(
+    component_id: str,
+    *,
+    revision: str | None = None,
+    snapshot_path: str | None = None,
+) -> ChemicalComponent:
     r"""
     Load one wwPDB Chemical Component Dictionary entry.
 
     Args:
         component_id: Exact CCD component code.
         revision: Hub dataset revision containing the desired CCD snapshot.
+        snapshot_path: Existing local directory containing resolver-schema
+            Parquet shards. Local resolution performs no Hub access.
 
     Returns:
         The resolved chemical component.
 
     Raises:
-        KeyError: If the component does not exist at ``revision``.
+        KeyError: If the component does not exist in the selected snapshot.
+        FileNotFoundError: If ``snapshot_path`` is not an existing directory.
         TypeError: If the stored row has an invalid type.
-        ValueError: If the stored row is internally inconsistent.
+        ValueError: If exactly one locator is not supplied, the local directory
+            has no Parquet shards, or a stored row is internally inconsistent.
     """
 
-    snapshot = _resolve_ccd_snapshot(revision=revision)
+    if (revision is None) == (snapshot_path is None):
+        raise ValueError("exactly one of revision or snapshot_path is required")
+    if revision is not None:
+        return _resolve_cached(component_id, revision, None)
+
+    assert snapshot_path is not None
+    canonical = validate_ccd_snapshot_path(snapshot_path)
+    return _resolve_cached(component_id, None, str(canonical))
+
+
+def validate_ccd_snapshot_path(snapshot_path: str) -> Path:
+    r"""Return the canonical path of a readable local resolver snapshot."""
+
+    path = Path(snapshot_path).expanduser()
+    try:
+        canonical = path.resolve(strict=True)
+    except FileNotFoundError:
+        raise FileNotFoundError(f"CCD snapshot_path does not exist: {path}") from None
+    if not canonical.is_dir():
+        raise FileNotFoundError(f"CCD snapshot_path is not a directory: {canonical}")
+    if not any(canonical.glob("*.parquet")):
+        raise ValueError(f"CCD snapshot_path contains no Parquet shards: {canonical}")
+    return canonical
+
+
+@cache
+def _resolve_cached(
+    component_id: str,
+    revision: str | None,
+    snapshot_path: str | None,
+) -> ChemicalComponent:
+    snapshot = Path(snapshot_path) if snapshot_path is not None else _resolve_ccd_snapshot(revision=revision)
     row = _read_component_row(snapshot, component_id)
     if row is None:
         raise KeyError(component_id)
     return _lower_row(row)
 
 
-def _resolve_ccd_snapshot(*, revision: str) -> Path:
+@cache
+def _resolve_ccd_snapshot(*, revision: str | None) -> Path:
     r"""
     Download the pinned CCD dataset's Parquet shards.
     """
+
+    if revision is None:
+        raise ValueError("revision is required for Hub CCD resolution")
 
     from huggingface_hub import snapshot_download
 
@@ -87,7 +134,7 @@ def _lower_row(row: dict[str, object]) -> ChemicalComponent:
 
     component_id = _require_str(row, "component_id")
     atom_ids = _require_str_list(row, "atom_ids")
-    elements = _require_str_list(row, "elements")
+    elements = [_canonical_element(value) for value in _require_str_list(row, "elements")]
     formal_charges = _require_optional_int_list(row, "formal_charges")
     aromatic = _require_optional_bool_list(row, "aromatic")
     stereo = _require_optional_str_list(row, "stereo")
@@ -211,6 +258,13 @@ def _as_str(value: object) -> str:
     if not isinstance(value, str):
         raise TypeError(f"expected a string, got {type(value).__name__}")
     return value
+
+
+def _canonical_element(value: str) -> str:
+    canonical = value[:1].upper() + value[1:].lower()
+    if canonical not in ATOMIC_NUMBER_BY_ELEMENT and canonical not in HYDROGEN_ELEMENTS:
+        raise ValueError(f"CCD row contains invalid element {value!r}")
+    return canonical
 
 
 def _optional_str(value: object) -> str | None:

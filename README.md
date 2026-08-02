@@ -16,6 +16,12 @@ config-consistent Processor, and applies the exact built-in objective and batchi
 behavior owned by the Runner. Training support is not a model-registration
 requirement.
 
+The canonical training CLI is `python -m ofoldx.runners.train`; `scripts/train.py`
+remains a compatibility wrapper. Fresh Processors accept `--ccd-revision` or the
+mutually exclusive `--ccd-snapshot-path`. These are distinct from `--revision`,
+which selects a pretrained model repository revision. `--print-config` exits without
+constructing a Runner, model, or dataset and without starting training.
+
 ## Get Started
 
 Install OFoldX:
@@ -30,6 +36,43 @@ For development, install from source:
 git clone https://github.com/OTeam-AI4S/OFoldX
 cd OFoldX
 pip install -e .
+```
+
+### CUDA Docker
+
+The CUDA image uses Python 3.12, PyTorch 2.12.1, and the official CUDA 13.2
+PyTorch wheels. Build it from the repository root:
+
+```bash
+docker build -t ofoldx:cuda .
+```
+
+The host must have an NVIDIA driver and NVIDIA Container Toolkit installed.
+Verify that the container can see a GPU:
+
+```bash
+docker run --rm --gpus all ofoldx:cuda \
+  python -c "import torch; assert torch.cuda.is_available(); print(torch.__version__, torch.version.cuda, torch.cuda.get_device_name())"
+```
+
+For training, mount the working tree and datasets. `--ipc=host` avoids a small
+default shared-memory limit when PyTorch data loaders are used:
+
+```bash
+docker run --rm --gpus all --ipc=host \
+  -v "$(pwd):/workspace/OFoldX" \
+  -v /path/to/datasets:/data:ro \
+  ofoldx:cuda \
+  python -m ofoldx.runners.train /data/cifs --device cuda --steps 1
+```
+
+The PyTorch and CUDA wheel versions can be overridden at build time, provided
+they are a supported pair:
+
+```bash
+docker build -t ofoldx:cuda \
+  --build-arg TORCH_VERSION=2.12.1 \
+  --build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu132 .
 ```
 
 Design operations have family-specific scientific controls. Load the concrete

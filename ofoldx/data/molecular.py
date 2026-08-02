@@ -9,9 +9,9 @@ from dataclasses import dataclass
 from typing import Any, Literal, TypeAlias, TypeVar
 
 import torch
-from tensordict import tensorclass
 from torch import Tensor
 
+from ._tensorclass import frozen_tensorclass
 from .elements import ATOMIC_NUMBER_BY_ELEMENT
 
 #: Supported polymer chemistries.
@@ -712,7 +712,7 @@ def _merge_bond(first: _BondRecord, second: _BondRecord) -> _BondRecord:
     )
 
 
-@tensorclass(frozen=True)
+@frozen_tensorclass
 class MolecularSystem:
     r"""
     Tensor-native molecular topology over entity, instance, component, atom, and bond axes.

@@ -37,6 +37,50 @@ class ModelConfig(chanfig.Config):
         super().__init__(*args, **kwargs)
 
 
+class ClusterSamplingConfig(chanfig.Config):
+    r"""Protenix-style cluster-weighted sampling for a training CIF split.
+
+    Example:
+        ``{"data": {"train": {"source": "train.jsonl", "cluster_sampling":``
+        ``{"enabled": True, "cluster_file": "clusters.txt", "epoch_size": 10000}}}}``
+
+    This asymmetric-unit-only mode caches weighted index rows and scans all CIFs
+    only when the cache is absent or invalid. Rows map back to full CIF
+    records/structures and carry chain/interface metadata that can produce
+    distinct Protenix crops. Default structure ingestion removes hydrogens and
+    water; configured ion handling and ``exclude_mol_types`` change sampling
+    rows only. ``epoch_size`` is the global draw count and DDP pads it upward
+    so every rank receives
+    ``ceil(epoch_size / world_size)`` rows.
+    """
+
+    enabled: bool = False
+    cluster_file: str | None = None
+    indices_file: str | None = None
+    epoch_size: int | None = None
+    replacement: bool = True
+    contact_cutoff: float = 5.0
+    include_all_chain_pairs: bool = False
+    exclude_mol_types: list[str]
+    seed: int | None = None
+    beta: chanfig.Config
+    alpha: chanfig.Config
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.enabled = False
+        self.cluster_file = None
+        self.indices_file = None
+        self.epoch_size = None
+        self.replacement = True
+        self.contact_cutoff = 5.0
+        self.include_all_chain_pairs = False
+        self.exclude_mol_types = ["ions"]
+        self.seed = None
+        self.beta = chanfig.Config({"chain": 0.5, "interface": 1.0})
+        self.alpha = chanfig.Config({"prot": 3.0, "nuc": 3.0, "ligand": 1.0})
+        super().__init__(*args, **kwargs)
+
+
 class DatasetConfig(chanfig.Config):
     r"""
     Configure one structure-dataset split.
@@ -45,13 +89,25 @@ class DatasetConfig(chanfig.Config):
 
     Attributes:
         source: Directory, glob, manifest, structure file, or ``None``.
+        seq_to_pdb_index: Optional JSON mapping from exact protein sequences to
+            indexed MSA directory names.
+        msa_path: Optional root directory for indexed MSAs. Must be configured
+            together with ``seq_to_pdb_index``.
     """
 
     source: str | None = None
+    seq_to_pdb_index: str | None = None
+    msa_path: str | None = None
+    cluster_sampling: ClusterSamplingConfig
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self.source = None
+        self.seq_to_pdb_index = None
+        self.msa_path = None
+        self.cluster_sampling = ClusterSamplingConfig()
         super().__init__(*args, **kwargs)
+        if not isinstance(self.cluster_sampling, ClusterSamplingConfig):
+            self.cluster_sampling = ClusterSamplingConfig(self.cluster_sampling)
 
 
 class DataConfig(chanfig.Config):
@@ -84,12 +140,16 @@ class RunnerConfig(dl.RunnerConfig):
         processor: Processor-config overrides that are not model settings
             (e.g. NA-MPNN ``shared_nucleic_tokens``).
         data: Dataset configuration keyed by split name.
+        gradient_checkpointing: Enable model-native activation checkpointing
+            during training. This is independent of training-state checkpoint
+            persistence.
     """
 
     model: ModelConfig
     processor: chanfig.Config
     data: DataConfig
     ddp: DdpConfig = DdpConfig()
+    gradient_checkpointing: bool = False
 
     def __post_init__(self, *args: Any, **kwargs: Any) -> None:
         super().__post_init__(*args, **kwargs)

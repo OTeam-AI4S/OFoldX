@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import pickle
+from dataclasses import FrozenInstanceError
+
 import pytest
 import torch
 
@@ -108,6 +111,40 @@ class TestConstructionValues:
 
 
 class TestMolecularSystem:
+    def test_pickle_round_trip_preserves_fields_and_frozen_state(self) -> None:
+        system = MolecularSystem.from_entities(
+            {
+                "ligand": Molecule(
+                    (
+                        ChemicalComponent(
+                            "LIG",
+                            (ChemicalAtom("C1", "C"), ChemicalAtom("O1", "O")),
+                            frozenset({ChemicalBond("C1", "O1")}),
+                        ),
+                    )
+                )
+            },
+            {"A": "ligand"},
+        )
+
+        restored = pickle.loads(pickle.dumps(system))
+
+        assert restored.symbols == system.symbols
+        assert system.is_locked
+        assert restored.is_locked
+        assert restored.batch_size == system.batch_size
+        assert restored.device == system.device
+        assert restored.names == system.names
+        for field in system.fields():
+            original_value = getattr(system, field.name)
+            restored_value = getattr(restored, field.name)
+            if isinstance(original_value, torch.Tensor):
+                assert torch.equal(restored_value, original_value)
+        with pytest.raises(FrozenInstanceError):
+            restored.symbols = ()  # type: ignore[misc]
+        with pytest.raises(RuntimeError, match="locked"):
+            restored.set("atomic_number", restored.atomic_number.clone())
+
     def test_materialization_exposes_one_canonical_tensor_graph(self) -> None:
         protein = PolymerSequence(
             "protein",

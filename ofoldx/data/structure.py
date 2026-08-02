@@ -7,13 +7,13 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 import torch
-from tensordict import tensorclass
 from torch import Tensor
 
+from ._tensorclass import frozen_tensorclass
 from .molecular import MolecularSystem
 
 
-@tensorclass(frozen=True)
+@frozen_tensorclass
 class Structure:
     r"""
     One coordinate realization of one or more ragged molecular systems.

@@ -6,12 +6,16 @@ from __future__ import annotations
 
 import glob
 import json
+import operator
 import os
 from collections.abc import Mapping
+from functools import cache
 from pathlib import Path
 from typing import Any
 
 from torch.utils.data import Dataset
+
+from ..processor import UnresolvedTrainingCropError
 
 _STRUCTURE_SUFFIXES: frozenset[str] = frozenset({".pdb", ".cif", ".mmcif"})
 _GLOB_MAGIC: tuple[str, ...] = ("*", "?", "[")
@@ -26,6 +30,9 @@ class StructureDataset(Dataset):
             dataset.
         processor: Callable that converts one structure into the value consumed by
             the model strategy.
+        seq_to_pdb_index: Optional JSON sequence-to-directory mapping for indexed
+            per-structure MSA loading.
+        msa_path: Optional root directory for indexed MSAs.
         processor_kwargs: Arguments forwarded to every processor call.
     """
 
@@ -34,10 +41,31 @@ class StructureDataset(Dataset):
         source: Any,
         processor: Any,
         *,
+        seq_to_pdb_index: str | os.PathLike[str] | None = None,
+        msa_path: str | os.PathLike[str] | None = None,
         processor_kwargs: Mapping[str, Any] | None = None,
+        ccd_revision: str | None = None,
+        ccd_snapshot_path: str | os.PathLike[str] | None = None,
     ) -> None:
+        if (seq_to_pdb_index is None) != (msa_path is None):
+            raise ValueError("seq_to_pdb_index and msa_path must be provided together")
         self.processor = processor
         self.processor_kwargs = dict(processor_kwargs or {})
+        if ccd_revision is not None and ccd_snapshot_path is not None:
+            raise ValueError("configure at most one of ccd_revision or ccd_snapshot_path")
+        self.ccd_revision = ccd_revision
+        self.ccd_snapshot_path = None if ccd_snapshot_path is None else os.fspath(ccd_snapshot_path)
+        self.seq_to_pdb_index: Mapping[str, object] | None = None
+        self.msa_path: Path | None = None
+        if seq_to_pdb_index is not None and msa_path is not None:
+            index_path = Path(seq_to_pdb_index).expanduser()
+            if not index_path.is_file():
+                raise FileNotFoundError(f"sequence-to-PDB index is not a file: {index_path}")
+            resolved_msa_path = Path(msa_path).expanduser()
+            if not resolved_msa_path.is_dir():
+                raise FileNotFoundError(f"MSA path is not a directory: {resolved_msa_path}")
+            self.seq_to_pdb_index = _load_seq_to_pdb_index(index_path.resolve())
+            self.msa_path = resolved_msa_path.resolve()
         # Records stay as paths and ordinary mappings; generic I/O reads their
         # canonical structure/evidence values per access.
         self.records: list[str | dict[str, Any]] = _resolve_records(source)
@@ -46,16 +74,47 @@ class StructureDataset(Dataset):
         return len(self.records)
 
     def __getitem__(self, index: int) -> Any:
-        from ..data import MSA, MSACollection, decode_msa_collection
+        length = len(self)
+        logical_index = operator.index(index)
+        if logical_index < 0:
+            logical_index += length
+        if logical_index < 0 or logical_index >= length:
+            raise IndexError("dataset index out of range")
+
+        last_error: UnresolvedTrainingCropError | None = None
+        for attempt in range(length):
+            candidate = (logical_index + attempt) % length
+            try:
+                return self._process_logical_index(candidate)
+            except UnresolvedTrainingCropError as error:
+                last_error = error
+        raise UnresolvedTrainingCropError(
+            f"no resolved training crop found after {length} attempts starting at logical index {logical_index}"
+        ) from last_error
+
+    def _process_logical_index(self, index: int) -> Any:
+        r"""Process the record represented by one normalized logical index."""
+
+        return self._process_record(index)
+
+    def _process_record(self, index: int, **extra_processor_kwargs: Any) -> Any:
+        from ..data import ENTITY_PROTEIN, MSA, MSACollection, decode_msa_collection
         from ..io import read_msa, read_structure
 
         record = self.records[index]
         msa: MSA | MSACollection | None
         if isinstance(record, str):
             structure_path = record
-            msa = None
         else:
             structure_path = record["structure"]
+        structure = read_structure(
+            structure_path,
+            ccd_revision=self.ccd_revision,
+            ccd_snapshot_path=self.ccd_snapshot_path,
+        )
+        if isinstance(record, str):
+            msa = None
+        else:
             if "msa" in record:
                 msa_spec = record["msa"]
                 msa = read_msa(msa_spec["path"], entity_id=msa_spec["entity_id"])
@@ -64,10 +123,116 @@ class StructureDataset(Dataset):
                 msa = decode_msa_collection(payload)
             else:
                 msa = None
-        structure = read_structure(structure_path)
+        if msa is None and self.seq_to_pdb_index is not None and self.msa_path is not None:
+            has_protein = any(int(entity_type) == ENTITY_PROTEIN for entity_type in structure.system.entity_type)
+            if has_protein:
+                msa = read_msa(structure, self.seq_to_pdb_index, self.msa_path)
+        processor_kwargs = {**self.processor_kwargs, **extra_processor_kwargs}
         if msa is not None:
-            return self.processor(structure, msa=msa, **self.processor_kwargs)
-        return self.processor(structure, **self.processor_kwargs)
+            return self.processor(structure, msa=msa, **processor_kwargs)
+        return self.processor(structure, **processor_kwargs)
+
+
+class ClusteredStructureDataset(StructureDataset):
+    r"""An eagerly indexed, asymmetric-unit CIF dataset for weighted sampling.
+
+    A row ordinal is mapped to its complete backing CIF record. When
+    ``forward_indices`` is true, the selected row is also passed to the
+    processor so chain and interface rows can choose distinct spatial crop
+    centres while retaining full-structure coordinate truth. Default structure
+    ingestion removes hydrogens and water; configured ion handling and
+    ``exclude_mol_types`` affect sampling rows only.
+    """
+
+    def __init__(
+        self,
+        source: Any,
+        processor: Any,
+        *,
+        cluster_file: str,
+        cluster_indices_file: str | os.PathLike[str] | None = None,
+        contact_cutoff: float = 5.0,
+        include_all_chain_pairs: bool = False,
+        exclude_mol_types: tuple[str, ...] = ("ions",),
+        beta: Mapping[str, float] | None = None,
+        alpha: Mapping[str, float] | None = None,
+        seq_to_pdb_index: str | os.PathLike[str] | None = None,
+        msa_path: str | os.PathLike[str] | None = None,
+        processor_kwargs: Mapping[str, Any] | None = None,
+        forward_indices: bool = False,
+        ccd_revision: str | None = None,
+        ccd_snapshot_path: str | os.PathLike[str] | None = None,
+    ) -> None:
+        super().__init__(
+            source,
+            processor,
+            seq_to_pdb_index=seq_to_pdb_index,
+            msa_path=msa_path,
+            processor_kwargs=processor_kwargs,
+            ccd_revision=ccd_revision,
+            ccd_snapshot_path=ccd_snapshot_path,
+        )
+        self.forward_indices = bool(forward_indices)
+        invalid = [
+            Path(record if isinstance(record, str) else record["structure"])
+            for record in self.records
+            if Path(record if isinstance(record, str) else record["structure"]).suffix.lower() not in {".cif", ".mmcif"}
+        ]
+        if invalid:
+            raise ValueError(f"cluster sampling only supports CIF/mmCIF records: {invalid[0]}")
+        from .cluster import calculate_cluster_weights, load_or_build_cluster_indices, make_cluster_indices
+
+        self.cluster_indices_file = (
+            Path(cluster_indices_file).expanduser().resolve() if cluster_indices_file is not None else None
+        )
+        if self.cluster_indices_file is None:
+            raw_entries = make_cluster_indices(
+                self.records,
+                cluster_file,
+                contact_cutoff=contact_cutoff,
+                include_all_chain_pairs=include_all_chain_pairs,
+                exclude_mol_types=exclude_mol_types,
+                ccd_revision=self.ccd_revision,
+                ccd_snapshot_path=self.ccd_snapshot_path,
+            )
+            self.entries, self.weights = calculate_cluster_weights(raw_entries, beta=beta, alpha=alpha)
+            self.cluster_indices_status = None
+        else:
+            self.entries, self.weights, self.cluster_indices_status = load_or_build_cluster_indices(
+                self.records,
+                cluster_file,
+                self.cluster_indices_file,
+                contact_cutoff=contact_cutoff,
+                include_all_chain_pairs=include_all_chain_pairs,
+                exclude_mol_types=exclude_mol_types,
+                beta=beta,
+                alpha=alpha,
+                ccd_revision=self.ccd_revision,
+                ccd_snapshot_path=self.ccd_snapshot_path,
+            )
+        if not self.entries:
+            raise ValueError("cluster sampling produced no valid chain or interface index rows")
+
+    def __len__(self) -> int:
+        return len(self.entries)
+
+    def _process_logical_index(self, index: int) -> Any:
+        r"""Process the backing record and metadata for one cluster row."""
+
+        entry = self.entries[index]
+        if self.forward_indices:
+            return self._process_record(entry.record_index, indices=entry)
+        return self._process_record(entry.record_index)
+
+
+@cache
+def _load_seq_to_pdb_index(path: Path) -> Mapping[str, object]:
+    r"""Load and cache one canonical sequence-to-MSA-directory JSON mapping."""
+
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"sequence-to-PDB index JSON must contain an object at the top level: {path}")
+    return payload
 
 
 def _resolve_records(source: Any) -> list[str | dict[str, Any]]:

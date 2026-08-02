@@ -2,15 +2,15 @@ r"""PDB and mmCIF I/O for the canonical tensor molecular graph."""
 
 from __future__ import annotations
 
-import contextlib
 import os
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Literal
+from typing import AbstractSet, Literal
 
 import numpy as np
 import torch
 
+from ..data.ccd import resolve_ccd_component
 from ..data.components import get_builtin_component_polymer_type, get_component
 from ..data.elements import ATOMIC_NUMBER_BY_ELEMENT
 from ..data.molecular import (
@@ -32,15 +32,21 @@ _FORMATS: dict[str, Literal["pdb", "mmcif"]] = {".pdb": "pdb", ".cif": "mmcif", 
 _ALTLOC_POLICIES = frozenset({"highest_occupancy", "first"})
 
 
+class NoRetainedStructureError(ValueError):
+    """The ingestion policy intentionally removed every source occurrence."""
+
+
 def read_structure(
     path: str | os.PathLike[str],
     *,
     model: int = 1,
     assembly_id: str | None = None,
     altloc: Literal["highest_occupancy", "first"] = "highest_occupancy",
-    include_water: bool = True,
-    include_hydrogens: bool = True,
+    include_water: bool = False,
+    include_hydrogens: bool = False,
     components: Mapping[str, ChemicalComponent] | None = None,
+    ccd_revision: str | None = None,
+    ccd_snapshot_path: str | None = None,
 ) -> Structure:
     r"""
     Read one model and alternate-location realization from PDB or mmCIF.
@@ -53,7 +59,9 @@ def read_structure(
         altloc: Residue-level alternate-location choice.
         include_water: Whether to retain water entities.
         include_hydrogens: Whether to retain hydrogen atoms in the molecular graph.
-        components: Optional component definitions overriding built-in chemistry.
+        components: Optional component definitions overriding CCD chemistry.
+        ccd_revision: Optional pinned Hub CCD revision.
+        ccd_snapshot_path: Optional local resolver-schema CCD snapshot directory.
 
     Returns:
         A CPU tensor Structure whose atom axis is the complete retained system graph.
@@ -64,9 +72,10 @@ def read_structure(
         raise ValueError("model must be a positive one-based integer")
     if altloc not in _ALTLOC_POLICIES:
         raise ValueError(f"unsupported altloc policy: {altloc!r}")
+    if ccd_revision is not None and ccd_snapshot_path is not None:
+        raise ValueError("configure at most one of ccd_revision or ccd_snapshot_path")
 
     cif_file: object | None = None
-    source_components: dict[str, ChemicalComponent] = {}
     declared_component_ids: set[str] = set()
     pdb_lines: tuple[str, ...] = ()
     pdb_missing_residues: tuple[tuple[str, str, int, str], ...] = ()
@@ -74,9 +83,9 @@ def read_structure(
         from .mmcif import parse_mmcif
 
         source_rows, cif_file = parse_mmcif(source, model=model, assembly_id=assembly_id)
-        from .mmcif import read_mmcif_components
+        from .mmcif import read_mmcif_declared_component_ids
 
-        source_components, declared_component_ids = read_mmcif_components(cif_file)
+        declared_component_ids = read_mmcif_declared_component_ids(cif_file)
     else:
         from .pdb import parse_pdb
 
@@ -88,22 +97,13 @@ def read_structure(
     if not len(source_rows):
         raise ValueError("structure source contains no atoms for the requested model/assembly")
 
-    component_table: dict[str, ChemicalComponent] = {}
-    for component_id in {*source_rows.component_id, *declared_component_ids}:
-        with contextlib.suppress(KeyError):
-            component_table[str(component_id)] = get_component(str(component_id))
-    for component_id, component in source_components.items():
-        component_table.setdefault(component_id, component)
-    if components is not None:
-        for component_id, component in components.items():
-            if component.component_id != component_id:
-                raise ValueError("component mapping keys must equal ChemicalComponent.component_id")
-            component_table[component_id] = component
-
-    rows = source_rows
-    if not include_water:
-        rows = _exclude_water_rows(format_name, rows, cif_file, component_table)
-    _add_observed_components(rows, component_table)
+    explicit_components = {} if components is None else dict(components)
+    for component_id, component in explicit_components.items():
+        if component.component_id != component_id:
+            raise ValueError("component mapping keys must equal ChemicalComponent.component_id")
+    rows = _normalize_source_rows(source_rows, explicit_component_ids=set(explicit_components))
+    if not len(rows):
+        raise NoRetainedStructureError("structure contains only excluded UNX/UNL occurrences")
     if not include_hydrogens:
         rows = rows[
             np.isin(
@@ -112,9 +112,49 @@ def read_structure(
                 invert=True,
             )
         ].view(np.recarray)
-        component_table = {
-            component_id: component.without_hydrogens() for component_id, component in component_table.items()
+        explicit_components = {
+            component_id: component.without_hydrogens()
+            for component_id, component in explicit_components.items()
         }
+    if not len(rows):
+        raise NoRetainedStructureError("structure contains no heavy atoms after hydrogen filtering")
+    component_table: dict[str, ChemicalComponent] = dict(explicit_components)
+    component_ids = {str(value) for value in rows.component_id} | declared_component_ids
+    component_ids -= {component_id for component_id in {"UNX", "UNL"} if component_id not in explicit_components}
+    for component_id in component_ids - set(component_table):
+        try:
+            if ccd_revision is not None or ccd_snapshot_path is not None:
+                component_table[component_id] = resolve_ccd_component(
+                    component_id,
+                    revision=ccd_revision,
+                    snapshot_path=ccd_snapshot_path,
+                )
+            else:
+                component_table[component_id] = get_component(component_id)
+            if not include_hydrogens:
+                component_table[component_id] = component_table[component_id].without_hydrogens()
+        except KeyError:
+            pass
+    observed_only_component_ids = _add_observed_components(rows, component_table)
+    rows = _filter_source_component_atoms(rows, component_table, observed_only_component_ids)
+    if format_name == "mmcif":
+        assert cif_file is not None
+        row_count_before_unknown_filter = len(rows)
+        rows = _remove_all_unknown_protein_chains(rows, cif_file)
+        if row_count_before_unknown_filter and not len(rows):
+            raise NoRetainedStructureError("structure contains only excluded all-UNK protein chains")
+    if not include_water:
+        rows = _exclude_water_rows(format_name, rows, cif_file, component_table)
+        if not len(rows):
+            raise NoRetainedStructureError("structure contains only water excluded by the ingestion policy")
+    component_table = {
+        component_id: (
+            component
+            if component_id in explicit_components
+            else _without_component_topology(component)
+        )
+        for component_id, component in component_table.items()
+    }
     rows = _select_altloc(rows, altloc)
     return _build_structure(
         format_name,
@@ -185,8 +225,6 @@ def _exclude_water_rows(
     fallback_rows = rows[np.asarray([row.entity_id is None or row.entity_id not in entity_types for row in rows])].view(
         np.recarray
     )
-    fallback_components = dict(component_table)
-    _add_observed_components(fallback_rows, fallback_components)
     groups: dict[tuple[object, ...], list[np.record]] = {}
     for row in fallback_rows:
         key = (
@@ -199,7 +237,7 @@ def _exclude_water_rows(
         int(row.row_index)
         for group_rows in groups.values()
         if all(
-            is_water_component(fallback_components[str(component_id)])
+            str(component_id) in component_table and is_water_component(component_table[str(component_id)])
             for component_id in {row.component_id for row in group_rows}
         )
         for row in group_rows
@@ -215,7 +253,9 @@ def _exclude_water_rows(
 def _add_observed_components(
     rows: np.recarray,
     component_table: dict[str, ChemicalComponent],
-) -> None:
+) -> set[str]:
+    r"""Create atom-site-only placeholders for component IDs absent from the configured CCD."""
+
     atoms_by_component: dict[str, dict[str, ChemicalAtom]] = {}
     for row in rows:
         component_id = str(row.component_id)
@@ -224,29 +264,155 @@ def _add_observed_components(
         element = str(row.element)
         if element not in ATOMIC_NUMBER_BY_ELEMENT:
             raise ValueError(
-                f"source atom {row.atom_name!r} in component {component_id!r} " f"has invalid element {element!r}"
+                f"source atom {row.atom_name!r} in component {component_id!r} has invalid element {element!r}"
             )
         atom = ChemicalAtom(
             atom_id=str(row.atom_name),
             element=element,
-            isotope=row.isotope,
-            formal_charge=row.charge,
         )
         component_atoms = atoms_by_component.setdefault(component_id, {})
-        previous = component_atoms.get(str(row.atom_name))
+        previous = component_atoms.get(atom.atom_id)
         if previous is None:
-            component_atoms[str(row.atom_name)] = atom
-        elif previous != atom:
-            raise ValueError(f"component {component_id!r} has conflicting source chemistry for atom {row.atom_name!r}")
-    component_table.update(
-        {
-            component_id: ChemicalComponent(
-                component_id=component_id,
-                atoms=tuple(atoms.values()),
-                bonds=None,
+            component_atoms[atom.atom_id] = atom
+            continue
+        if previous.element != atom.element:
+            raise ValueError(
+                f"component {component_id!r} has conflicting observed elements for atom {atom.atom_id!r}"
             )
-            for component_id, atoms in atoms_by_component.items()
-        }
+    for component_id, atoms_by_id in atoms_by_component.items():
+        component_table[component_id] = ChemicalComponent(
+            component_id=component_id,
+            atoms=tuple(atoms_by_id.values()),
+            bonds=None,
+        )
+    return set(atoms_by_component)
+
+
+def _normalize_source_rows(
+    rows: np.recarray,
+    *,
+    explicit_component_ids: set[str],
+) -> np.recarray:
+    """Apply the Protenix raw-occurrence normalization before CCD matching."""
+
+    normalized = rows.copy().view(np.recarray)
+    keep = np.ones(len(normalized), dtype=np.bool_)
+    for index, row in enumerate(normalized):
+        component_id = str(row.component_id)
+        if component_id in {"UNX", "UNL"} and component_id not in explicit_component_ids:
+            keep[index] = False
+            continue
+        if component_id == "ASX":
+            row.component_id = "ASP"
+            row.auth_component_id = "ASP"
+            if row.atom_name in {"XD1", "XD2"}:
+                row.atom_name = "O" + str(row.atom_name)[1:]
+            if row.auth_atom_name in {"XD1", "XD2"}:
+                row.auth_atom_name = "O" + str(row.auth_atom_name)[1:]
+            if row.element == "X":
+                row.element = "O"
+        elif component_id == "GLX":
+            row.component_id = "GLU"
+            row.auth_component_id = "GLU"
+            if row.atom_name in {"XE1", "XE2"}:
+                row.atom_name = "O" + str(row.atom_name)[1:]
+            if row.auth_atom_name in {"XE1", "XE2"}:
+                row.auth_atom_name = "O" + str(row.auth_atom_name)[1:]
+            if row.element == "X":
+                row.element = "O"
+    return normalized[keep].view(np.recarray)
+
+
+def _filter_source_component_atoms(
+    rows: np.recarray,
+    component_table: Mapping[str, ChemicalComponent],
+    observed_only_component_ids: set[str],
+) -> np.recarray:
+    """Keep exact CCD atom IDs and apply Protenix's matched>unmatched occurrence gate."""
+
+    keep = np.zeros(len(rows), dtype=np.bool_)
+    occurrences: dict[tuple[object, ...], list[int]] = {}
+    for index, row in enumerate(rows):
+        occurrences.setdefault(atom_row_residue_key(row), []).append(index)
+    for indices in occurrences.values():
+        component_id = str(rows[indices[0]].component_id)
+        component = component_table[component_id]
+        if component_id in observed_only_component_ids:
+            keep[indices] = True
+            continue
+        atoms_by_id = {atom.atom_id: atom for atom in component.atoms}
+        atom_ids = set(atoms_by_id)
+        matched = [index for index in indices if str(rows[index].atom_name) in atom_ids]
+        if len(matched) > len(indices) - len(matched):
+            for index in matched:
+                row = rows[index]
+                expected = atoms_by_id[str(row.atom_name)].element
+                source_element = str(row.element)
+                comparable_source = "H" if source_element in HYDROGEN_ELEMENTS else source_element
+                comparable_expected = "H" if expected in HYDROGEN_ELEMENTS else expected
+                if comparable_source != comparable_expected:
+                    raise ValueError(
+                        f"source atom {row.atom_name!r} in component {component_id!r} has element "
+                        f"{row.element!r}, expected CCD element {expected!r}"
+                    )
+            keep[matched] = True
+    return rows[keep].view(np.recarray)
+
+
+def _remove_all_unknown_protein_chains(rows: np.recarray, cif_file: object) -> np.recarray:
+    from .mmcif import _read_mmcif_entity_declarations
+
+    _, polymer_monomers, entity_poly_types, _, _, _ = _read_mmcif_entity_declarations(cif_file)
+    keep = np.ones(len(rows), dtype=np.bool_)
+    chains: dict[tuple[object, object], list[int]] = {}
+    for index, row in enumerate(rows):
+        chains.setdefault((row.symmetry_id, row.chain_id), []).append(index)
+    for indices in chains.values():
+        entity_id = str(rows[indices[0]].entity_id)
+        if entity_poly_types.get(entity_id, "").casefold() != "polypeptide(l)":
+            continue
+        declared = None if polymer_monomers is None else polymer_monomers.get(entity_id)
+        if declared and all(set(candidates) == {"UNK"} for _, candidates in declared):
+            keep[indices] = False
+    return rows[keep].view(np.recarray)
+
+
+def _induce_component_atoms(component: ChemicalComponent, retained_atom_ids: set[str]) -> ChemicalComponent:
+    keep = tuple(atom.atom_id in retained_atom_ids for atom in component.atoms)
+    atoms = tuple(atom for atom, retained in zip(component.atoms, keep) if retained)
+    bonds = component.bonds
+    if bonds is not None:
+        bonds = frozenset(
+            bond
+            for bond in bonds
+            if bond.atom_a in retained_atom_ids
+            and bond.atom_b in retained_atom_ids
+            and (bond.stereo_atoms is None or set(bond.stereo_atoms) <= retained_atom_ids)
+        )
+    return ChemicalComponent(
+        component.component_id,
+        atoms,
+        bonds,
+        reference_coordinates=(
+            tuple(value for value, retained in zip(component.reference_coordinates, keep) if retained)
+            if component.reference_coordinates
+            else ()
+        ),
+    )
+
+
+def _without_component_topology(component: ChemicalComponent) -> ChemicalComponent:
+    """Retain component atoms, attachments, and references but mark internal topology unknown."""
+
+    if component.bonds is None:
+        return component
+    return ChemicalComponent(
+        component_id=component.component_id,
+        atoms=component.atoms,
+        bonds=None,
+        previous_attachment=component.previous_attachment,
+        next_attachment=component.next_attachment,
+        reference_coordinates=component.reference_coordinates,
     )
 
 
@@ -297,6 +463,38 @@ def _select_altloc(
     return rows[keep].view(np.recarray)
 
 
+def _resolve_branch_component_index(
+    row: np.record,
+    component_indices: Mapping[tuple[object, ...], AbstractSet[int]],
+    residue_key: tuple[object, ...],
+) -> int:
+    identity_candidates: list[set[int]] = []
+    label_candidates = component_indices.get(
+        ("label", row.chain_id, row.entity_id, row.component_id, row.chain_id, None)
+    )
+    if label_candidates is not None:
+        identity_candidates.append(set(label_candidates))
+    if row.auth_component_id is not None and row.auth_chain_id is not None:
+        pdb_identity_candidates = component_indices.get(
+            (
+                "pdb",
+                row.chain_id,
+                row.entity_id,
+                row.auth_component_id,
+                row.auth_chain_id,
+                row.auth_residue_id,
+            )
+        )
+        if pdb_identity_candidates is not None:
+            identity_candidates.append(set(pdb_identity_candidates))
+    candidates = set.intersection(*identity_candidates) if identity_candidates else set()
+    if not candidates:
+        raise ValueError(f"cannot map branched-entity residue {residue_key!r} to its declaration")
+    if len(candidates) != 1:
+        raise ValueError(f"branched-entity residue {residue_key!r} maps ambiguously to its declaration")
+    return next(iter(candidates))
+
+
 _ENTITY_POLY_TYPE_TO_POLYMER: dict[str, PolymerType] = {
     "polypeptide(l)": "protein",
     "polypeptide(d)": "protein",
@@ -338,10 +536,7 @@ def _resolve_declared_component(
 ) -> ChemicalComponent:
     component = component_table.get(component_id)
     if component is None:
-        try:
-            component = get_component(component_id)
-        except KeyError:
-            component = ChemicalComponent(component_id=component_id, atoms=(), bonds=None)
+        component = ChemicalComponent(component_id=component_id, atoms=(), bonds=None)
     return component if include_hydrogens else component.without_hydrogens()
 
 
@@ -530,17 +725,15 @@ def _build_structure(
     asym_entities: dict[str, str] = {}
     nonpoly_components: dict[str, str] = {}
     segment_by_serial: dict[str, int] = {}
+    molecule_component_table: dict[str, ChemicalComponent] = dict(component_table)
     if format_name == "mmcif":
         assert cif_file is not None
         from .mmcif import (
+            _mmcif_branch_entities_with_components,
             _read_mmcif_entity_declarations,
             read_mmcif_branch_entities,
         )
 
-        branch_entities, branch_component_indices = read_mmcif_branch_entities(
-            cif_file,
-            component_table,
-        )
         (
             entity_types,
             polymer_monomers,
@@ -549,6 +742,23 @@ def _build_structure(
             asym_entities,
             nonpoly_components,
         ) = _read_mmcif_entity_declarations(cif_file)
+        retained_nonpoly_atoms: dict[str, set[str]] = {}
+        for row in rows:
+            if entity_types.get(str(row.entity_id)) == "polymer":
+                continue
+            retained_nonpoly_atoms.setdefault(str(row.component_id), set()).add(str(row.atom_name))
+        for component_id, atom_ids in retained_nonpoly_atoms.items():
+            molecule_component_table[component_id] = _induce_component_atoms(
+                component_table[component_id],
+                atom_ids,
+            )
+        missing_raw_component_ids = {"UNX", "UNL"} - set(molecule_component_table)
+        excluded_branch_entities = _mmcif_branch_entities_with_components(cif_file, missing_raw_component_ids)
+        branch_entities, branch_component_indices = read_mmcif_branch_entities(
+            cif_file,
+            molecule_component_table,
+            excluded_entity_ids=frozenset(excluded_branch_entities),
+        )
         for entity_id in branch_entities:
             entity_type = entity_types.get(entity_id)
             if entity_type not in {None, "branched"}:
@@ -560,7 +770,9 @@ def _build_structure(
         missing_branch_definition = {
             entity_id
             for entity_id, entity_type in entity_types.items()
-            if entity_type == "branched" and entity_id not in branch_entities
+            if entity_type == "branched"
+            and entity_id not in branch_entities
+            and entity_id not in excluded_branch_entities
         }
         if missing_branch_definition:
             raise ValueError(
@@ -765,7 +977,7 @@ def _build_structure(
 
         for group_residues in molecule_groups:
             first = residue_rows[group_residues[0]][0]
-            first_component = component_table[str(first.component_id)]
+            first_component = molecule_component_table[str(first.component_id)]
             residue_label = first.auth_residue_id if first.auth_residue_id is not None else first.residue_id
             residue_identity = f"{residue_label}{first.insertion_code or ''}"
             source_entity_id = None if first.entity_id is None else str(first.entity_id)
@@ -776,32 +988,11 @@ def _build_structure(
                 indexed_residues: list[tuple[int, tuple[object, ...]]] = []
                 for residue_key in group_residues:
                     row = residue_rows[residue_key][0]
-                    branch_component_index: int | None = None
-                    for source_monomer in (
-                        row.component_id,
-                        row.auth_component_id,
-                    ):
-                        if source_monomer is None:
-                            continue
-                        for source_asym in (
-                            row.auth_chain_id,
-                            row.chain_id,
-                        ):
-                            branch_component_index = branch_component_indices.get(
-                                (
-                                    row.chain_id,
-                                    row.entity_id,
-                                    source_monomer,
-                                    source_asym,
-                                    row.auth_residue_id,
-                                )
-                            )
-                            if branch_component_index is not None:
-                                break
-                        if branch_component_index is not None:
-                            break
-                    if branch_component_index is None:
-                        raise ValueError(f"cannot map branched-entity residue {residue_key!r} to its declaration")
+                    branch_component_index = _resolve_branch_component_index(
+                        row,
+                        branch_component_indices,
+                        residue_key,
+                    )
                     indexed_residues.append((branch_component_index, residue_key))
                 if len({index for index, _ in indexed_residues}) != len(indexed_residues):
                     raise ValueError(f"branched entity {source_entity_id!r} maps multiple residues to one component")
@@ -846,6 +1037,13 @@ def _build_structure(
         if not include_water and source_entity_type == "water":
             continue
         if source_entity_type == "polymer":
+            declared_monomers = None if polymer_monomers is None else polymer_monomers.get(source_entity_id)
+            if (
+                entity_poly_types.get(source_entity_id, "").casefold() == "polypeptide(l)"
+                and declared_monomers
+                and all(set(candidates) == {"UNK"} for _, candidates in declared_monomers)
+            ):
+                continue
             declared = _declared_polymer(
                 source_entity_id,
                 polymer_monomers,
@@ -868,9 +1066,11 @@ def _build_structure(
             component_id = nonpoly_components.get(source_entity_id)
             if component_id is None:
                 continue
+            if component_id in {"UNX", "UNL"} and component_id not in molecule_component_table:
+                continue
             component = _resolve_declared_component(
                 component_id,
-                component_table,
+                molecule_component_table,
                 include_hydrogens=include_hydrogens,
             )
             entity_id = source_entity_id
@@ -910,8 +1110,9 @@ def _build_structure(
                     ),
                     site,
                 )
-                for source_key, branch_index in branch_component_indices.items():
+                for source_key, branch_indices in branch_component_indices.items():
                     (
+                        namespace,
                         label_asym,
                         source_branch_entity,
                         monomer,
@@ -919,37 +1120,40 @@ def _build_structure(
                         auth_sequence,
                     ) = source_key
                     if (
-                        branch_index != component_index
+                        component_index not in branch_indices
                         or label_asym != asym_id
                         or source_branch_entity != source_entity_id
                     ):
                         continue
-                    add_unmodeled_site(
-                        (None, label_asym, None, None, monomer, atom.atom_id),
-                        site,
-                    )
+                    if namespace == "label":
+                        add_unmodeled_site(
+                            (None, label_asym, None, None, monomer, atom.atom_id),
+                            site,
+                        )
+                    elif namespace == "pdb":
+                        add_unmodeled_site(
+                            (
+                                None,
+                                auth_asym,
+                                auth_sequence,
+                                None,
+                                monomer,
+                                atom.atom_id,
+                            ),
+                            site,
+                        )
+                if source_entity_id not in branch_entities:
                     add_unmodeled_site(
                         (
                             None,
-                            auth_asym,
-                            auth_sequence,
-                            None,
-                            monomer,
+                            asym_id,
+                            source_author_number,
+                            insertion,
+                            component.component_id,
                             atom.atom_id,
                         ),
                         site,
                     )
-                add_unmodeled_site(
-                    (
-                        None,
-                        asym_id,
-                        source_author_number,
-                        insertion,
-                        component.component_id,
-                        atom.atom_id,
-                    ),
-                    site,
-                )
         groups.append(
             (
                 len(source_rows) + declaration_index,
@@ -1020,8 +1224,9 @@ def _build_structure(
             first = residue_rows[indexed[0][1]][0]
             source_entity_id = first.entity_id
             observed_components = {component_index for component_index, _ in indexed}
-            for source_key, component_index in branch_component_indices.items():
+            for source_key, component_indices in branch_component_indices.items():
                 (
+                    namespace,
                     source_label_asym_id,
                     source_branch_entity_id,
                     source_monomer_id,
@@ -1029,10 +1234,15 @@ def _build_structure(
                     source_auth_number,
                 ) = source_key
                 if (
-                    source_branch_entity_id != source_entity_id
+                    namespace not in {"label", "pdb"}
+                    or source_branch_entity_id != source_entity_id
                     or source_label_asym_id != first.chain_id
-                    or component_index in observed_components
                 ):
+                    continue
+                if len(component_indices) != 1:
+                    continue
+                component_index = next(iter(component_indices))
+                if component_index in observed_components:
                     continue
                 author = author_numbering.get((str(source_label_asym_id), component_index + 1))
                 insertion = None if author is None else author[1]
@@ -1044,28 +1254,30 @@ def _build_structure(
                 component = entity.components[component_index]
                 for atom in component.atoms:
                     site = AtomSite(instance_id, component_index, atom.atom_id)
-                    add_unmodeled_site(
-                        (
-                            first.symmetry_id,
-                            source_label_asym_id,
-                            None,
-                            insertion,
-                            source_monomer_id,
-                            atom.atom_id,
-                        ),
-                        site,
-                    )
-                    add_unmodeled_site(
-                        (
-                            first.symmetry_id,
-                            source_auth_asym_id,
-                            source_auth_number,
-                            insertion,
-                            source_monomer_id,
-                            atom.atom_id,
-                        ),
-                        site,
-                    )
+                    if namespace == "label":
+                        add_unmodeled_site(
+                            (
+                                first.symmetry_id,
+                                source_label_asym_id,
+                                None,
+                                insertion,
+                                source_monomer_id,
+                                atom.atom_id,
+                            ),
+                            site,
+                        )
+                    else:
+                        add_unmodeled_site(
+                            (
+                                first.symmetry_id,
+                                source_auth_asym_id,
+                                source_auth_number,
+                                insertion,
+                                source_monomer_id,
+                                atom.atom_id,
+                            ),
+                            site,
+                        )
 
     if format_name == "pdb":
         from .pdb import read_pdb_bonds
@@ -1082,6 +1294,18 @@ def _build_structure(
             unmodeled_source_sites,
             ambiguous_unmodeled_sites,
         )
+    source_bonds = tuple(
+        bond
+        for bond in source_bonds
+        if (
+            bond.site_a.instance_id,
+            bond.site_a.component_index,
+        )
+        != (
+            bond.site_b.instance_id,
+            bond.site_b.component_index,
+        )
+    )
     system = MolecularSystem.from_entities(
         entities,
         instances,
@@ -1116,7 +1340,18 @@ def _build_structure(
     occupancy_mask = torch.zeros(atom_count, dtype=torch.bool)
     b_factor = torch.zeros(atom_count, dtype=torch.float32)
     b_factor_mask = torch.zeros(atom_count, dtype=torch.bool)
-    atom_indices = [atom_index_by_site[site_by_row_index[int(row.row_index)]] for row in rows]
+    atom_indices = []
+    resolved_source_rows: list[int] = []
+    for source_row_index, row in enumerate(rows):
+        site = site_by_row_index[int(row.row_index)]
+        try:
+            atom_indices.append(atom_index_by_site[site])
+        except KeyError:
+            # CCD leaving atoms (notably observed OXT) are intentionally absent
+            # after canonical polymer bonds are formed.
+            continue
+        resolved_source_rows.append(source_row_index)
+    rows = rows[np.asarray(resolved_source_rows, dtype=np.int64)].view(np.recarray)
     seen_atom_indices: set[int] = set()
     for atom_index in atom_indices:
         if atom_index in seen_atom_indices:

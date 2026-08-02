@@ -31,7 +31,6 @@ from ..data.molecular import (
     MOLECULE_NON_POLYMER,
     MOLECULE_WATER,
     AtomSite,
-    BondDirection,
     ChemicalAtom,
     ChemicalBond,
     ChemicalComponent,
@@ -226,7 +225,11 @@ def read_mmcif_components(
                 atom_id=atom_id,
                 element=element.capitalize(),
                 formal_charge=optional_integer(charge),
-                aromatic=None if aromatic is None else aromatic.upper() == "Y",
+                aromatic=(
+                    None
+                    if aromatic is None or aromatic.upper() not in {"Y", "N"}
+                    else aromatic.upper() == "Y"
+                ),
                 stereo=None if stereo in {None, "N"} else stereo,
             )
         )
@@ -254,15 +257,16 @@ def read_mmcif_components(
             if component_id is None or atom_a is None or atom_b is None:
                 raise ValueError("mmCIF chem_comp_bond row is missing comp_id or atom IDs")
             components_with_bonds.add(component_id)
-            order, order_aromatic = _cif_bond_order(order_name)
+            order, order_aromatic = _cif_component_bond_order(order_name)
             if aromatic is None:
                 aromatic_value = order_aromatic
             else:
-                if aromatic.upper() not in {"Y", "N"}:
-                    raise ValueError("mmCIF chem_comp_bond pdbx_aromatic_flag must be Y or N")
-                aromatic_value = aromatic.upper() == "Y"
-                if order_aromatic is not None and aromatic_value != order_aromatic:
-                    raise ValueError("mmCIF chem_comp_bond value_order and " "pdbx_aromatic_flag disagree")
+                normalized_aromatic = aromatic.upper()
+                aromatic_value = (
+                    normalized_aromatic == "Y"
+                    if normalized_aromatic in {"Y", "N"}
+                    else None
+                )
             bonds_by_component.setdefault(component_id, set()).add(
                 ChemicalBond(
                     atom_a,
@@ -288,6 +292,38 @@ def read_mmcif_components(
         },
         declared_components,
     )
+
+
+def _normalized_component_id(component_id: str) -> str:
+    return {"ASX": "ASP", "GLX": "GLU"}.get(component_id, component_id)
+
+
+def _normalized_atom_id(component_id: str, atom_id: str) -> str:
+    if component_id == "ASX" and atom_id in {"XD1", "XD2"}:
+        return "O" + atom_id[1:]
+    if component_id == "GLX" and atom_id in {"XE1", "XE2"}:
+        return "O" + atom_id[1:]
+    return atom_id
+
+
+def read_mmcif_declared_component_ids(cif_file: object) -> set[str]:
+    """Read structural component declarations without consulting embedded chemistry categories."""
+
+    block = cast("CIFFile", cif_file).block
+    declared: set[str] = set()
+    for category_name, column_name in (
+        ("entity_poly_seq", "mon_id"),
+        ("pdbx_entity_branch_list", "comp_id"),
+        ("pdbx_entity_nonpoly", "comp_id"),
+    ):
+        if category_name not in block:
+            continue
+        declared.update(
+            _normalized_component_id(value)
+            for value in _cif_column(block[category_name], column_name)
+            if value is not None
+        )
+    return declared
 
 
 def _read_mmcif_entity_declarations(
@@ -341,6 +377,7 @@ def _read_mmcif_entity_declarations(
                 raise ValueError("mmCIF _entity_poly_seq row is missing entity_id, num, or mon_id")
             if index < 1:
                 raise ValueError(f"mmCIF _entity_poly_seq.num must be positive, got {index}")
+            monomer = _normalized_component_id(monomer)
             candidates = polymer_monomers.setdefault(entity_id, {}).setdefault(index, [])
             if monomer not in candidates:
                 candidates.append(monomer)
@@ -383,17 +420,16 @@ def _read_mmcif_entity_declarations(
 
     if "pdbx_branch_scheme" in block:
         category = block["pdbx_branch_scheme"]
-        for asym_id, number, auth_number, pdb_number, ins_code in zip(
+        for asym_id, number, pdb_number, ins_code in zip(
             _cif_column(category, "asym_id"),
             _cif_column(category, "num"),
-            _cif_column(category, "auth_seq_num"),
             _cif_column(category, "pdb_seq_num"),
             _cif_column(category, "pdb_ins_code"),
         ):
             component_number = optional_integer(number)
             if asym_id is None or component_number is None:
                 raise ValueError("mmCIF _pdbx_branch_scheme row is missing asym_id or num")
-            author_residue_number = auth_number or pdb_number
+            author_residue_number = present_string(pdb_number)
             key = (asym_id, component_number)
             numbering = (author_residue_number, ins_code)
             if key in author_numbering and author_numbering[key] != numbering:
@@ -402,16 +438,18 @@ def _read_mmcif_entity_declarations(
 
     if "pdbx_nonpoly_scheme" in block:
         category = block["pdbx_nonpoly_scheme"]
-        for asym_id, auth_number, pdb_number, ins_code in zip(
+        for asym_id, ndb_number, auth_number, pdb_number, ins_code in zip(
             _cif_column(category, "asym_id"),
+            _cif_column(category, "ndb_seq_num"),
             _cif_column(category, "auth_seq_num"),
             _cif_column(category, "pdb_seq_num"),
             _cif_column(category, "pdb_ins_code"),
         ):
-            if asym_id is None:
-                raise ValueError("mmCIF _pdbx_nonpoly_scheme row is missing asym_id")
+            component_number = optional_integer(ndb_number)
+            if asym_id is None or component_number is None:
+                raise ValueError("mmCIF _pdbx_nonpoly_scheme row is missing asym_id or ndb_seq_num")
             author_residue_number = auth_number or pdb_number
-            key = (asym_id, 1)
+            key = (asym_id, component_number)
             numbering = (author_residue_number, ins_code)
             if key in author_numbering and author_numbering[key] != numbering:
                 raise ValueError("mmCIF _pdbx_nonpoly_scheme has conflicting numbering " f"for {key!r}")
@@ -440,6 +478,7 @@ def _read_mmcif_entity_declarations(
         ):
             if entity_id is None or component_id is None:
                 raise ValueError("mmCIF _pdbx_entity_nonpoly row is missing entity_id or comp_id")
+            component_id = _normalized_component_id(component_id)
             previous = nonpoly_components.get(entity_id)
             if previous is not None and previous != component_id:
                 raise ValueError(f"mmCIF non-polymer entity {entity_id!r} has conflicting components")
@@ -471,26 +510,32 @@ def _cif_bond_order(value: str | None) -> tuple[float | None, bool | None]:
         raise ValueError(f"unsupported mmCIF covalent bond order: {value!r}") from None
 
 
+def _cif_component_bond_order(value: str | None) -> tuple[float | None, bool | None]:
+    order, aromatic = _cif_bond_order(value)
+    if value is not None and value.lower() != "arom":
+        aromatic = None
+    return order, aromatic
+
+
 def _remove_component_atoms(component: ChemicalComponent, atom_ids: set[str]) -> ChemicalComponent:
     atom_by_id = {atom.atom_id: atom for atom in component.atoms}
     removed = set(atom_by_id).intersection(atom_ids)
     if not removed:
         return component
     bonds = component.bonds
-    if bonds is None:
-        raise ValueError(f"component {component.component_id!r} has no known bond graph")
-    for bond in bonds:
-        if bond.atom_a in removed and atom_by_id[bond.atom_b].element in HYDROGEN_ELEMENTS:
-            removed.add(bond.atom_b)
-        if bond.atom_b in removed and atom_by_id[bond.atom_a].element in HYDROGEN_ELEMENTS:
-            removed.add(bond.atom_a)
-    for bond in bonds:
-        if (
-            bond.stereo_atoms is not None
-            and removed.intersection(bond.stereo_atoms)
-            and not removed.intersection((bond.atom_a, bond.atom_b))
-        ):
-            raise ValueError("a declared leaving atom is required to define retained bond stereochemistry")
+    if bonds is not None:
+        for bond in bonds:
+            if bond.atom_a in removed and atom_by_id[bond.atom_b].element in HYDROGEN_ELEMENTS:
+                removed.add(bond.atom_b)
+            if bond.atom_b in removed and atom_by_id[bond.atom_a].element in HYDROGEN_ELEMENTS:
+                removed.add(bond.atom_a)
+        for bond in bonds:
+            if (
+                bond.stereo_atoms is not None
+                and removed.intersection(bond.stereo_atoms)
+                and not removed.intersection((bond.atom_a, bond.atom_b))
+            ):
+                raise ValueError("a declared leaving atom is required to define retained bond stereochemistry")
     keep = tuple(atom.atom_id not in removed for atom in component.atoms)
     retained = set(atom_by_id) - removed
     previous = component.previous_attachment
@@ -516,7 +561,11 @@ def _remove_component_atoms(component: ChemicalComponent, atom_ids: set[str]) ->
     return ChemicalComponent(
         component_id=component.component_id,
         atoms=tuple(atom for atom, present in zip(component.atoms, keep) if present),
-        bonds=frozenset(bond for bond in bonds if bond.atom_a not in removed and bond.atom_b not in removed),
+        bonds=(
+            None
+            if bonds is None
+            else frozenset(bond for bond in bonds if bond.atom_a not in removed and bond.atom_b not in removed)
+        ),
         previous_attachment=previous,
         next_attachment=following,
         reference_coordinates=(
@@ -527,16 +576,42 @@ def _remove_component_atoms(component: ChemicalComponent, atom_ids: set[str]) ->
     )
 
 
+def _mmcif_branch_entities_with_components(
+    cif_file: object,
+    component_ids: set[str],
+) -> set[str]:
+    """Return branch entity IDs declaring at least one selected component ID."""
+
+    block = cast("CIFFile", cif_file).block
+    if "pdbx_entity_branch_list" not in block:
+        return set()
+    category = block["pdbx_entity_branch_list"]
+    return {
+        entity_id
+        for entity_id, component_id in zip(
+            _cif_column(category, "entity_id"),
+            _cif_column(category, "comp_id"),
+        )
+        if entity_id is not None
+        and component_id is not None
+        and _normalized_component_id(component_id) in component_ids
+    }
+
+
 def read_mmcif_branch_entities(
     cif_file: object,
     component_table: Mapping[str, ChemicalComponent],
-) -> tuple[dict[str, Molecule], dict[tuple[object, ...], int]]:
+    *,
+    excluded_entity_ids: frozenset[str] = frozenset(),
+) -> tuple[dict[str, Molecule], dict[tuple[object, ...], frozenset[int]]]:
     r"""
     Decode selected mmCIF branched entities and source component indices.
 
     Args:
         cif_file: Parsed mmCIF document.
         component_table: Chemical components available by component ID.
+        excluded_entity_ids: Raw branch entities intentionally removed by the
+            ingestion policy.
 
     Returns:
         Branched entities by entity ID and source residue keys mapped to component indices.
@@ -556,11 +631,12 @@ def read_mmcif_branch_entities(
     numbers = _cif_column(category, "num")
     declarations: dict[str, dict[int, str]] = {}
     for entity_id, component_id, number in zip(entity_ids, component_ids, numbers):
-        if entity_id is None:
+        if entity_id is None or entity_id in excluded_entity_ids:
             continue
         component_index = optional_integer(number)
         if component_id is None or component_index is None:
             raise ValueError("mmCIF branched-entity components require entity_id, comp_id, and num")
+        component_id = _normalized_component_id(component_id)
         entity_components = declarations.setdefault(entity_id, {})
         if component_index in entity_components:
             raise ValueError(f"duplicate branched-entity component number {component_index} for entity {entity_id!r}")
@@ -610,6 +686,18 @@ def read_mmcif_branch_entities(
             ) = values
             if entity_id not in declarations:
                 continue
+            if first_component is not None:
+                first_atom = None if first_atom is None else _normalized_atom_id(first_component, first_atom)
+                first_leaving = (
+                    None if first_leaving is None else _normalized_atom_id(first_component, first_leaving)
+                )
+                first_component = _normalized_component_id(first_component)
+            if second_component is not None:
+                second_atom = None if second_atom is None else _normalized_atom_id(second_component, second_atom)
+                second_leaving = (
+                    None if second_leaving is None else _normalized_atom_id(second_component, second_leaving)
+                )
+                second_component = _normalized_component_id(second_component)
             first_number_int = optional_integer(first_number)
             second_number_int = optional_integer(second_number)
             if first_number_int is None or second_number_int is None or first_atom is None or second_atom is None:
@@ -648,7 +736,7 @@ def read_mmcif_branch_entities(
             molecule_type="branched",
         )
 
-    component_indices: dict[tuple[object, ...], int] = {}
+    component_index_candidates: dict[tuple[object, ...], set[int]] = {}
     if "pdbx_branch_scheme" in block:
         scheme = block["pdbx_branch_scheme"]
         label_asym_ids = _cif_column(scheme, "asym_id")
@@ -687,42 +775,51 @@ def read_mmcif_branch_entities(
             ) = values
             if entity_id not in entities:
                 continue
+            monomer_id = None if monomer_id is None else _normalized_component_id(monomer_id)
+            pdb_monomer_id = None if pdb_monomer_id is None else _normalized_component_id(pdb_monomer_id)
+            auth_monomer_id = None if auth_monomer_id is None else _normalized_component_id(auth_monomer_id)
             number_int = optional_integer(number)
             if number_int is None:
                 raise ValueError("mmCIF branch scheme requires an integer component number")
-            component_index = number_to_index[entity_id][number_int]
-            source_monomer_ids = {monomer_id, pdb_monomer_id, auth_monomer_id} - {None}
-            source_positions: set[tuple[object, str | None]] = {
-                (source_asym_id, source_sequence_number)
-                for source_asym_id, source_sequence_number in (
-                    (pdb_asym_id, present_string(pdb_sequence_number)),
-                    (auth_asym_id, present_string(auth_sequence_number)),
+            try:
+                component_index = number_to_index[entity_id][number_int]
+            except KeyError:
+                raise ValueError(
+                    f"mmCIF branch scheme component number {number_int} is not declared for entity {entity_id!r}"
+                ) from None
+            if monomer_id != declarations[entity_id][number_int]:
+                raise ValueError(
+                    f"mmCIF branch scheme component {number_int} mon_id {monomer_id!r} "
+                    f"disagrees with declaration {declarations[entity_id][number_int]!r}"
                 )
-                if source_asym_id is not None and source_sequence_number is not None
-            }
-            if (
-                present_string(auth_sequence_number) is None
-                and list(declarations[entity_id].values()).count(declarations[entity_id][number_int]) == 1
-            ):
-                source_positions.update(
-                    (source_asym_id, None)
-                    for source_asym_id in (auth_asym_id, label_asym_id)
-                    if source_asym_id is not None
-                )
-            for source_monomer_id in source_monomer_ids:
-                for source_asym_id, source_sequence_number in source_positions:
-                    key = (
+            keys = []
+            if label_asym_id is not None and monomer_id is not None:
+                keys.append(("label", label_asym_id, entity_id, monomer_id, label_asym_id, None))
+            if pdb_asym_id is not None and pdb_monomer_id is not None:
+                keys.append(
+                    (
+                        "pdb",
                         label_asym_id,
                         entity_id,
-                        source_monomer_id,
-                        source_asym_id,
-                        source_sequence_number,
+                        pdb_monomer_id,
+                        pdb_asym_id,
+                        present_string(pdb_sequence_number),
                     )
-                    previous = component_indices.get(key)
-                    if previous is not None and previous != component_index:
-                        raise ValueError(f"ambiguous mmCIF branch-scheme identity: {key!r}")
-                    component_indices[key] = component_index
-    return entities, component_indices
+                )
+            if auth_asym_id is not None and auth_monomer_id is not None:
+                keys.append(
+                    (
+                        "author",
+                        label_asym_id,
+                        entity_id,
+                        auth_monomer_id,
+                        auth_asym_id,
+                        present_string(auth_sequence_number),
+                    )
+                )
+            for key in keys:
+                component_index_candidates.setdefault(key, set()).add(component_index)
+    return entities, {key: frozenset(indices) for key, indices in component_index_candidates.items()}
 
 
 def read_mmcif_bonds(
@@ -777,73 +874,96 @@ def read_mmcif_bonds(
     auth_atom_2 = _cif_column(category, "ptnr2_auth_atom_id")
     ins_1 = _cif_column(category, "pdbx_ptnr1_PDB_ins_code")
     ins_2 = _cif_column(category, "pdbx_ptnr2_PDB_ins_code")
-    roles_1 = _cif_column(category, "ptnr1_role")
-    roles_2 = _cif_column(category, "ptnr2_role")
     symmetry_1 = _cif_column(category, "ptnr1_symmetry")
     symmetry_2 = _cif_column(category, "ptnr2_symmetry")
-    value_orders = (
-        _cif_column(category, "pdbx_value_order") if "pdbx_value_order" in category else ("sing",) * category.row_count
-    )
     selected_sites, ambiguous_source_sites = selected_source_sites(selected_rows, site_by_row_index)
+    for key in ambiguous_unmodeled_sites:
+        selected_sites.pop(key, None)
     ambiguous_source_sites.update(ambiguous_unmodeled_sites)
     for key, site in unmodeled_source_sites.items():
-        if key not in ambiguous_source_sites:
+        if key in ambiguous_source_sites:
+            continue
+        previous = selected_sites.get(key)
+        if previous is not None and previous != site:
+            selected_sites.pop(key)
+            ambiguous_source_sites.add(key)
+        else:
             selected_sites[key] = site
     symmetry_ids = {row.symmetry_id for row in selected_rows}
     bonds: list[SystemBond] = []
+    allowed_connection_types = {
+        "covale",
+        "covale_base",
+        "covale_phosphate",
+        "covale_sugar",
+        "disulf",
+        "modres",
+        "modres_link",
+    }
     for index, conn_type in enumerate(conn_types):
-        if conn_type is None or not (
-            conn_type.startswith("covale") or conn_type.startswith("disulf") or conn_type.startswith("metalc")
-        ):
+        if conn_type is None or conn_type.casefold() not in allowed_connection_types:
             continue
         if symmetry_1[index] not in {None, "1_555"} or symmetry_2[index] not in {None, "1_555"}:
             continue
-        value_order = value_orders[index]
-        if value_order is not None and value_order.lower() == "arom":
-            raise ValueError("mmCIF struct_conn pdbx_value_order does not support aromatic bonds")
-        order, aromatic = _cif_bond_order(value_order)
-        if conn_type.startswith("disulf") and order is None:
-            order, aromatic = 1.0, False
-        direction: BondDirection | None = "undirected"
-        if conn_type.startswith("metalc"):
-            direction_evidence: set[BondDirection] = set()
-            for endpoint, role in enumerate(
-                (roles_1[index], roles_2[index]),
-                start=1,
-            ):
-                normalized = None if role is None else role.casefold()
-                if normalized in {"donor", "metal coordination"}:
-                    direction_evidence.add("a_to_b" if endpoint == 1 else "b_to_a")
-                elif normalized in {"acceptor", "metal"}:
-                    direction_evidence.add("b_to_a" if endpoint == 1 else "a_to_b")
-            direction = direction_evidence.pop() if len(direction_evidence) == 1 else None
+        original_label_component_1 = label_comp_1[index]
+        original_label_component_2 = label_comp_2[index]
+        normalized_label_component_1 = (
+            None if original_label_component_1 is None else _normalized_component_id(original_label_component_1)
+        )
+        normalized_label_component_2 = (
+            None if original_label_component_2 is None else _normalized_component_id(original_label_component_2)
+        )
         endpoint_1 = (
             label_asym_1[index],
             optional_integer(label_seq_1[index]),
             ins_1[index],
-            label_comp_1[index],
-            label_atom_1[index],
+            normalized_label_component_1,
+            (
+                label_atom_1[index]
+                if original_label_component_1 is None or label_atom_1[index] is None
+                else _normalized_atom_id(original_label_component_1, label_atom_1[index])
+            ),
         )
         endpoint_2 = (
             label_asym_2[index],
             optional_integer(label_seq_2[index]),
             ins_2[index],
-            label_comp_2[index],
-            label_atom_2[index],
+            normalized_label_component_2,
+            (
+                label_atom_2[index]
+                if original_label_component_2 is None or label_atom_2[index] is None
+                else _normalized_atom_id(original_label_component_2, label_atom_2[index])
+            ),
         )
+        original_auth_component_1 = auth_comp_1[index] or original_label_component_1
+        original_auth_component_2 = auth_comp_2[index] or original_label_component_2
         auth_endpoint_1 = (
             auth_asym_1[index] or label_asym_1[index],
             present_string(auth_seq_1[index]) or label_seq_1[index],
             ins_1[index],
-            auth_comp_1[index] or label_comp_1[index],
-            auth_atom_1[index] or label_atom_1[index],
+            None if original_auth_component_1 is None else _normalized_component_id(original_auth_component_1),
+            (
+                auth_atom_1[index] or label_atom_1[index]
+                if original_auth_component_1 is None
+                else _normalized_atom_id(
+                    original_auth_component_1,
+                    auth_atom_1[index] or label_atom_1[index] or "",
+                )
+            ),
         )
         auth_endpoint_2 = (
             auth_asym_2[index] or label_asym_2[index],
             present_string(auth_seq_2[index]) or label_seq_2[index],
             ins_2[index],
-            auth_comp_2[index] or label_comp_2[index],
-            auth_atom_2[index] or label_atom_2[index],
+            None if original_auth_component_2 is None else _normalized_component_id(original_auth_component_2),
+            (
+                auth_atom_2[index] or label_atom_2[index]
+                if original_auth_component_2 is None
+                else _normalized_atom_id(
+                    original_auth_component_2,
+                    auth_atom_2[index] or label_atom_2[index] or "",
+                )
+            ),
         )
         for symmetry_id in symmetry_ids:
             resolved_sites: list[AtomSite | None] = []
@@ -863,18 +983,14 @@ def read_mmcif_bonds(
                 # assembly. The bond is then unrepresentable, so skip it rather than dropping the
                 # whole structure (excluded water lands here too, its sites having been removed).
                 continue
-            if direction is None:
-                raise ValueError(
-                    "mmCIF metalc struct_conn requires consistent explicit " "donor/acceptor or metal partner roles"
-                )
+            if site_a.instance_id == site_b.instance_id and site_a.component_index == site_b.component_index:
+                continue
             bonds.append(
                 SystemBond(
                     site_a,
                     site_b,
-                    order=order,
-                    aromatic=aromatic,
-                    kind="dative" if conn_type.startswith("metalc") else "covalent",
-                    direction=direction,
+                    order=1.0,
+                    aromatic=False,
                     role="assembly",
                 )
             )
@@ -938,7 +1054,6 @@ def write_mmcif(structure: Structure, path: Path) -> None:
             atom_start = int(component_atom_ptr[component_index])
             atom_stop = int(component_atom_ptr[component_index + 1])
             atom_component[atom_start:atom_stop] = [component_index] * (atom_stop - atom_start)
-
     label_asym_by_instance: dict[int, str] = {}
     used_asym_ids: set[str] = set()
     for instance_index in range(instance_count):
@@ -1014,7 +1129,7 @@ def write_mmcif(structure: Structure, path: Path) -> None:
         order_value = order_name(index)
         expected_order = float(bond_order[index]) if bool(bond_order_known[index]) else None
         expected_aromatic = bool(bond_aromatic[index]) if bool(bond_aromatic_known[index]) else None
-        decoded_order, order_aromatic = _cif_bond_order(None if order_value == "?" else order_value)
+        decoded_order, order_aromatic = _cif_component_bond_order(None if order_value == "?" else order_value)
         if expected_aromatic is None:
             decoded_aromatic = order_aromatic
             aromatic_value = "?"
@@ -1677,6 +1792,13 @@ def write_mmcif(structure: Structure, path: Path) -> None:
         components_by_id.setdefault(component_id(component_index), []).append(component_index)
     embedded_component_by_id: dict[str, int] = {}
     cpu_system = system
+    polymer_types: dict[int, PolymerType] = {
+        ENTITY_PROTEIN: "protein",
+        ENTITY_RNA: "rna",
+        ENTITY_DNA: "dna",
+        ENTITY_DNA_RNA_HYBRID: "dna_rna_hybrid",
+        ENTITY_PNA: "pna",
+    }
     polymer_pairs = {
         tuple(
             sorted(
@@ -1688,13 +1810,6 @@ def write_mmcif(structure: Structure, path: Path) -> None:
         )
         for edge in range(edge_index.shape[1])
         if int(bond_role[edge]) == BOND_ROLE_POLYMER
-    }
-    polymer_types: dict[int, PolymerType] = {
-        ENTITY_PROTEIN: "protein",
-        ENTITY_RNA: "rna",
-        ENTITY_DNA: "dna",
-        ENTITY_DNA_RNA_HYBRID: "dna_rna_hybrid",
-        ENTITY_PNA: "pna",
     }
 
     expected_definitions: dict[
@@ -1788,7 +1903,7 @@ def write_mmcif(structure: Structure, path: Path) -> None:
             stop = int(component_atom_ptr[component_index + 1])
             decoded_topology_complete = stop - start == 1 or bool(component_bond_indices.get(component_index))
             if bool(component_topology_complete[component_index]) != decoded_topology_complete:
-                raise ValueError("mmCIF cannot encode this unknown component's topology " "completeness")
+                raise ValueError("mmCIF cannot encode this unknown component's topology completeness")
             isotope_representable = (atomic_number[start:stop] == 1) & torch.isin(
                 isotope[start:stop],
                 isotope.new_tensor((2, 3)),
@@ -1805,7 +1920,7 @@ def write_mmcif(structure: Structure, path: Path) -> None:
             ):
                 if bool(getattr(cpu_system, field)[start:stop].any()):
                     raise ValueError(
-                        f"mmCIF cannot encode known {field.removesuffix('_known')} " "for an unknown component"
+                        f"mmCIF cannot encode known {field.removesuffix('_known')} for an unknown component"
                     )
             for edge in component_bond_indices.get(component_index, ()):
                 if (
@@ -1841,9 +1956,8 @@ def write_mmcif(structure: Structure, path: Path) -> None:
     for name, component_index in embedded_component_by_id.items():
         instance_index = component_instance[component_index]
         entity_index = int(instance_entity[instance_index])
-        if bool(component_topology_complete[component_index]):
-            chem_comp_columns["id"].append(name)
-            chem_comp_columns["type"].append(component_type_by_code[int(entity_type[entity_index])])
+        chem_comp_columns["id"].append(name)
+        chem_comp_columns["type"].append(component_type_by_code[int(entity_type[entity_index])])
         atom_start = int(component_atom_ptr[component_index])
         atom_stop = int(component_atom_ptr[component_index + 1])
         for atom_index in range(atom_start, atom_stop):

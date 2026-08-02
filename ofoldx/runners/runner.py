@@ -134,9 +134,12 @@ class Runner(dl.Runner):
         super().__init__(config)
 
         self.model, self.processor = self._build(repository, registration)
+        if config.gradient_checkpointing:
+            self.model.gradient_checkpointing_enable()
         self.criterion = criterion_factory(self.model, self.processor)
         self.collate_fn = collate_fn
         self._process_training = process_training
+        self._forward_cluster_indices = registration.id == "protenix"
         # DanLing toggles module mode from its ``mode`` setter (train_epoch/evaluate_epoch/infer set it), but
         # it fixed ``mode=train`` before this model existed, so the first train_epoch's mode=train is a no-op
         # that will not force train mode -- and a repository model loads in eval(). Establish train mode here.
@@ -239,16 +242,111 @@ class Runner(dl.Runner):
         to produce the separate ``(input, target)`` required by their objective.
         """
 
-        from .dataset import StructureDataset
+        from .cluster import default_cluster_indices_path
+        from .dataset import ClusteredStructureDataset, StructureDataset
 
         datasets: dict[str, Any] = {}
+        processor_config = getattr(self.processor, "config", None)
+        if isinstance(processor_config, Mapping):
+            ccd_revision = processor_config.get("ccd_revision")
+            ccd_snapshot_path = processor_config.get("ccd_snapshot_path")
+        else:
+            ccd_revision = getattr(processor_config, "ccd_revision", None)
+            ccd_snapshot_path = getattr(processor_config, "ccd_snapshot_path", None)
         processor: Any = self.processor
         if self._process_training:
             processor = processor.process_training
         for split, split_config in self.config.data.items():
-            processor_kwargs = {key: value for key, value in split_config.items() if key != "source"}
-            datasets[split] = StructureDataset(split_config.source, processor, processor_kwargs=processor_kwargs)
+            processor_kwargs = {
+                key: value
+                for key, value in split_config.items()
+                if key not in {"source", "cluster_sampling", "seq_to_pdb_index", "msa_path"}
+            }
+            seq_to_pdb_index = split_config.get("seq_to_pdb_index")
+            msa_path = split_config.get("msa_path")
+            cluster = split_config.cluster_sampling
+            if cluster.enabled:
+                configured_train_splits = self.config.get("train_splits")
+                is_train_split = split == "train" if configured_train_splits is None else split in self.train_splits
+                if not is_train_split:
+                    raise ValueError(f"cluster sampling is only supported for training splits, not {split!r}")
+                if not cluster.cluster_file:
+                    raise ValueError(f"data.{split}.cluster_sampling.cluster_file is required when enabled")
+                if split_config.source is None:
+                    raise ValueError(f"data.{split}.source is required when cluster sampling is enabled")
+                indices_file = getattr(cluster, "indices_file", None)
+                if not indices_file:
+                    workspace = self.config.get("workspace", {})
+                    workspace_root = workspace.get("root", ".") if isinstance(workspace, Mapping) else workspace.root
+                    indices_file = default_cluster_indices_path(
+                        workspace_root,
+                        split_config.source,
+                        cluster.cluster_file,
+                        contact_cutoff=float(cluster.contact_cutoff),
+                        include_all_chain_pairs=bool(cluster.include_all_chain_pairs),
+                        exclude_mol_types=tuple(cluster.exclude_mol_types),
+                        beta=dict(cluster.beta),
+                        alpha=dict(cluster.alpha),
+                        ccd_revision=ccd_revision,
+                        ccd_snapshot_path=ccd_snapshot_path,
+                    )
+                datasets[split] = ClusteredStructureDataset(
+                    split_config.source,
+                    processor,
+                    cluster_file=cluster.cluster_file,
+                    cluster_indices_file=indices_file,
+                    contact_cutoff=float(cluster.contact_cutoff),
+                    include_all_chain_pairs=bool(cluster.include_all_chain_pairs),
+                    exclude_mol_types=tuple(cluster.exclude_mol_types),
+                    beta=dict(cluster.beta),
+                    alpha=dict(cluster.alpha),
+                    seq_to_pdb_index=seq_to_pdb_index,
+                    msa_path=msa_path,
+                    processor_kwargs=processor_kwargs,
+                    forward_indices=self._forward_cluster_indices,
+                    ccd_revision=ccd_revision,
+                    ccd_snapshot_path=ccd_snapshot_path,
+                )
+            else:
+                datasets[split] = StructureDataset(
+                    split_config.source,
+                    processor,
+                    seq_to_pdb_index=seq_to_pdb_index,
+                    msa_path=msa_path,
+                    processor_kwargs=processor_kwargs,
+                    ccd_revision=ccd_revision,
+                    ccd_snapshot_path=ccd_snapshot_path,
+                )
         return datasets
+
+    def build_datasampler(self, dataset: Any, *, split: str, shuffle: bool) -> Any:
+        r"""Use row-weighted cluster sampling only for explicitly enabled training splits."""
+
+        from .cluster import ClusterWeightedSampler
+        from .dataset import ClusteredStructureDataset
+
+        if not isinstance(dataset, ClusteredStructureDataset) or split not in self.train_splits:
+            return super().build_datasampler(dataset, split=split, shuffle=shuffle)
+
+        cluster = self.config.data[split].cluster_sampling
+        epoch_size = cluster.epoch_size
+        if epoch_size is None:
+            epoch_size = len(dataset.entries)
+        seed = self.config.seed if cluster.seed is None else cluster.seed
+        num_replicas, rank = 1, 0
+        if self.distributed:
+            num_replicas, rank = self.world_size, self.rank
+            if self.fault_tolerance is not None:
+                num_replicas, rank = self.fault_tolerance.data_parallel_info(num_replicas, rank)
+        return ClusterWeightedSampler(
+            dataset.entries,
+            dataset.weights,
+            int(epoch_size),
+            replacement=bool(cluster.replacement),
+            seed=0 if seed is None else int(seed),
+            num_replicas=num_replicas,
+            rank=rank,
+        )
 
     # -- steps ---------------------------------------------------------------
 

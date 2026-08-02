@@ -20,11 +20,18 @@ from ofoldx.data.ccd import resolve_ccd_component
 
 component = resolve_ccd_component("HEM", revision="2026-07-23")
 # -> ofoldx.data.molecular.ChemicalComponent
+
+# Or resolve from an explicitly prepared local snapshot with no Hub access.
+component = resolve_ccd_component("HEM", snapshot_path="/data/ccd-v20240608")
 ```
 
 - `component_id: str` — an exact wwPDB CCD code (for example `"HEM"`, `"ATP"`).
-- `revision: str` — the wwPDB snapshot date. It pins the Hub dataset commit so a
-  resolved value is fully reproducible and provenance-tagged.
+- `revision: str | None` — an explicit Hub revision. It pins the remote dataset
+  commit so a resolved value is reproducible and provenance-tagged.
+- `snapshot_path: str | None` — an existing local directory containing one or
+  more resolver-schema `*.parquet` shards. This mode performs no Hub access.
+- Exactly one of `revision` and `snapshot_path` is required. There is no implicit
+  latest revision and no fallback between remote and local resolution.
 - Unknown codes raise `KeyError`; a malformed row raises `ValueError` /
   `TypeError`.
 
@@ -44,6 +51,11 @@ Parquet with **one component per row**. The resolver downloads it through the sa
 
 **Revision = wwPDB snapshot date.** Each dataset revision corresponds to one wwPDB
 CCD snapshot; passing that date as `revision` fixes exact provenance.
+
+For offline work, build or copy the same Parquet schema into a versioned local
+directory and pass that directory explicitly as `snapshot_path`. The directory
+name and accompanying metadata should record the source CCD snapshot date; a
+local snapshot must never be labeled as a newer remote revision.
 
 ### Parquet row schema
 
@@ -82,6 +94,21 @@ split into one dict per `data_` block), and the field lowering mirrors
 `alphafold3/structure/chemical_components.py` (`parse_atom_data` /
 `parse_bond_data`). The mmCIF and Parquet dependencies are imported lazily by the
 build entry points.
+
+A complete offline build is:
+
+```python
+from ofoldx.data.ccd.build import build_rows, write_parquet
+
+rows = build_rows("/data/components.v20240608.cif")
+write_parquet(rows, "/data/ccd-v20240608/components.parquet")
+```
+
+The converter materializes the parsed CIF and normalized rows, so a full CCD
+build should run as a dedicated data-preparation job with adequate memory. At
+runtime, the resolver reads only the resulting Parquet shards. The RDKit pickle
+distributed by some model datasets is not resolver input and is not used to
+generate reference coordinates.
 
 `build.py` is a build-time tool only — it is never imported during modeling and
 never runs during tensor compute.

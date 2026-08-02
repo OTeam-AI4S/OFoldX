@@ -375,7 +375,11 @@ class ProtenixProcessorConfig(Config):
     Args:
         max_msa_rows: Maximum MSA depth included in model inputs.
         augment_reference_positions: Whether to randomly rotate and translate reference coordinates.
+        ccd_revision: Optional pinned Hub revision used to hydrate reference-less components.
+        ccd_snapshot_path: Optional local resolver-schema snapshot directory used offline.
     """
 
     max_msa_rows: int = 16384
     augment_reference_positions: bool = True
+    ccd_revision: str | None = None
+    ccd_snapshot_path: str | None = None

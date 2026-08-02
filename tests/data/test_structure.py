@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import pickle
+from dataclasses import FrozenInstanceError
+
+import pytest
 import torch
 
 import ofoldx.data as public_data
@@ -36,6 +40,29 @@ def _structure(instance_id: str, offset: float = 0.0) -> Structure:
 
 
 class TestStructure:
+    def test_pickle_round_trip_preserves_fields_and_frozen_state(self) -> None:
+        structure = _structure("A")
+
+        restored = pickle.loads(pickle.dumps(structure))
+
+        assert restored.source_symbols == structure.source_symbols
+        assert restored.system.symbols == structure.system.symbols
+        assert structure.is_locked
+        assert restored.is_locked
+        assert restored.system.is_locked
+        assert restored.batch_size == structure.batch_size
+        assert restored.device == structure.device
+        assert restored.names == structure.names
+        for field in structure.fields():
+            original_value = getattr(structure, field.name)
+            restored_value = getattr(restored, field.name)
+            if isinstance(original_value, torch.Tensor):
+                assert torch.equal(restored_value, original_value)
+        with pytest.raises(FrozenInstanceError):
+            restored.source_symbols = ()  # type: ignore[misc]
+        with pytest.raises(RuntimeError, match="locked"):
+            restored.set("coordinates", restored.coordinates.clone())
+
     def test_public_class_and_atom_aligned_values(self) -> None:
         structure = _structure("A")
 

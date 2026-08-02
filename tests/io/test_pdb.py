@@ -125,7 +125,7 @@ END
         path = tmp_path / "alanine.pdb"
 
         write_structure(structure, path)
-        restored = read_structure(path)
+        restored = read_structure(path, include_hydrogens=True)
 
         assert restored.system.instance_id(0) == "A"
         assert torch.equal(restored.coordinates, structure.coordinates)

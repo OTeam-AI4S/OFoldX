@@ -460,3 +460,10 @@ FodyWeavers.xsd
 OOps/
 artifacts/
 docs/site/
+
+# agent files
+tmp/
+artifacts/
+
+# third party
+baseline/

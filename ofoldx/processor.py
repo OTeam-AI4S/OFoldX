@@ -11,6 +11,10 @@ import torch
 from typing_extensions import Self
 
 
+class UnresolvedTrainingCropError(ValueError):
+    r"""Raised when a training crop contains no resolved model-visible atoms."""
+
+
 class Processor:
     r"""
     Base class for processors with a default tensor device and dtype.

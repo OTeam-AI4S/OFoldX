@@ -7,7 +7,7 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Protocol, cast
 
 import numpy as np
 import torch
@@ -15,6 +15,9 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from ...data import water_component_mask
+from ...data.ccd import resolve_ccd_component
+from ...data.ccd.resolver import validate_ccd_snapshot_path
+from ...data.components import get_component
 from ...data.evidence import (
     MSA,
     MSACollection,
@@ -32,14 +35,16 @@ from ...data.molecular import (
     ENTITY_PROTEIN,
     ENTITY_RNA,
     AtomSite,
+    ChemicalComponent,
     ComponentReference,
     MolecularSystem,
     Molecule,
     PolymerSequence,
+    replace_components,
 )
 from ...data.structure import Structure
 from ...modules.geometry import uniform_random_rotation
-from ...processor import Processor
+from ...processor import Processor, UnresolvedTrainingCropError
 from .config import ProtenixProcessorConfig
 from .model import (
     ProtenixAtomContact,
@@ -196,6 +201,13 @@ _POLYMER_TYPE = {
 }
 
 
+class ProtenixCropIndex(Protocol):
+    r"""Sampling-row metadata needed to choose spatial crop centres."""
+
+    type: str
+    reference_instance_ids: tuple[str, ...]
+
+
 class ProtenixProcessor(Processor):
     r"""
     Convert supported biomolecular inputs into `ProtenixInput`.
@@ -237,6 +249,10 @@ class ProtenixProcessor(Processor):
         self.config = ProtenixProcessorConfig() if config is None else config
         if not 1 <= self.config.max_msa_rows <= 16384:
             raise ValueError("max_msa_rows must be between 1 and 16384")
+        if self.config.ccd_revision is not None and self.config.ccd_snapshot_path is not None:
+            raise ValueError("configure at most one of ccd_revision or ccd_snapshot_path")
+        if self.config.ccd_snapshot_path is not None:
+            self.config.ccd_snapshot_path = str(validate_ccd_snapshot_path(self.config.ccd_snapshot_path))
         super().__init__(device=device, dtype=dtype)
 
     def __call__(
@@ -278,18 +294,51 @@ class ProtenixProcessor(Processor):
         *,
         msa: MSA | MSACollection | None = None,
         generator: torch.Generator | None = None,
+        max_tokens: int | None = None,
+        crop_method_weights: Sequence[float] = (0.2, 0.4, 0.4),
+        indices: ProtenixCropIndex | None = None,
     ) -> tuple[ProtenixInput, ProtenixStructureTarget]:
         r"""
-        Lower one structure into model input and separate coordinate truth.
+        Lower one structure into cropped model input and full coordinate truth.
+
+        Args:
+            input: Full canonical structure used for topology, resolved crop
+                centres, and coordinate truth.
+            msa: Optional protein MSA evidence.
+            generator: Optional generator shared by crop-method selection, chain
+                order, crop boundaries, spatial-centre selection, and ordinary
+                feature augmentation. CPU and CUDA generators are supported.
+            max_tokens: Maximum model-input token count. ``None`` disables
+                cropping. Structures already at or below the limit take the
+                ordinary lowering path without consuming crop randomness.
+            crop_method_weights: Non-negative finite weights for continuous,
+                spatial, and interface-spatial cropping, in that order.
+            indices: Sampled cluster-row metadata. It is required whenever an
+                over-limit structure has positive spatial or interface-spatial
+                weight; continuous-only cropping does not require it.
+
+        Returns:
+            A possibly cropped ``ProtenixInput`` and a
+            ``ProtenixStructureTarget`` that retains the complete canonical atom
+            axis. ``input.atom_index`` maps cropped model atoms into that target.
         """
 
-        processed = self(
+        _validate_crop_arguments(max_tokens, crop_method_weights)
+        structure = _hydrate_structure(
             input,
+            revision=self.config.ccd_revision,
+            snapshot_path=self.config.ccd_snapshot_path,
+        )
+        processed = self._lower(
+            structure,
             msa=msa,
+            crop_max_tokens=max_tokens,
+            crop_method_weights=tuple(float(weight) for weight in crop_method_weights),
+            crop_indices=indices,
             generator=generator,
         )
         return processed, _structure_target(
-            input,
+            structure,
             device=self.device,
             dtype=self.dtype,
         )
@@ -321,15 +370,33 @@ class ProtenixProcessor(Processor):
         structure_condition: Structure | None = None,
         tfg_guidance: ProtenixTfgGuidance | None = None,
         generator: torch.Generator | None = None,
+        crop_max_tokens: int | None = None,
+        crop_method_weights: tuple[float, float, float] = (0.2, 0.4, 0.4),
+        crop_indices: ProtenixCropIndex | None = None,
     ) -> ProtenixInput:
         atom_contact_values = tuple(atom_contacts)
         token_contact_values = tuple(token_contacts)
-        system = molecular_system_from_input(input)
+        system = molecular_system_from_input(
+            input,
+            revision=self.config.ccd_revision,
+            snapshot_path=self.config.ccd_snapshot_path,
+        )
         resolved_msa = self._resolve_msa(msa, system)
         # Atom contacts require atom-level tokens. Token contacts and pockets use
         # the tokenization already selected for each residue.
         expanded_residues = _atom_constraint_residues(atom_contact_values, system)
         tokens = _tokenize(system, expanded_residues)
+        if crop_max_tokens is not None and len(tokens) > crop_max_tokens:
+            if crop_indices is None and any(crop_method_weights[index] > 0 for index in (1, 2)):
+                raise ValueError("indices are required when spatial crop methods have positive weight")
+            tokens = _crop_training_tokens(
+                input=cast(Structure, input),
+                tokens=tokens,
+                max_tokens=crop_max_tokens,
+                method_weights=crop_method_weights,
+                indices=crop_indices,
+                generator=generator,
+            )
         return _features(
             system,
             tokens=tokens,
@@ -406,14 +473,19 @@ class ProtenixTemplateProcessor(ProtenixProcessor):
         Lower template-capable input and separate coordinate truth.
         """
 
-        processed = self(
+        structure = _hydrate_structure(
             input,
+            revision=self.config.ccd_revision,
+            snapshot_path=self.config.ccd_snapshot_path,
+        )
+        processed = self(
+            structure,
             msa=msa,
             templates=templates,
             generator=generator,
         )
         return processed, _structure_target(
-            input,
+            structure,
             device=self.device,
             dtype=self.dtype,
         )
@@ -491,14 +563,19 @@ class ProtenixStructureConditionProcessor(ProtenixProcessor):
         Lower structure-conditioned input and separate coordinate truth.
         """
 
-        processed = self(
+        structure = _hydrate_structure(
             input,
+            revision=self.config.ccd_revision,
+            snapshot_path=self.config.ccd_snapshot_path,
+        )
+        processed = self(
+            structure,
             structure_condition=structure_condition,
             msa=msa,
             generator=generator,
         )
         return processed, _structure_target(
-            input,
+            structure,
             device=self.device,
             dtype=self.dtype,
         )
@@ -579,8 +656,13 @@ class ProtenixConstraintProcessor(ProtenixProcessor):
         Lower constrained input and separate coordinate truth.
         """
 
-        processed = self(
+        structure = _hydrate_structure(
             input,
+            revision=self.config.ccd_revision,
+            snapshot_path=self.config.ccd_snapshot_path,
+        )
+        processed = self(
+            structure,
             msa=msa,
             atom_contacts=atom_contacts,
             token_contacts=token_contacts,
@@ -590,7 +672,7 @@ class ProtenixConstraintProcessor(ProtenixProcessor):
             generator=generator,
         )
         return processed, _structure_target(
-            input,
+            structure,
             device=self.device,
             dtype=self.dtype,
         )
@@ -613,8 +695,308 @@ def _structure_target(
     )
 
 
+def _validate_crop_arguments(max_tokens: int | None, method_weights: Sequence[float]) -> None:
+    if max_tokens is not None and (isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens <= 0):
+        raise ValueError("max_tokens must be a positive integer or None")
+    if isinstance(method_weights, (str, bytes)):
+        raise ValueError("crop_method_weights must be a numeric sequence")
+    try:
+        weight_count = len(method_weights)
+    except TypeError as error:
+        raise ValueError("crop_method_weights must be a numeric sequence") from error
+    if weight_count != 3:
+        raise ValueError("crop_method_weights must contain exactly three values")
+    try:
+        weights = tuple(float(weight) for weight in method_weights)
+    except (TypeError, ValueError) as error:
+        raise ValueError("crop_method_weights must be a numeric sequence") from error
+    if not all(math.isfinite(weight) for weight in weights):
+        raise ValueError("crop_method_weights must be finite")
+    if any(weight < 0 for weight in weights):
+        raise ValueError("crop_method_weights must be non-negative")
+    if sum(weights) <= 0:
+        raise ValueError("crop_method_weights must have a positive sum")
+
+
+def _generator_device(generator: torch.Generator | None) -> torch.device:
+    return torch.device("cpu") if generator is None else torch.device(generator.device)
+
+
+def _random_integer(high: int, generator: torch.Generator | None, *, low: int = 0) -> int:
+    if high <= low:
+        return low
+    return int(
+        torch.randint(
+            low,
+            high,
+            (),
+            generator=generator,
+            device=_generator_device(generator),
+        ).item()
+    )
+
+
+def _random_permutation(length: int, generator: torch.Generator | None) -> list[int]:
+    return torch.randperm(
+        length,
+        generator=generator,
+        device=_generator_device(generator),
+    ).detach().cpu().tolist()
+
+
+def _drop_partial_reference_spaces(
+    tokens: list[dict[str, object]],
+    selected_indices: Sequence[int],
+) -> list[int]:
+    total: dict[int, int] = {}
+    selected: dict[int, int] = {}
+    for token in tokens:
+        reference_space = cast(int, token["reference_space"])
+        total[reference_space] = total.get(reference_space, 0) + 1
+    for index in selected_indices:
+        reference_space = cast(int, tokens[index]["reference_space"])
+        selected[reference_space] = selected.get(reference_space, 0) + 1
+    return [
+        index
+        for index in selected_indices
+        if selected[cast(int, tokens[index]["reference_space"])]
+        == total[cast(int, tokens[index]["reference_space"])]
+    ]
+
+
+def _continuous_crop_indices(
+    system: MolecularSystem,
+    tokens: list[dict[str, object]],
+    max_tokens: int,
+    generator: torch.Generator | None,
+) -> list[int]:
+    del system
+    chains: list[list[int]] = []
+    for token_index, token in enumerate(tokens):
+        chain_index = cast(int, token["chain_index"])
+        while len(chains) <= chain_index:
+            chains.append([])
+        chains[chain_index].append(token_index)
+
+    classified_single_atom: list[bool] = []
+    for chain in chains:
+        if not chain:
+            classified_single_atom.append(False)
+            continue
+        only_atoms = cast(tuple[int, ...], tokens[chain[0]]["atoms"])
+        classified_single_atom.append(len(chain) == 1 and len(only_atoms) == 1)
+
+    first_indices = [0] * len(tokens)
+    last_indices = [0] * len(tokens)
+    reference_groups: dict[int, list[int]] = {}
+    for token_index, token in enumerate(tokens):
+        reference_groups.setdefault(cast(int, token["reference_space"]), []).append(token_index)
+    for group in reference_groups.values():
+        for token_index in group:
+            first_indices[token_index] = group[0]
+            last_indices[token_index] = group[-1]
+
+    def qualifies(current_size: int, minimum_size: int, already_added: int) -> bool:
+        return current_size >= minimum_size and current_size + already_added <= max_tokens
+
+    def complete_boundaries(
+        start: int,
+        end: int,
+        minimum_size: int,
+        already_added: int,
+    ) -> tuple[int, int]:
+        if start == end:
+            return start, end
+
+        left_start = right_start = start
+        if first_indices[start] != start:
+            start_in_middle = True
+            left_start = first_indices[start]
+            right_start = last_indices[start] + 1
+        else:
+            start_in_middle = False
+
+        left_end = right_end = end
+        if end > 0 and last_indices[end - 1] != end - 1:
+            end_in_middle = True
+            left_end = first_indices[end - 1]
+            right_end = last_indices[end - 1] + 1
+        else:
+            end_in_middle = False
+
+        if not start_in_middle and not end_in_middle:
+            return start, end
+        if start_in_middle and end_in_middle:
+            # This matches upstream's deterministic "always use left edge"
+            # rule when both sampled boundaries split reference spaces.
+            start_in_middle = False
+            start = left_start
+
+        if not start_in_middle and end_in_middle:
+            left_size = left_end - start
+            right_size = right_end - start
+            left_ok = qualifies(left_size, minimum_size, already_added)
+            right_ok = qualifies(right_size, minimum_size, already_added)
+            if left_ok and right_ok:
+                return (start, left_end) if _random_integer(2, generator) == 0 else (start, right_end)
+            if left_ok:
+                return start, left_end
+            if right_ok:
+                return start, right_end
+            # ``drop_last=True``: repeatedly discard the final complete
+            # reference space until the global token quota is respected.
+            completed_end = left_end
+            while completed_end - start + already_added > max_tokens:
+                if completed_end > start:
+                    completed_end = first_indices[completed_end - 1]
+                else:
+                    break
+            return start, completed_end
+
+        # Only the start boundary is in the middle of a reference space.
+        left_size = end - left_start
+        right_size = end - right_start
+        left_ok = qualifies(left_size, minimum_size, already_added)
+        right_ok = qualifies(right_size, minimum_size, already_added)
+        if left_ok and right_ok:
+            return (left_start, end) if _random_integer(2, generator) == 0 else (right_start, end)
+        if left_ok:
+            return left_start, end
+        if right_ok:
+            return right_start, end
+        # ``drop_last=True`` selects the right edge, dropping the incomplete
+        # leading reference space rather than returning a partial group.
+        return right_start, end
+
+    selected: list[int] = []
+    remaining = len(tokens) - sum(classified_single_atom)
+    for chain_offset in _random_permutation(len(chains), generator):
+        if len(selected) >= max_tokens:
+            break
+        chain = chains[chain_offset]
+        if classified_single_atom[chain_offset]:
+            continue
+        chain_length = len(chain)
+        remaining -= chain_length
+        minimum = min(chain_length, max(0, max_tokens - len(selected) - remaining))
+        maximum = min(chain_length, max_tokens - len(selected))
+        crop_length = _random_integer(maximum + 1, generator, low=minimum)
+        crop_start = _random_integer(chain_length - crop_length + 1, generator)
+        start = chain[0] + crop_start
+        end = start + crop_length
+        start, end = complete_boundaries(start, end, minimum, len(selected))
+        selected.extend(range(start, end))
+
+    return sorted(selected)
+
+
+def _spatial_crop_indices(
+    structure: Structure,
+    tokens: list[dict[str, object]],
+    max_tokens: int,
+    indices: ProtenixCropIndex,
+    generator: torch.Generator | None,
+    *,
+    interface: bool,
+) -> list[int]:
+    if indices.type not in {"chain", "interface"}:
+        raise ValueError("indices.type must be 'chain' or 'interface'")
+    reference_instances = frozenset(indices.reference_instance_ids)
+    if not reference_instances:
+        raise ValueError("indices.reference_instance_ids must be non-empty for spatial cropping")
+
+    system = structure.system
+    center_indices = torch.tensor([cast(int, token["center"]) for token in tokens], dtype=torch.long)
+    coordinates = structure.coordinates.detach().cpu()[center_indices]
+    resolved = structure.coordinate_mask.detach().cpu()[center_indices].bool()
+    chain_indices = torch.tensor([cast(int, token["chain_index"]) for token in tokens], dtype=torch.long)
+    sampled = torch.tensor(
+        [
+            system.instance_id(cast(int, token["instance_index"])) in reference_instances
+            for token in tokens
+        ],
+        dtype=torch.bool,
+    )
+    if not bool(sampled.any()):
+        raise ValueError("indices.reference_instance_ids do not match any model token")
+    reference_candidates = torch.nonzero(resolved & sampled, as_tuple=False).flatten()
+    if reference_candidates.numel() == 0:
+        raise UnresolvedTrainingCropError("sampled crop row has no resolved token centre candidates")
+    if interface:
+        interface_candidates = []
+        resolved_indices = torch.nonzero(resolved, as_tuple=False).flatten()
+        for candidate in reference_candidates.tolist():
+            other_chain = resolved_indices[chain_indices[resolved_indices] != chain_indices[candidate]]
+            if other_chain.numel() and torch.any(
+                torch.linalg.vector_norm(coordinates[other_chain] - coordinates[candidate], dim=-1) < 15.0
+            ):
+                interface_candidates.append(candidate)
+        if interface_candidates:
+            reference_candidates = torch.tensor(interface_candidates, dtype=torch.long)
+        elif indices.type == "chain":
+            # A sampled chain without an interface falls back to any of its
+            # resolved centres. Interface rows must describe a real interface.
+            reference_candidates = torch.nonzero(resolved & sampled, as_tuple=False).flatten()
+        else:
+            raise ValueError("sampled interface has no resolved <15A cross-chain centre candidate")
+
+    reference_index = int(
+        reference_candidates[_random_integer(reference_candidates.numel(), generator)].item()
+    )
+    distances = torch.linalg.vector_norm(coordinates - coordinates[reference_index], dim=-1)
+    distances = torch.where(resolved, distances, torch.full_like(distances, torch.inf))
+    canonical_indices = torch.tensor(
+        [cast(int, token["token_index"]) for token in tokens],
+        dtype=distances.dtype,
+    )
+    scores = distances + canonical_indices * 1e-3
+    nearest = torch.topk(scores, min(max_tokens, len(tokens)), largest=False).indices.sort().values.tolist()
+    return _drop_partial_reference_spaces(tokens, nearest)
+
+
+def _crop_training_tokens(
+    *,
+    input: Structure,
+    tokens: list[dict[str, object]],
+    max_tokens: int,
+    method_weights: tuple[float, float, float],
+    indices: ProtenixCropIndex | None,
+    generator: torch.Generator | None,
+) -> list[dict[str, object]]:
+    weights = torch.tensor(method_weights, dtype=torch.float64, device=_generator_device(generator))
+    method = int(torch.multinomial(weights, 1, generator=generator).item())
+    if method == 0:
+        selected = _continuous_crop_indices(input.system, tokens, max_tokens, generator)
+    else:
+        if indices is None:  # guarded before method sampling; retained for type narrowing
+            raise ValueError("indices are required for spatial cropping")
+        selected = _spatial_crop_indices(
+            input,
+            tokens,
+            max_tokens,
+            indices,
+            generator,
+            interface=method == 2,
+        )
+    if not selected:
+        raise ValueError("training crop selected no complete non-metal token groups")
+    atom_indices = [
+        atom_index
+        for token_index in selected
+        for atom_index in cast(tuple[int, ...], tokens[token_index]["atoms"])
+    ]
+    coordinate_mask = input.coordinate_mask
+    mask_indices = torch.tensor(atom_indices, dtype=torch.long, device=coordinate_mask.device)
+    if not bool(coordinate_mask[mask_indices].any()):
+        raise UnresolvedTrainingCropError("training crop contains no resolved atoms to score")
+    return [tokens[index] for index in selected]
+
+
 def molecular_system_from_input(
     input: PolymerSequence | Sequence[PolymerSequence] | MolecularSystem | Structure,
+    *,
+    revision: str | None = None,
+    snapshot_path: str | None = None,
 ) -> MolecularSystem:
     r"""
     Normalize one Protenix biological input to its molecular system.
@@ -622,6 +1004,8 @@ def molecular_system_from_input(
     Args:
         input: One polymer, a polymer collection, a molecular system, or a
             structure whose topology supplies the system.
+        revision: Pinned CCD snapshot used to hydrate reference-less components.
+        snapshot_path: Local resolver-schema snapshot directory used offline.
 
     Returns:
         The canonical molecular system. Protenix-visible axes exclude water
@@ -631,21 +1015,192 @@ def molecular_system_from_input(
     # A Structure supplied as the primary input contributes only topology. The
     # constraint Processor lowers coordinates only from its explicit substructure argument.
     if isinstance(input, Structure):
-        return input.system
+        system = input.system
     elif isinstance(input, MolecularSystem):
-        return input
+        system = input
     elif isinstance(input, PolymerSequence):
-        return molecular_system_from_named_sequences((("A", input),))
+        system = molecular_system_from_named_sequences((("A", input),))
     elif isinstance(input, Sequence):
         sequence_values = tuple(cast(Sequence[object], input))
         if not sequence_values or not all(isinstance(sequence, PolymerSequence) for sequence in sequence_values):
             raise TypeError("Protenix sequence collections must contain PolymerSequence values")
         polymer_sequences = cast(tuple[PolymerSequence, ...], sequence_values)
-        return molecular_system_from_named_sequences(
+        system = molecular_system_from_named_sequences(
             tuple((f"chain_{index + 1}", sequence) for index, sequence in enumerate(polymer_sequences))
         )
-    raise TypeError(
-        "Protenix input must be a PolymerSequence, sequence of PolymerSequence " "values, MolecularSystem, or Structure"
+    else:
+        raise TypeError(
+            "Protenix input must be a PolymerSequence, sequence of PolymerSequence "
+            "values, MolecularSystem, or Structure"
+        )
+    return _hydrate_system(system, revision=revision, snapshot_path=snapshot_path)[0]
+
+
+def _hydrate_system(
+    system: MolecularSystem,
+    *,
+    revision: str | None,
+    snapshot_path: str | None,
+) -> tuple[MolecularSystem, Tensor]:
+    r"""Best-effort hydrate reference-less occurrences from a configured CCD."""
+
+    component_count = system.component_symbol.numel()
+    atom_count = system.atom_symbol.numel()
+    atom_component = torch.repeat_interleave(
+        torch.arange(component_count, dtype=torch.int64, device=system.atom_symbol.device),
+        system.component_atom_ptr[1:] - system.component_atom_ptr[:-1],
+    )
+    reference_count = torch.zeros(component_count, dtype=torch.int64, device=system.atom_symbol.device)
+    reference_count.scatter_add_(0, atom_component, system.reference_coordinate_mask.to(torch.int64))
+    hydrate_mask = (
+        (system.component_atom_ptr[1:] == system.component_atom_ptr[:-1])
+        | (reference_count == 0)
+        | ~system.component_topology_complete
+    )
+    component_index = torch.nonzero(hydrate_mask, as_tuple=False).flatten()
+    if not component_index.numel():
+        return system, torch.arange(atom_count, dtype=torch.int64, device=system.atom_symbol.device)
+
+    cache: dict[str, ChemicalComponent | None] = {}
+
+    component_instance = torch.repeat_interleave(
+        torch.arange(
+            system.instance_symbol.numel(),
+            dtype=torch.int64,
+            device=system.instance_component_ptr.device,
+        ),
+        system.instance_component_ptr[1:] - system.instance_component_ptr[:-1],
+    )
+
+    def observed_atom_ids(component: int) -> set[str]:
+        start = int(system.component_atom_ptr[component])
+        stop = int(system.component_atom_ptr[component + 1])
+        return {
+            system.symbols[int(symbol)]
+            for symbol in system.atom_symbol[start:stop].detach().cpu().tolist()
+        }
+
+    def induce_observed(value: ChemicalComponent, atom_ids: set[str]) -> ChemicalComponent:
+        keep = tuple(atom.atom_id in atom_ids for atom in value.atoms)
+        bonds = value.bonds
+        if bonds is not None:
+            bonds = frozenset(
+                bond
+                for bond in bonds
+                if bond.atom_a in atom_ids
+                and bond.atom_b in atom_ids
+                and (bond.stereo_atoms is None or set(bond.stereo_atoms) <= atom_ids)
+            )
+        return ChemicalComponent(
+            component_id=value.component_id,
+            atoms=tuple(atom for atom, retained in zip(value.atoms, keep) if retained),
+            bonds=bonds,
+            reference_coordinates=(
+                tuple(
+                    coordinate
+                    for coordinate, retained in zip(value.reference_coordinates, keep)
+                    if retained
+                )
+                if value.reference_coordinates
+                else ()
+            ),
+        )
+
+    def resolve(component: int) -> ChemicalComponent | None:
+        component_id = system.symbols[int(system.component_symbol[component])]
+        if component_id == "UNK":
+            if bool(system.component_topology_complete[component]):
+                return None
+            try:
+                value = get_component(component_id).without_hydrogens()
+            except KeyError:
+                return None
+            return ChemicalComponent(
+                component_id=value.component_id,
+                atoms=value.atoms,
+                bonds=value.bonds,
+                previous_attachment=value.previous_attachment,
+                next_attachment=value.next_attachment,
+                reference_coordinates=(),
+            )
+        if component_id not in cache:
+            try:
+                if revision is None and snapshot_path is None:
+                    cache[component_id] = get_component(component_id).without_hydrogens()
+                else:
+                    cache[component_id] = resolve_ccd_component(
+                        component_id,
+                        revision=revision,
+                        snapshot_path=snapshot_path,
+                    ).without_hydrogens()
+            except KeyError:
+                cache[component_id] = None
+        return cache[component_id]
+
+    selected = component_index.detach().cpu().tolist()
+    resolved_indices: list[int] = []
+    resolved_components: list[ChemicalComponent] = []
+    for component in selected:
+        value = resolve(component)
+        if value is None:
+            continue
+        instance = int(component_instance[component])
+        entity = int(system.instance_entity[instance])
+        if int(system.entity_type[entity]) == ENTITY_MOLECULE:
+            atom_ids = observed_atom_ids(component)
+            value = induce_observed(value, atom_ids)
+            if atom_ids and not value.atoms:
+                continue
+        resolved_indices.append(component)
+        resolved_components.append(value)
+    if not resolved_indices:
+        return system, torch.arange(atom_count, dtype=torch.int64, device=system.atom_symbol.device)
+    hydrated, old_to_new, _ = replace_components(
+        system,
+        torch.tensor(resolved_indices, dtype=torch.int64, device=component_index.device),
+        resolved_components,
+    )
+    return hydrated, old_to_new
+
+
+def _hydrate_structure(
+    structure: Structure,
+    *,
+    revision: str | None,
+    snapshot_path: str | None,
+) -> Structure:
+    r"""Hydrate topology and map observed fields by component-local atom ID."""
+
+    system, old_to_new = _hydrate_system(
+        structure.system,
+        revision=revision,
+        snapshot_path=snapshot_path,
+    )
+    if system is structure.system:
+        return structure
+
+    retained = old_to_new >= 0
+    source_atom = torch.nonzero(retained, as_tuple=False).flatten()
+    output_atom = old_to_new[retained]
+    atom_count = system.atom_symbol.numel()
+
+    def scatter(value: Tensor) -> Tensor:
+        output = value.new_zeros((atom_count, *value.shape[1:]))
+        output[output_atom] = value[source_atom]
+        return output
+
+    return Structure(  # type: ignore[call-arg]
+        system=system,
+        coordinates=scatter(structure.coordinates),
+        coordinate_mask=scatter(structure.coordinate_mask),
+        occupancy=scatter(structure.occupancy),
+        occupancy_mask=scatter(structure.occupancy_mask),
+        b_factor=scatter(structure.b_factor),
+        b_factor_mask=scatter(structure.b_factor_mask),
+        source_symbols=structure.source_symbols,
+        residue_id=structure.residue_id,
+        insertion_code=structure.insertion_code,
+        batch_size=[],
     )
 
 
@@ -796,6 +1351,7 @@ def _tokenize(system: MolecularSystem, expanded: frozenset[int]) -> list[dict[st
                     )
                     tokens.append(
                         {
+                            "token_index": len(tokens),
                             "atoms": group,
                             "atom_index": group[0] if atom_token else None,
                             "component_index": component_index,
@@ -831,6 +1387,7 @@ def _tokenize(system: MolecularSystem, expanded: frozenset[int]) -> list[dict[st
                 for atom_index in atom_indices:
                     tokens.append(
                         {
+                            "token_index": len(tokens),
                             "atoms": (atom_index,),
                             "atom_index": atom_index,
                             "component_index": component_index,
@@ -1729,15 +2286,13 @@ def _reference_features(
         grouped.setdefault(int(atom_component[atom_index]), []).append(model_atom_index)
 
     group_indices: list[Tensor] = []
-    component_symbols = system.component_symbol.detach().cpu().tolist()
-    for component_index, model_indices in grouped.items():
+    for model_indices in grouped.values():
         indices = torch.tensor(model_indices)
         if not bool(mask[indices].any()):
-            component_id = system.symbols[component_symbols[component_index]]
-            raise ValueError(
-                f"Protenix requires explicit reference_coordinates for {component_id!r}; "
-                "the Processor does not generate conformers implicitly"
-            )
+            positions[indices] = 0
+            mask[indices] = False
+            charges[indices] = 0
+            continue
         positions[indices] -= positions[indices].mean(dim=0)
         if augment:
             group_indices.append(indices)

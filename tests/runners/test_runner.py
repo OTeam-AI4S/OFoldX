@@ -5,7 +5,9 @@ from pathlib import Path
 
 import pytest
 import torch
+from torch.utils.data import DataLoader, Dataset
 
+from ofoldx.data import MolecularSystem, Structure
 from ofoldx.models.registry import MODELS
 from ofoldx.modules.diffusion.loss import resolved_atom_mask
 from ofoldx.runners import Runner
@@ -37,6 +39,24 @@ _MINIMAL_BOLTZ1: dict = {
     "denoiser": {"num_token_encoder_blocks": 1, "num_atom_encoder_blocks": 1, "num_atom_decoder_blocks": 1},
     "confidence": {"enabled": False},
 }
+
+
+class _StructureWorkerDataset(Dataset[Structure]):
+    def __init__(self, structure: Structure) -> None:
+        self.structure = structure
+
+    def __len__(self) -> int:
+        return 1
+
+    def __getitem__(self, index: int) -> Structure:
+        if index != 0:
+            raise IndexError(index)
+        return self.structure
+
+
+def _collate_structure_graph(items: list[Structure]) -> dict[str, Structure | MolecularSystem]:
+    structure = items[0]
+    return {"structure": structure, "system": structure.system}
 
 
 def _write(path: Path, text: str = _TRIPEPTIDE) -> Path:
@@ -116,6 +136,19 @@ def test_unsupported_stack_is_rejected(tmp_path: Path) -> None:
         Runner(config)
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_runner_applies_model_gradient_checkpointing_switch(tmp_path: Path, enabled: bool) -> None:
+    config = _config(tmp_path, name="proteinmpnn")
+    config["gradient_checkpointing"] = enabled
+
+    runner = Runner(config)
+    try:
+        assert runner.config.gradient_checkpointing is enabled
+        assert runner.model.is_gradient_checkpointing is enabled
+    finally:
+        runner.close()
+
+
 def test_denoising_collate_normalizer_is_the_resolved_atom_count(tmp_path: Path) -> None:
     # The batch's loss_normalizer must equal the count the criterion averages over (resolved atoms), so
     # DanLing's normalizer-weighted backward forms a true per-atom mean rather than over-weighting large
@@ -127,6 +160,31 @@ def test_denoising_collate_normalizer_is_the_resolved_atom_count(tmp_path: Path)
     batch = collate_denoising([item])
     model_input, model_target = batch["input"]["input"], batch["input"]["target"]
     assert batch["loss_normalizer"] == int(resolved_atom_mask(model_target, model_input).sum())
+
+
+def test_dataloader_worker_round_trips_frozen_structure_graph(tmp_path: Path) -> None:
+    from ofoldx.io import read_structure
+
+    expected = read_structure(_write(tmp_path / "worker-ipc.pdb"))
+    loader = DataLoader(
+        _StructureWorkerDataset(expected),
+        batch_size=1,
+        num_workers=1,
+        collate_fn=_collate_structure_graph,
+    )
+
+    [payload] = list(loader)
+    structure = payload["structure"]
+    system = payload["system"]
+
+    assert isinstance(structure, Structure)
+    assert isinstance(system, MolecularSystem)
+    assert structure.system.symbols == expected.system.symbols
+    assert torch.equal(structure.coordinates, expected.coordinates)
+    assert torch.equal(system.atomic_number, expected.system.atomic_number)
+    assert structure.is_locked
+    assert structure.system.is_locked
+    assert system.is_locked
 
 
 def test_infer_step_returns_dataclass_output(tmp_path: Path) -> None:
