@@ -1,0 +1,27 @@
+# From the repository root, after creating logs/, submit with:
+# sbatch ofoldx/runners/submit_train.slurm -- --config configs/train.yaml
+# This is a conservative one-step GPU smoke run of the fresh Protenix model.
+train_datasets:
+  afdb_swissprot:
+    source: /data/projects/allodesign/datasets/afdb_swissprot/mmcif
+    sampling_ratio: 1.0
+    seq_to_pdb_index: /data/projects/allodesign/datasets/afdb_swissprot/seq_to_pdb_index.json
+    msa_path: /data/projects/allodesign/datasets/afdb_swissprot/mmcif_msa
+
+epochs: 1
+device: cuda
+precision: bf16
+batch_size: 1
+workers: 4
+gradient_checkpointing: true
+max_tokens: 384
+# No cluster file is configured, so only continuous cropping is valid.
+crop_method_weights: [1.0, 0.0, 0.0]
+processor_config:
+  max_msa_rows: 2048
+ccd_snapshot_path: /data/users/qinghanw313/AlloDesign/tmp/ccd-v20240608
+checkpoint: false
+workspace: /data/users/qinghanw313/AlloDesign/train/afdb_swissprot
+run_name: afdb-swissprot-smoke
+logging: true
+log_interval: 1

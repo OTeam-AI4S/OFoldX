@@ -38,6 +38,33 @@ def _structure() -> Structure:
     )
 
 
+def _msa(query: str) -> MSA:
+    return MSA(
+        "target",
+        (query,),
+        np.zeros((1, len(query)), dtype=np.uint32),
+        (query,),
+        np.zeros((1, len(query)), dtype=np.uint32),
+    )
+
+
+def _two_instance_system(second_sequence: str = "AGV") -> MolecularSystem:
+    return MolecularSystem.from_entities(
+        {"target": PolymerSequence.from_one_letter("AGV")},
+        {"A": "target", "B": "target"},
+        instance_values={"B": PolymerSequence.from_one_letter(second_sequence)},
+    )
+
+
+def _targeted_collection(query: str, instance_id: str) -> MSACollection:
+    return MSACollection(
+        (_msa(query),),
+        np.array([[0]], dtype=np.int64),
+        np.array([[True]], dtype=np.bool_),
+        target_instance_ids=(instance_id,),
+    )
+
+
 class TestMSA:
     def test_keeps_paired_and_unpaired_pools(self) -> None:
         msa = MSA(
@@ -88,6 +115,28 @@ class TestMSACollection:
                 np.array([[0], [-1]], dtype=np.int64),
                 np.array([[True], [True]], dtype=np.bool_),
             )
+
+    def test_broadcast_validates_every_matching_instance(self) -> None:
+        system = _two_instance_system()
+
+        resolved = resolve_msa_bindings(_msa("AGV"), system)
+
+        assert resolved[0][1:] == (None, 0)
+
+    def test_broadcast_rejects_a_divergent_later_instance(self) -> None:
+        system = _two_instance_system("AAV")
+
+        with pytest.raises(ValueError, match=r"entity 'target' instance 'B'.*column 1"):
+            resolve_msa_bindings(_msa("AGV"), system)
+
+    def test_exact_target_uses_that_instances_sequence(self) -> None:
+        system = _two_instance_system("AAV")
+
+        resolved = resolve_msa_bindings(_targeted_collection("AAV", "B"), system)
+
+        assert resolved[0][1:] == (1, 0)
+        with pytest.raises(ValueError, match=r"target instance 'B'.*column 1"):
+            resolve_msa_bindings(_targeted_collection("AGV", "B"), system)
 
 
 class TestTemplateAlignment:

@@ -11,6 +11,7 @@ accumulation weighted by the normalizer.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from dataclasses import fields
 from typing import Any
 
@@ -158,6 +159,59 @@ def collate_denoising(batch: list[Any]) -> dict[str, Any]:
         raise ValueError("the batch has no resolved atom to score")
     pair = {"input": model_input, "target": model_target}
     return {"input": pair, "target": pair, "loss_normalizer": count}
+
+
+def collate_protenix_baseline(batch: list[Any]) -> dict[str, Any]:
+    r"""Batch one Protenix baseline example with structure-level normalization.
+
+    The baseline objective first reduces every loss term to one scalar for the
+    structure. DanLing must therefore give each accumulated structure equal
+    weight instead of weighting micro-batches by their resolved-atom counts.
+    The model and criterion still receive the same immutable input/target pair
+    used by the shared EDM collate.
+    """
+
+    model_input, model_target = collate_single(batch)
+    pair = {"input": model_input, "target": model_target}
+    return {"input": pair, "target": pair, "loss_normalizer": 1}
+
+
+def collate_with_model_kwargs(
+    batch: list[Any],
+    *,
+    collate_fn: Callable[[list[Any]], dict[str, Any]],
+    model_kwargs: Mapping[str, Any],
+) -> dict[str, Any]:
+    r"""Add Runner-controlled model keywords to a collated DanLing batch.
+
+    The wrapper is a module-level callable so a ``functools.partial`` binding it
+    remains pickle-safe for multiprocessing data loaders. It copies both the
+    outer batch and the model-input mapping: neither the criterion target nor a
+    processor-produced object is mutated.
+
+    Args:
+        batch: Per-sample values supplied by the data loader.
+        collate_fn: Base collate function producing DanLing's batch mapping.
+        model_kwargs: Static, Runner-controlled keyword arguments for the model.
+
+    Returns:
+        The collated batch with ``model_kwargs`` merged into its ``input`` mapping.
+
+    Raises:
+        TypeError: If the base collate did not produce a mapping under ``input``.
+        ValueError: If a model keyword would overwrite a collated model input.
+    """
+
+    collated = collate_fn(batch)
+    model_input = collated.get("input")
+    if not isinstance(model_input, Mapping):
+        raise TypeError("model keyword arguments require the collated batch input to be a mapping")
+    conflicts = sorted(set(model_kwargs).intersection(model_input))
+    if conflicts:
+        raise ValueError(f"model keyword arguments cannot overwrite collated input keys: {', '.join(conflicts)}")
+    merged_input = dict(model_input)
+    merged_input.update(model_kwargs)
+    return {**collated, "input": merged_input}
 
 
 def collate_odesign(batch: list[Any]) -> dict[str, Any]:

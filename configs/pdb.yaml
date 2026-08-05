@@ -1,0 +1,33 @@
+# PDB Protenix resume configuration.
+# Submit from the repository root with:
+# sbatch ofoldx/runners/submit_train.slurm -- --config configs/pdb.yaml
+#
+# Runtime data processing uses the Runner's default 30-second best-effort
+# timeout. Increase `steps` and `workers` for a full training run.
+train_datasets:
+  pdb:
+    source: /data/shared/datasets/protenix/mmcif
+    sampling_ratio: 1.0
+    seq_to_pdb_index: /data/shared/datasets/protenix/seq_to_pdb_index.json
+    msa_path: /data/shared/datasets/protenix/mmcif_msa
+
+steps: 1650
+device: cuda
+precision: bf16
+batch_size: 1
+workers: 8
+gradient_checkpointing: true
+objective_recipe: ofoldx_edm_v1
+max_tokens: 768
+# No cluster file is configured, so only continuous cropping is valid.
+crop_method_weights: [1.0, 0.0, 0.0]
+processor_config:
+  max_msa_rows: 2048
+ccd_snapshot_path: /data/users/qinghanw313/AlloDesign/tmp/ccd-v20240608
+checkpoint: true
+checkpoint_interval: 100
+workspace: /data/users/qinghanw313/AlloDesign/train/pdb
+run_name: pdb-384token-2048msadepth
+logging: true
+log_interval: 1
+resume_from: /data/users/qinghanw313/AlloDesign/train/pdb/ofoldx-f4d11185-d46fbe557e4/f4d11185-d46fbe557e4-22465edb143c/checkpoints/ckpt-s000000000600-g000000000600-q000003

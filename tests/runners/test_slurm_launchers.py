@@ -76,6 +76,7 @@ def _run_launcher(
     nnodes: int = 1,
     nproc_per_node: int = 1,
     socket_family: str | None = None,
+    arguments: list[str] | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
     env, capture_args, capture_family = _launcher_environment(
         tmp_path,
@@ -84,8 +85,9 @@ def _run_launcher(
         nproc_per_node=nproc_per_node,
         socket_family=socket_family,
     )
+    launcher_arguments = ["train.cif", "--print-config"] if arguments is None else arguments
     result = subprocess.run(
-        ["bash", str(RUNNERS_DIR / launcher_name), "train.cif", "--print-config"],
+        ["bash", str(RUNNERS_DIR / launcher_name), *launcher_arguments],
         check=False,
         capture_output=True,
         env=env,
@@ -96,6 +98,36 @@ def _run_launcher(
 
 def _captured_arguments(path: Path) -> list[str]:
     return [part.decode() for part in path.read_bytes().split(b"\0") if part]
+
+
+@pytest.mark.parametrize("launcher_name", LAUNCHERS)
+@pytest.mark.parametrize(
+    ("nnodes", "nproc_per_node"),
+    [(1, 1), (1, 2), (2, 2)],
+    ids=["direct", "single-node-distributed", "multi-node-distributed"],
+)
+def test_yaml_config_path_is_forwarded_unchanged_without_shell_expansion(
+    tmp_path: Path,
+    launcher_name: str,
+    nnodes: int,
+    nproc_per_node: int,
+) -> None:
+    expansion_marker = tmp_path / "must-not-exist"
+    config_path = f"~/run name,$(touch {expansion_marker})[*].yaml"
+
+    result, capture_args, _ = _run_launcher(
+        tmp_path,
+        launcher_name,
+        nnodes=nnodes,
+        nproc_per_node=nproc_per_node,
+        arguments=["--", "--config", config_path],
+    )
+
+    assert result.returncode == 0, result.stderr
+    arguments = _captured_arguments(capture_args)
+    module_index = arguments.index("ofoldx.runners.train")
+    assert arguments[module_index + 1 :] == ["--config", config_path]
+    assert not expansion_marker.exists()
 
 
 @pytest.mark.parametrize("launcher_name", LAUNCHERS)

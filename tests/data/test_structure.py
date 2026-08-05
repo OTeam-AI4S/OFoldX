@@ -74,6 +74,8 @@ class TestStructure:
         assert structure.coordinate_mask.tolist() == [True, False]
         assert structure.residue_id.tolist() == [0]
         assert structure.source_symbols == ("7", "A")
+        assert structure.resolution is None
+        assert structure.resolution_is_known is None
 
         double = structure.double()
         assert double.coordinates.dtype == torch.float64
@@ -81,6 +83,41 @@ class TestStructure:
         assert double.coordinate_mask.dtype == torch.bool
         assert double.residue_id.dtype == torch.int64
         assert double.system.edge_index.dtype == torch.int64
+
+    def test_resolution_moves_batches_and_unbatches_with_legacy_unknowns(self) -> None:
+        first = _structure("A").replace(
+            resolution=torch.tensor(2.25),
+            resolution_is_known=torch.tensor(True),
+        )
+        second = _structure("B", 10.0)
+
+        batched = Structure.batch((first, second))
+
+        assert batched.resolution is not None
+        assert batched.resolution_is_known is not None
+        assert batched.resolution.tolist() == [2.25, -1.0]
+        assert batched.resolution_is_known.tolist() == [True, False]
+        doubled = batched.double()
+        assert doubled.resolution is not None
+        assert doubled.resolution.dtype == torch.float64
+        assert doubled.resolution_is_known is not None
+        assert doubled.resolution_is_known.dtype == torch.bool
+
+        restored_first, restored_second = batched.unbatch()
+        assert restored_first.resolution is not None
+        assert restored_first.resolution.item() == 2.25
+        assert restored_first.resolution_is_known is not None
+        assert restored_first.resolution_is_known.item()
+        assert restored_second.resolution is not None
+        assert restored_second.resolution.item() == -1.0
+        assert restored_second.resolution_is_known is not None
+        assert not restored_second.resolution_is_known.item()
+
+    def test_batch_preserves_absent_legacy_resolution_metadata(self) -> None:
+        batched = Structure.batch((_structure("A"), _structure("B", 10.0)))
+
+        assert batched.resolution is None
+        assert batched.resolution_is_known is None
 
     def test_batch_and_unbatch_remap_source_symbols(self) -> None:
         first = _structure("A")

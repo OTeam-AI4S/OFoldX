@@ -1,0 +1,53 @@
+# PDB + AFDB Protenix mixed-training configuration with two evaluation sets.
+# Submit from the repository root with:
+# sbatch ofoldx/runners/submit_train.slurm -- --config configs/mix.yaml
+#
+# PDB runtime processing gets a longer best-effort deadline for large entries;
+# AFDB retains the Runner's 30-second training default. Both retain the
+# five-consecutive-recoverable-error policy.
+train_datasets:
+  pdb:
+    source: /data/shared/datasets/protenix/mmcif
+    sampling_ratio: 0.6
+    seq_to_pdb_index: /data/shared/datasets/protenix/seq_to_pdb_index.json
+    msa_path: /data/shared/datasets/protenix/mmcif_msa
+    processing_timeout_seconds: 240
+    max_consecutive_processing_errors: 5
+
+  afdb_swissprot:
+    source: /data/projects/allodesign/datasets/afdb_swissprot/mmcif
+    sampling_ratio: 0.4
+    seq_to_pdb_index: /data/projects/allodesign/datasets/afdb_swissprot/seq_to_pdb_index.json
+    msa_path: /data/projects/allodesign/datasets/afdb_swissprot/mmcif_msa
+
+# Evaluation splits are intentionally unclustered and uncropped.
+eval_source:
+  - recentPDB=/data/shared/datasets/protenix/recentPDB_mmcif-2560
+  - posebusters=/data/shared/datasets/protenix/posebusters_mmcif-2560
+score_split: recentPDB
+seq_to_pdb_index: /data/shared/datasets/protenix/seq_to_pdb_index.json
+msa_path: /data/shared/datasets/protenix/mmcif_msa
+
+epochs: 200
+train_epoch_size: 51200
+device: cuda
+precision: bf16
+batch_size: 1
+diffusion_batch_size: 1
+diffusion_chunk_size: 1
+workers: 8
+gradient_checkpointing: true
+max_tokens: 768
+# Cropping applies only to the two training components.
+crop_method_weights: [1,0,0]
+processor_config:
+  max_msa_rows: 2048
+ccd_snapshot_path: /data/users/qinghanw313/AlloDesign/tmp/ccd-v20240608
+checkpoint: true
+checkpoint_interval: 400
+workspace: /data/users/qinghanw313/AlloDesign/train/mix
+run_name: mix-training
+logging: true
+log_interval: 1
+tensorboard: true
+ema_decay: 0.999

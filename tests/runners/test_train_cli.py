@@ -117,6 +117,90 @@ def test_print_config_does_not_construct_runner(capsys: pytest.CaptureFixture[st
     assert config["processor"] == {"ccd_revision": "ccd-v1"}
 
 
+@pytest.mark.parametrize("model", [None, "protenix", "protenix_template"])
+def test_known_protenix_defaults_to_baseline_objective_recipe(model: str | None) -> None:
+    arguments = ["train.cif"]
+    if model is not None:
+        arguments.extend(["--model", model])
+
+    config = canonical.build_config(canonical.parse_args(arguments))
+
+    assert config["objective_recipe"] == "protenix_baseline_v1"
+
+
+def test_known_protenix_retains_explicit_edm_objective_recipe() -> None:
+    config = canonical.build_config(
+        canonical.parse_args(
+            ["train.cif", "--model", "protenix", "--objective-recipe", "ofoldx_edm_v1"]
+        )
+    )
+
+    assert config["objective_recipe"] == "ofoldx_edm_v1"
+
+
+@pytest.mark.parametrize("model", ["ligandmpnn", "proteinmpnn"])
+@pytest.mark.parametrize("recipe_arguments", [[], ["--objective-recipe", "ofoldx_edm_v1"]])
+def test_known_non_protenix_omits_absent_or_edm_objective_recipe(
+    model: str,
+    recipe_arguments: list[str],
+) -> None:
+    config = canonical.build_config(
+        canonical.parse_args(["train.cif", "--model", model, *recipe_arguments])
+    )
+
+    assert "objective_recipe" not in config
+
+
+@pytest.mark.parametrize("model", ["ligandmpnn", "proteinmpnn"])
+def test_known_non_protenix_rejects_protenix_baseline_objective_recipe(model: str) -> None:
+    with pytest.raises(SystemExit, match="2"):
+        canonical.parse_args(
+            [
+                "train.cif",
+                "--model",
+                model,
+                "--objective-recipe",
+                "protenix_baseline_v1",
+            ]
+        )
+
+
+@pytest.mark.parametrize(
+    ("recipe_arguments", "expected_recipe"),
+    [
+        ([], None),
+        (["--objective-recipe", "ofoldx_edm_v1"], "ofoldx_edm_v1"),
+        (["--objective-recipe", "protenix_baseline_v1"], "protenix_baseline_v1"),
+    ],
+)
+def test_unresolved_pretrained_objective_recipe_remains_absent_or_explicit(
+    recipe_arguments: list[str],
+    expected_recipe: str | None,
+) -> None:
+    config = canonical.build_config(
+        canonical.parse_args(
+            ["train.cif", "--pretrained", "organization/model", *recipe_arguments]
+        )
+    )
+
+    if expected_recipe is None:
+        assert "objective_recipe" not in config
+    else:
+        assert config["objective_recipe"] == expected_recipe
+
+
+def test_pdb_yaml_config_print_pins_historical_edm_objective_recipe(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config_path = Path(__file__).parents[2] / "configs" / "pdb.yaml"
+
+    assert canonical.main(["--config", str(config_path), "--print-config"]) == 0
+
+    config = json.loads(capsys.readouterr().out)
+    assert config["model"]["name"] == "protenix"
+    assert config["objective_recipe"] == "ofoldx_edm_v1"
+
+
 def test_legacy_logging_config_is_exact_and_new_backends_are_absent_by_default() -> None:
     config = canonical.build_config(canonical.parse_args(["train.cif", "--no-logging", "--log-interval", "7"]))
 
@@ -392,6 +476,510 @@ def test_print_config_includes_normalized_crop_settings(capsys: pytest.CaptureFi
     assert config["data"]["train"]["crop_method_weights"] == [1.0, 0.0, 0.0]
 
 
+def test_inline_train_dataset_mixture_builds_normalized_composite_config() -> None:
+    args = canonical.parse_args(
+        [
+            "--train-datasets",
+            '{"structures": {"source": "structures"}, '
+            '"clustered": {"source": "cifs", "sampling_ratio": 2.5, '
+            '"cluster_sampling": {"enabled": true, "cluster_file": "clusters.txt"}}}',
+            "--train-epoch-size",
+            "120",
+            "--seed",
+            "17",
+        ]
+    )
+
+    config = canonical.build_config(args)
+
+    assert config["train_splits"] == ["train"]
+    assert config["data"]["train"] == {
+        "datasets": {
+            "structures": {"source": "structures", "sampling_ratio": 1},
+            "clustered": {
+                "source": "cifs",
+                "sampling_ratio": 2.5,
+                "cluster_sampling": {"enabled": True, "cluster_file": "clusters.txt"},
+            },
+        },
+        "epoch_size": 120,
+        "replacement": True,
+        "seed": 17,
+    }
+
+
+def test_component_processing_controls_build_and_print_config(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    specification = json.dumps(
+        {
+            "bounded": {
+                "source": "bounded.cif",
+                "processing_timeout_seconds": 12.5,
+                "max_consecutive_processing_errors": 7,
+            },
+            "disabled": {
+                "source": "disabled.cif",
+                "processing_timeout_seconds": None,
+                "max_consecutive_processing_errors": None,
+            },
+            "defaults": {"source": "defaults.cif"},
+        }
+    )
+
+    built = canonical.build_config(canonical.parse_args(["--train-datasets", specification]))
+    built_datasets = built["data"]["train"]["datasets"]
+    assert built_datasets["bounded"]["processing_timeout_seconds"] == 12.5
+    assert built_datasets["bounded"]["max_consecutive_processing_errors"] == 7
+    assert built_datasets["disabled"]["processing_timeout_seconds"] is None
+    assert built_datasets["disabled"]["max_consecutive_processing_errors"] is None
+    assert "processing_timeout_seconds" not in built_datasets["defaults"]
+    assert "max_consecutive_processing_errors" not in built_datasets["defaults"]
+
+    assert canonical.main(["--train-datasets", specification, "--print-config"]) == 0
+    printed_datasets = json.loads(capsys.readouterr().out)["data"]["train"]["datasets"]
+    assert printed_datasets == built_datasets
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("processing_timeout_seconds", True),
+        ("processing_timeout_seconds", 0),
+        ("processing_timeout_seconds", -0.5),
+        ("processing_timeout_seconds", float("inf")),
+        ("processing_timeout_seconds", "30"),
+        ("max_consecutive_processing_errors", True),
+        ("max_consecutive_processing_errors", 0),
+        ("max_consecutive_processing_errors", -1),
+        ("max_consecutive_processing_errors", float("inf")),
+        ("max_consecutive_processing_errors", "5"),
+        ("max_consecutive_processing_errors", 1.5),
+    ],
+    ids=[
+        "timeout-bool",
+        "timeout-zero",
+        "timeout-negative",
+        "timeout-infinite",
+        "timeout-string",
+        "limit-bool",
+        "limit-zero",
+        "limit-negative",
+        "limit-infinite",
+        "limit-string",
+        "limit-noninteger",
+    ],
+)
+def test_cli_rejects_invalid_component_processing_controls_with_precise_location(
+    capsys: pytest.CaptureFixture[str],
+    key: str,
+    value: object,
+) -> None:
+    specification = json.dumps(
+        {"broken_component": {"source": "train.cif", key: value}}
+    )
+
+    with pytest.raises(SystemExit) as error:
+        canonical.parse_args(["--train-datasets", specification])
+
+    assert error.value.code == 2
+    message = capsys.readouterr().err
+    assert "broken_component" in message
+    assert key in message
+
+
+def test_train_dataset_mixture_can_be_loaded_from_json_file(tmp_path: Path) -> None:
+    specification = tmp_path / "datasets.json"
+    specification.write_text(json.dumps({"primary": {"source": "train.cif"}}), encoding="utf-8")
+
+    config = canonical.build_config(
+        canonical.parse_args(["--train-datasets", str(specification)])
+    )
+
+    assert config["data"]["train"]["datasets"] == {
+        "primary": {"source": "train.cif", "sampling_ratio": 1}
+    }
+    assert config["data"]["train"]["epoch_size"] is None
+
+
+def test_mixture_accepts_complete_cluster_sampling_schema() -> None:
+    config = canonical.build_config(
+        canonical.parse_args(
+            [
+                "--train-datasets",
+                '{"clustered": {"source": "cifs", "cluster_sampling": {'
+                '"enabled": true, "cluster_file": "clusters.txt", '
+                '"indices_file": "cache/indices.jsonl", "epoch_size": null, '
+                '"replacement": true, "contact_cutoff": 6.5, '
+                '"include_all_chain_pairs": true, "exclude_mol_types": ["ions", "water"], '
+                '"seed": null, "beta": {"chain": 0.25, "interface": 2}, '
+                '"alpha": {"prot": 4, "nuc": 2.5, "ligand": 0}}}}',
+            ]
+        )
+    )
+
+    expected_indices_file = str(Path("cache/indices.jsonl").resolve())
+    assert config["data"]["train"]["datasets"]["clustered"]["cluster_sampling"] == {
+        "enabled": True,
+        "cluster_file": "clusters.txt",
+        "indices_file": expected_indices_file,
+        "epoch_size": None,
+        "replacement": True,
+        "contact_cutoff": 6.5,
+        "include_all_chain_pairs": True,
+        "exclude_mol_types": ["ions", "water"],
+        "seed": None,
+        "beta": {"chain": 0.25, "interface": 2},
+        "alpha": {"prot": 4, "nuc": 2.5, "ligand": 0},
+    }
+
+
+@pytest.mark.parametrize(
+    "cluster_sampling",
+    [
+        '{"unknown": 1}',
+        '{"enabled": 1}',
+        '{"enabled": true, "cluster_file": []}',
+        '{"indices_file": ""}',
+        '{"indices_file": 4}',
+        '{"epoch_size": 10}',
+        '{"seed": 10}',
+        '{"replacement": false}',
+        '{"replacement": 1}',
+        '{"contact_cutoff": 0}',
+        '{"contact_cutoff": true}',
+        '{"contact_cutoff": "5"}',
+        '{"include_all_chain_pairs": 1}',
+        '{"exclude_mol_types": "ions"}',
+        '{"exclude_mol_types": ["ions", ""]}',
+        '{"beta": []}',
+        '{"beta": {"unknown": 1}}',
+        '{"beta": {"chain": -1}}',
+        '{"beta": {"interface": true}}',
+        '{"alpha": []}',
+        '{"alpha": {"protein": 1}}',
+        '{"alpha": {"prot": -1}}',
+        '{"alpha": {"ligand": "1"}}',
+    ],
+)
+def test_mixture_rejects_invalid_nested_cluster_sampling_schema(
+    cluster_sampling: str,
+) -> None:
+    specification = '{"one": {"source": "x", "cluster_sampling": ' + cluster_sampling + "}}"
+
+    with pytest.raises(SystemExit, match="2"):
+        canonical.parse_args(["--train-datasets", specification])
+
+
+@pytest.mark.parametrize(
+    "specification",
+    [
+        '{"one": {"source": "first"}, "one": {"source": "second"}}',
+        '{"one": {"source": "first", "source": "second"}}',
+        '{"one": {"source": "x", "cluster_sampling": {"enabled": false, "enabled": true}}}',
+    ],
+)
+def test_inline_json_rejects_duplicate_object_keys_at_any_level(specification: str) -> None:
+    with pytest.raises(SystemExit, match="2"):
+        canonical.parse_args(["--train-datasets", specification])
+
+
+def test_json_file_rejects_duplicate_object_keys(tmp_path: Path) -> None:
+    specification = tmp_path / "duplicate.json"
+    specification.write_text(
+        '{"one": {"source": "first"}, "one": {"source": "second"}}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit, match="2"):
+        canonical.parse_args(["--train-datasets", str(specification)])
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        [],
+        ["train.cif", "--train-datasets", '{"other": {"source": "other.cif"}}'],
+        ["train.cif", "--train-epoch-size", "10"],
+        ["--train-datasets", "{}"],
+        ["--train-datasets", '{"bad.name": {"source": "x"}}'],
+        ["--train-datasets", '{"one": "x"}'],
+        ["--train-datasets", '{"one": {"source": ""}}'],
+        ["--train-datasets", '{"one": {"source": 3}}'],
+        ["--train-datasets", '{"one": {"source": "x", "sampling_ratio": 0}}'],
+        ["--train-datasets", '{"one": {"source": "x", "sampling_ratio": true}}'],
+        ["--train-datasets", '{"one": {"source": "x", "sampling_ratio": "1"}}'],
+        ["--train-datasets", '{"one": {"source": "x", "unknown": 1}}'],
+        ["--train-datasets", '{"one": {"source": "x", "seq_to_pdb_index": "index"}}'],
+        ["--train-datasets", '{"one": {"source": "x", "msa_path": "msa"}}'],
+        [
+            "--train-datasets",
+            '{"one": {"source": "x", "cluster_sampling": true}}',
+        ],
+        [
+            "--train-datasets",
+            '{"one": {"source": "x", "cluster_sampling": null}}',
+        ],
+        [
+            "--train-datasets",
+            '{"one": {"source": "x", "cluster_sampling": {"enabled": "yes"}}}',
+        ],
+        [
+            "--train-datasets",
+            '{"one": {"source": "x", "cluster_sampling": {"enabled": true}}}',
+        ],
+    ],
+)
+def test_invalid_train_dataset_mixtures_are_rejected(argv: list[str]) -> None:
+    with pytest.raises(SystemExit, match="2"):
+        canonical.parse_args(argv)
+
+
+@pytest.mark.parametrize(
+    "cluster_arguments",
+    [
+        ["--cluster-file", "clusters.txt"],
+        ["--cluster-seed", "3"],
+        ["--no-cluster-replacement"],
+        ["--cluster-all-pairs"],
+    ],
+)
+def test_mixture_rejects_legacy_cluster_controls(cluster_arguments: list[str]) -> None:
+    with pytest.raises(SystemExit, match="2"):
+        canonical.parse_args(
+            [
+                "--train-datasets",
+                '{"one": {"source": "one.cif"}}',
+                *cluster_arguments,
+            ]
+        )
+
+
+def test_mixture_msa_inheritance_local_override_and_eval_global_pair() -> None:
+    config = canonical.build_config(
+        canonical.parse_args(
+            [
+                "--train-datasets",
+                '{"inherited": {"source": "one.cif"}, '
+                '"local": {"source": "two.cif", "seq_to_pdb_index": "local-index.json", '
+                '"msa_path": "local-msa"}}',
+                "--seq-to-pdb-index",
+                "global-index.json",
+                "--msa-path",
+                "global-msa",
+                "--val-source",
+                "val.cif",
+            ]
+        )
+    )
+
+    assert config["data"]["train"]["datasets"]["inherited"] == {
+        "source": "one.cif",
+        "sampling_ratio": 1,
+        "seq_to_pdb_index": "global-index.json",
+        "msa_path": "global-msa",
+    }
+    assert config["data"]["train"]["datasets"]["local"] == {
+        "source": "two.cif",
+        "sampling_ratio": 1,
+        "seq_to_pdb_index": "local-index.json",
+        "msa_path": "local-msa",
+    }
+    assert config["data"]["val"] == {
+        "source": "val.cif",
+        "seq_to_pdb_index": "global-index.json",
+        "msa_path": "global-msa",
+    }
+
+
+@pytest.mark.parametrize("flag", ["--seq-to-pdb-index", "--msa-path"])
+@pytest.mark.parametrize("empty_value", ["", "   ", "\t"])
+def test_global_msa_paths_must_be_nonempty_before_config_generation(
+    flag: str,
+    empty_value: str,
+) -> None:
+    companion = "--msa-path" if flag == "--seq-to-pdb-index" else "--seq-to-pdb-index"
+
+    with pytest.raises(SystemExit, match="2"):
+        canonical.parse_args(["train.cif", flag, empty_value, companion, "valid"])
+
+
+def test_mixture_print_config_uses_global_msa_pair_for_inheritance_and_all_evaluation_splits(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert canonical.main(
+        [
+            "--train-datasets",
+            '{"inherited": {"source": "train.cif"}}',
+            "--seq-to-pdb-index",
+            "global-index.json",
+            "--msa-path",
+            "global-msa",
+            "--val-source",
+            "val.cif",
+            "--eval-source",
+            "benchmark=test.cif",
+            "--print-config",
+        ]
+    ) == 0
+
+    config = json.loads(capsys.readouterr().out)
+    assert config["data"]["train"]["datasets"]["inherited"]["seq_to_pdb_index"] == (
+        "global-index.json"
+    )
+    assert config["data"]["train"]["datasets"]["inherited"]["msa_path"] == "global-msa"
+    for split in ("val", "benchmark"):
+        assert config["data"][split]["seq_to_pdb_index"] == "global-index.json"
+        assert config["data"][split]["msa_path"] == "global-msa"
+
+
+def test_mixture_print_config_resolves_component_indices_file(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    indices_file = tmp_path / "cache" / "indices.jsonl"
+    specification = json.dumps(
+        {
+            "clustered": {
+                "source": "train.cif",
+                "cluster_sampling": {
+                    "enabled": True,
+                    "cluster_file": "clusters.txt",
+                    "indices_file": str(tmp_path / "cache" / "." / "indices.jsonl"),
+                },
+            }
+        }
+    )
+
+    assert canonical.main(["--train-datasets", specification, "--print-config"]) == 0
+
+    config = json.loads(capsys.readouterr().out)
+    cluster_sampling = config["data"]["train"]["datasets"]["clustered"]["cluster_sampling"]
+    assert cluster_sampling["indices_file"] == str(indices_file.resolve())
+
+
+def test_mixture_rejects_component_indices_file_aliases(tmp_path: Path) -> None:
+    indices_file = tmp_path / "cache" / "indices.jsonl"
+    alias = tmp_path / "cache" / "nested" / ".." / "indices.jsonl"
+    specification = json.dumps(
+        {
+            "first": {
+                "source": "first.cif",
+                "cluster_sampling": {"indices_file": str(indices_file)},
+            },
+            "second": {
+                "source": "second.cif",
+                "cluster_sampling": {"indices_file": str(alias)},
+            },
+        }
+    )
+
+    with pytest.raises(SystemExit, match="2"):
+        canonical.parse_args(["--train-datasets", specification])
+
+
+def test_train_datasets_json_file_expands_user_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    specification = tmp_path / "datasets.json"
+    specification.write_text('{"primary": {"source": "train.cif"}}', encoding="utf-8")
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    args = canonical.parse_args(["--train-datasets", "~/datasets.json"])
+
+    assert args.train_datasets["primary"]["source"] == "train.cif"
+
+
+def test_mixture_crop_settings_are_copied_to_every_component() -> None:
+    config = canonical.build_config(
+        canonical.parse_args(
+            [
+                "--train-datasets",
+                '{"one": {"source": "one.cif"}, "two": {"source": "two.cif"}}',
+                "--max-tokens",
+                "256",
+            ]
+        )
+    )
+
+    for component in config["data"]["train"]["datasets"].values():
+        assert component["max_tokens"] == 256
+        assert component["crop_method_weights"] == [1.0, 0.0, 0.0]
+
+
+def test_mixture_default_crop_is_mixed_only_when_every_component_is_clustered() -> None:
+    args = canonical.parse_args(
+        [
+            "--train-datasets",
+            '{"one": {"source": "one.cif", "cluster_sampling": '
+            '{"enabled": true, "cluster_file": "one.txt"}}, '
+            '"two": {"source": "two.cif", "cluster_sampling": '
+            '{"enabled": true, "cluster_file": "two.txt"}}}',
+            "--max-tokens",
+            "256",
+        ]
+    )
+
+    assert args.crop_method_weights == [0.2, 0.4, 0.4]
+
+
+def test_mixture_spatial_crop_requires_every_component_to_be_clustered() -> None:
+    with pytest.raises(SystemExit, match="2"):
+        canonical.parse_args(
+            [
+                "--train-datasets",
+                '{"clustered": {"source": "one.cif", "cluster_sampling": '
+                '{"enabled": true, "cluster_file": "one.txt"}}, '
+                '"plain": {"source": "two.cif"}}',
+                "--max-tokens",
+                "256",
+                "--crop-method-weights",
+                "0",
+                "1",
+                "0",
+            ]
+        )
+
+
+def test_mixture_print_config_does_not_construct_runner_or_check_source_paths(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class UnexpectedRunner:
+        def __init__(self, config: dict[str, Any]) -> None:
+            raise AssertionError("Runner must not be constructed by --print-config")
+
+    monkeypatch.setattr("ofoldx.runners.runner.Runner", UnexpectedRunner)
+
+    assert canonical.main(
+        [
+            "--train-datasets",
+            '{"missing": {"source": "/definitely/not/present.cif"}}',
+            "--print-config",
+        ]
+    ) == 0
+    assert json.loads(capsys.readouterr().out)["data"]["train"]["datasets"]["missing"]["source"] == (
+        "/definitely/not/present.cif"
+    )
+
+
+def test_mixture_cluster_cache_diagnostics_include_component_names() -> None:
+    class Component:
+        def __init__(self, path: str | None, status: str = "unknown") -> None:
+            self.cluster_indices_file = path
+            self.cluster_indices_status = status
+
+    class Mixture:
+        datasets = {
+            "clustered": Component("cache/clustered.jsonl", "created"),
+            "ordinary": Component(None),
+        }
+
+    assert canonical._cluster_cache_diagnostics(Mixture()) == [
+        ("clustered", "cache/clustered.jsonl", "created")
+    ]
+
+
 def test_multiple_named_evaluation_sources_preserve_order_and_select_first_score() -> None:
     args = canonical.parse_args(
         [
@@ -475,22 +1063,18 @@ def test_invalid_named_evaluation_options_are_rejected(arguments: list[str]) -> 
 def test_main_checks_every_evaluation_split_and_closes_runner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    state = {"closed": False, "trained": False}
-
-    class FakeModel:
-        def set_backend(self, backend: str) -> None:
-            assert backend == "cueq"
+    state = {"backend": None, "closed": False, "trained": False}
 
     class FakeRunner:
         rank = 1
-        model = FakeModel()
 
         def __init__(self, config: dict[str, Any]) -> None:
             assert config["evaluate_splits"] == ["first", "empty"]
             self.datasets = {"train": [object()], "first": [object()], "empty": []}
 
-        def unwrap(self, model: FakeModel) -> FakeModel:
-            return model
+        def set_backend(self, backend: str) -> None:
+            assert backend == "oops"
+            state["backend"] = backend
 
         def train(self) -> None:
             state["trained"] = True
@@ -513,31 +1097,27 @@ def test_main_checks_every_evaluation_split_and_closes_runner(
             ]
         )
 
-    assert state == {"closed": True, "trained": False}
+    assert state == {"backend": "oops", "closed": True, "trained": False}
 
 
 def test_main_distributed_error_fails_fast_without_closing_runner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    state = {"closed": 0, "fail_fast": 0}
+    state = {"backend": None, "closed": 0, "fail_fast": 0}
 
     class FailFastExit(BaseException):
         pass
 
-    class FakeModel:
-        def set_backend(self, backend: str) -> None:
-            assert backend == "cueq"
-
     class FakeRunner:
         distributed = True
         rank = 1
-        model = FakeModel()
 
         def __init__(self, config: dict[str, Any]) -> None:
             self.datasets = {"train": [object()]}
 
-        def unwrap(self, model: FakeModel) -> FakeModel:
-            return model
+        def set_backend(self, backend: str) -> None:
+            assert backend == "oops"
+            state["backend"] = backend
 
         def train(self) -> None:
             raise RuntimeError("loader failed")
@@ -555,7 +1135,7 @@ def test_main_distributed_error_fails_fast_without_closing_runner(
     with pytest.raises(FailFastExit):
         canonical.main(["train.cif", "--device", "cpu"])
 
-    assert state == {"closed": 0, "fail_fast": 1}
+    assert state == {"backend": "oops", "closed": 0, "fail_fast": 1}
 
 
 def test_distributed_fail_fast_reports_flushes_and_exits(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -595,21 +1175,17 @@ def test_distributed_fail_fast_reports_flushes_and_exits(monkeypatch: pytest.Mon
 
 
 def test_main_success_closes_runner_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    state = {"closed": 0, "trained": 0}
-
-    class FakeModel:
-        def set_backend(self, backend: str) -> None:
-            assert backend == "cueq"
+    state = {"backend": None, "closed": 0, "trained": 0}
 
     class FakeRunner:
         rank = 1
-        model = FakeModel()
 
         def __init__(self, config: dict[str, Any]) -> None:
             self.datasets = {"train": [object()]}
 
-        def unwrap(self, model: FakeModel) -> FakeModel:
-            return model
+        def set_backend(self, backend: str) -> None:
+            assert backend == "oops"
+            state["backend"] = backend
 
         def train(self) -> None:
             state["trained"] += 1
@@ -620,4 +1196,4 @@ def test_main_success_closes_runner_once(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr("ofoldx.runners.runner.Runner", FakeRunner)
 
     assert canonical.main(["train.cif", "--device", "cpu"]) == 0
-    assert state == {"closed": 1, "trained": 1}
+    assert state == {"backend": "oops", "closed": 1, "trained": 1}

@@ -2,6 +2,8 @@ r"""Standard mmCIF projection of the canonical tensor molecular graph."""
 
 from __future__ import annotations
 
+import gzip
+import math
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -64,6 +66,12 @@ _CIF_BOND_ORDERS = {
     "arom": (1.5, True),
 }
 
+_MMCIF_RESOLUTION_FIELDS = (
+    ("refine", "ls_d_res_high"),
+    ("em_3d_reconstruction", "resolution"),
+    ("reflns", "d_resolution_high"),
+)
+
 
 def parse_mmcif(path: Path, *, model: int, assembly_id: str | None) -> tuple[np.recarray, object]:
     r"""
@@ -84,7 +92,11 @@ def parse_mmcif(path: Path, *, model: int, assembly_id: str | None) -> tuple[np.
 
     from biotite.structure.io import pdbx
 
-    cif_file = pdbx.CIFFile.read(str(path))
+    if path.suffix.lower() == ".gz":
+        with gzip.open(path, "rt") as handle:
+            cif_file = pdbx.CIFFile.read(handle)
+    else:
+        cif_file = pdbx.CIFFile.read(str(path))
     block = cif_file.block
     atom_site = block.get("atom_site")
     if atom_site is None:
@@ -172,6 +184,28 @@ def _cif_column(category: CIFCategory, name: str) -> tuple[str | None, ...]:
     if name not in category:
         return (None,) * category.row_count
     return tuple(present_string(value) for value in category[name].as_array())
+
+
+def read_mmcif_resolution(cif_file: object) -> float | None:
+    r"""Read the authoritative experimental high-resolution limit, in Angstroms."""
+
+    block = cast("CIFFile", cif_file).block
+    for category_name, column_name in _MMCIF_RESOLUTION_FIELDS:
+        if category_name not in block or column_name not in block[category_name]:
+            continue
+        values = _cif_column(block[category_name], column_name)
+        if not values:
+            continue
+        value = values[0]
+        if value is None:
+            continue
+        try:
+            resolution = float(value)
+        except ValueError:
+            continue
+        if math.isfinite(resolution) and resolution > 0.0:
+            return resolution
+    return None
 
 
 def read_mmcif_components(
@@ -332,7 +366,7 @@ def _read_mmcif_entity_declarations(
     dict[str, str],
     dict[str, tuple[tuple[int, tuple[str, ...]], ...]] | None,
     dict[str, str],
-    dict[tuple[str, int], tuple[str | None, str | None]],
+    dict[tuple[str, int] | tuple[str, int, str], tuple[str | None, str | None]],
     dict[str, str],
     dict[str, str],
 ]:
@@ -364,13 +398,15 @@ def _read_mmcif_entity_declarations(
             entity_types[entity_id] = entity_type.lower()
 
     polymer_monomers: dict[str, dict[int, list[str]]] = {}
+    polymer_monomer_hetero: dict[tuple[str, int, str], list[str | None]] = {}
     has_polymer_sequences = "entity_poly_seq" in block
     if has_polymer_sequences:
         category = block["entity_poly_seq"]
-        for entity_id, number, monomer in zip(
+        for entity_id, number, monomer, hetero in zip(
             _cif_column(category, "entity_id"),
             _cif_column(category, "num"),
             _cif_column(category, "mon_id"),
+            _cif_column(category, "hetero"),
         ):
             index = optional_integer(number)
             if entity_id is None or index is None or monomer is None:
@@ -381,10 +417,29 @@ def _read_mmcif_entity_declarations(
             candidates = polymer_monomers.setdefault(entity_id, {}).setdefault(index, [])
             if monomer not in candidates:
                 candidates.append(monomer)
+            polymer_monomer_hetero.setdefault((entity_id, index, monomer), []).append(
+                None if hetero is None else hetero.casefold()
+            )
         for entity_id, positions in polymer_monomers.items():
             numbers = sorted(positions)
             if numbers != list(range(1, len(numbers) + 1)):
                 raise ValueError(f"mmCIF polymer entity {entity_id!r} has a non-contiguous declared sequence")
+            for number, candidates in positions.items():
+                if len(candidates) <= 1:
+                    continue
+                invalid = {
+                    monomer
+                    for monomer in candidates
+                    if any(
+                        flag not in {"y", "yes"}
+                        for flag in polymer_monomer_hetero[(entity_id, number, monomer)]
+                    )
+                }
+                if invalid:
+                    raise ValueError(
+                        f"mmCIF polymer entity {entity_id!r} position {number} has conflicting "
+                        f"non-heterogeneous monomer declarations {sorted(candidates)!r}"
+                    )
 
     entity_poly_types: dict[str, str] = {}
     if "entity_poly" in block:
@@ -396,12 +451,21 @@ def _read_mmcif_entity_declarations(
                 raise ValueError(f"mmCIF _entity_poly contains duplicate entity_id {entity_id!r}")
             entity_poly_types[entity_id] = poly_type.lower()
 
-    author_numbering: dict[tuple[str, int], tuple[str | None, str | None]] = {}
+    author_numbering: dict[
+        tuple[str, int] | tuple[str, int, str],
+        tuple[str | None, str | None],
+    ] = {}
     if "pdbx_poly_seq_scheme" in block:
         category = block["pdbx_poly_seq_scheme"]
-        for asym_id, seq_id, auth_number, pdb_number, ins_code in zip(
+        polymer_numbering: dict[
+            tuple[str, int, str | None],
+            tuple[str | None, str | None],
+        ] = {}
+        for asym_id, entity_id, seq_id, monomer, auth_number, pdb_number, ins_code in zip(
             _cif_column(category, "asym_id"),
+            _cif_column(category, "entity_id"),
             _cif_column(category, "seq_id"),
+            _cif_column(category, "mon_id"),
             _cif_column(category, "auth_seq_num"),
             _cif_column(category, "pdb_seq_num"),
             _cif_column(category, "pdb_ins_code"),
@@ -412,11 +476,30 @@ def _read_mmcif_entity_declarations(
             author_residue_number = present_string(auth_number)
             if author_residue_number is None:
                 author_residue_number = present_string(pdb_number)
-            key = (asym_id, seq)
+            normalized_monomer = None if monomer is None else _normalized_component_id(monomer)
+            if entity_id is not None and normalized_monomer is not None:
+                declared_positions = polymer_monomers.get(entity_id)
+                if declared_positions is not None:
+                    declared_candidates = declared_positions.get(seq)
+                    if declared_candidates is None or normalized_monomer not in declared_candidates:
+                        raise ValueError(
+                            f"mmCIF _pdbx_poly_seq_scheme monomer {normalized_monomer!r} is not declared "
+                            f"at entity {entity_id!r} position {seq}"
+                        )
+            key = (asym_id, seq, normalized_monomer)
             numbering = (author_residue_number, ins_code)
-            if key in author_numbering and author_numbering[key] != numbering:
+            if key in polymer_numbering and polymer_numbering[key] != numbering:
                 raise ValueError(f"mmCIF _pdbx_poly_seq_scheme has conflicting numbering for {key!r}")
-            author_numbering[key] = numbering
+            polymer_numbering[key] = numbering
+
+        numbering_by_position: dict[tuple[str, int], set[tuple[str | None, str | None]]] = {}
+        for (asym_id, seq, monomer), numbering in polymer_numbering.items():
+            if monomer is not None:
+                author_numbering[(asym_id, seq, monomer)] = numbering
+            numbering_by_position.setdefault((asym_id, seq), set()).add(numbering)
+        for key, numberings in numbering_by_position.items():
+            if len(numberings) == 1:
+                author_numbering[key] = next(iter(numberings))
 
     if "pdbx_branch_scheme" in block:
         category = block["pdbx_branch_scheme"]
@@ -602,6 +685,7 @@ def read_mmcif_branch_entities(
     cif_file: object,
     component_table: Mapping[str, ChemicalComponent],
     *,
+    selected_rows: np.recarray | None = None,
     excluded_entity_ids: frozenset[str] = frozenset(),
 ) -> tuple[dict[str, Molecule], dict[tuple[object, ...], frozenset[int]]]:
     r"""
@@ -610,6 +694,7 @@ def read_mmcif_branch_entities(
     Args:
         cif_file: Parsed mmCIF document.
         component_table: Chemical components available by component ID.
+        selected_rows: Atom rows retained after alternate-location selection.
         excluded_entity_ids: Raw branch entities intentionally removed by the
             ingestion policy.
 
@@ -629,23 +714,205 @@ def read_mmcif_branch_entities(
     entity_ids = _cif_column(category, "entity_id")
     component_ids = _cif_column(category, "comp_id")
     numbers = _cif_column(category, "num")
-    declarations: dict[str, dict[int, str]] = {}
-    for entity_id, component_id, number in zip(entity_ids, component_ids, numbers):
+    hetero_flags = _cif_column(category, "hetero")
+    declaration_rows: dict[str, dict[int, set[tuple[str, str | None]]]] = {}
+    for entity_id, component_id, number, hetero in zip(entity_ids, component_ids, numbers, hetero_flags):
         if entity_id is None or entity_id in excluded_entity_ids:
             continue
         component_index = optional_integer(number)
         if component_id is None or component_index is None:
             raise ValueError("mmCIF branched-entity components require entity_id, comp_id, and num")
         component_id = _normalized_component_id(component_id)
-        entity_components = declarations.setdefault(entity_id, {})
-        if component_index in entity_components:
-            raise ValueError(f"duplicate branched-entity component number {component_index} for entity {entity_id!r}")
-        entity_components[component_index] = component_id
+        declaration_rows.setdefault(entity_id, {}).setdefault(component_index, set()).add(
+            (component_id, None if hetero is None else hetero.casefold())
+        )
+
+    declarations: dict[str, dict[int, frozenset[str]]] = {}
+    for entity_id, numbered_rows in declaration_rows.items():
+        entity_components: dict[int, frozenset[str]] = {}
+        for component_number, rows in numbered_rows.items():
+            candidates = frozenset(component_id for component_id, _ in rows)
+            if len(candidates) > 1 and any(hetero != "y" for _, hetero in rows):
+                raise ValueError(
+                    f"branched-entity component number {component_number} for entity {entity_id!r} "
+                    f"has conflicting non-heterogeneous declarations {sorted(candidates)!r}"
+                )
+            entity_components[component_number] = candidates
+        declarations[entity_id] = entity_components
 
     number_to_index = {
         entity_id: {number: index for index, number in enumerate(sorted(components))}
         for entity_id, components in declarations.items()
     }
+
+    scheme_mappings: list[tuple[str, int, str, tuple[tuple[object, ...], ...]]] = []
+    selection_candidates: dict[tuple[object, ...], set[tuple[int, str]]] = {}
+    if "pdbx_branch_scheme" in block:
+        scheme = block["pdbx_branch_scheme"]
+        label_asym_ids = _cif_column(scheme, "asym_id")
+        scheme_entities = _cif_column(scheme, "entity_id")
+        monomer_ids = _cif_column(scheme, "mon_id")
+        scheme_numbers = _cif_column(scheme, "num")
+        pdb_asym_ids = _cif_column(scheme, "pdb_asym_id")
+        pdb_monomer_ids = _cif_column(scheme, "pdb_mon_id")
+        pdb_sequence_numbers = _cif_column(scheme, "pdb_seq_num")
+        auth_asym_ids = _cif_column(scheme, "auth_asym_id")
+        auth_monomer_ids = _cif_column(scheme, "auth_mon_id")
+        auth_sequence_numbers = _cif_column(scheme, "auth_seq_num")
+        for values in zip(
+            label_asym_ids,
+            scheme_entities,
+            monomer_ids,
+            scheme_numbers,
+            pdb_asym_ids,
+            pdb_monomer_ids,
+            pdb_sequence_numbers,
+            auth_asym_ids,
+            auth_monomer_ids,
+            auth_sequence_numbers,
+        ):
+            (
+                label_asym_id,
+                entity_id,
+                monomer_id,
+                number,
+                pdb_asym_id,
+                pdb_monomer_id,
+                pdb_sequence_number,
+                auth_asym_id,
+                auth_monomer_id,
+                auth_sequence_number,
+            ) = values
+            if entity_id not in declarations:
+                continue
+            monomer_id = None if monomer_id is None else _normalized_component_id(monomer_id)
+            pdb_monomer_id = None if pdb_monomer_id is None else _normalized_component_id(pdb_monomer_id)
+            auth_monomer_id = None if auth_monomer_id is None else _normalized_component_id(auth_monomer_id)
+            number_int = optional_integer(number)
+            if number_int is None:
+                raise ValueError("mmCIF branch scheme requires an integer component number")
+            if number_int not in declarations[entity_id]:
+                raise ValueError(
+                    f"mmCIF branch scheme component number {number_int} is not declared for entity {entity_id!r}"
+                )
+            if monomer_id not in declarations[entity_id][number_int]:
+                raise ValueError(
+                    f"mmCIF branch scheme component {number_int} mon_id {monomer_id!r} "
+                    f"disagrees with declarations {sorted(declarations[entity_id][number_int])!r}"
+                )
+            assert monomer_id is not None
+            keys: list[tuple[object, ...]] = []
+            if label_asym_id is not None:
+                keys.append(("label", label_asym_id, entity_id, monomer_id, label_asym_id, None))
+            if pdb_asym_id is not None and pdb_monomer_id is not None:
+                keys.append(
+                    (
+                        "pdb",
+                        label_asym_id,
+                        entity_id,
+                        pdb_monomer_id,
+                        pdb_asym_id,
+                        present_string(pdb_sequence_number),
+                    )
+                )
+            if auth_asym_id is not None and auth_monomer_id is not None:
+                keys.append(
+                    (
+                        "author",
+                        label_asym_id,
+                        entity_id,
+                        auth_monomer_id,
+                        auth_asym_id,
+                        present_string(auth_sequence_number),
+                    )
+                )
+            scheme_mappings.append((entity_id, number_int, monomer_id, tuple(keys)))
+            for key in keys:
+                selection_candidates.setdefault(key, set()).add((number_int, monomer_id))
+
+    selected_declarations: dict[str, dict[int, str]] = {}
+    for entity_id, numbered_candidates in declarations.items():
+        selected_declarations[entity_id] = {
+            number: next(iter(candidates))
+            for number, candidates in numbered_candidates.items()
+            if len(candidates) == 1
+        }
+
+    microheterogeneous_positions = {
+        (entity_id, number)
+        for entity_id, numbered_candidates in declarations.items()
+        for number, candidates in numbered_candidates.items()
+        if len(candidates) > 1
+    }
+    microheterogeneous_entities = {entity_id for entity_id, _ in microheterogeneous_positions}
+    selected_by_instance: dict[tuple[str, str, int], set[str]] = {}
+    if selected_rows is not None and microheterogeneous_positions:
+        for row in selected_rows:
+            if row.entity_id is None:
+                continue
+            entity_id = str(row.entity_id)
+            if entity_id not in microheterogeneous_entities:
+                continue
+            identities = [
+                ("label", row.chain_id, row.entity_id, row.component_id, row.chain_id, None),
+            ]
+            if row.auth_component_id is not None and row.auth_chain_id is not None:
+                identities.append(
+                    (
+                        "pdb",
+                        row.chain_id,
+                        row.entity_id,
+                        row.auth_component_id,
+                        row.auth_chain_id,
+                        row.auth_residue_id,
+                    )
+                )
+            identity_candidates = [selection_candidates[key] for key in identities if key in selection_candidates]
+            candidates = set.intersection(*map(set, identity_candidates)) if identity_candidates else set()
+            if len(candidates) != 1:
+                continue
+            number, component_id = next(iter(candidates))
+            if component_id != _normalized_component_id(str(row.component_id)):
+                continue
+            if (entity_id, number) not in microheterogeneous_positions:
+                continue
+            selected_by_instance.setdefault((entity_id, str(row.chain_id), number), set()).add(component_id)
+
+    for entity_id, component_number in sorted(microheterogeneous_positions):
+        instance_selections = {
+            asym_id: candidates
+            for (selected_entity, asym_id, number), candidates in selected_by_instance.items()
+            if selected_entity == entity_id and number == component_number
+        }
+        selected_candidates = set().union(*instance_selections.values()) if instance_selections else set()
+        declared_candidates = declarations[entity_id][component_number]
+        if not selected_candidates:
+            raise ValueError(
+                f"unobserved microheterogeneous branched-entity component {component_number} "
+                f"of entity {entity_id!r} has ambiguous candidates {sorted(declared_candidates)!r}"
+            )
+        if any(len(candidates) > 1 for candidates in instance_selections.values()) or len(selected_candidates) > 1:
+            formatted = {asym_id: sorted(candidates) for asym_id, candidates in sorted(instance_selections.items())}
+            raise ValueError(
+                f"microheterogeneous branched-entity component {component_number} of entity {entity_id!r} "
+                f"has conflicting selections across source-entity instances: {formatted!r}"
+            )
+        selected_component = next(iter(selected_candidates))
+        if selected_component not in declared_candidates:
+            raise ValueError(
+                f"selected component {selected_component!r} is not declared at branched-entity "
+                f"component {component_number} of entity {entity_id!r}"
+            )
+        selected_declarations[entity_id][component_number] = selected_component
+
+    component_index_candidates: dict[tuple[object, ...], set[int]] = {}
+    for entity_id, number, monomer_id, keys in scheme_mappings:
+        if selected_declarations[entity_id][number] != monomer_id:
+            continue
+        component_index = number_to_index[entity_id][number]
+        for key in keys:
+            component_index_candidates.setdefault(key, set()).add(component_index)
+
     removed_atoms: dict[tuple[str, int], set[str]] = {}
     bonds: dict[str, set[MoleculeBond]] = {entity_id: set() for entity_id in declarations}
     if "pdbx_entity_branch_link" in block:
@@ -703,8 +970,14 @@ def read_mmcif_branch_entities(
             if first_number_int is None or second_number_int is None or first_atom is None or second_atom is None:
                 raise ValueError("mmCIF branched-entity links require two component numbers and atom IDs")
             declared = declarations[entity_id]
-            if declared.get(first_number_int) != first_component or declared.get(second_number_int) != second_component:
+            if (
+                first_component not in declared.get(first_number_int, frozenset())
+                or second_component not in declared.get(second_number_int, frozenset())
+            ):
                 raise ValueError(f"branched-entity link disagrees with component declaration for entity {entity_id!r}")
+            selected = selected_declarations[entity_id]
+            if selected[first_number_int] != first_component or selected[second_number_int] != second_component:
+                continue
             first_index = number_to_index[entity_id][first_number_int]
             second_index = number_to_index[entity_id][second_number_int]
             order, aromatic = _cif_bond_order(order_name)
@@ -717,7 +990,7 @@ def read_mmcif_branch_entities(
                 removed_atoms.setdefault((entity_id, second_index), set()).add(second_leaving)
 
     entities: dict[str, Molecule] = {}
-    for entity_id, numbered_components in declarations.items():
+    for entity_id, numbered_components in selected_declarations.items():
         components: list[ChemicalComponent] = []
         for component_index, component_number in enumerate(sorted(numbered_components)):
             component_id = numbered_components[component_number]
@@ -735,90 +1008,6 @@ def read_mmcif_branch_entities(
             bonds=frozenset(bonds[entity_id]),
             molecule_type="branched",
         )
-
-    component_index_candidates: dict[tuple[object, ...], set[int]] = {}
-    if "pdbx_branch_scheme" in block:
-        scheme = block["pdbx_branch_scheme"]
-        label_asym_ids = _cif_column(scheme, "asym_id")
-        scheme_entities = _cif_column(scheme, "entity_id")
-        monomer_ids = _cif_column(scheme, "mon_id")
-        scheme_numbers = _cif_column(scheme, "num")
-        pdb_asym_ids = _cif_column(scheme, "pdb_asym_id")
-        pdb_monomer_ids = _cif_column(scheme, "pdb_mon_id")
-        pdb_sequence_numbers = _cif_column(scheme, "pdb_seq_num")
-        auth_asym_ids = _cif_column(scheme, "auth_asym_id")
-        auth_monomer_ids = _cif_column(scheme, "auth_mon_id")
-        auth_sequence_numbers = _cif_column(scheme, "auth_seq_num")
-        for values in zip(
-            label_asym_ids,
-            scheme_entities,
-            monomer_ids,
-            scheme_numbers,
-            pdb_asym_ids,
-            pdb_monomer_ids,
-            pdb_sequence_numbers,
-            auth_asym_ids,
-            auth_monomer_ids,
-            auth_sequence_numbers,
-        ):
-            (
-                label_asym_id,
-                entity_id,
-                monomer_id,
-                number,
-                pdb_asym_id,
-                pdb_monomer_id,
-                pdb_sequence_number,
-                auth_asym_id,
-                auth_monomer_id,
-                auth_sequence_number,
-            ) = values
-            if entity_id not in entities:
-                continue
-            monomer_id = None if monomer_id is None else _normalized_component_id(monomer_id)
-            pdb_monomer_id = None if pdb_monomer_id is None else _normalized_component_id(pdb_monomer_id)
-            auth_monomer_id = None if auth_monomer_id is None else _normalized_component_id(auth_monomer_id)
-            number_int = optional_integer(number)
-            if number_int is None:
-                raise ValueError("mmCIF branch scheme requires an integer component number")
-            try:
-                component_index = number_to_index[entity_id][number_int]
-            except KeyError:
-                raise ValueError(
-                    f"mmCIF branch scheme component number {number_int} is not declared for entity {entity_id!r}"
-                ) from None
-            if monomer_id != declarations[entity_id][number_int]:
-                raise ValueError(
-                    f"mmCIF branch scheme component {number_int} mon_id {monomer_id!r} "
-                    f"disagrees with declaration {declarations[entity_id][number_int]!r}"
-                )
-            keys = []
-            if label_asym_id is not None and monomer_id is not None:
-                keys.append(("label", label_asym_id, entity_id, monomer_id, label_asym_id, None))
-            if pdb_asym_id is not None and pdb_monomer_id is not None:
-                keys.append(
-                    (
-                        "pdb",
-                        label_asym_id,
-                        entity_id,
-                        pdb_monomer_id,
-                        pdb_asym_id,
-                        present_string(pdb_sequence_number),
-                    )
-                )
-            if auth_asym_id is not None and auth_monomer_id is not None:
-                keys.append(
-                    (
-                        "author",
-                        label_asym_id,
-                        entity_id,
-                        auth_monomer_id,
-                        auth_asym_id,
-                        present_string(auth_sequence_number),
-                    )
-                )
-            for key in keys:
-                component_index_candidates.setdefault(key, set()).add(component_index)
     return entities, {key: frozenset(indices) for key, indices in component_index_candidates.items()}
 
 
@@ -844,7 +1033,8 @@ def read_mmcif_bonds(
     Returns:
         Resolved covalent system bonds. Connections whose endpoints are absent from the
         selected model (an unmodeled cap or modified residue, or a partner in another
-        assembly) are skipped.
+        assembly) are skipped. For an explicit alternate location, a sole sequence-qualified
+        label or author identity is authoritative.
 
     Raises:
         ValueError: If a selected covalent connection declares an unsupported bond order
@@ -874,8 +1064,47 @@ def read_mmcif_bonds(
     auth_atom_2 = _cif_column(category, "ptnr2_auth_atom_id")
     ins_1 = _cif_column(category, "pdbx_ptnr1_PDB_ins_code")
     ins_2 = _cif_column(category, "pdbx_ptnr2_PDB_ins_code")
+    altloc_1 = _cif_column(category, "pdbx_ptnr1_label_alt_id")
+    altloc_2 = _cif_column(category, "pdbx_ptnr2_label_alt_id")
     symmetry_1 = _cif_column(category, "ptnr1_symmetry")
     symmetry_2 = _cif_column(category, "ptnr2_symmetry")
+
+    selected_altloc_sites: dict[tuple[object, ...], AtomSite] = {}
+    ambiguous_altloc_sites: set[tuple[object, ...]] = set()
+    for row in selected_rows:
+        if row.altloc_id is None:
+            continue
+        altloc = str(row.altloc_id)
+        site = site_by_row_index[int(row.row_index)]
+        for key in (
+            (
+                row.symmetry_id,
+                row.chain_id,
+                row.label_seq_id,
+                row.insertion_code,
+                row.component_id,
+                row.atom_name,
+                altloc,
+            ),
+            (
+                row.symmetry_id,
+                row.auth_chain_id,
+                row.auth_residue_id,
+                row.insertion_code,
+                row.auth_component_id,
+                row.auth_atom_name,
+                altloc,
+            ),
+        ):
+            if key in ambiguous_altloc_sites:
+                continue
+            previous = selected_altloc_sites.get(key)
+            if previous is not None and previous != site:
+                selected_altloc_sites.pop(key)
+                ambiguous_altloc_sites.add(key)
+            else:
+                selected_altloc_sites[key] = site
+
     selected_sites, ambiguous_source_sites = selected_source_sites(selected_rows, site_by_row_index)
     for key in ambiguous_unmodeled_sites:
         selected_sites.pop(key, None)
@@ -967,13 +1196,31 @@ def read_mmcif_bonds(
         )
         for symmetry_id in symmetry_ids:
             resolved_sites: list[AtomSite | None] = []
-            for endpoint_number, (label_endpoint, auth_endpoint) in enumerate(
-                ((endpoint_1, auth_endpoint_1), (endpoint_2, auth_endpoint_2)),
+            for endpoint_number, (label_endpoint, auth_endpoint, declared_altloc) in enumerate(
+                (
+                    (endpoint_1, auth_endpoint_1, altloc_1[index]),
+                    (endpoint_2, auth_endpoint_2, altloc_2[index]),
+                ),
                 start=1,
             ):
-                keys = ((symmetry_id, *label_endpoint), (symmetry_id, *auth_endpoint))
-                candidates = {selected_sites[key] for key in keys if key in selected_sites}
-                if len(candidates) > 1 or (not candidates and any(key in ambiguous_source_sites for key in keys)):
+                if declared_altloc is None:
+                    keys = ((symmetry_id, *label_endpoint), (symmetry_id, *auth_endpoint))
+                    candidates = {selected_sites[key] for key in keys if key in selected_sites}
+                    ambiguous_keys = ambiguous_source_sites
+                else:
+                    label_key = (symmetry_id, *label_endpoint, declared_altloc)
+                    auth_key = (symmetry_id, *auth_endpoint, declared_altloc)
+                    label_is_sequence_qualified = label_endpoint[1] is not None
+                    auth_is_sequence_qualified = auth_endpoint[1] is not None
+                    if label_is_sequence_qualified != auth_is_sequence_qualified:
+                        # An unqualified identity can span residues, so the sole identity with a
+                        # sequence position authoritatively names the explicit alternate location.
+                        keys = (label_key,) if label_is_sequence_qualified else (auth_key,)
+                    else:
+                        keys = (label_key, auth_key)
+                    candidates = {selected_altloc_sites[key] for key in keys if key in selected_altloc_sites}
+                    ambiguous_keys = ambiguous_altloc_sites
+                if len(candidates) > 1 or (not candidates and any(key in ambiguous_keys for key in keys)):
                     raise ValueError(f"mmCIF struct_conn row {index} endpoint {endpoint_number} is ambiguous")
                 resolved_sites.append(next(iter(candidates)) if candidates else None)
             site_a, site_b = resolved_sites

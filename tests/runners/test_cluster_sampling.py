@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import json
 import os
 import threading
@@ -22,7 +23,7 @@ from ofoldx.data import (
     Structure,
     get_component,
 )
-from ofoldx.io import write_structure
+from ofoldx.io import read_structure, write_structure
 from ofoldx.processor import UnresolvedTrainingCropError
 from ofoldx.runners import (
     ClusterIndex,
@@ -33,7 +34,12 @@ from ofoldx.runners import (
     parse_pdb_cluster_file,
 )
 from ofoldx.runners import cluster as cluster_module
-from ofoldx.runners.dataset import ClusteredStructureDataset
+from ofoldx.runners.dataset import (
+    ClusteredStructureDataset,
+    ConsecutiveDataLoadingErrors,
+    ProcessingTimeoutExhaustionError,
+    StructureProcessingTimeoutError,
+)
 
 
 def _structure(
@@ -109,6 +115,157 @@ def _cif(
     return path
 
 
+def _microheterogeneous_cluster_cif(path: Path) -> Path:
+    r"""Write two source chains whose legal realized sequences split one source entity."""
+
+    entity_rows: list[str] = []
+    for sequence_id in range(1, 11):
+        if sequence_id == 5:
+            entity_rows.extend(("1 5 PRO y", "1 5 SER y"))
+        else:
+            entity_rows.append(f"1 {sequence_id} ALA n")
+    scheme_rows: list[str] = []
+    atom_rows: list[str] = []
+    serial = 1
+    for chain_ordinal, chain_id in enumerate(("A", "B")):
+        for sequence_id in range(1, 11):
+            if sequence_id == 5:
+                declared_candidates = (("PRO", "A", 5), ("SER", "B", 105))
+                observed_candidates = declared_candidates[:1] if chain_id == "A" else declared_candidates[1:]
+            else:
+                declared_candidates = (("ALA", ".", sequence_id),)
+                observed_candidates = declared_candidates
+            hetero = "y" if sequence_id == 5 else "n"
+            for component_id, _altloc_id, author_number in declared_candidates:
+                scheme_rows.append(
+                    f"{chain_id} 1 {sequence_id} {component_id} {author_number} "
+                    f"{author_number} ? {hetero}"
+                )
+            for component_id, altloc_id, author_number in observed_candidates:
+                atom_rows.append(
+                    f"ATOM {serial} C CA {altloc_id} {component_id} {chain_id} 1 {sequence_id} ? "
+                    f"{float(sequence_id + 2 * chain_ordinal):.1f} 0.0 0.0 "
+                    f"{'0.5' if sequence_id == 5 else '1.0'} 10.0 {author_number} "
+                    f"{component_id} {chain_id} CA 1"
+                )
+                serial += 1
+    path.write_text(
+        f"""data_cluster_microheterogeneity
+loop_
+_entity.id
+_entity.type
+1 polymer
+loop_
+_entity_poly.entity_id
+_entity_poly.type
+1 'polypeptide(L)'
+loop_
+_struct_asym.id
+_struct_asym.entity_id
+A 1
+B 1
+loop_
+_entity_poly_seq.entity_id
+_entity_poly_seq.num
+_entity_poly_seq.mon_id
+_entity_poly_seq.hetero
+{chr(10).join(entity_rows)}
+loop_
+_pdbx_poly_seq_scheme.asym_id
+_pdbx_poly_seq_scheme.entity_id
+_pdbx_poly_seq_scheme.seq_id
+_pdbx_poly_seq_scheme.mon_id
+_pdbx_poly_seq_scheme.auth_seq_num
+_pdbx_poly_seq_scheme.pdb_seq_num
+_pdbx_poly_seq_scheme.pdb_ins_code
+_pdbx_poly_seq_scheme.hetero
+{chr(10).join(scheme_rows)}
+loop_
+_atom_site.group_PDB
+_atom_site.id
+_atom_site.type_symbol
+_atom_site.label_atom_id
+_atom_site.label_alt_id
+_atom_site.label_comp_id
+_atom_site.label_asym_id
+_atom_site.label_entity_id
+_atom_site.label_seq_id
+_atom_site.pdbx_PDB_ins_code
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+_atom_site.occupancy
+_atom_site.B_iso_or_equiv
+_atom_site.auth_seq_id
+_atom_site.auth_comp_id
+_atom_site.auth_asym_id
+_atom_site.auth_atom_id
+_atom_site.pdbx_PDB_model_num
+{chr(10).join(atom_rows)}
+""",
+        encoding="ascii",
+    )
+    return path
+
+
+def _genuine_suffixed_asym_nonpoly_cif(path: Path) -> Path:
+    r"""Write genuine source asym IDs that resemble the reader's internal suffixes."""
+
+    path.write_text(
+        """data_genuine_suffixed_asym
+loop_
+_entity.id
+_entity.type
+1 non-polymer
+loop_
+_struct_asym.id
+_struct_asym.entity_id
+B 1
+B_2 1
+loop_
+_pdbx_entity_nonpoly.entity_id
+_pdbx_entity_nonpoly.comp_id
+1 LIG
+loop_
+_pdbx_nonpoly_scheme.asym_id
+_pdbx_nonpoly_scheme.entity_id
+_pdbx_nonpoly_scheme.mon_id
+_pdbx_nonpoly_scheme.ndb_seq_num
+_pdbx_nonpoly_scheme.pdb_seq_num
+_pdbx_nonpoly_scheme.auth_seq_num
+_pdbx_nonpoly_scheme.pdb_strand_id
+_pdbx_nonpoly_scheme.pdb_ins_code
+B 1 LIG 1 1 1 B ?
+B_2 1 LIG 1 1 1 B_2 ?
+loop_
+_atom_site.group_PDB
+_atom_site.id
+_atom_site.type_symbol
+_atom_site.label_atom_id
+_atom_site.label_alt_id
+_atom_site.label_comp_id
+_atom_site.label_asym_id
+_atom_site.label_entity_id
+_atom_site.label_seq_id
+_atom_site.pdbx_PDB_ins_code
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+_atom_site.occupancy
+_atom_site.B_iso_or_equiv
+_atom_site.auth_seq_id
+_atom_site.auth_comp_id
+_atom_site.auth_asym_id
+_atom_site.auth_atom_id
+_atom_site.pdbx_PDB_model_num
+HETATM 1 C C1 . LIG B 1 . ? 0.0 0.0 0.0 1.0 10.0 1 LIG B C1 1
+HETATM 2 C C1 . LIG B_2 1 . ? 20.0 0.0 0.0 1.0 10.0 1 LIG B_2 C1 1
+""",
+        encoding="ascii",
+    )
+    return path
+
+
 def _entry(**overrides: object) -> ClusterIndex:
     values: dict[str, object] = {
         "type": "chain",
@@ -151,7 +308,8 @@ def test_cluster_indices_cache_created_then_loaded_without_rescanning(
     lines = cache.read_text(encoding="utf-8").splitlines()
     metadata = json.loads(lines[0])
     assert metadata["schema"] == "ofoldx.cluster_indices"
-    assert metadata["schema_version"] == 1
+    assert metadata["schema_version"] == 2
+    assert metadata["generator_version"] == 2
     assert metadata["entry_count"] == 1
     assert json.loads(lines[1])["entry"]["reference_instance_ids"] == []
 
@@ -662,6 +820,54 @@ def test_entity_id_is_preserved_for_cluster_lookup(
     assert row.cluster_1_id == f"pdb_cluster_MOCK_{entity_id}"
 
 
+def test_cluster_scan_uses_source_entity_for_split_microheterogeneous_sequences(
+    tmp_path: Path,
+) -> None:
+    cif = _microheterogeneous_cluster_cif(tmp_path / "mock.cif")
+    cluster = tmp_path / "clusters.txt"
+    cluster.write_text("MOCK_1\n", encoding="ascii")
+
+    realized = read_structure(cif)
+    instance_indices = {
+        realized.system.instance_id(index): index
+        for index in range(int(realized.system.instance_symbol.numel()))
+    }
+    assert set(instance_indices) == {"A", "B"}
+    assert int(realized.system.instance_entity[instance_indices["A"]]) != int(
+        realized.system.instance_entity[instance_indices["B"]]
+    )
+    realized_components: dict[str, str] = {}
+    for instance_id, instance_index in instance_indices.items():
+        position_five = int(realized.system.instance_component_ptr[instance_index]) + 4
+        realized_components[instance_id] = realized.system.symbols[
+            int(realized.system.component_symbol[position_five])
+        ]
+    assert realized_components == {"A": "PRO", "B": "SER"}
+
+    rows = make_cluster_indices([str(cif)], cluster)
+    chain_rows = [row for row in rows if row.type == "chain"]
+
+    assert [row.chain_key for row in chain_rows] == ["A", "B"]
+    assert {row.entity_1_id for row in chain_rows} == {"1"}
+    assert {row.cluster_1_id for row in chain_rows} == {"pdb_cluster_MOCK_1"}
+    assert [row.reference_instance_ids for row in chain_rows] == [("A",), ("B",)]
+
+
+def test_cluster_scan_preserves_genuine_suffixed_source_asym_ids(tmp_path: Path) -> None:
+    cif = _genuine_suffixed_asym_nonpoly_cif(tmp_path / "genuine_suffix.cif")
+    cluster = tmp_path / "clusters.txt"
+    cluster.write_text("", encoding="ascii")
+
+    rows = make_cluster_indices([str(cif)], cluster)
+    chain_rows = [row for row in rows if row.type == "chain"]
+
+    assert [row.chain_key for row in chain_rows] == ["B", "B_2"]
+    assert [row.chain_1_id for row in chain_rows] == ["B", "B_2"]
+    assert [row.entity_1_id for row in chain_rows] == ["1", "1"]
+    assert [row.reference_instance_ids for row in chain_rows] == [("B",), ("B_2",)]
+    assert [row.cluster_1_id for row in chain_rows] == ["LIG", "LIG"]
+
+
 def test_weight_formula_includes_cluster_unique_members_and_duplicate_correction() -> None:
     rows = [
         _entry(),
@@ -822,6 +1028,29 @@ def test_cluster_dataset_maps_row_ordinal_and_optionally_forwards_indices(tmp_pa
     assert seen[0].reference_instance_ids != seen[1].reference_instance_ids
 
 
+@pytest.mark.parametrize("compound_suffix", [".cif.gz", ".mmcif.gz"])
+def test_cluster_dataset_accepts_gzip_cif_and_matches_uncompressed_indices(
+    tmp_path: Path,
+    compound_suffix: str,
+) -> None:
+    plain = _cif(
+        tmp_path / "1abc.cif",
+        sequences=("AAAAAAAAAA",),
+        origins=(0.0,),
+    )
+    compressed = tmp_path / f"1abc{compound_suffix}"
+    compressed.write_bytes(gzip.compress(plain.read_bytes()))
+    cluster = tmp_path / "clusters.txt"
+    cluster.write_text("1ABC_1\n", encoding="ascii")
+
+    expected = ClusteredStructureDataset(plain, lambda value: value, cluster_file=str(cluster))
+    observed = ClusteredStructureDataset(compressed, lambda value: value, cluster_file=str(cluster))
+
+    assert observed.records == [str(compressed)]
+    assert observed.entries == expected.entries
+    assert observed.weights == expected.weights
+
+
 def test_cluster_dataset_retry_advances_row_and_forwards_replacement_indices(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -832,6 +1061,8 @@ def test_cluster_dataset_retry_advances_row_and_forwards_replacement_indices(
     dataset.records = ["shared.cif"]
     dataset.entries = [first, second]
     dataset.forward_indices = True
+    dataset.max_consecutive_processing_errors = None
+    dataset.training_log_file = None
     calls: list[tuple[int, ClusterIndex]] = []
 
     def process(record_index: int, **kwargs: object) -> str:
@@ -846,6 +1077,223 @@ def test_cluster_dataset_retry_advances_row_and_forwards_replacement_indices(
 
     assert dataset[0] == "B"
     assert calls == [(0, first), (0, second)]
+
+
+@pytest.mark.parametrize("stage", ["read_structure", "read_msa"])
+def test_cluster_dataset_record_wide_timeout_skips_rows_for_same_cif_within_request(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    stage: str,
+) -> None:
+    first = _entry(chain_key="A", reference_instance_ids=("A",))
+    same_cif = _entry(chain_key="B", entity_1_id="2", reference_instance_ids=("B",))
+    next_cif = _entry(record_index=1, pdb_id="2xyz", chain_key="C", reference_instance_ids=("C",))
+    dataset = ClusteredStructureDataset.__new__(ClusteredStructureDataset)
+    dataset.records = ["shared.cif", "success.cif"]
+    dataset.entries = [first, same_cif, next_cif]
+    dataset.forward_indices = True
+    dataset.processing_timeout_seconds = 1.0
+    dataset.max_consecutive_processing_errors = None
+    dataset.training_log_file = None
+    calls: list[tuple[int, ClusterIndex]] = []
+
+    def process(record_index: int, **kwargs: object) -> str:
+        indices = kwargs["indices"]
+        assert isinstance(indices, ClusterIndex)
+        calls.append((record_index, indices))
+        if record_index == 0:
+            raise StructureProcessingTimeoutError("shared CIF timed out", stage=stage)
+        return indices.chain_key
+
+    monkeypatch.setattr(dataset, "_process_record", process)
+
+    with caplog.at_level("WARNING", logger="ofoldx.runners.dataset"):
+        assert dataset[0] == "C"
+    assert calls == [(0, first), (1, next_cif)]
+    assert len(caplog.messages) == 1
+    assert "logical index 0" in caplog.messages[0]
+    assert "backing record index 0/path 'shared.cif'" in caplog.messages[0]
+    assert f"stage {stage}" in caplog.messages[0]
+    assert "next sample" not in caplog.messages[0]
+
+
+@pytest.mark.parametrize("stage", ["processor", "unknown"])
+def test_cluster_dataset_row_specific_timeout_allows_later_row_for_same_cif(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+) -> None:
+    first = _entry(chain_key="A", reference_instance_ids=("A",))
+    same_cif = _entry(chain_key="B", entity_1_id="2", reference_instance_ids=("B",))
+    dataset = ClusteredStructureDataset.__new__(ClusteredStructureDataset)
+    dataset.records = ["shared.cif"]
+    dataset.entries = [first, same_cif]
+    dataset.forward_indices = True
+    dataset.processing_timeout_seconds = 1.0
+    dataset.max_consecutive_processing_errors = None
+    dataset.training_log_file = None
+    calls: list[tuple[int, ClusterIndex]] = []
+
+    def process(record_index: int, **kwargs: object) -> str:
+        indices = kwargs["indices"]
+        assert isinstance(indices, ClusterIndex)
+        calls.append((record_index, indices))
+        if indices is first:
+            raise StructureProcessingTimeoutError("row-specific timeout", stage=stage)
+        return indices.chain_key
+
+    monkeypatch.setattr(dataset, "_process_record", process)
+
+    assert dataset[0] == "B"
+    assert calls == [(0, first), (0, same_cif)]
+
+
+def test_cluster_dataset_timeout_exhaustion_reports_scanned_and_processed_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _entry(chain_key="A", reference_instance_ids=("A",))
+    same_cif = _entry(chain_key="B", entity_1_id="2", reference_instance_ids=("B",))
+    next_cif = _entry(record_index=1, pdb_id="2xyz", chain_key="C", reference_instance_ids=("C",))
+    dataset = ClusteredStructureDataset.__new__(ClusteredStructureDataset)
+    dataset.records = ["shared.cif", "other.cif"]
+    dataset.entries = [first, same_cif, next_cif]
+    dataset.forward_indices = True
+    dataset.processing_timeout_seconds = 1.0
+    dataset.max_consecutive_processing_errors = None
+    dataset.training_log_file = None
+    calls: list[int] = []
+
+    def timeout(record_index: int, **kwargs: object) -> None:
+        calls.append(record_index)
+        raise StructureProcessingTimeoutError(f"record {record_index} timed out", stage="read_structure")
+
+    monkeypatch.setattr(dataset, "_process_record", timeout)
+
+    with pytest.raises(ProcessingTimeoutExhaustionError) as exc_info:
+        dataset[0]
+
+    assert calls == [0, 1]
+    assert "scanning 3 logical candidates and processing 2 attempts" in str(exc_info.value)
+    assert exc_info.value.timeout_count == 2
+    assert exc_info.value.scanned_candidates == 3
+    assert exc_info.value.processed_attempts == 2
+
+
+def test_cluster_dataset_deduplicates_recoverable_read_error_for_shared_backing_record(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _entry(chain_key="A", reference_instance_ids=("A",))
+    same_cif = _entry(chain_key="B", entity_1_id="2", reference_instance_ids=("B",))
+    next_cif = _entry(record_index=1, pdb_id="2xyz", chain_key="C", reference_instance_ids=("C",))
+    dataset = ClusteredStructureDataset.__new__(ClusteredStructureDataset)
+    dataset.records = ["shared.cif", "success.cif"]
+    dataset.entries = [first, same_cif, next_cif]
+    dataset.forward_indices = True
+    dataset.processing_timeout_seconds = None
+    dataset.max_consecutive_processing_errors = 5
+    dataset.training_log_file = None
+    dataset.ccd_revision = None
+    dataset.ccd_snapshot_path = None
+    dataset.seq_to_pdb_index = None
+    dataset.msa_path = None
+    dataset.processor_kwargs = {}
+    read_calls: list[str] = []
+    processor_calls: list[ClusterIndex] = []
+    structure = SimpleNamespace(system=SimpleNamespace(entity_type=[]))
+
+    def read(path: str, **kwargs: object) -> object:
+        read_calls.append(path)
+        if path == "shared.cif":
+            raise ValueError("duplicate source atom declaration")
+        return structure
+
+    def processor(value: object, **kwargs: object) -> str:
+        assert value is structure
+        indices = kwargs["indices"]
+        assert isinstance(indices, ClusterIndex)
+        processor_calls.append(indices)
+        return indices.chain_key
+
+    monkeypatch.setattr("ofoldx.io.read_structure", read)
+    dataset.processor = processor
+
+    assert dataset[0] == "C"
+    assert read_calls == ["shared.cif", "success.cif"]
+    assert processor_calls == [next_cif]
+
+
+def test_cluster_dataset_recoverable_processor_error_remains_row_specific(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _entry(chain_key="A", reference_instance_ids=("A",))
+    same_cif = _entry(chain_key="B", entity_1_id="2", reference_instance_ids=("B",))
+    dataset = ClusteredStructureDataset.__new__(ClusteredStructureDataset)
+    dataset.records = ["shared.cif"]
+    dataset.entries = [first, same_cif]
+    dataset.forward_indices = True
+    dataset.processing_timeout_seconds = None
+    dataset.max_consecutive_processing_errors = 5
+    dataset.training_log_file = None
+    dataset.ccd_revision = None
+    dataset.ccd_snapshot_path = None
+    dataset.seq_to_pdb_index = None
+    dataset.msa_path = None
+    dataset.processor_kwargs = {}
+    read_calls: list[str] = []
+    processor_calls: list[ClusterIndex] = []
+    structure = SimpleNamespace(system=SimpleNamespace(entity_type=[]))
+
+    def read(path: str, **kwargs: object) -> object:
+        read_calls.append(path)
+        return structure
+
+    def processor(value: object, **kwargs: object) -> str:
+        indices = kwargs["indices"]
+        assert isinstance(indices, ClusterIndex)
+        processor_calls.append(indices)
+        if indices is first:
+            raise ValueError("row-specific processor failure")
+        return indices.chain_key
+
+    monkeypatch.setattr("ofoldx.io.read_structure", read)
+    dataset.processor = processor
+
+    assert dataset[0] == "B"
+    assert read_calls == ["shared.cif", "shared.cif"]
+    assert processor_calls == [first, same_cif]
+
+
+def test_cluster_dataset_unique_backing_exhaustion_preserves_last_processed_row_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _entry(chain_key="A", reference_instance_ids=("A",))
+    same_cif = _entry(chain_key="B", entity_1_id="2", reference_instance_ids=("B",))
+    next_cif = _entry(record_index=1, pdb_id="2xyz", chain_key="C", reference_instance_ids=("C",))
+    dataset = ClusteredStructureDataset.__new__(ClusteredStructureDataset)
+    dataset.records = ["shared.cif", "other.cif"]
+    dataset.entries = [first, same_cif, next_cif]
+    dataset.forward_indices = True
+    dataset.processing_timeout_seconds = None
+    dataset.max_consecutive_processing_errors = 5
+    dataset.training_log_file = None
+    dataset.ccd_revision = None
+    dataset.ccd_snapshot_path = None
+    dataset.seq_to_pdb_index = None
+    dataset.msa_path = None
+    dataset.processor_kwargs = {}
+    calls: list[str] = []
+
+    def read(path: str, **kwargs: object) -> object:
+        calls.append(path)
+        raise ValueError(f"bad backing record {path}")
+
+    monkeypatch.setattr("ofoldx.io.read_structure", read)
+    dataset.processor = lambda value, **kwargs: value
+
+    with pytest.raises(ConsecutiveDataLoadingErrors) as exc_info:
+        dataset[0]
+    assert calls == ["shared.cif", "other.cif"]
+    assert type(exc_info.value.__cause__) is ValueError
+    assert str(exc_info.value.__cause__) == "bad backing record other.cif"
 
 
 def test_runner_uses_cluster_sampler_without_forwarding_reserved_config(tmp_path: Path) -> None:
@@ -867,7 +1315,7 @@ def test_runner_uses_cluster_sampler_without_forwarding_reserved_config(tmp_path
                     },
                 }
             },
-            "optim": {"type": "adamw", "lr": 1e-3},
+            "optim": {"type": "torch_adamw", "lr": 1e-3},
             "dataloader": {"batch_size": 1, "drop_last": False, "num_workers": 0},
             "logging": {"enabled": False},
             "workspace": {"root": str(tmp_path / "workspace")},
@@ -950,7 +1398,7 @@ def test_runner_ordinary_split_keeps_default_sampler(tmp_path: Path) -> None:
             "model": {"name": "proteinmpnn"},
             "steps": 1,
             "data": {"train": {"source": str(cif)}},
-            "optim": {"type": "adamw", "lr": 1e-3},
+            "optim": {"type": "torch_adamw", "lr": 1e-3},
             "dataloader": {"batch_size": 1, "drop_last": False, "num_workers": 0},
             "logging": {"enabled": False},
             "workspace": {"root": str(tmp_path / "workspace")},
@@ -980,7 +1428,7 @@ def test_runner_rejects_cluster_sampling_on_validation_split(tmp_path: Path) -> 
                         "cluster_sampling": {"enabled": True, "cluster_file": str(cluster)},
                     }
                 },
-                "optim": {"type": "adamw", "lr": 1e-3},
+                "optim": {"type": "torch_adamw", "lr": 1e-3},
                 "dataloader": {"batch_size": 1, "drop_last": False, "num_workers": 0},
                 "logging": {"enabled": False},
                 "workspace": {"root": str(tmp_path / "workspace")},

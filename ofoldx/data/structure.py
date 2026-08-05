@@ -32,6 +32,8 @@ class Structure:
     source_symbols: tuple[str, ...]
     residue_id: Tensor
     insertion_code: Tensor
+    resolution: Tensor | None = None
+    resolution_is_known: Tensor | None = None
 
     def to(
         self,
@@ -73,6 +75,10 @@ class Structure:
             source_symbols=self.source_symbols,
             residue_id=move(self.residue_id),
             insertion_code=move(self.insertion_code),
+            resolution=None if self.resolution is None else move(self.resolution),
+            resolution_is_known=(
+                None if self.resolution_is_known is None else move(self.resolution_is_known)
+            ),
             batch_size=[],
         )
 
@@ -98,6 +104,12 @@ class Structure:
         source_offset = 0
         residue_ids = []
         insertion_codes = []
+        resolution_values = []
+        resolution_known_values = []
+        has_resolution = any(
+            structure.resolution is not None or structure.resolution_is_known is not None
+            for structure in structures
+        )
         for structure in structures:
             source_symbols.extend(structure.source_symbols)
             residue_ids.append(
@@ -115,6 +127,22 @@ class Structure:
                 )
             )
             source_offset += len(structure.source_symbols)
+            if has_resolution:
+                system_count = structure.system.system_entity_ptr.numel() - 1
+                if structure.resolution is None and structure.resolution_is_known is None:
+                    resolution_values.append(structure.coordinates.new_full((system_count,), -1.0))
+                    resolution_known_values.append(
+                        torch.zeros(system_count, dtype=torch.bool, device=structure.coordinates.device)
+                    )
+                elif structure.resolution is None or structure.resolution_is_known is None:
+                    raise ValueError("resolution and resolution_is_known must either both be present or both be absent")
+                else:
+                    resolution = structure.resolution.reshape(-1)
+                    resolution_is_known = structure.resolution_is_known.reshape(-1)
+                    if resolution.numel() != system_count or resolution_is_known.numel() != system_count:
+                        raise ValueError("resolution fields must have one value per molecular system")
+                    resolution_values.append(resolution)
+                    resolution_known_values.append(resolution_is_known)
 
         return cls(  # type: ignore[call-arg]
             system=MolecularSystem.batch([structure.system for structure in structures]),
@@ -127,6 +155,8 @@ class Structure:
             source_symbols=tuple(source_symbols),
             residue_id=torch.cat(residue_ids),
             insertion_code=torch.cat(insertion_codes),
+            resolution=torch.cat(resolution_values) if has_resolution else None,
+            resolution_is_known=torch.cat(resolution_known_values) if has_resolution else None,
             batch_size=[],
         )
 
@@ -185,6 +215,14 @@ class Structure:
                     source_symbols=source_symbols,
                     residue_id=remapped_residue_id,
                     insertion_code=remapped_insertion_code,
+                    resolution=(
+                        None if self.resolution is None else self.resolution.reshape(-1)[system_index]
+                    ),
+                    resolution_is_known=(
+                        None
+                        if self.resolution_is_known is None
+                        else self.resolution_is_known.reshape(-1)[system_index]
+                    ),
                     batch_size=[],
                 )
             )

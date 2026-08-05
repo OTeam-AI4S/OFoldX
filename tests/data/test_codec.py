@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 
 import numpy as np
+import pytest
 import torch
 
 from ofoldx.data import (
@@ -72,7 +73,10 @@ class TestTensorCodecs:
             assert torch.equal(restored_arrays[name], value)
 
     def test_structure_round_trip_preserves_graph_and_aligned_evidence(self) -> None:
-        structure = _structure()
+        structure = _structure().replace(
+            resolution=torch.tensor(1.8),
+            resolution_is_known=torch.tensor(True),
+        )
         metadata, arrays = encode_structure(structure, array_prefix="structure")
         restored = decode_structure(json.loads(json.dumps(metadata)), arrays)
         restored_metadata, restored_arrays = encode_structure(
@@ -82,8 +86,22 @@ class TestTensorCodecs:
 
         assert restored_metadata == metadata
         assert restored.source_symbols == ("7", "B")
+        assert restored.resolution is not None
+        assert restored.resolution.item() == pytest.approx(1.8)
+        assert restored.resolution_is_known is not None
+        assert restored.resolution_is_known.item()
         for name, value in arrays.items():
             assert torch.equal(restored_arrays[name], value)
+
+    def test_structure_decode_accepts_legacy_metadata_without_resolution(self) -> None:
+        metadata, arrays = encode_structure(_structure(), array_prefix="structure")
+
+        assert "structure.resolution" not in arrays
+        assert "structure.resolution_is_known" not in arrays
+        restored = decode_structure(json.loads(json.dumps(metadata)), arrays)
+
+        assert restored.resolution is None
+        assert restored.resolution_is_known is None
 
 
 class TestEvidenceCodecs:

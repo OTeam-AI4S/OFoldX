@@ -22,6 +22,13 @@ END
 
 
 class TestStructureIO:
+    def test_rejects_unsupported_gzip_suffix(self, tmp_path: Path) -> None:
+        path = tmp_path / "structure.txt.gz"
+        path.touch()
+
+        with pytest.raises(ValueError, match="structure path suffix"):
+            read_structure(path)
+
     def test_altloc_selects_one_coordinate_on_the_canonical_atom_axis(
         self,
         tmp_path: Path,

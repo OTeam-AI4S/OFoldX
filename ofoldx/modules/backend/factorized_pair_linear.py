@@ -11,7 +11,7 @@ from torch import Tensor
 from ._oops import oops_kernel
 from .resolve import resolve_tensor_backend
 
-_oops_factorized_pair_linear = oops_kernel("factorized_pair_linear")
+_oops_factorized_pair_linear = oops_kernel("factorized_linear")
 
 
 def factorized_pair_linear(

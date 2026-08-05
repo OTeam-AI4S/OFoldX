@@ -630,6 +630,142 @@ read_structure(path, atom_layout="complete_all")
 - 2026-07-30：Tik 指出 R1 使用旧 compat wheel，R1 改标 `STALE_WHEEL_INVALID`。R2 从当前 clean tracked OFoldX 源码构建并安装 fresh wheel；新 blocker 是 wheel 未包含被 `.gitignore` 排除的 `ofoldx/_version.py`，状态保持 `Open`。
 - 2026-07-30：Tik 发现 `compare-real-msa` 成功写盘仍可能使用 scope 前的局部 `count_checks` 和旧 `summary_lines`。writer 现对最终 report 递归执行幂等 scope，并只用 `_render_adapted_real_msa_summary(report)` 生成 TXT；新增真实 CLI/writer-branch 回归后 data self-test 51/51。harness SHA256=`eacb21d6885d14a88956cc15ffcde1ba10bc67f2b60ee2396c0245c13f468baa`；现有 4ame JSON/TXT 幂等重写后 SHA256 仍分别为 `43382cc059a6a4d9e5c0e773625d8c6664ae8b986344d7840b1a993e2c9d25bb`、`abf9270287342012e26e3bd7efbd32d37fb3103328921f44e4d3be7ce9285338`，JSON/TXT 裸 `PASS`/`PASS_EXACT`/`PASS_TOLERANCE`/`CONFIRMED` token 均为 0。
 
+### BUG-20260805-001: OFoldX Protenix training forward/loss 与 baseline 不具备 parity
+
+- 日期：2026-08-05
+- 来源任务：current Protenix forward/loss static parity review
+- 状态：Open（修复实现已落地；同权重 full-model 数值 parity 验收仍待完成）
+- 严重级别：High
+- Owner：Tok
+- Tik 复审：2026-08-05 原始 static report APPROVED；修复后的 Processor、forward、objective、Runner、recipe scope
+  和 evaluation contact/permutation 均经独立 Tik 复审通过。cross-component review 要求的 pinned full-model 数值
+  harness 尚未完成，因此状态保持 `Open`。
+- 修复前影响：这是 upstream parity blocker：OFoldX 的默认训练 forward、loss 和评估不能复现 baseline Protenix；
+  分布式 nonfinite parity 当时也未验证。共享 `ofoldx/modules/diffusion/loss.py` 的 EDM-only objective 是历史兼容
+  范围，不再代表 fresh Protenix Runner 的默认训练合同。
+- 修复前根因：OFoldX 实现的是较窄的单步 EDM denoising/coordinate-loss 训练范围；baseline 还把训练时 mini-rollout
+  label matching、随机 recycle/MSA、完整 auxiliary heads、分子类型加权、结构级归约及评估反向扩散纳入训练合同。
+  baseline 另有 synchronized nonfinite 行为；若只比较共同 EDM 公式，会遗漏这些默认路径差异。
+- 修复位置：family-local 实现位于 `ofoldx/models/protenix/model.py`、`processor.py`、`objectives.py` 和
+  `permutation.py`；Runner 编排位于 `ofoldx/runners/runner.py`、`config.py` 和 `collate.py`。共享 EDM loss 保持
+  legacy compatibility，不承载新的 Protenix aggregate objective。
+
+> 以下 A--D 是创建本 bug 时记录的**修复前行为快照**，用于保留原始问题证据；不描述当前实现。
+> baseline 行号固定在 pinned commit `c3bfc365b3e1341a11935eddfe7bfdc308092147`。OFoldX 当时是 dirty
+> worktree，无法诚实绑定到 commit；因此这里只保留文件/符号级证据，不把已随本修复漂移的旧行号当作当前定位。
+
+#### A. Default-path forward blockers
+
+| 项目 | 静态证据与结论 |
+| --- | --- |
+| mini-rollout label matching | baseline 默认执行 S=1、20-step、no-grad mini-rollout，并依次把 chain、atom matching 后的 GT labels 写回（`baseline/Protenix/configs/configs_base.py:176-184,361-389`；`baseline/Protenix/protenix/model/protenix.py:720-769`；`baseline/Protenix/protenix/utils/permutation/permutation.py:61-98`）。修复前 OFoldX `ofoldx/models/protenix/model.py` 的 training forward 直接 gather canonical target 后做单步 denoise，没有该 mini-rollout/symmetry machinery。边界：baseline train diffusion-sample chain matching 默认被跳过；atom matching 会运行，但默认 `train.diffusion_sample=False`，所以 prediction 侧仅记录日志、不 write back（`baseline/Protenix/protenix/utils/permutation/permutation.py:141-159,181-236`；`baseline/Protenix/configs/configs_base.py:361-389`）。因此 blocker 是缺少 mini-rollout label matching，不能表述为 baseline 默认应用 post-denoise permutation。 |
+| recycle | baseline 每个 train step 在 `1..N_cycle` 随机抽取 recycle 次数（`baseline/Protenix/protenix/model/protenix.py:886-902`）；修复前 OFoldX `Protenix.forward` 使用固定配置次数。 |
+| MSA subsampling | baseline 在每个 recycle 内随机 subsample MSA（`baseline/Protenix/protenix/model/modules/pairformer.py:848-868`；`baseline/Protenix/protenix/model/utils.py:290-349`）。修复前 OFoldX training forward 不传 `msa_indices`，使用 processor 给出的 rows；当时的 sampler 只进入 sample/inference 路径。 |
+| unresolved atoms | baseline 在 coordinate augmentation 后把 unresolved coordinates 重新 mask 为 0（`baseline/Protenix/protenix/model/utils.py:92-94`）。修复前 OFoldX `Protenix.forward` 初始 target 虽已 mask，但 augmentation 后不再 re-mask，因此 denoiser input 不同。 |
+| auxiliary/confidence | 修复前 Runner 的 Protenix training preset 强制关闭 auxiliary heads。即使手动开启，当时 OFoldX confidence 也消费同一批 S 个 training-denoise samples；baseline 使用独立、detached、S=1 mini-rollout（`baseline/Protenix/protenix/model/protenix.py:769-793`），且 baseline 的 confidence-only stage（`baseline/Protenix/protenix/model/protenix.py:795-797`）在当时 OFoldX 没有对应实现。 |
+| evaluation/inference boundary | 修复前 OFoldX evaluation 仍使用相同的单步 stochastic EDM forward/criterion。baseline eval 则运行 reverse diffusion，并在默认 test stage 执行 chain/atom permutation，包含 confidence-head permutation（`baseline/Protenix/protenix/model/protenix.py:916+`；`baseline/Protenix/protenix/utils/permutation/permutation.py:453+`）。纯 inference 没有 label 时不执行 GT permutation。 |
+
+#### B. Loss blockers
+
+| 项目 | 静态证据与结论 |
+| --- | --- |
+| objective membership | 修复前 OFoldX shared criterion `ofoldx/modules/diffusion/loss.py` 明确只实现 EDM coordinate loss，而非完整 upstream aggregate recipe。baseline 是完整 objective（`baseline/Protenix/protenix/model/loss.py:1462-1485,1652-1731,1733-1799`）：配置中 smooth-LDDT、distogram、pLDDT、PDE、resolved 的默认权重为 nonzero，但 pLDDT/PDE/resolved 的有效 contribution 受 head/resolution gate 控制；PAE/bond 默认权重为 0，不同 stage 可以开启（`baseline/Protenix/configs/configs_base.py:399-450`）。 |
+| MSE/scaling/atom weights | baseline 使用 `weight_mse=1/3`、aggregate `alpha_diffusion=4`，atom weight 为 `1 + 5*dna + 5*rna + 10*ligand`，且该 atom weight 同时用于 Kabsch 与 SE（`baseline/Protenix/protenix/model/loss.py:1068-1123,1134-1150,1192-1205`；`baseline/Protenix/configs/configs_base.py:399-438`）。修复前 shared EDM criterion 使用 uniform resolved weights，没有这些 scaling。 |
+| reduction | 同一 structure 内的 S-sample mean 对齐。baseline 在 `batch_size=1` 下生成一个 per-structure scalar，并按固定 accumulation 次数平均（`baseline/Protenix/protenix/data/pipeline/dataloader.py:328-350`；`baseline/Protenix/protenix/model/loss.py:42-60,1192-1207`；`baseline/Protenix/runner/train.py:606-613`）。修复前 OFoldX collate 把 resolved-atom count 作为 `loss_normalizer` 提供给 Runner，因此意图在 accumulation 间按 atom count 加权；DanLing/runtime aggregation 和跨 rank 行为当时未审计，不能声称已验证 global cross-rank per-atom mean。 |
+| precision | baseline 默认 outer bf16，同时对 diffusion/loss 禁用 AMP；相关 decorator 不会递归 cast nested dict（`baseline/Protenix/configs/configs_base.py:135-145`；`baseline/Protenix/protenix/utils/torch_utils.py:199-222`；`baseline/Protenix/runner/train.py:583-604`）。修复前 OFoldX target/noise 继承 representation dtype；OFoldX 的确切 outer autocast 和 dtype parity 当时依赖 DanLing/config，尚未验证。 |
+| nonfinite/output contract | baseline 跨 ranks 同步 nonfinite skip（`baseline/Protenix/protenix/utils/training.py:118-144`；`baseline/Protenix/runner/train.py:606-610`）。静态范围内未找到 OFoldX-local synchronized nonfinite mechanism；未审计继承的 DanLing 行为，不能据此声称端到端机制缺失。baseline 返回每项 raw/weighted metrics，OFoldX 只返回一个 Tensor。 |
+
+#### C. Configuration/capability gaps（不是无条件 default bug）
+
+| 项目 | 静态证据与边界 |
+| --- | --- |
+| S/C | baseline 默认 S=48、C=4（`baseline/Protenix/configs/configs_base.py:122-123`）；OFoldX model 历史默认 S=1、无 chunk，但 Runner 可配置 S/C，且两侧 sample-then-chunk-concat 语义对齐。因此这是默认配置/capability 审计项，不是不可配置的实现 blocker。 |
+| conditioning dropout | baseline 支持 conditioning dropout、默认值为 0（`baseline/Protenix/protenix/model/protenix.py:802-822`；`baseline/Protenix/configs/configs_base.py:250`）；修复前 OFoldX `Protenix.forward` 只使用 static conditioning。默认 0 下不能据此单独判定数值 bug。 |
+| shared diffusion cache | baseline 有可选 shared diffusion cache，但默认关闭（`baseline/Protenix/protenix/model/protenix.py:694-719`；`baseline/Protenix/configs/configs_base.py:131`）；这里只是 performance capability gap。 |
+
+#### D. 已对齐项（不代表整体 parity）
+
+- 相同 lognormal sigma 采样公式和 EDM sigma weight。
+- resolved-atom coordinate augmentation distribution 对齐。
+- 相同 S/C sample-then-chunk-concat 语义。
+- detached GT→prediction rigid alignment direction 对齐。
+- 单个 structure 内的 S mean 对齐。
+
+#### E. 当前修复实现
+
+| 组件 | 当前行为 |
+| --- | --- |
+| versioned recipe | fresh Protenix Runner 默认 `protenix_baseline_v1`，缺省 S=48/C=4（可显式覆盖）；显式 `ofoldx_edm_v1` 保留历史单步 EDM 与 checkpoint 语义。recipe identity 仅属于 Protenix；其他 model family 不写入该 key，也不改变历史 config hash。 |
+| Processor target | 完整 uncropped target、current→full `atom_index`、molecule/chemistry metadata、frames、bonds、resolution 与 RDKit local-symmetry pools 一次性发布；crop 只改变 current model axis。 |
+| training forward | baseline recipe 执行随机 recycle、per-cycle MSA subsampling、detached S=1/20-step mini-rollout、truth-side chain/local-atom matching、unresolved remask、独立 confidence heads、FP32 diffusion/distogram islands 和 full-head output。 |
+| objective | family-local aggregate objective 实现 MSE、smooth-LDDT、bond、distogram、pLDDT、PDE、resolved、PAE 的 released 权重、chemistry atom weights、resolution gate、structure/S reduction 与 raw/weighted/total metrics。 |
+| evaluation | baseline eval 使用 EMA（若配置）、S=5/N=200/full recycle reverse diffusion、prediction-side chain/atom matching，并同步 gather coordinates、confidence heads 和每个 sample 的 contact map；共享 raw distogram 保持 `(B,N,N,D)`，canonical contacts 为 `(B,S,N,N)`，不会物化 `(B,S,N,N,D)`。 |
+| distributed Runner | pre-backward 跨 rank nonfinite gate、DDP reducer-safe zero backward、gradient accumulation、optimizer/scheduler/global-step/EMA lifecycle 与稳定 metric schema 已实现并做双 rank fault-injection 验证。 |
+
+OFoldX 的代码编排保持 family-local：Protenix-specific matching/objective 没有下沉到共享 diffusion objective；Runner 只在
+解析到 Protenix baseline recipe 时 lazy import 这些组件。历史 direct-model 默认与 EDM checkpoint 兼容路径仍可用。
+
+#### F. 当前验证证据
+
+- Slurm Job `136050`：当前修复快照的 Processor/permutation/objective/model/Runner/CLI 重点套件
+  `303 passed, 4 deselected`。
+- Slurm Job `136044`：A800 CUDA bf16/autocast FP32-boundary 两项 `2 passed`。
+- Slurm Job `136045`：单节点 2×A800、2 ranks 的 synchronized nonfinite/gradient-accumulation fault injection，
+  两个 rank 均 `1 passed`。
+- Slurm Job `136052`：真实 `6hlv.cif`、indexed MSA（depth 64）、A800/bf16；224 tokens、1827 atoms，成功完成
+  1 次 forward/backward/optimizer update，以及 baseline S=5/N=200 eval。train/eval loss 均 finite；eval 输出保持
+  shared distogram `(1,224,224,4)`，并产生 canonical contact maps `(1,5,224,224)`。
+- Slurm Job `136099`：CPU/FP32 pinned vendor primitive harness 在 clean baseline commit
+  `c3bfc365b3e1341a11935eddfe7bfdc308092147` 与 Job 时 content-pinned 的 OFoldX dirty worktree 之间通过。覆盖 protein/mixed
+  chemistry × S=1/S=3、released default + 8 个 isolated recipes、两次 bitwise repeat；native `ProtenixLoss`
+  与 OFoldX 实际 raw/weighted/total、输入 gradients、chain/local permutation、atom/token heads 和 per-sample contact
+  共 `854/854` comparisons 通过，`32/32` active-gradient、`4/4` oracle 以及全部 config/source provenance gate 通过。
+  最大 loss 绝对误差 `4.768e-7`，最大 gradient 绝对误差 `2.697e-6`，最低 owning-gradient cosine
+  `0.9999999999992635`；harness SHA256 为
+  `9456e89083dfe873c00a3ce4c053bcf82653f631c0e27214d2d871e7e6ccf3e6`。结构化报告位于
+  `tmp/bug-20260805-001/primitive-parity-136099/report.json`。
+- Tik final review：recipe/config/checkpoint scope `APPROVED`；evaluation contact/permutation correction `APPROVED`；
+  Processor、forward、objective 与 Runner 的既有专项复审也均 `APPROVED`。
+- 较广 Runner 回归 Job `136051` 有 `252 passed`；剩余 4 项是 ProteinMPNN/DanLing `NestedTensor` unpack shape
+  failure，与本 Protenix recipe/objective/permutation 路径无调用关系，不作为本 bug 的通过证据，也未在本修复中扩 scope。
+
+#### G. 尚未满足的最终验收
+
+当前证据证明 OFoldX 内部合同、真实 Protenix train/eval 路径、CUDA precision boundary 与 distributed nonfinite 行为；
+但尚不能声称 pinned baseline **full-model numerical parity**。关闭本 bug 前仍需：
+
+- 在 pinned `baseline/Protenix` 与当前 OFoldX 之间，用相同权重、输入和显式 replay 的 recycle/MSA/noise/augmentation
+  随机量，逐项比较 trunk、mini-rollout、matched labels、denoised coordinates、所有 heads、raw/weighted/total loss
+  和代表性 parameter gradients；
+- 覆盖 fixed protein 与 mixed DNA/RNA/ligand、S=1/multi-S、bf16 autocast 和 full reverse-diffusion eval；
+- 将当前 dirty OFoldX worktree 固化为可复现 commit/environment。当前只能标为
+  `CONTENT_PINNED_DIRTY_WORKTREE`，不能声称 commit-pinned parity。
+
+不加载 checkpoint 的 pinned vendor primitive harness 已由 Job `136099` 验证 loss/permutation 边界；该 harness 的
+通过不替代上述同权重 full-model 验收。
+
+#### History
+
+- 2026-08-05：基于 current Protenix forward/loss static parity review 新建 `Open` 条目；记录 upstream parity
+  blockers、intentional EDM-only scope 边界与 runtime/numerical 验收要求，等待 Tik 复审。
+- 2026-08-05：Tik 复审判定 `REVISE`；已按 findings 修正 EDM-only 引用、objective gating、reduction、precision、
+  nonfinite 与 confidence-stage 证据边界，状态保持 `Open`，等待最终复审。
+- 2026-08-05：第二次 `REVISE` 指出高层影响与根因仍把分布式 nonfinite parity 写成无条件缺失；已改为 DanLing
+  行为未审计、parity 尚未验证，状态保持 `Open`，等待最终复审。
+- 2026-08-05：Tik 最终复审判定 `APPROVED`；确认 EDM-only scope、default-path blockers、configuration/capability gaps、aligned items 及未审计的 DanLing/nonfinite 边界表述准确，状态保持 `Open`（production parity blockers 尚未修复）。
+- 2026-08-05：实现 `protenix_baseline_v1` family-local training/evaluation recipe、完整 aggregate objective、
+  truth/prediction permutation、Processor target metadata、DDP nonfinite gate、EMA eval 与 legacy EDM checkpoint 边界。
+- 2026-08-05：cross-component review 发现 recipe identity 泄漏到非 Protenix family，以及 eval raw distogram 未随
+  sample-specific token permutation 提供 canonical contact maps；两项均修复并新增回归。
+- 2026-08-05：fresh Tik 对 recipe/checkpoint scope 和 evaluation contact/permutation 最终判定 `APPROVED`；Slurm
+  `136050`、`136044`、`136045`、`136052` 通过。由于 pinned same-weight full-model numerical harness 尚未完成，
+  状态保持 `Open`，不把 semantic/runtime 修复外推为 bitwise 或 checkpoint-level parity。
+- 2026-08-05：pinned vendor primitive harness v2 最终 Job `136099` 通过 `854/854` comparisons；早期 Job
+  `136053`、`136054`、`136079`、`136080`、`136097`、`136098` 分别暴露节点本地解释器、v1 protocol 缺口、
+  provenance scanner、fixture dtype、Torch lazy import 和 JSON serialization 等 harness/bootstrap 问题，均不作为
+  最终 parity 通过证据。其中 `136054` 虽显示 v1 `PASS`，但该 protocol 已被 v2 supersede，属于 invalid acceptance。
+  full-model same-weight 验收仍未完成，状态保持 `Open`。
+
 ## Bug Template
 
 <!--

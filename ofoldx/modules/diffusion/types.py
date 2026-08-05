@@ -8,10 +8,26 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TypeAlias
 
+from tensordict import TypedTensorDict
 from torch import Tensor
 
 from ..atom import LocalAtomGeometry
 from ..embedding.position import RelativePositionBuckets
+
+
+class CoordinateDenoisingOutput(TypedTensorDict, dict):
+    r"""Minimal tensors produced by a stochastic coordinate-denoising pass.
+
+    Attributes:
+        coordinates: Denoised coordinates with shape ``[..., S, N_atom, 3]``.
+        augmented_target_coordinates: Target coordinates after random rigid
+            augmentation, with shape ``[..., S, N_atom, 3]``.
+        noise_level: Noise levels with shape ``[..., S]``.
+    """
+
+    coordinates: Tensor
+    augmented_target_coordinates: Tensor
+    noise_level: Tensor
 
 
 @dataclass(eq=False)

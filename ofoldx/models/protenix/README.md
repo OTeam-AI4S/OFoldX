@@ -162,12 +162,24 @@ therefore remains an argument of the concrete Pipeline.
 ## Training Details
 
 `ProtenixProcessor.process_training(structure, ...)` returns a
-`ProtenixInput` and separate `ProtenixStructureTarget`. Calling the model with
-those values runs one differentiable stochastic denoising pass and returns
-denoised coordinates, augmented target coordinates, sampled noise levels, the
-distogram, and all four confidence logits. `model.denoise(...)` retains the
-explicit noisy-coordinate operation, while `model.sample(...)` exposes raw
+`ProtenixInput` and separate `ProtenixStructureTarget`. A direct model call
+continues to default to the historical `ofoldx_edm_v1` contract: it runs one
+differentiable stochastic denoising pass and returns denoised coordinates,
+augmented target coordinates, sampled noise levels, the distogram, and all four
+confidence logits. Passing `training_recipe="protenix_baseline_v1"` instead
+executes the parity-oriented training forward and returns the public
+`ProtenixTrainingOutput`, including matched labels and the detached mini-rollout
+used by the confidence heads. `model.denoise(...)` retains the explicit
+noisy-coordinate operation, while `model.sample(...)` exposes raw
 reverse-diffusion output and `model.fold(...)` decodes it.
+
+A fresh native Runner configuration for any Protenix architecture defaults to
+`protenix_baseline_v1`. The Runner enables the required auxiliary heads and
+optimizes the family-local aggregate criterion over coordinate MSE, smooth-LDDT,
+bond, distogram, pLDDT, PDE, resolved, and PAE terms, subject to the preset's
+weights and resolution gates. Select `objective_recipe: ofoldx_edm_v1`
+explicitly to retain the legacy coordinate-denoising objective and its
+checkpoint semantics.
 
 The built-in Runner accepts training crop controls directly under the split.
 Spatial modes require cluster sampling because the sampled chain/interface row
@@ -176,6 +188,7 @@ provides the exact canonical instance IDs eligible as crop centres:
 ```yaml
 model:
   name: protenix
+objective_recipe: protenix_baseline_v1  # default for a fresh Protenix run
 data:
   train:
     source: /path/to/asymmetric-unit-cifs
@@ -192,17 +205,20 @@ Cropping runs only when tokenization exceeds `max_tokens`. Use
 cluster-row metadata. The cropped `ProtenixInput.atom_index` remains a canonical
 gather mapping into the complete, uncropped `ProtenixStructureTarget`.
 
-OFoldX reproduces the complete released Model graph, not Protenix's complete
-four-stage training program. Dataset policy, objectives, stage weights,
-condition-dropout curriculum, optimizer, and training runner remain the
-responsibility of the training application.
+OFoldX reproduces the complete released Model graph and provides a
+baseline-aligned initial aggregate objective, not Protenix's complete four-stage
+training program. The upstream stage curriculum and transitions, learning-rate
+scheduler, and dataset selection, mixture, and sampling policy are not
+reproduced by the baseline recipe; those choices remain the responsibility of
+the training application.
 
 ## Limitations
 
-The built-in Runner objective covers the EDM coordinate-denoising term, not
-Protenix's complete four-stage training program or its auxiliary-head and
-condition-dropout schedules. The selected converted checkpoint determines
-which of the four concrete input contracts is available.
+The built-in baseline recipe covers the initial aggregate objective, but not
+Protenix's full four-stage curriculum, stage-specific scheduler, or released
+dataset policy. The explicit legacy `ofoldx_edm_v1` compatibility recipe covers
+only the historical coordinate-denoising objective. The selected converted
+checkpoint determines which of the four concrete input contracts is available.
 
 ## Citation
 

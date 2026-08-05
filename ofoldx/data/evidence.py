@@ -41,15 +41,11 @@ def _instance_component_bounds(system: MolecularSystem, instance_index: int) -> 
     return int(pointers[instance_index]), int(pointers[instance_index + 1])
 
 
-def _entity_component_bounds(system: MolecularSystem, entity_index: int) -> tuple[int, int]:
-    instance_index = int((system.instance_entity == entity_index).nonzero(as_tuple=False)[0, 0])
-    return _instance_component_bounds(system, instance_index)
-
-
-def _query_conflicts_with_entity(
+def _query_conflicts_with_instance(
     query: str,
     system: MolecularSystem,
     entity_index: int,
+    instance_index: int,
 ) -> int | None:
     r"""
     Locate the first query column whose residue chemistry contradicts the target sequence.
@@ -67,7 +63,7 @@ def _query_conflicts_with_entity(
     standard_ids = _STANDARD_COMPONENT_IDS.get(polymer_type)
     if standard_ids is None:
         return None
-    start, stop = _entity_component_bounds(system, entity_index)
+    start, stop = _instance_component_bounds(system, instance_index)
     component_symbols = system.component_symbol[start:stop].detach().cpu().tolist()
     for index, (symbol, component_symbol) in enumerate(zip(query, component_symbols)):
         target_id = system.symbols[component_symbol]
@@ -278,18 +274,36 @@ def resolve_msa_bindings(
                 )
         query = column.unpaired_sequences[0]
         width = len(query)
-        start, stop = _entity_component_bounds(system, entity_index)
-        component_count = stop - start
-        if width != component_count:
-            raise ValueError(
-                f"MSA for entity {column.entity_id!r} spans {width} columns "
-                f"but the entity has {component_count} components"
+        instance_indices = (
+            (target_instance_index,)
+            if target_instance_index is not None
+            else tuple(
+                int(index)
+                for index in (system.instance_entity == entity_index).nonzero(as_tuple=False).flatten().tolist()
             )
-        conflict = _query_conflicts_with_entity(query, system, entity_index)
-        if conflict is not None:
-            raise ValueError(
-                f"MSA query for entity {column.entity_id!r} disagrees with the target sequence at column {conflict}"
-            )
+        )
+        for instance_index in instance_indices:
+            instance_id = system.instance_id(instance_index)
+            start, stop = _instance_component_bounds(system, instance_index)
+            component_count = stop - start
+            if width != component_count:
+                target = (
+                    f"target instance {instance_id!r} of entity {column.entity_id!r}"
+                    if target_instance_index is not None
+                    else f"entity {column.entity_id!r} instance {instance_id!r}"
+                )
+                raise ValueError(
+                    f"MSA for {target} spans {width} columns "
+                    f"but the instance has {component_count} components"
+                )
+            conflict = _query_conflicts_with_instance(query, system, entity_index, instance_index)
+            if conflict is not None:
+                target = (
+                    f"target instance {instance_id!r} of entity {column.entity_id!r}"
+                    if target_instance_index is not None
+                    else f"entity {column.entity_id!r} instance {instance_id!r}"
+                )
+                raise ValueError(f"MSA query for {target} disagrees with the target sequence at column {conflict}")
         resolved.append((column, target_instance_index, entity_index))
     return tuple(resolved)
 

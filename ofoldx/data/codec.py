@@ -67,6 +67,11 @@ _STRUCTURE_TENSOR_FIELDS = (
     "insertion_code",
 )
 
+_STRUCTURE_OPTIONAL_TENSOR_FIELDS = (
+    "resolution",
+    "resolution_is_known",
+)
+
 
 def _encode_tensor_fields(
     value: object,
@@ -165,6 +170,12 @@ def encode_structure(
         _STRUCTURE_TENSOR_FIELDS,
         array_prefix,
     )
+    for field in _STRUCTURE_OPTIONAL_TENSOR_FIELDS:
+        value = cast(Tensor | None, getattr(structure, field))
+        if value is not None:
+            reference = f"{array_prefix}.{field}"
+            references[field] = reference
+            structure_arrays[reference] = value.detach().cpu()
     arrays.update(structure_arrays)
     return (
         {
@@ -195,7 +206,18 @@ def decode_structure(
     data = cast(dict[str, object], value)
     if data["kind"] != "structure":
         raise ValueError("Structure kind must be 'structure'")
-    fields = _decode_tensor_fields(data["tensors"], _STRUCTURE_TENSOR_FIELDS, arrays)
+    fields = cast(
+        dict[str, Tensor | None],
+        _decode_tensor_fields(
+            data["tensors"],
+            _STRUCTURE_TENSOR_FIELDS,
+            arrays,
+        ),
+    )
+    references = cast(dict[str, str], data["tensors"])
+    for field in _STRUCTURE_OPTIONAL_TENSOR_FIELDS:
+        reference = references.get(field)
+        fields[field] = None if reference is None else arrays[reference]
     return Structure(  # type: ignore[call-arg]
         system=decode_system(data["system"], arrays),
         source_symbols=tuple(cast(list[str], data["source_symbols"])),

@@ -467,3 +467,6 @@ artifacts/
 
 # third party
 baseline/
+
+# training log
+train/

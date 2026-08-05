@@ -10,6 +10,7 @@ sampling rows only, not the retained full structure or full-axis target.
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import json
 import math
@@ -40,9 +41,9 @@ _STANDARD_PROTEIN_COMPONENT_IDS = STANDARD_AMINO_ACID_IDS | {"UNK"}
 _STANDARD_RNA_COMPONENT_IDS = frozenset({"A", "G", "C", "U", "N"})
 _STANDARD_DNA_COMPONENT_IDS = frozenset({"DA", "DG", "DC", "DT", "DN"})
 _CACHE_SCHEMA = "ofoldx.cluster_indices"
-_CACHE_SCHEMA_VERSION = 1
-_CACHE_GENERATOR_VERSION = 1
-_STRUCTURE_INGESTION_POLICY = "ccd-heavy-no-water-v2"
+_CACHE_SCHEMA_VERSION = 2
+_CACHE_GENERATOR_VERSION = 2
+_STRUCTURE_INGESTION_POLICY = "ccd-heavy-no-water-random-polymer-microheterogeneity-v3"
 _METADATA_FIELDS = {
     "schema",
     "schema_version",
@@ -119,7 +120,9 @@ def _effective_record(record: str | Mapping[str, Any]) -> dict[str, Any]:
     r"""Return low-cost file identity metadata without reading structure contents."""
 
     path = Path(record if isinstance(record, str) else os.fspath(record["structure"])).expanduser().resolve()
-    pdb_id = str(record.get("pdb_id", path.stem) if isinstance(record, Mapping) else path.stem).lower()
+    pdb_id = str(
+        record.get("pdb_id", _cif_record_id(path)) if isinstance(record, Mapping) else _cif_record_id(path)
+    ).lower()
     assembly_id = record.get("assembly_id") if isinstance(record, Mapping) else None
     stat = path.stat()
     return {
@@ -222,7 +225,7 @@ def default_cluster_indices_path(
         ),
     }
     digest = hashlib.sha256(_canonical_json(locator)).hexdigest()
-    return Path(workspace_root).expanduser().resolve() / ".cache" / "ofoldx" / "cluster-indices" / f"v1-{digest}.jsonl"
+    return Path(workspace_root).expanduser().resolve() / ".cache" / "ofoldx" / "cluster-indices" / f"v2-{digest}.jsonl"
 
 
 def _decode_entry(payload: Any, record_count: int) -> tuple[ClusterIndex, float]:
@@ -483,6 +486,39 @@ def _source_chain_id(instance_id: str, is_molecule: bool, first_component_id: st
     return instance_id
 
 
+def _cif_record_id(path: Path) -> str:
+    """Return the entry stem while ignoring one optional gzip suffix."""
+
+    source = path.with_suffix("") if path.suffix.lower() == ".gz" else path
+    return source.stem
+
+
+def _source_asym_entities(path: Path) -> dict[str, str]:
+    """Read the source `_struct_asym` mapping independently of internal entity realization."""
+
+    from biotite.structure.io import pdbx
+
+    if path.suffix.lower() == ".gz":
+        with gzip.open(path, "rt") as handle:
+            cif_file = pdbx.CIFFile.read(handle)
+    else:
+        cif_file = pdbx.CIFFile.read(str(path))
+    block = cif_file.block
+    if "struct_asym" not in block:
+        return {}
+    category = block["struct_asym"]
+    asym_ids = category["id"].as_array().tolist()
+    entity_ids = category["entity_id"].as_array().tolist()
+    mapping: dict[str, str] = {}
+    for raw_asym_id, raw_entity_id in zip(asym_ids, entity_ids):
+        asym_id, entity_id = str(raw_asym_id), str(raw_entity_id)
+        previous = mapping.get(asym_id)
+        if previous is not None and previous != entity_id:
+            raise ValueError(f"mmCIF _struct_asym has conflicting entity for {asym_id!r}")
+        mapping[asym_id] = entity_id
+    return mapping
+
+
 def _scan_resolved_atoms(structure: Any) -> tuple[dict[str, np.ndarray], set[str]]:
     r"""Group resolved heavy coordinates and centre eligibility in one site pass."""
 
@@ -552,17 +588,30 @@ def make_cluster_indices(
     entries: list[ClusterIndex] = []
     for record_index, record in enumerate(records):
         path = Path(record if isinstance(record, str) else os.fspath(record["structure"]))
-        if path.suffix.lower() not in {".cif", ".mmcif"}:
+        source_suffix = path.with_suffix("").suffix.lower() if path.suffix.lower() == ".gz" else path.suffix.lower()
+        if source_suffix not in {".cif", ".mmcif"}:
             raise ValueError(f"cluster sampling only supports CIF/mmCIF records: {path}")
-        pdb_id = str(record.get("pdb_id", path.stem) if isinstance(record, Mapping) else path.stem).lower()
+        pdb_id = str(
+            record.get("pdb_id", _cif_record_id(path)) if isinstance(record, Mapping) else _cif_record_id(path)
+        ).lower()
         assembly_id = record.get("assembly_id") if isinstance(record, Mapping) else None
         if assembly_id not in (None, ""):
             raise ValueError("cluster sampling supports asymmetric-unit records only; assembly_id must be empty")
+        # Unit/integration adapters may supply a mocked read_structure together
+        # with a non-existent locator. Preserve the legacy internal-ID fallback
+        # only for that case; existing CIF files remain strictly source-validated.
+        source_asym_entities = _source_asym_entities(path) if path.is_file() else None
+        seed = int.from_bytes(
+            hashlib.sha256(str(path.expanduser().resolve()).encode("utf-8")).digest()[:8],
+            byteorder="little",
+        )
+        generator = torch.Generator(device="cpu").manual_seed(seed)
         try:
             structure = read_structure(
                 path,
                 ccd_revision=ccd_revision,
                 ccd_snapshot_path=ccd_snapshot_path,
+                generator=generator,
             )
         except NoRetainedStructureError:
             continue
@@ -585,27 +634,51 @@ def make_cluster_indices(
                 entity_type == ENTITY_MOLECULE,
                 component_ids[0] if component_ids else "",
             )
+            source_entity_id = (
+                entity_id if source_asym_entities is None else source_asym_entities.get(source_chain_id)
+            )
             if entity_type == ENTITY_MOLECULE:
                 suffixed = re.fullmatch(r"(.+)_(\d+)", source_chain_id)
-                if suffixed is not None and int(suffixed.group(2)) >= 2:
+                source_chain_is_declared = (
+                    source_asym_entities is not None and source_chain_id in source_asym_entities
+                )
+                if (
+                    suffixed is not None
+                    and int(suffixed.group(2)) >= 2
+                    and not source_chain_is_declared
+                ):
                     base_chain_id = suffixed.group(1)
                     base_group = source_groups.get(base_chain_id)
-                    if base_group is not None and base_group["entity_id"] == entity_id:
+                    base_source_entity_id = (
+                        entity_id
+                        if source_asym_entities is None
+                        else source_asym_entities.get(base_chain_id)
+                    )
+                    if base_group is not None and base_group["entity_id"] == base_source_entity_id and (
+                        source_asym_entities is None or source_entity_id in {None, base_source_entity_id}
+                    ):
                         source_chain_id = base_chain_id
+                        source_entity_id = base_source_entity_id
+            if source_entity_id is None:
+                if entity_type != ENTITY_MOLECULE:
+                    raise ValueError(
+                        f"source polymer chain {source_chain_id!r} is missing from mmCIF _struct_asym"
+                    )
+                source_entity_id = entity_id
             group = source_groups.setdefault(
                 source_chain_id,
                 {
-                    "entity_id": entity_id,
+                    "entity_id": source_entity_id,
                     "entity_type": entity_type,
                     "entity_molecule_type": int(system.entity_molecule_type[entity_index].item()),
                     "instance_ids": [],
                     "component_ids": [],
                 },
             )
-            if group["entity_id"] != entity_id:
+            if group["entity_id"] != source_entity_id:
                 raise ValueError(
                     f"source chain {source_chain_id!r} maps conflicting entity IDs "
-                    f"{group['entity_id']!r} and {entity_id!r}"
+                    f"{group['entity_id']!r} and {source_entity_id!r}"
                 )
             group["instance_ids"].append(instance_id)
             group["component_ids"].extend(component_ids)

@@ -52,6 +52,7 @@ dependencies = [
   "multimolecule>=0.2",
   "numpy",
   "pyarrow",
+  "PyYAML>=6",
   "rdkit",
   "safetensors>=0.2.8",
   "scipy",

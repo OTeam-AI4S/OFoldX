@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,6 +10,7 @@ import torch
 from ofoldx.data import (
     BOND_DIRECTION_UNDIRECTED,
     BOND_KIND_COVALENT,
+    BOND_ROLE_ASSEMBLY,
     BOND_ROLE_COMPONENT,
     BOND_ROLE_POLYMER,
     MOLECULE_BRANCHED,
@@ -31,10 +33,17 @@ from ofoldx.io.mmcif import (
     _cif_component_bond_order,
     _read_mmcif_entity_declarations,
     _remove_component_atoms,
-    read_mmcif_components,
+    parse_mmcif,
+    read_mmcif_bonds,
     read_mmcif_branch_entities,
+    read_mmcif_components,
 )
-from ofoldx.io.structure import NoRetainedStructureError, _resolve_branch_component_index
+from ofoldx.io.structure import (
+    NoRetainedStructureError,
+    _canonical_polymer_leaving_sites,
+    _resolve_branch_component_index,
+    _select_altloc,
+)
 
 
 def _ligand_component(
@@ -96,6 +105,286 @@ def _read_cif(path: Path, text: str) -> object:
 
     path.write_text(text)
     return pdbx.CIFFile.read(str(path))
+
+
+def _microheterogeneous_polymer_components() -> dict[str, ChemicalComponent]:
+    r"""Return tiny, fully observed polymer definitions without consulting CCD."""
+
+    return {
+        component_id: ChemicalComponent(
+            component_id,
+            (
+                ChemicalAtom("N", "N"),
+                ChemicalAtom("C", "C"),
+            ),
+            frozenset({ChemicalBond("N", "C")}),
+            previous_attachment=PolymerAttachment("N"),
+            next_attachment=PolymerAttachment("C"),
+            reference_coordinates=((0.0, 0.0, 0.0), (1.0, 0.0, 0.0)),
+        )
+        for component_id in ("ALA", "GLY", "HYP", "PRO", "VAL")
+    }
+
+
+def _write_microheterogeneous_polymer_cif(
+    path: Path,
+    *,
+    chain_ids: tuple[str, ...] = ("A",),
+    include_assembly: bool = False,
+) -> Path:
+    r"""Write a 3a0m-shaped two-residue A/B polymer microheterogeneity fixture."""
+
+    atom_rows: list[str] = []
+    scheme_rows: list[str] = []
+    serial = 1
+    for chain_ordinal, chain_id in enumerate(chain_ids):
+        for label_seq_id in (1, 2):
+            for component_id, altloc_id, author_offset in (("HYP", "A", 12), ("PRO", "B", 112)):
+                author_residue_id = author_offset + label_seq_id
+                scheme_rows.append(
+                    f"{chain_id} 1 {label_seq_id} {component_id} {author_residue_id} "
+                    f"{author_residue_id} ? y"
+                )
+                for atom_ordinal, (atom_name, element) in enumerate((("N", "N"), ("C", "C"))):
+                    x = 100.0 * (component_id == "PRO") + 10.0 * chain_ordinal + label_seq_id
+                    y = float(atom_ordinal)
+                    atom_rows.append(
+                        f"ATOM {serial} {element} {atom_name} {altloc_id} {component_id} {chain_id} 1 "
+                        f"{label_seq_id} ? {x:.1f} {y:.1f} 0.0 0.5 10.0 {author_residue_id} "
+                        f"{component_id} {chain_id} {atom_name} 1"
+                    )
+                    serial += 1
+
+    assembly = ""
+    if include_assembly:
+        assembly = f"""
+loop_
+_pdbx_struct_assembly.id
+_pdbx_struct_assembly.details
+1 'two symmetry copies'
+loop_
+_pdbx_struct_assembly_gen.assembly_id
+_pdbx_struct_assembly_gen.oper_expression
+_pdbx_struct_assembly_gen.asym_id_list
+1 '(1,2)' {chain_ids[0]}
+loop_
+_pdbx_struct_oper_list.id
+_pdbx_struct_oper_list.type
+_pdbx_struct_oper_list.matrix[1][1]
+_pdbx_struct_oper_list.matrix[1][2]
+_pdbx_struct_oper_list.matrix[1][3]
+_pdbx_struct_oper_list.vector[1]
+_pdbx_struct_oper_list.matrix[2][1]
+_pdbx_struct_oper_list.matrix[2][2]
+_pdbx_struct_oper_list.matrix[2][3]
+_pdbx_struct_oper_list.vector[2]
+_pdbx_struct_oper_list.matrix[3][1]
+_pdbx_struct_oper_list.matrix[3][2]
+_pdbx_struct_oper_list.matrix[3][3]
+_pdbx_struct_oper_list.vector[3]
+1 identity 1 0 0 0 0 1 0 0 0 0 1 0
+2 'crystal symmetry operation' 1 0 0 20 0 1 0 0 0 0 1 0
+"""
+
+    path.write_text(
+        f"""data_microheterogeneity
+loop_
+_entity.id
+_entity.type
+1 polymer
+loop_
+_entity_poly.entity_id
+_entity_poly.type
+1 'polypeptide(L)'
+loop_
+_struct_asym.id
+_struct_asym.entity_id
+{chr(10).join(f'{chain_id} 1' for chain_id in chain_ids)}
+loop_
+_entity_poly_seq.entity_id
+_entity_poly_seq.num
+_entity_poly_seq.mon_id
+_entity_poly_seq.hetero
+1 1 HYP y
+1 1 PRO y
+1 2 HYP y
+1 2 PRO y
+loop_
+_pdbx_poly_seq_scheme.asym_id
+_pdbx_poly_seq_scheme.entity_id
+_pdbx_poly_seq_scheme.seq_id
+_pdbx_poly_seq_scheme.mon_id
+_pdbx_poly_seq_scheme.auth_seq_num
+_pdbx_poly_seq_scheme.pdb_seq_num
+_pdbx_poly_seq_scheme.pdb_ins_code
+_pdbx_poly_seq_scheme.hetero
+{chr(10).join(scheme_rows)}
+{assembly}
+loop_
+_atom_site.group_PDB
+_atom_site.id
+_atom_site.type_symbol
+_atom_site.label_atom_id
+_atom_site.label_alt_id
+_atom_site.label_comp_id
+_atom_site.label_asym_id
+_atom_site.label_entity_id
+_atom_site.label_seq_id
+_atom_site.pdbx_PDB_ins_code
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+_atom_site.occupancy
+_atom_site.B_iso_or_equiv
+_atom_site.auth_seq_id
+_atom_site.auth_comp_id
+_atom_site.auth_asym_id
+_atom_site.auth_atom_id
+_atom_site.pdbx_PDB_model_num
+{chr(10).join(atom_rows)}
+""",
+        encoding="ascii",
+    )
+    return path
+
+
+def _instance_component_ids(structure: Structure, instance_id: str) -> tuple[str, ...]:
+    instance_index = next(
+        index
+        for index in range(int(structure.system.instance_symbol.numel()))
+        if structure.system.instance_id(index) == instance_id
+    )
+    start = int(structure.system.instance_component_ptr[instance_index])
+    stop = int(structure.system.instance_component_ptr[instance_index + 1])
+    return tuple(
+        structure.system.symbols[int(structure.system.component_symbol[index])]
+        for index in range(start, stop)
+    )
+
+
+def _instance_entity_index(structure: Structure, instance_id: str) -> int:
+    instance_index = next(
+        index
+        for index in range(int(structure.system.instance_symbol.numel()))
+        if structure.system.instance_id(index) == instance_id
+    )
+    return int(structure.system.instance_entity[instance_index])
+
+
+def _instance_residue_numbers(structure: Structure, instance_id: str) -> tuple[str, ...]:
+    instance_index = next(
+        index
+        for index in range(int(structure.system.instance_symbol.numel()))
+        if structure.system.instance_id(index) == instance_id
+    )
+    start = int(structure.system.instance_component_ptr[instance_index])
+    stop = int(structure.system.instance_component_ptr[instance_index + 1])
+    return tuple(
+        structure.source_symbols[int(structure.residue_id[index])]
+        for index in range(start, stop)
+    )
+
+
+def _write_3a0m_shaped_polymer_block_cif(path: Path, *, link_blocks: bool = True) -> Path:
+    r"""Write exact 3a0m-shaped 13--17 A/B conformers, optionally linked by GLY altlocs."""
+
+    entity_rows = [f"1 {number} ALA n" for number in range(1, 13)]
+    entity_rows.extend(
+        (
+            "1 13 HYP y",
+            "1 13 PRO y",
+            "1 14 VAL y",
+            "1 14 PRO y",
+            "1 15 GLY n",
+            "1 16 PRO y",
+            "1 16 HYP y",
+            "1 17 PRO y",
+            "1 17 VAL y",
+        )
+    )
+    scheme_rows = [f"A 1 {number} ALA {number} {number} ? n" for number in range(1, 13)]
+    atom_rows: list[str] = []
+    serial = 1
+    candidates_by_number = {
+        13: (("HYP", "A", 13), ("PRO", "B", 113)),
+        14: (("VAL", "A", 14), ("PRO", "B", 114)),
+        15: (("GLY", "A", 15), ("GLY", "B", 15)) if link_blocks else (("GLY", None, 15),),
+        16: (("PRO", "A", 16), ("HYP", "B", 116)),
+        17: (("PRO", "A", 17), ("VAL", "B", 117)),
+    }
+    for number, candidates in candidates_by_number.items():
+        if number == 15:
+            scheme_rows.append("A 1 15 GLY 15 15 ? n")
+        else:
+            for component_id, _label, author_number in candidates:
+                scheme_rows.append(
+                    f"A 1 {number} {component_id} {author_number} {author_number} ? y"
+                )
+        for component_id, label, author_number in candidates:
+            for atom_ordinal, (atom_name, element) in enumerate((("N", "N"), ("C", "C"))):
+                x = number + (100.0 if label == "B" else 0.0)
+                atom_rows.append(
+                    f"ATOM {serial} {element} {atom_name} {label or '.'} {component_id} A 1 {number} ? "
+                    f"{x:.1f} {float(atom_ordinal):.1f} 0.0 0.5 10.0 {author_number} "
+                    f"{component_id} A {atom_name} 1"
+                )
+                serial += 1
+    path.write_text(
+        f"""data_3a0m_shaped_microheterogeneity
+loop_
+_entity.id
+_entity.type
+1 polymer
+loop_
+_entity_poly.entity_id
+_entity_poly.type
+1 'polypeptide(L)'
+loop_
+_struct_asym.id
+_struct_asym.entity_id
+A 1
+loop_
+_entity_poly_seq.entity_id
+_entity_poly_seq.num
+_entity_poly_seq.mon_id
+_entity_poly_seq.hetero
+{chr(10).join(entity_rows)}
+loop_
+_pdbx_poly_seq_scheme.asym_id
+_pdbx_poly_seq_scheme.entity_id
+_pdbx_poly_seq_scheme.seq_id
+_pdbx_poly_seq_scheme.mon_id
+_pdbx_poly_seq_scheme.auth_seq_num
+_pdbx_poly_seq_scheme.pdb_seq_num
+_pdbx_poly_seq_scheme.pdb_ins_code
+_pdbx_poly_seq_scheme.hetero
+{chr(10).join(scheme_rows)}
+loop_
+_atom_site.group_PDB
+_atom_site.id
+_atom_site.type_symbol
+_atom_site.label_atom_id
+_atom_site.label_alt_id
+_atom_site.label_comp_id
+_atom_site.label_asym_id
+_atom_site.label_entity_id
+_atom_site.label_seq_id
+_atom_site.pdbx_PDB_ins_code
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+_atom_site.occupancy
+_atom_site.B_iso_or_equiv
+_atom_site.auth_seq_id
+_atom_site.auth_comp_id
+_atom_site.auth_asym_id
+_atom_site.auth_atom_id
+_atom_site.pdbx_PDB_model_num
+{chr(10).join(atom_rows)}
+""",
+        encoding="ascii",
+    )
+    return path
 
 
 def test_remove_component_atoms_without_topology_removes_only_declared_atoms() -> None:
@@ -177,6 +466,409 @@ _pdbx_entity_branch_link.value_order
     assert len(branch.bonds) == 1
 
 
+@pytest.mark.parametrize(
+    ("bem_occupancy", "reverse_declarations_and_links", "selected_component", "selected_links"),
+    [
+        (
+            0.6,
+            False,
+            "BEM",
+            {(1, "C1", 0, "O4"), (2, "C1", 1, "O4"), (3, "C1", 2, "O4")},
+        ),
+        (
+            0.4,
+            True,
+            "LGU",
+            {(1, "O4", 0, "O4"), (2, "O4", 1, "C1"), (3, "C1", 2, "O4")},
+        ),
+    ],
+)
+def test_branch_microheterogeneity_follows_selected_altloc_and_filters_links(
+    tmp_path: Path,
+    bem_occupancy: float,
+    reverse_declarations_and_links: bool,
+    selected_component: str,
+    selected_links: set[tuple[int, str, int, str]],
+) -> None:
+    declarations = ["1 LGU 1 n", "1 BEM 2 y", "1 LGU 2 y", "1 LGU 3 n", "1 MAW 4 n"]
+    links = [
+        "1 2 BEM C1 ? 1 LGU O4 ? sing",
+        "1 2 LGU O4 ? 1 LGU O4 ? sing",
+        "1 3 LGU C1 ? 2 BEM O4 ? sing",
+        "1 3 LGU O4 ? 2 LGU C1 ? sing",
+        "1 4 MAW C1 ? 3 LGU O4 ? sing",
+    ]
+    if reverse_declarations_and_links:
+        declarations.reverse()
+        links.reverse()
+    path = tmp_path / "branch-microheterogeneity.cif"
+    path.write_text(
+        f"""data_branch
+loop_
+_pdbx_entity_branch_list.entity_id
+_pdbx_entity_branch_list.comp_id
+_pdbx_entity_branch_list.num
+_pdbx_entity_branch_list.hetero
+{chr(10).join(declarations)}
+loop_
+_pdbx_branch_scheme.asym_id
+_pdbx_branch_scheme.entity_id
+_pdbx_branch_scheme.mon_id
+_pdbx_branch_scheme.num
+_pdbx_branch_scheme.pdb_asym_id
+_pdbx_branch_scheme.pdb_mon_id
+_pdbx_branch_scheme.pdb_seq_num
+B 1 LGU 1 B LGU 1
+B 1 BEM 2 B BEM 2
+B 1 LGU 2 B LGU 2
+B 1 LGU 3 B LGU 3
+B 1 MAW 4 B MAW 4
+loop_
+_pdbx_entity_branch_link.entity_id
+_pdbx_entity_branch_link.entity_branch_list_num_1
+_pdbx_entity_branch_link.comp_id_1
+_pdbx_entity_branch_link.atom_id_1
+_pdbx_entity_branch_link.leaving_atom_id_1
+_pdbx_entity_branch_link.entity_branch_list_num_2
+_pdbx_entity_branch_link.comp_id_2
+_pdbx_entity_branch_link.atom_id_2
+_pdbx_entity_branch_link.leaving_atom_id_2
+_pdbx_entity_branch_link.value_order
+{chr(10).join(links)}
+loop_
+_atom_site.group_PDB
+_atom_site.id
+_atom_site.type_symbol
+_atom_site.label_atom_id
+_atom_site.label_alt_id
+_atom_site.label_comp_id
+_atom_site.label_asym_id
+_atom_site.label_entity_id
+_atom_site.label_seq_id
+_atom_site.pdbx_PDB_ins_code
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+_atom_site.occupancy
+_atom_site.B_iso_or_equiv
+_atom_site.auth_seq_id
+_atom_site.auth_comp_id
+_atom_site.auth_asym_id
+_atom_site.auth_atom_id
+_atom_site.pdbx_PDB_model_num
+HETATM 1 O O4 . LGU B 1 . ? 0 0 0 1.0 10 1 LGU B O4 1
+HETATM 2 C C1 A BEM B 1 . ? 1 0 0 {bem_occupancy} 10 2 BEM B C1 1
+HETATM 3 C C1 B LGU B 1 . ? 1 0 0 {1.0 - bem_occupancy} 10 2 LGU B C1 1
+HETATM 4 C C1 . LGU B 1 . ? 2 0 0 1.0 10 3 LGU B C1 1
+HETATM 5 C C1 . MAW B 1 . ? 3 0 0 1.0 10 4 MAW B C1 1
+"""
+    )
+    rows, cif_file = parse_mmcif(path, model=1, assembly_id=None)
+    selected_rows = _select_altloc(rows, "highest_occupancy")
+    components = {
+        component_id: ChemicalComponent(
+            component_id,
+            (ChemicalAtom("C1", "C"), ChemicalAtom("O4", "O")),
+            frozenset(),
+        )
+        for component_id in ("LGU", "BEM", "MAW")
+    }
+
+    entities, _ = read_mmcif_branch_entities(
+        cif_file,
+        components,
+        selected_rows=selected_rows,
+    )
+    branch = entities["1"]
+
+    assert tuple(component.component_id for component in branch.components) == (
+        "LGU",
+        selected_component,
+        "LGU",
+        "MAW",
+    )
+    assert {
+        (bond.component_a, bond.atom_a, bond.component_b, bond.atom_b)
+        for bond in branch.bonds
+    } == selected_links
+
+
+def test_branch_declaration_exact_duplicate_is_idempotent(tmp_path: Path) -> None:
+    cif_file = _read_cif(
+        tmp_path / "duplicate-branch-declaration.cif",
+        """data_branch
+loop_
+_pdbx_entity_branch_list.entity_id
+_pdbx_entity_branch_list.comp_id
+_pdbx_entity_branch_list.num
+1 X 1
+1 X 1
+""",
+    )
+    component = ChemicalComponent("X", (ChemicalAtom("A", "C"),), frozenset())
+
+    entities, _ = read_mmcif_branch_entities(cif_file, {"X": component})
+
+    assert entities["1"].components == (component,)
+
+
+def test_branch_nonheterogeneous_conflicting_declarations_fail(tmp_path: Path) -> None:
+    cif_file = _read_cif(
+        tmp_path / "conflicting-branch-declaration.cif",
+        """data_branch
+loop_
+_pdbx_entity_branch_list.entity_id
+_pdbx_entity_branch_list.comp_id
+_pdbx_entity_branch_list.num
+_pdbx_entity_branch_list.hetero
+1 X 1 n
+1 Y 1 y
+""",
+    )
+
+    with pytest.raises(ValueError, match="conflicting non-heterogeneous declarations"):
+        read_mmcif_branch_entities(cif_file, {})
+
+
+def test_unobserved_branch_microheterogeneity_is_ambiguous(tmp_path: Path) -> None:
+    cif_file = _read_cif(
+        tmp_path / "unobserved-branch-microheterogeneity.cif",
+        """data_branch
+loop_
+_pdbx_entity_branch_list.entity_id
+_pdbx_entity_branch_list.comp_id
+_pdbx_entity_branch_list.num
+_pdbx_entity_branch_list.hetero
+1 X 1 y
+1 Y 1 y
+""",
+    )
+
+    with pytest.raises(ValueError, match="unobserved microheterogeneous.*ambiguous candidates"):
+        read_mmcif_branch_entities(cif_file, {})
+
+
+def test_branch_microheterogeneity_conflicting_instance_selections_fail(tmp_path: Path) -> None:
+    cif_file = _read_cif(
+        tmp_path / "conflicting-branch-instance-selections.cif",
+        """data_branch
+loop_
+_pdbx_entity_branch_list.entity_id
+_pdbx_entity_branch_list.comp_id
+_pdbx_entity_branch_list.num
+_pdbx_entity_branch_list.hetero
+1 X 1 y
+1 Y 1 y
+loop_
+_pdbx_branch_scheme.asym_id
+_pdbx_branch_scheme.entity_id
+_pdbx_branch_scheme.mon_id
+_pdbx_branch_scheme.num
+B 1 X 1
+B 1 Y 1
+C 1 X 1
+C 1 Y 1
+""",
+    )
+    selected_rows = [
+        SimpleNamespace(
+            entity_id="1",
+            chain_id=chain_id,
+            component_id=component_id,
+            auth_component_id=None,
+            auth_chain_id=None,
+            auth_residue_id=None,
+        )
+        for chain_id, component_id in (("B", "X"), ("C", "Y"))
+    ]
+
+    with pytest.raises(ValueError, match="conflicting selections across source-entity instances"):
+        read_mmcif_branch_entities(cif_file, {}, selected_rows=selected_rows)  # type: ignore[arg-type]
+
+
+def test_struct_conn_explicit_altloc_uses_selected_conformer_identity(tmp_path: Path) -> None:
+    from biotite.structure.io import pdbx
+
+    cif_file = _read_cif(
+        tmp_path / "struct-conn-altloc.cif",
+        """data_connections
+loop_
+_struct_conn.id
+_struct_conn.conn_type_id
+_struct_conn.ptnr1_label_asym_id
+_struct_conn.ptnr1_label_comp_id
+_struct_conn.ptnr1_label_seq_id
+_struct_conn.ptnr1_label_atom_id
+_struct_conn.ptnr1_auth_asym_id
+_struct_conn.ptnr1_auth_comp_id
+_struct_conn.ptnr1_auth_seq_id
+_struct_conn.ptnr1_auth_atom_id
+_struct_conn.ptnr2_label_asym_id
+_struct_conn.ptnr2_label_comp_id
+_struct_conn.ptnr2_label_seq_id
+_struct_conn.ptnr2_label_atom_id
+_struct_conn.ptnr2_auth_asym_id
+_struct_conn.ptnr2_auth_comp_id
+_struct_conn.ptnr2_auth_seq_id
+_struct_conn.ptnr2_auth_atom_id
+_struct_conn.pdbx_ptnr1_label_alt_id
+_struct_conn.pdbx_ptnr2_label_alt_id
+1 covale B LGU ? O4 B LGU 1 O4 B BEM ? C1 B BEM 2 C1 A A
+2 covale B LGU ? O4 B LGU 1 O4 B LGU ? C1 B LGU 2 C1 B B
+""",
+    )
+
+    def selected_row(row_index: int, auth_residue_id: str, component_id: str, atom_name: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            row_index=row_index,
+            symmetry_id=None,
+            chain_id="B",
+            label_seq_id=None,
+            insertion_code=None,
+            component_id=component_id,
+            atom_name=atom_name,
+            auth_chain_id="B",
+            auth_residue_id=auth_residue_id,
+            auth_component_id=component_id,
+            auth_atom_name=atom_name,
+            altloc_id="A",
+        )
+
+    selected_rows = [
+        selected_row(0, "1", "LGU", "C1"),
+        selected_row(1, "1", "LGU", "O4"),
+        selected_row(2, "2", "BEM", "C1"),
+        selected_row(3, "3", "LGU", "C1"),
+    ]
+    site_by_row_index = {
+        0: AtomSite("B", 0, "C1"),
+        1: AtomSite("B", 0, "O4"),
+        2: AtomSite("B", 1, "C1"),
+        3: AtomSite("B", 2, "C1"),
+    }
+    synthesized_aliases = {
+        (None, "B", "2", None, "BEM", "C1"): AtomSite("B", 2, "C1"),
+    }
+
+    bonds = read_mmcif_bonds(
+        cif_file,
+        selected_rows,  # type: ignore[arg-type]
+        site_by_row_index,
+        synthesized_aliases,
+        set(),
+    )
+
+    assert bonds == (SystemBond(AtomSite("B", 0, "O4"), AtomSite("B", 1, "C1")),)
+
+    category = cif_file.block["struct_conn"]
+    category["pdbx_ptnr1_label_alt_id"] = pdbx.CIFColumn(["A", "?"])
+    category["pdbx_ptnr2_label_alt_id"] = pdbx.CIFColumn(["A", "?"])
+    with pytest.raises(ValueError, match="struct_conn row 1 endpoint 2 is ambiguous"):
+        read_mmcif_bonds(
+            cif_file,
+            selected_rows,  # type: ignore[arg-type]
+            site_by_row_index,
+            synthesized_aliases,
+            set(),
+        )
+
+
+@pytest.mark.parametrize(
+    ("auth_residue_id", "expected_bonds"),
+    [
+        (
+            "1",
+            (SystemBond(AtomSite("B", 0, "C1"), AtomSite("M", 0, "CA")),),
+        ),
+        ("2", ()),
+    ],
+)
+def test_struct_conn_explicit_altloc_uses_precise_auth_identity_for_repeated_components(
+    tmp_path: Path,
+    auth_residue_id: str,
+    expected_bonds: tuple[SystemBond, ...],
+) -> None:
+    cif_file = _read_cif(
+        tmp_path / f"repeated-component-altloc-{auth_residue_id}.cif",
+        f"""data_connections
+loop_
+_struct_conn.id
+_struct_conn.conn_type_id
+_struct_conn.ptnr1_label_asym_id
+_struct_conn.ptnr1_label_comp_id
+_struct_conn.ptnr1_label_seq_id
+_struct_conn.ptnr1_label_atom_id
+_struct_conn.ptnr1_auth_asym_id
+_struct_conn.ptnr1_auth_comp_id
+_struct_conn.ptnr1_auth_seq_id
+_struct_conn.ptnr1_auth_atom_id
+_struct_conn.ptnr2_label_asym_id
+_struct_conn.ptnr2_label_comp_id
+_struct_conn.ptnr2_label_seq_id
+_struct_conn.ptnr2_label_atom_id
+_struct_conn.ptnr2_auth_asym_id
+_struct_conn.ptnr2_auth_comp_id
+_struct_conn.ptnr2_auth_seq_id
+_struct_conn.ptnr2_auth_atom_id
+_struct_conn.pdbx_ptnr1_label_alt_id
+_struct_conn.pdbx_ptnr2_label_alt_id
+1 covale B NAG ? C1 B NAG {auth_residue_id} C1 M CA ? CA M CA {auth_residue_id} CA B B
+""",
+    )
+
+    def selected_row(
+        row_index: int,
+        chain_id: str,
+        auth_residue_id: str,
+        component_id: str,
+        atom_name: str,
+        altloc_id: str,
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            row_index=row_index,
+            symmetry_id=None,
+            chain_id=chain_id,
+            label_seq_id=None,
+            insertion_code=None,
+            component_id=component_id,
+            atom_name=atom_name,
+            auth_chain_id=chain_id,
+            auth_residue_id=auth_residue_id,
+            auth_component_id=component_id,
+            auth_atom_name=atom_name,
+            altloc_id=altloc_id,
+        )
+
+    # The B conformers at author residues 1 and 3 deliberately collide under
+    # each sequence-less label identity. Author residue 2 instead selected A.
+    selected_rows = [
+        selected_row(0, "B", "1", "NAG", "C1", "B"),
+        selected_row(1, "B", "2", "NAG", "C1", "A"),
+        selected_row(2, "B", "3", "NAG", "C1", "B"),
+        selected_row(3, "M", "1", "CA", "CA", "B"),
+        selected_row(4, "M", "2", "CA", "CA", "A"),
+        selected_row(5, "M", "3", "CA", "CA", "B"),
+    ]
+    site_by_row_index = {
+        0: AtomSite("B", 0, "C1"),
+        1: AtomSite("B", 1, "C1"),
+        2: AtomSite("B", 2, "C1"),
+        3: AtomSite("M", 0, "CA"),
+        4: AtomSite("M", 1, "CA"),
+        5: AtomSite("M", 2, "CA"),
+    }
+
+    bonds = read_mmcif_bonds(
+        cif_file,
+        selected_rows,  # type: ignore[arg-type]
+        site_by_row_index,
+        {},
+        set(),
+    )
+
+    assert bonds == expected_bonds
+
+
 def _fully_observed_structure(system: MolecularSystem) -> Structure:
     atom_count = system.atom_symbol.numel()
     component_count = system.component_symbol.numel()
@@ -209,7 +901,562 @@ def _bonded_molecules() -> tuple[Structure, dict[str, ChemicalComponent]]:
     )
 
 
+def test_canonical_polymer_leaving_sites_use_instance_values() -> None:
+    atoms = (
+        ChemicalAtom("LINK", "C"),
+        ChemicalAtom("DECLARED_DROP", "O"),
+        ChemicalAtom("SELECTED_DROP", "O"),
+    )
+    right = ChemicalComponent(
+        "RIGHT",
+        (ChemicalAtom("LINK", "N"),),
+        frozenset(),
+        previous_attachment=PolymerAttachment("LINK"),
+    )
+    declared = PolymerSequence(
+        "protein",
+        (
+            ChemicalComponent(
+                "LEFT",
+                atoms,
+                frozenset(),
+                next_attachment=PolymerAttachment("LINK", frozenset({"DECLARED_DROP"})),
+            ),
+            right,
+        ),
+    )
+    selected = PolymerSequence(
+        "protein",
+        (
+            ChemicalComponent(
+                "LEFT",
+                atoms,
+                frozenset(),
+                next_attachment=PolymerAttachment("LINK", frozenset({"SELECTED_DROP"})),
+            ),
+            right,
+        ),
+    )
+
+    sites = _canonical_polymer_leaving_sites(
+        {"protein": declared},
+        {"A": "protein", "B": "protein"},
+        instance_values={"B": selected},
+    )
+
+    assert sites == frozenset(
+        {
+            AtomSite("A", 0, "DECLARED_DROP"),
+            AtomSite("B", 0, "SELECTED_DROP"),
+        }
+    )
+
+
 class TestMmcifIO:
+    @pytest.mark.parametrize(
+        ("seed", "selected_component", "residue_numbers", "x_offset"),
+        [
+            (0, "HYP", ("13", "14"), 0.0),
+            (1, "PRO", ("113", "114"), 100.0),
+        ],
+    )
+    def test_polymer_microheterogeneity_randomly_keeps_one_complete_conformer(
+        self,
+        tmp_path: Path,
+        seed: int,
+        selected_component: str,
+        residue_numbers: tuple[str, str],
+        x_offset: float,
+    ) -> None:
+        path = _write_microheterogeneous_polymer_cif(tmp_path / f"microheterogeneity-{seed}.cif")
+        generator = torch.Generator(device="cpu").manual_seed(seed)
+
+        restored = read_structure(
+            path,
+            components=_microheterogeneous_polymer_components(),
+            generator=generator,
+        )
+
+        assert _instance_component_ids(restored, "A") == (selected_component, selected_component)
+        assert _instance_residue_numbers(restored, "A") == residue_numbers
+        assert restored.coordinate_mask.tolist() == [True, True, True, True]
+        assert restored.occupancy.tolist() == pytest.approx([0.5, 0.5, 0.5, 0.5])
+        assert restored.coordinates[restored.system.atom_index(AtomSite("A", 0, "N"))].tolist() == pytest.approx(
+            [x_offset + 1.0, 0.0, 0.0]
+        )
+        assert restored.coordinates[restored.system.atom_index(AtomSite("A", 1, "C"))].tolist() == pytest.approx(
+            [x_offset + 2.0, 1.0, 0.0]
+        )
+        assert restored.system.edge_index.shape[1] == 3
+        assert (restored.system.bond_role == BOND_ROLE_COMPONENT).sum().item() == 2
+        assert (restored.system.bond_role == BOND_ROLE_POLYMER).sum().item() == 1
+
+    def test_polymer_microheterogeneity_same_seed_reproduces_identity_and_structure_metadata(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        path = _write_microheterogeneous_polymer_cif(tmp_path / "seeded-microheterogeneity.cif")
+        components = _microheterogeneous_polymer_components()
+
+        first = read_structure(
+            path,
+            components=components,
+            generator=torch.Generator(device="cpu").manual_seed(1),
+        )
+        second = read_structure(
+            path,
+            components=components,
+            generator=torch.Generator(device="cpu").manual_seed(1),
+        )
+
+        first_metadata, first_arrays = encode_system(first.system)
+        second_metadata, second_arrays = encode_system(second.system)
+        assert _instance_component_ids(first, "A") == _instance_component_ids(second, "A")
+        assert second_metadata == first_metadata
+        assert second.source_symbols == first.source_symbols
+        for name, first_array in first_arrays.items():
+            assert torch.equal(second_arrays[name], first_array)
+        for name in (
+            "coordinates",
+            "coordinate_mask",
+            "occupancy",
+            "occupancy_mask",
+            "b_factor",
+            "b_factor_mask",
+            "residue_id",
+            "insertion_code",
+        ):
+            assert torch.equal(getattr(second, name), getattr(first, name))
+
+    def test_polymer_microheterogeneity_uses_one_label_for_the_whole_residue_block(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        path = _write_microheterogeneous_polymer_cif(tmp_path / "microheterogeneous-block.cif")
+
+        for seed in (0, 1):
+            restored = read_structure(
+                path,
+                components=_microheterogeneous_polymer_components(),
+                generator=torch.Generator(device="cpu").manual_seed(seed),
+            )
+            component_ids = _instance_component_ids(restored, "A")
+            assert component_ids in {("HYP", "HYP"), ("PRO", "PRO")}
+
+    @pytest.mark.parametrize(
+        ("seed", "selected_label", "selected_components"),
+        [
+            (0, "A", ("HYP", "VAL", "GLY", "PRO", "PRO")),
+            (1, "B", ("PRO", "PRO", "GLY", "HYP", "VAL")),
+        ],
+    )
+    def test_polymer_microheterogeneity_links_across_single_monomer_altloc_residue(
+        self,
+        tmp_path: Path,
+        seed: int,
+        selected_label: str,
+        selected_components: tuple[str, ...],
+    ) -> None:
+        path = _write_3a0m_shaped_polymer_block_cif(tmp_path / "3a0m-shaped-block.cif")
+
+        restored = read_structure(
+            path,
+            components=_microheterogeneous_polymer_components(),
+            generator=torch.Generator(device="cpu").manual_seed(seed),
+        )
+
+        selected_labels: list[str] = []
+        for label_seq_id in range(13, 18):
+            atom_index = restored.system.atom_index(AtomSite("A", label_seq_id - 1, "N"))
+            assert bool(restored.coordinate_mask[atom_index])
+            selected_labels.append("B" if float(restored.coordinates[atom_index, 0]) >= 100.0 else "A")
+        assert selected_labels == [selected_label] * 5
+        assert _instance_component_ids(restored, "A")[12:17] == selected_components
+
+    def test_polymer_microheterogeneity_selects_two_disjoint_blocks_deterministically(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        path = _write_3a0m_shaped_polymer_block_cif(
+            tmp_path / "3a0m-shaped-disjoint-blocks.cif",
+            link_blocks=False,
+        )
+        components = _microheterogeneous_polymer_components()
+
+        restored = [
+            read_structure(
+                path,
+                components=components,
+                generator=torch.Generator(device="cpu").manual_seed(0),
+            )
+            for _ in range(2)
+        ]
+
+        expected = ("HYP", "VAL", "GLY", "HYP", "VAL")
+        assert [_instance_component_ids(item, "A")[12:17] for item in restored] == [expected, expected]
+        assert torch.equal(restored[0].coordinates, restored[1].coordinates)
+
+    @pytest.mark.parametrize(
+        ("policy", "expected_x", "expected_occupancy"),
+        [("first", 1.0, 0.25), ("highest_occupancy", 101.0, 0.75)],
+    )
+    def test_ordinary_polymer_altloc_honors_policy_without_consuming_generator(
+        self,
+        tmp_path: Path,
+        policy: str,
+        expected_x: float,
+        expected_occupancy: float,
+    ) -> None:
+        path = tmp_path / f"ordinary-altloc-{policy}.cif"
+        path.write_text(
+            """data_ordinary_altloc
+loop_
+_entity.id
+_entity.type
+1 polymer
+loop_
+_entity_poly.entity_id
+_entity_poly.type
+1 'polypeptide(L)'
+loop_
+_struct_asym.id
+_struct_asym.entity_id
+A 1
+loop_
+_entity_poly_seq.entity_id
+_entity_poly_seq.num
+_entity_poly_seq.mon_id
+_entity_poly_seq.hetero
+1 1 GLY n
+loop_
+_pdbx_poly_seq_scheme.asym_id
+_pdbx_poly_seq_scheme.entity_id
+_pdbx_poly_seq_scheme.seq_id
+_pdbx_poly_seq_scheme.mon_id
+_pdbx_poly_seq_scheme.auth_seq_num
+_pdbx_poly_seq_scheme.pdb_seq_num
+_pdbx_poly_seq_scheme.pdb_ins_code
+A 1 1 GLY 1 1 ?
+loop_
+_atom_site.group_PDB
+_atom_site.id
+_atom_site.type_symbol
+_atom_site.label_atom_id
+_atom_site.label_alt_id
+_atom_site.label_comp_id
+_atom_site.label_asym_id
+_atom_site.label_entity_id
+_atom_site.label_seq_id
+_atom_site.pdbx_PDB_ins_code
+_atom_site.Cartn_x
+_atom_site.Cartn_y
+_atom_site.Cartn_z
+_atom_site.occupancy
+_atom_site.B_iso_or_equiv
+_atom_site.auth_seq_id
+_atom_site.auth_comp_id
+_atom_site.auth_asym_id
+_atom_site.auth_atom_id
+_atom_site.pdbx_PDB_model_num
+ATOM 1 N N A GLY A 1 1 ? 1.0 0.0 0.0 0.25 10.0 1 GLY A N 1
+ATOM 2 C C A GLY A 1 1 ? 2.0 0.0 0.0 0.25 10.0 1 GLY A C 1
+ATOM 3 N N B GLY A 1 1 ? 101.0 0.0 0.0 0.75 10.0 1 GLY A N 1
+ATOM 4 C C B GLY A 1 1 ? 102.0 0.0 0.0 0.75 10.0 1 GLY A C 1
+""",
+            encoding="ascii",
+        )
+        generator = torch.Generator(device="cpu").manual_seed(7)
+        initial_state = generator.get_state().clone()
+
+        restored = read_structure(
+            path,
+            altloc=policy,  # type: ignore[arg-type]
+            components=_microheterogeneous_polymer_components(),
+            generator=generator,
+        )
+
+        atom_index = restored.system.atom_index(AtomSite("A", 0, "N"))
+        assert restored.coordinates[atom_index].tolist() == [expected_x, 0.0, 0.0]
+        assert restored.occupancy.tolist() == pytest.approx([expected_occupancy, expected_occupancy])
+        assert torch.equal(generator.get_state(), initial_state)
+
+    def test_polymer_microheterogeneity_splits_only_distinct_realized_entities(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        path = _write_microheterogeneous_polymer_cif(
+            tmp_path / "microheterogeneous-entities.cif",
+            chain_ids=("A", "B", "C"),
+        )
+
+        restored = read_structure(
+            path,
+            components=_microheterogeneous_polymer_components(),
+            generator=torch.Generator(device="cpu").manual_seed(0),
+        )
+
+        assert _instance_component_ids(restored, "A") == ("HYP", "HYP")
+        assert _instance_component_ids(restored, "B") == ("PRO", "PRO")
+        assert _instance_component_ids(restored, "C") == ("PRO", "PRO")
+        assert _instance_entity_index(restored, "A") != _instance_entity_index(restored, "B")
+        assert _instance_entity_index(restored, "B") == _instance_entity_index(restored, "C")
+        assert restored.system.entity_symbol.numel() == 2
+
+    def test_polymer_microheterogeneity_assembly_copies_reuse_the_source_choice(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        path = _write_microheterogeneous_polymer_cif(
+            tmp_path / "microheterogeneous-assembly.cif",
+            include_assembly=True,
+        )
+
+        restored = read_structure(
+            path,
+            assembly_id="1",
+            components=_microheterogeneous_polymer_components(),
+            generator=torch.Generator(device="cpu").manual_seed(0),
+        )
+
+        instance_ids = [
+            restored.system.instance_id(index)
+            for index in range(int(restored.system.instance_symbol.numel()))
+        ]
+        assert len(instance_ids) == 2
+        assert len({_instance_component_ids(restored, instance_id) for instance_id in instance_ids}) == 1
+        assert len({_instance_entity_index(restored, instance_id) for instance_id in instance_ids}) == 1
+
+    def test_polymer_microheterogeneity_candidates_require_all_hetero_flags(self, tmp_path: Path) -> None:
+        cif_file = _read_cif(
+            tmp_path / "invalid-polymer-microheterogeneity.cif",
+            """data_microheterogeneity
+loop_
+_entity_poly_seq.entity_id
+_entity_poly_seq.num
+_entity_poly_seq.mon_id
+_entity_poly_seq.hetero
+1 1 HYP y
+1 1 PRO n
+""",
+        )
+
+        with pytest.raises(ValueError, match="hetero|microheterogeneous|non-heterogeneous"):
+            _read_mmcif_entity_declarations(cif_file)
+
+    def test_polymer_microheterogeneity_accepts_yes_as_an_affirmative_hetero_flag(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        cif_file = _read_cif(
+            tmp_path / "yes-polymer-microheterogeneity.cif",
+            """data_microheterogeneity
+loop_
+_entity_poly_seq.entity_id
+_entity_poly_seq.num
+_entity_poly_seq.mon_id
+_entity_poly_seq.hetero
+1 1 HYP yes
+1 1 PRO yes
+""",
+        )
+
+        _, polymer_monomers, _, _, _, _ = _read_mmcif_entity_declarations(cif_file)
+
+        assert polymer_monomers == {"1": ((1, ("HYP", "PRO")),)}
+
+    def test_polymer_microheterogeneity_exact_duplicate_y_declaration_is_idempotent(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        cif_file = _read_cif(
+            tmp_path / "duplicate-polymer-microheterogeneity.cif",
+            """data_microheterogeneity
+loop_
+_entity_poly_seq.entity_id
+_entity_poly_seq.num
+_entity_poly_seq.mon_id
+_entity_poly_seq.hetero
+1 1 HYP y
+1 1 HYP y
+1 1 PRO y
+""",
+        )
+
+        _, polymer_monomers, _, _, _, _ = _read_mmcif_entity_declarations(cif_file)
+
+        assert polymer_monomers == {"1": ((1, ("HYP", "PRO")),)}
+
+    def test_polymer_microheterogeneity_rejects_one_altloc_label_for_multiple_monomers(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        path = _write_microheterogeneous_polymer_cif(tmp_path / "ambiguous-label-monomers.cif")
+        path.write_text(path.read_text().replace(" B PRO A 1 ", " A PRO A 1 "), encoding="ascii")
+
+        with pytest.raises(ValueError, match="maps alternate labels to multiple monomers"):
+            read_structure(
+                path,
+                components=_microheterogeneous_polymer_components(),
+                generator=torch.Generator(device="cpu").manual_seed(0),
+            )
+
+    def test_polymer_microheterogeneity_rejects_labelled_and_unlabelled_candidate_mixture(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        path = _write_microheterogeneous_polymer_cif(tmp_path / "mixed-labelled-unlabelled.cif")
+        path.write_text(path.read_text().replace(" B PRO A 1 ", " . PRO A 1 "), encoding="ascii")
+
+        with pytest.raises(ValueError, match="mixes labelled and unlabelled monomer candidates"):
+            read_structure(
+                path,
+                components=_microheterogeneous_polymer_components(),
+                generator=torch.Generator(device="cpu").manual_seed(0),
+            )
+
+    @pytest.mark.parametrize("scheme_hetero", [None, "?", "y"])
+    def test_polymer_microheterogeneity_candidate_numbering_does_not_require_scheme_hetero(
+        self,
+        tmp_path: Path,
+        scheme_hetero: str | None,
+    ) -> None:
+        scheme_hetero_column = "" if scheme_hetero is None else "_pdbx_poly_seq_scheme.hetero\n"
+        scheme_hetero_suffix = "" if scheme_hetero is None else f" {scheme_hetero}"
+        cif_file = _read_cif(
+            tmp_path / f"candidate-specific-numbering-{scheme_hetero or 'omitted'}.cif",
+            f"""data_microheterogeneity
+loop_
+_entity_poly_seq.entity_id
+_entity_poly_seq.num
+_entity_poly_seq.mon_id
+_entity_poly_seq.hetero
+1 1 HYP y
+1 1 PRO y
+loop_
+_pdbx_poly_seq_scheme.asym_id
+_pdbx_poly_seq_scheme.entity_id
+_pdbx_poly_seq_scheme.seq_id
+_pdbx_poly_seq_scheme.mon_id
+_pdbx_poly_seq_scheme.auth_seq_num
+_pdbx_poly_seq_scheme.pdb_seq_num
+_pdbx_poly_seq_scheme.pdb_ins_code
+{scheme_hetero_column}A 1 1 HYP 13 13 ?{scheme_hetero_suffix}
+A 1 1 PRO 113 113 ?{scheme_hetero_suffix}
+""",
+        )
+
+        _read_mmcif_entity_declarations(cif_file)
+
+    def test_polymer_microheterogeneity_same_candidate_scheme_conflict_is_rejected(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        cif_file = _read_cif(
+            tmp_path / "same-candidate-numbering-conflict.cif",
+            """data_microheterogeneity
+loop_
+_entity_poly_seq.entity_id
+_entity_poly_seq.num
+_entity_poly_seq.mon_id
+_entity_poly_seq.hetero
+1 1 HYP y
+1 1 PRO y
+loop_
+_pdbx_poly_seq_scheme.asym_id
+_pdbx_poly_seq_scheme.entity_id
+_pdbx_poly_seq_scheme.seq_id
+_pdbx_poly_seq_scheme.mon_id
+_pdbx_poly_seq_scheme.auth_seq_num
+_pdbx_poly_seq_scheme.pdb_seq_num
+_pdbx_poly_seq_scheme.pdb_ins_code
+_pdbx_poly_seq_scheme.hetero
+A 1 1 HYP 13 13 ? y
+A 1 1 HYP 14 14 ? y
+""",
+        )
+
+        with pytest.raises(ValueError, match="conflicting numbering"):
+            _read_mmcif_entity_declarations(cif_file)
+
+    @pytest.mark.parametrize("compressed_name", ["microheterogeneity.cif.gz", "microheterogeneity.mmcif.gz"])
+    def test_polymer_microheterogeneity_gzip_matches_with_equal_generator_state(
+        self,
+        tmp_path: Path,
+        compressed_name: str,
+    ) -> None:
+        path = _write_microheterogeneous_polymer_cif(tmp_path / "microheterogeneity.cif")
+        compressed_path = tmp_path / compressed_name
+        with gzip.open(compressed_path, "wb") as handle:
+            handle.write(path.read_bytes())
+        components = _microheterogeneous_polymer_components()
+
+        expected = read_structure(
+            path,
+            components=components,
+            generator=torch.Generator(device="cpu").manual_seed(0),
+        )
+        actual = read_structure(
+            compressed_path,
+            components=components,
+            generator=torch.Generator(device="cpu").manual_seed(0),
+        )
+
+        expected_metadata, expected_arrays = encode_system(expected.system)
+        actual_metadata, actual_arrays = encode_system(actual.system)
+        assert actual_metadata == expected_metadata
+        assert actual.source_symbols == expected.source_symbols
+        for name, expected_array in expected_arrays.items():
+            assert torch.equal(actual_arrays[name], expected_array)
+        for name in (
+            "coordinates",
+            "coordinate_mask",
+            "occupancy",
+            "occupancy_mask",
+            "b_factor",
+            "b_factor_mask",
+            "residue_id",
+            "insertion_code",
+        ):
+            assert torch.equal(getattr(actual, name), getattr(expected, name))
+
+    @pytest.mark.parametrize("compressed_name", ["ligand.cif.gz", "ligand.mmcif.gz"])
+    def test_gzip_compressed_input_matches_uncompressed_mmcif(
+        self,
+        tmp_path: Path,
+        compressed_name: str,
+    ) -> None:
+        path = tmp_path / "ligand.cif"
+        compressed_path = tmp_path / compressed_name
+        write_structure(_structure(), path)
+        with gzip.open(compressed_path, "wb") as handle:
+            handle.write(path.read_bytes())
+
+        expected = read_structure(path)
+        actual = read_structure(compressed_path)
+
+        expected_metadata, expected_arrays = encode_system(expected.system)
+        actual_metadata, actual_arrays = encode_system(actual.system)
+        assert actual_metadata == expected_metadata
+        for name, expected_array in expected_arrays.items():
+            assert torch.equal(actual_arrays[name], expected_array)
+        for name in (
+            "coordinates",
+            "coordinate_mask",
+            "occupancy",
+            "occupancy_mask",
+            "b_factor",
+            "b_factor_mask",
+            "residue_id",
+            "insertion_code",
+        ):
+            assert torch.equal(getattr(actual, name), getattr(expected, name))
+        assert actual.source_symbols == expected.source_symbols
+
+    @pytest.mark.parametrize("name", ["output.pdb.gz", "output.cif.gz", "output.mmcif.gz"])
+    def test_write_structure_rejects_gzip_paths(self, tmp_path: Path, name: str) -> None:
+        with pytest.raises(ValueError, match="structure path suffix"):
+            write_structure(_structure(), tmp_path / name)
+
     def test_water_only_defaults_to_excluded_and_can_be_opted_in(self, tmp_path: Path) -> None:
         water = _water_component()
         system = MolecularSystem.from_entities(
@@ -247,6 +1494,87 @@ class TestMmcifIO:
             retained.system.symbols[int(symbol)]
             for symbol in retained.system.component_symbol.tolist()
         } == {"LIG"}
+
+    def test_deuterium_only_asym_is_not_rematerialized_after_default_filtering(self, tmp_path: Path) -> None:
+        from biotite.structure.io import pdbx
+
+        ligand = _ligand_component()
+        deuterium = ChemicalComponent("D8U", (ChemicalAtom("D", "H"),), frozenset())
+        system = MolecularSystem.from_entities(
+            {
+                "ligand": Molecule((ligand,)),
+                "deuterium": Molecule((deuterium,)),
+            },
+            {"L": "ligand", "D": "deuterium"},
+        )
+        path = tmp_path / "mixed-deuterium.cif"
+        write_structure(_fully_observed_structure(system), path)
+        cif_file = pdbx.CIFFile.read(str(path))
+        atom_site = cif_file.block["atom_site"]
+        type_symbols = atom_site["type_symbol"].as_array()
+        asym_ids = atom_site["label_asym_id"].as_array()
+        type_symbols[asym_ids == "D"] = "D"
+        atom_site["type_symbol"] = pdbx.CIFColumn(type_symbols)
+        cif_file.write(str(path))
+
+        default = read_structure(path, components={"LIG": ligand, "D8U": deuterium})
+        opted_in = read_structure(
+            path,
+            components={"LIG": ligand, "D8U": deuterium},
+            include_hydrogens=True,
+        )
+
+        assert [
+            default.system.instance_id(index)
+            for index in range(int(default.system.instance_symbol.numel()))
+        ] == ["L"]
+        assert default.system.atomic_number.tolist() == [6, 8]
+        assert [
+            opted_in.system.instance_id(index)
+            for index in range(int(opted_in.system.instance_symbol.numel()))
+        ] == ["L", "D"]
+        deuterium_index = opted_in.system.atom_index(AtomSite("D", 0, "D"))
+        assert int(opted_in.system.atomic_number[deuterium_index]) == 1
+        assert int(opted_in.system.isotope[deuterium_index]) == 2
+
+    def test_unobserved_declared_heavy_nonpoly_is_still_rematerialized(self, tmp_path: Path) -> None:
+        ligand = _ligand_component()
+        ion = ChemicalComponent("ION", (ChemicalAtom("N", "N"),), frozenset())
+        system = MolecularSystem.from_entities(
+            {
+                "ligand": Molecule((ligand,)),
+                "ion": Molecule((ion,)),
+            },
+            {"L": "ligand", "U": "ion"},
+        )
+        structure = _fully_observed_structure(system)
+        ion_atom = system.atom_index(AtomSite("U", 0, "N"))
+        coordinate_mask = structure.coordinate_mask.clone()
+        occupancy_mask = structure.occupancy_mask.clone()
+        b_factor_mask = structure.b_factor_mask.clone()
+        coordinate_mask[ion_atom] = False
+        occupancy_mask[ion_atom] = False
+        b_factor_mask[ion_atom] = False
+        structure = structure.replace(
+            coordinates=structure.coordinates.clone(),
+            coordinate_mask=coordinate_mask,
+            occupancy=structure.occupancy.clone(),
+            occupancy_mask=occupancy_mask,
+            b_factor=structure.b_factor.clone(),
+            b_factor_mask=b_factor_mask,
+        )
+        path = tmp_path / "unobserved-heavy-nonpoly.cif"
+        write_structure(structure, path)
+
+        restored = read_structure(path, components={"LIG": ligand, "ION": ion})
+
+        assert [
+            restored.system.instance_id(index)
+            for index in range(int(restored.system.instance_symbol.numel()))
+        ] == ["L", "U"]
+        restored_ion_atom = restored.system.atom_index(AtomSite("U", 0, "N"))
+        assert int(restored.system.atomic_number[restored_ion_atom]) == 7
+        assert not bool(restored.coordinate_mask[restored_ion_atom])
 
     def test_unobserved_declared_water_asym_is_not_rematerialized_by_default(self, tmp_path: Path) -> None:
         ligand = _ligand_component()
@@ -310,6 +1638,133 @@ class TestMmcifIO:
         assert restored.system.bond_order.tolist() == [1.0]
         assert restored.system.bond_kind.tolist() == [BOND_KIND_COVALENT]
         assert restored.system.bond_direction.tolist() == [BOND_DIRECTION_UNDIRECTED]
+
+    def test_struct_conn_endpoint_removed_by_canonical_polymer_link_is_filtered(self, tmp_path: Path) -> None:
+        from biotite.structure.io import pdbx
+
+        left_atoms = (
+            ChemicalAtom("LINK", "C"),
+            ChemicalAtom("DROP", "O"),
+            ChemicalAtom("KEEP", "C"),
+        )
+        right_atoms = (
+            ChemicalAtom("LINK", "N"),
+            ChemicalAtom("DROP", "O"),
+            ChemicalAtom("KEEP", "C"),
+        )
+        ligand = ChemicalComponent(
+            "LIG",
+            (
+                ChemicalAtom("L1", "N"),
+                ChemicalAtom("L2", "S"),
+                ChemicalAtom("L3", "P"),
+            ),
+            None,
+        )
+        raw_left = ChemicalComponent("LEFT", left_atoms, None)
+        raw_right = ChemicalComponent("RIGHT", right_atoms, None)
+        raw_system = MolecularSystem.from_entities(
+            {
+                "protein": PolymerSequence("protein", (raw_left, raw_right)),
+                "ligand": Molecule((ligand,)),
+            },
+            {"A": "protein", "L": "ligand"},
+            (
+                SystemBond(AtomSite("A", 0, "DROP"), AtomSite("L", 0, "L1")),
+                SystemBond(AtomSite("L", 0, "L3"), AtomSite("A", 1, "DROP")),
+                SystemBond(AtomSite("A", 1, "KEEP"), AtomSite("L", 0, "L2")),
+            ),
+        )
+        path = tmp_path / "polymer-leaving-struct-conn.cif"
+        write_structure(_fully_observed_structure(raw_system), path)
+        cif_file = pdbx.CIFFile.read(str(path))
+        connections = cif_file.block["struct_conn"]
+        right_conflict = next(
+            index
+            for index, (component, atom) in enumerate(
+                zip(
+                    connections["ptnr1_label_comp_id"].as_array(),
+                    connections["ptnr1_label_atom_id"].as_array(),
+                    strict=True,
+                )
+            )
+            if (component, atom) == ("RIGHT", "DROP")
+        )
+        for partner_1, partner_2 in (
+            ("ptnr1_label_asym_id", "ptnr2_label_asym_id"),
+            ("ptnr1_label_seq_id", "ptnr2_label_seq_id"),
+            ("ptnr1_label_comp_id", "ptnr2_label_comp_id"),
+            ("ptnr1_label_atom_id", "ptnr2_label_atom_id"),
+            ("ptnr1_auth_asym_id", "ptnr2_auth_asym_id"),
+            ("ptnr1_auth_seq_id", "ptnr2_auth_seq_id"),
+            ("ptnr1_auth_comp_id", "ptnr2_auth_comp_id"),
+            ("ptnr1_auth_atom_id", "ptnr2_auth_atom_id"),
+            ("pdbx_ptnr1_PDB_ins_code", "pdbx_ptnr2_PDB_ins_code"),
+            ("ptnr1_role", "ptnr2_role"),
+            ("ptnr1_symmetry", "ptnr2_symmetry"),
+        ):
+            values_1 = connections[partner_1].as_array().tolist()
+            values_2 = connections[partner_2].as_array().tolist()
+            values_1[right_conflict], values_2[right_conflict] = (
+                values_2[right_conflict],
+                values_1[right_conflict],
+            )
+            connections[partner_1] = pdbx.CIFColumn(values_1)
+            connections[partner_2] = pdbx.CIFColumn(values_2)
+        assert (
+            connections["ptnr1_label_comp_id"].as_array()[right_conflict],
+            connections["ptnr1_label_atom_id"].as_array()[right_conflict],
+            connections["ptnr2_label_comp_id"].as_array()[right_conflict],
+            connections["ptnr2_label_atom_id"].as_array()[right_conflict],
+        ) == ("LIG", "L3", "RIGHT", "DROP")
+        cif_file.write(str(path))
+        left = ChemicalComponent(
+            "LEFT",
+            left_atoms,
+            None,
+            next_attachment=PolymerAttachment("LINK", frozenset({"DROP"})),
+        )
+        right = ChemicalComponent(
+            "RIGHT",
+            right_atoms,
+            None,
+            previous_attachment=PolymerAttachment("LINK", frozenset({"DROP"})),
+        )
+
+        restored = read_structure(
+            path,
+            components={"LEFT": left, "RIGHT": right, "LIG": ligand},
+        )
+
+        edges = {
+            (
+                frozenset(
+                    {
+                        restored.system.atom_site(atom_a),
+                        restored.system.atom_site(atom_b),
+                    }
+                ),
+                role,
+            )
+            for (atom_a, atom_b), role in zip(
+                restored.system.edge_index.T.tolist(),
+                restored.system.bond_role.tolist(),
+                strict=True,
+            )
+        }
+        assert edges == {
+            (
+                frozenset({AtomSite("A", 0, "LINK"), AtomSite("A", 1, "LINK")}),
+                BOND_ROLE_POLYMER,
+            ),
+            (
+                frozenset({AtomSite("A", 1, "KEEP"), AtomSite("L", 0, "L2")}),
+                BOND_ROLE_ASSEMBLY,
+            ),
+        }
+        for component_index in (0, 1):
+            with pytest.raises(KeyError):
+                restored.system.atom_index(AtomSite("A", component_index, "DROP"))
 
     @pytest.mark.parametrize("connection_type", ["metalc", "covalent", "hydrog"])
     def test_struct_conn_ignores_unsupported_connection_types(

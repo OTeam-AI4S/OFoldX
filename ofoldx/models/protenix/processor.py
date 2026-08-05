@@ -4,7 +4,9 @@ Prepare biomolecular features for Protenix.
 
 from __future__ import annotations
 
+import itertools
 import math
+from collections import defaultdict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, cast
@@ -26,6 +28,7 @@ from ...data.evidence import (
     resolve_msa_bindings,
 )
 from ...data.molecular import (
+    BOND_KIND_COVALENT,
     BOND_ROLE_COMPONENT,
     BOND_ROLE_ENTITY,
     ENTITY_DNA,
@@ -199,6 +202,33 @@ _POLYMER_TYPE = {
     ENTITY_DNA_RNA_HYBRID: "dna_rna_hybrid",
     ENTITY_PNA: "pna",
 }
+_STANDARD_LOCAL_SYMMETRY = {
+    "ASP": (("OD1", "OD2"), ("OD2", "OD1")),
+    "GLU": (("OE1", "OE2"), ("OE2", "OE1")),
+    "PHE": (
+        ("CD1", "CD2", "CE1", "CE2"),
+        ("CD2", "CD1", "CE2", "CE1"),
+    ),
+    "TYR": (
+        ("CD1", "CD2", "CE1", "CE2"),
+        ("CD2", "CD1", "CE2", "CE1"),
+    ),
+    "A": (("OP1", "OP2"), ("OP2", "OP1")),
+    "G": (("OP1", "OP2"), ("OP2", "OP1")),
+    "C": (("OP1", "OP2"), ("OP2", "OP1")),
+    "U": (("OP1", "OP2"), ("OP2", "OP1")),
+    "DA": (("OP1", "OP2"), ("OP2", "OP1")),
+    "DG": (("OP1", "OP2"), ("OP2", "OP1")),
+    "DC": (("OP1", "OP2"), ("OP2", "OP1")),
+    "DT": (("OP1", "OP2"), ("OP2", "OP1")),
+}
+
+
+@dataclass(frozen=True)
+class _ProtenixTrainingContext:
+    full_tokens: list[dict[str, object]]
+    current_tokens: list[dict[str, object]]
+    crop_method: int | None
 
 
 class ProtenixCropIndex(Protocol):
@@ -329,6 +359,7 @@ class ProtenixProcessor(Processor):
             revision=self.config.ccd_revision,
             snapshot_path=self.config.ccd_snapshot_path,
         )
+        training_context: list[_ProtenixTrainingContext] = []
         processed = self._lower(
             structure,
             msa=msa,
@@ -336,11 +367,13 @@ class ProtenixProcessor(Processor):
             crop_method_weights=tuple(float(weight) for weight in crop_method_weights),
             crop_indices=indices,
             generator=generator,
+            _training_context=training_context,
         )
         return processed, _structure_target(
             structure,
+            processed,
+            training_context[0],
             device=self.device,
-            dtype=self.dtype,
         )
 
     def _resolve_msa(
@@ -373,6 +406,7 @@ class ProtenixProcessor(Processor):
         crop_max_tokens: int | None = None,
         crop_method_weights: tuple[float, float, float] = (0.2, 0.4, 0.4),
         crop_indices: ProtenixCropIndex | None = None,
+        _training_context: list[_ProtenixTrainingContext] | None = None,
     ) -> ProtenixInput:
         atom_contact_values = tuple(atom_contacts)
         token_contact_values = tuple(token_contacts)
@@ -386,10 +420,12 @@ class ProtenixProcessor(Processor):
         # the tokenization already selected for each residue.
         expanded_residues = _atom_constraint_residues(atom_contact_values, system)
         tokens = _tokenize(system, expanded_residues)
+        full_tokens = tokens
+        crop_method: int | None = None
         if crop_max_tokens is not None and len(tokens) > crop_max_tokens:
             if crop_indices is None and any(crop_method_weights[index] > 0 for index in (1, 2)):
                 raise ValueError("indices are required when spatial crop methods have positive weight")
-            tokens = _crop_training_tokens(
+            tokens, crop_method = _crop_training_tokens(
                 input=cast(Structure, input),
                 tokens=tokens,
                 max_tokens=crop_max_tokens,
@@ -397,7 +433,7 @@ class ProtenixProcessor(Processor):
                 indices=crop_indices,
                 generator=generator,
             )
-        return _features(
+        processed = _features(
             system,
             tokens=tokens,
             msa=msa,
@@ -416,6 +452,15 @@ class ProtenixProcessor(Processor):
             device=self.device,
             dtype=self.dtype,
         )
+        if _training_context is not None:
+            _training_context.append(
+                _ProtenixTrainingContext(
+                    full_tokens=full_tokens,
+                    current_tokens=tokens,
+                    crop_method=crop_method,
+                )
+            )
+        return processed
 
 
 class ProtenixTemplateProcessor(ProtenixProcessor):
@@ -478,16 +523,19 @@ class ProtenixTemplateProcessor(ProtenixProcessor):
             revision=self.config.ccd_revision,
             snapshot_path=self.config.ccd_snapshot_path,
         )
-        processed = self(
+        training_context: list[_ProtenixTrainingContext] = []
+        processed = self._lower(
             structure,
             msa=msa,
-            templates=templates,
+            templates=tuple(templates),
             generator=generator,
+            _training_context=training_context,
         )
         return processed, _structure_target(
             structure,
+            processed,
+            training_context[0],
             device=self.device,
-            dtype=self.dtype,
         )
 
     def _resolve_msa(
@@ -568,16 +616,19 @@ class ProtenixStructureConditionProcessor(ProtenixProcessor):
             revision=self.config.ccd_revision,
             snapshot_path=self.config.ccd_snapshot_path,
         )
-        processed = self(
+        training_context: list[_ProtenixTrainingContext] = []
+        processed = self._lower(
             structure,
             structure_condition=structure_condition,
             msa=msa,
             generator=generator,
+            _training_context=training_context,
         )
         return processed, _structure_target(
             structure,
+            processed,
+            training_context[0],
             device=self.device,
-            dtype=self.dtype,
         )
 
 
@@ -661,7 +712,8 @@ class ProtenixConstraintProcessor(ProtenixProcessor):
             revision=self.config.ccd_revision,
             snapshot_path=self.config.ccd_snapshot_path,
         )
-        processed = self(
+        training_context: list[_ProtenixTrainingContext] = []
+        processed = self._lower(
             structure,
             msa=msa,
             atom_contacts=atom_contacts,
@@ -670,29 +722,654 @@ class ProtenixConstraintProcessor(ProtenixProcessor):
             substructure=substructure,
             substructure_coordinate_noise_scale=substructure_coordinate_noise_scale,
             generator=generator,
+            _training_context=training_context,
         )
         return processed, _structure_target(
             structure,
+            processed,
+            training_context[0],
             device=self.device,
-            dtype=self.dtype,
         )
 
 
 def _structure_target(
     structure: Structure,
+    input: ProtenixInput,
+    context: _ProtenixTrainingContext,
     *,
     device: torch.device,
-    dtype: torch.dtype,
 ) -> ProtenixStructureTarget:
     r"""
-    Move full-axis canonical coordinate truth to the model placement.
+    Lower full-axis coordinate truth and deterministic loss/permutation metadata.
     """
 
+    system = structure.system
+    molecule_id, molecule_equivalence_index, molecule_atom_index, atom_molecule_type = _molecule_metadata(
+        system,
+        structure.coordinate_mask,
+    )
+    model_atom_index = tuple(int(index) for index in input.atom_index[0].detach().cpu().tolist() if index >= 0)
+    representative_atom_mask = torch.zeros(system.atom_symbol.numel(), dtype=torch.bool)
+    representative_atom_mask[
+        torch.tensor(
+            [cast(int, token["center"]) for token in context.full_tokens],
+            dtype=torch.long,
+        )
+    ] = True
+    permutation_pool_mask = _permutation_pool_mask(
+        model_atom_index,
+        molecule_id,
+        molecule_equivalence_index,
+        molecule_atom_index,
+        restrict_to_current_molecules=context.crop_method in {1, 2},
+    )
+    symmetry_atom_index, symmetry_permutation = _local_symmetry_features(
+        system,
+        model_atom_index,
+    )
+    token_center_atom_index, token_frame_atom_index, token_has_frame = _token_frame_features(
+        system,
+        context.current_tokens,
+        model_atom_index,
+    )
+    plddt_rep_atom_mask = _plddt_rep_atom_mask(system, model_atom_index)
+    ligand_polymer_bond_index, ligand_polymer_bond_mask = _ligand_polymer_bond_features(
+        system,
+        model_atom_index,
+    )
+    if structure.resolution is None or structure.resolution_is_known is None:
+        resolution = torch.tensor([-1.0], dtype=torch.float32, device=device)
+        resolution_is_known = torch.tensor([False], dtype=torch.bool, device=device)
+    else:
+        resolution = structure.resolution.reshape(-1)
+        resolution_is_known = structure.resolution_is_known.reshape(-1)
+        if resolution.numel() != 1 or resolution_is_known.numel() != 1:
+            raise ValueError("Protenix process_training requires scalar structure resolution metadata")
+        resolution = resolution.to(device=device, dtype=torch.float32)
+        resolution_is_known = resolution_is_known.to(device=device, dtype=torch.bool)
+
+    def placed(value: Tensor) -> Tensor:
+        return value.to(device=device).unsqueeze(0)
+
     return ProtenixStructureTarget(  # type: ignore[call-arg]
-        coordinates=structure.coordinates.to(device=device, dtype=dtype).unsqueeze(0),
+        coordinates=structure.coordinates.to(device=device, dtype=torch.float32).unsqueeze(0),
         coordinate_mask=structure.coordinate_mask.to(device=device).unsqueeze(0),
+        molecule_id=placed(molecule_id),
+        molecule_equivalence_index=placed(molecule_equivalence_index),
+        molecule_atom_index=placed(molecule_atom_index),
+        representative_atom_mask=placed(representative_atom_mask),
+        permutation_pool_mask=placed(permutation_pool_mask),
+        atom_molecule_type=placed(atom_molecule_type),
+        symmetry_atom_index=placed(symmetry_atom_index),
+        symmetry_permutation=placed(symmetry_permutation),
+        token_center_atom_index=placed(token_center_atom_index),
+        token_frame_atom_index=placed(token_frame_atom_index),
+        token_has_frame=placed(token_has_frame),
+        plddt_rep_atom_mask=placed(plddt_rep_atom_mask),
+        ligand_polymer_bond_index=placed(ligand_polymer_bond_index),
+        ligand_polymer_bond_mask=placed(ligand_polymer_bond_mask),
+        resolution=resolution,
+        resolution_is_known=resolution_is_known,
         batch_size=[1],
     )
+
+
+def _molecule_metadata(
+    system: MolecularSystem,
+    coordinate_mask: Tensor,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    r"""
+    Assign baseline-style instance-graph molecules and exact-layout equivalence.
+
+    Every instance starts as one molecule, even when its component graph is
+    disconnected. Resolved inter-instance covalent bonds merge instance nodes,
+    except polymer-polymer links such as disulfides. Molecule ids follow first
+    canonical atom occurrence. Equivalence intentionally includes both entity
+    composition and the complete ordered atom layout, so incomplete or otherwise
+    non-isomorphic copies never become permutation peers.
+    """
+
+    atom_count = system.atom_symbol.numel()
+    if coordinate_mask.numel() != atom_count:
+        raise ValueError("coordinate_mask must align with the canonical atom axis")
+    resolved = coordinate_mask.reshape(-1).detach().cpu().bool().tolist()
+    instance_count = system.instance_symbol.numel()
+    parent = list(range(instance_count))
+
+    def root(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(first: int, second: int) -> None:
+        first_root = root(first)
+        second_root = root(second)
+        if first_root == second_root:
+            return
+        if first_root < second_root:
+            parent[second_root] = first_root
+        else:
+            parent[first_root] = second_root
+
+    component_instance = torch.repeat_interleave(
+        torch.arange(instance_count, dtype=torch.long),
+        (system.instance_component_ptr[1:] - system.instance_component_ptr[:-1]).detach().cpu(),
+    ).tolist()
+    atom_component = torch.repeat_interleave(
+        torch.arange(system.component_symbol.numel(), dtype=torch.long),
+        (system.component_atom_ptr[1:] - system.component_atom_ptr[:-1]).detach().cpu(),
+    ).tolist()
+    atom_instance = [component_instance[component_index] for component_index in atom_component]
+    instance_entities = system.instance_entity.detach().cpu().tolist()
+    entity_types = system.entity_type.detach().cpu().tolist()
+    polymer_types = {
+        ENTITY_PROTEIN,
+        ENTITY_RNA,
+        ENTITY_DNA,
+        ENTITY_DNA_RNA_HYBRID,
+        ENTITY_PNA,
+    }
+
+    edge_index = system.edge_index.detach().cpu()
+    bond_kind = system.bond_kind.detach().cpu().tolist()
+    for edge_offset, (first, second) in enumerate(edge_index.T.tolist()):
+        first_instance = atom_instance[first]
+        second_instance = atom_instance[second]
+        if first_instance == second_instance or bond_kind[edge_offset] != BOND_KIND_COVALENT:
+            continue
+        if not resolved[first] or not resolved[second]:
+            continue
+        first_type = entity_types[instance_entities[first_instance]]
+        second_type = entity_types[instance_entities[second_instance]]
+        if first_type in polymer_types and second_type in polymer_types:
+            continue
+        union(first_instance, second_instance)
+
+    atoms_by_root: dict[int, list[int]] = {}
+    for atom_index in range(atom_count):
+        atoms_by_root.setdefault(root(atom_instance[atom_index]), []).append(atom_index)
+    molecule_atoms = list(atoms_by_root.values())
+
+    instance_components = system.instance_component_ptr.detach().cpu().tolist()
+    component_atoms = system.component_atom_ptr.detach().cpu().tolist()
+    component_symbols = system.component_symbol.detach().cpu().tolist()
+    atom_symbols = system.atom_symbol.detach().cpu().tolist()
+
+    molecule_id = torch.empty(atom_count, dtype=torch.long)
+    molecule_atom_index = torch.empty(atom_count, dtype=torch.long)
+    molecule_equivalence_index = torch.empty(atom_count, dtype=torch.long)
+    equivalence_by_layout: dict[tuple[object, ...], int] = {}
+    for current_molecule_id, atom_indices in enumerate(molecule_atoms):
+        instance_order = tuple(dict.fromkeys(atom_instance[atom_index] for atom_index in atom_indices))
+        instance_rank = {instance_index: rank for rank, instance_index in enumerate(instance_order)}
+        entity_composition = tuple(sorted(instance_entities[instance_index] for instance_index in instance_order))
+        atom_layout = tuple(
+            (
+                instance_entities[atom_instance[atom_index]],
+                instance_rank[atom_instance[atom_index]],
+                atom_component[atom_index] - instance_components[atom_instance[atom_index]],
+                component_symbols[atom_component[atom_index]],
+                atom_index - component_atoms[atom_component[atom_index]],
+                atom_symbols[atom_index],
+            )
+            for atom_index in atom_indices
+        )
+        layout_key: tuple[object, ...] = (entity_composition, atom_layout)
+        equivalence_index = equivalence_by_layout.setdefault(layout_key, len(equivalence_by_layout))
+        molecule_id[atom_indices] = current_molecule_id
+        molecule_atom_index[atom_indices] = torch.arange(len(atom_indices))
+        molecule_equivalence_index[atom_indices] = equivalence_index
+
+    atom_molecule_type = torch.tensor(
+        [entity_types[instance_entities[atom_instance[index]]] for index in range(atom_count)],
+        dtype=torch.long,
+    )
+    return molecule_id, molecule_equivalence_index, molecule_atom_index, atom_molecule_type
+
+
+def _permutation_pool_mask(
+    current_atom_index: tuple[int, ...],
+    molecule_id: Tensor,
+    molecule_equivalence_index: Tensor,
+    molecule_atom_index: Tensor,
+    *,
+    restrict_to_current_molecules: bool,
+) -> Tensor:
+    current_pairs = {
+        (int(molecule_equivalence_index[index]), int(molecule_atom_index[index])) for index in current_atom_index
+    }
+    current_molecules = {int(molecule_id[index]) for index in current_atom_index}
+    return torch.tensor(
+        [
+            (int(equivalence), int(atom_index)) in current_pairs
+            and (not restrict_to_current_molecules or int(molecule) in current_molecules)
+            for molecule, equivalence, atom_index in zip(
+                molecule_id.tolist(),
+                molecule_equivalence_index.tolist(),
+                molecule_atom_index.tolist(),
+            )
+        ],
+        dtype=torch.bool,
+    )
+
+
+def _local_symmetry_features(
+    system: MolecularSystem,
+    atom_indices: tuple[int, ...],
+) -> tuple[Tensor, Tensor]:
+    r"""Build baseline-compatible CCD permutations on the current model axis."""
+
+    system_to_model_atom = {atom_index: model_index for model_index, atom_index in enumerate(atom_indices)}
+    component_instance = torch.repeat_interleave(
+        torch.arange(system.instance_symbol.numel(), dtype=torch.long),
+        (system.instance_component_ptr[1:] - system.instance_component_ptr[:-1]).detach().cpu(),
+    ).tolist()
+    instance_entities = system.instance_entity.detach().cpu().tolist()
+    entity_types = system.entity_type.detach().cpu().tolist()
+    component_symbols = system.component_symbol.detach().cpu().tolist()
+    component_atoms = system.component_atom_ptr.detach().cpu().tolist()
+    atom_symbols = system.atom_symbol.detach().cpu().tolist()
+    current_atom_indices = set(atom_indices)
+    groups: list[tuple[tuple[int, ...], tuple[tuple[int, ...], ...]]] = []
+    for component_index, instance_index in enumerate(component_instance):
+        entity_type = entity_types[instance_entities[instance_index]]
+        atom_start = component_atoms[component_index]
+        atom_stop = component_atoms[component_index + 1]
+        visible_local = [
+            atom_index - atom_start
+            for atom_index in range(atom_start, atom_stop)
+            if atom_index in system_to_model_atom
+        ]
+        if len(visible_local) < 2:
+            continue
+        identity = tuple(system_to_model_atom[atom_start + local_index] for local_index in visible_local)
+        candidates = {identity}
+        boundary_local = {
+            atom_index - atom_start
+            for atom_index in _component_boundary_atoms(
+                system,
+                component_index,
+                current_atom_indices,
+            )
+        }
+        if bool(system.component_topology_complete[component_index]):
+            try:
+                molecule = _rdkit_component(system, component_index)
+                for boundary_offset, local_index in enumerate(sorted(boundary_local), 1):
+                    molecule.GetAtomWithIdx(local_index).SetIsotope(1000 + boundary_offset)
+                for permutation in _ccd_component_permutations(molecule, max_matches=1000):
+                    if any(permutation[index] != index for index in boundary_local):
+                        continue
+                    mapped_local = tuple(permutation[index] for index in visible_local)
+                    if set(mapped_local) != set(visible_local):
+                        continue
+                    candidates.add(
+                        tuple(system_to_model_atom[atom_start + index] for index in mapped_local)
+                    )
+            except (KeyError, RuntimeError, ValueError):
+                pass
+        if len(candidates) == 1 and _is_standard(system, component_index, entity_type):
+            component_id = system.symbols[component_symbols[component_index]]
+            standard_permutations = _STANDARD_LOCAL_SYMMETRY.get(component_id)
+            if standard_permutations is not None:
+                by_name = {
+                    system.symbols[atom_symbols[atom_start + local_index]]: local_index
+                    for local_index in visible_local
+                }
+                source_names, target_names = standard_permutations
+                if all(name in by_name for name in (*source_names, *target_names)):
+                    local_permutation = list(range(atom_stop - atom_start))
+                    for source_name, target_name in zip(source_names, target_names):
+                        local_permutation[by_name[source_name]] = by_name[target_name]
+                    if not any(local_permutation[index] != index for index in boundary_local):
+                        mapped_local = tuple(local_permutation[index] for index in visible_local)
+                        candidates.add(
+                            tuple(system_to_model_atom[atom_start + index] for index in mapped_local)
+                        )
+        if len(candidates) > 1:
+            groups.append((identity, (identity, *sorted(candidates - {identity}))))
+
+    if not groups:
+        return torch.empty((0, 0), dtype=torch.long), torch.empty((0, 0, 0), dtype=torch.long)
+    max_width = max(len(group) for group, _ in groups)
+    max_permutations = max(len(permutations) for _, permutations in groups)
+    group_atom_index = torch.full((len(groups), max_width), -1, dtype=torch.long)
+    permutation = torch.full((len(groups), max_permutations, max_width), -1, dtype=torch.long)
+    for group_index, (atom_group, permutations) in enumerate(groups):
+        group_atom_index[group_index, : len(atom_group)] = torch.tensor(atom_group)
+        for permutation_index, values in enumerate(permutations):
+            permutation[group_index, permutation_index, : len(values)] = torch.tensor(values)
+    return group_atom_index, permutation
+
+
+def _neutralize_symmetry_atoms(molecule: Mol) -> Mol:
+    r"""Apply the baseline charge/H-count neutralization used for CCD symmetry."""
+
+    from rdkit import Chem
+
+    pattern = Chem.MolFromSmarts(
+        "[+1!h0!$([*]~[-1,-2,-3,-4]),-1!#4!#5!$([*]~[+1,+2,+3,+4])]"
+    )
+    if pattern is None:
+        raise RuntimeError("failed to construct the CCD symmetry neutralization pattern")
+    for (atom_index,) in molecule.GetSubstructMatches(pattern):
+        atom = molecule.GetAtomWithIdx(atom_index)
+        charge = atom.GetFormalCharge()
+        atom.SetFormalCharge(0)
+        atom.SetNumExplicitHs(atom.GetTotalNumHs() - charge)
+        atom.UpdatePropertyCache()
+    return molecule
+
+
+def _augment_conjugated_terminal_permutations(
+    molecule: Mol,
+    permutations: tuple[tuple[int, ...], ...],
+    *,
+    max_matches: int,
+) -> tuple[tuple[int, ...], ...]:
+    r"""Augment automorphisms with baseline conjugated terminal-group swaps."""
+
+    from rdkit import Chem
+
+    pattern = Chem.MolFromSmarts(
+        "[O,N;D1;$([O,N;D1]-[*]=[O,N;D1]),$([O,N;D1]=[*]-[O,N;D1])]~[*]"
+    )
+    if pattern is None:
+        raise RuntimeError("failed to construct the conjugated terminal-group pattern")
+    graph: defaultdict[int, set[int]] = defaultdict(set)
+    for first, second in molecule.GetSubstructMatches(pattern):
+        graph[first].add(second)
+        graph[second].add(first)
+
+    terminal_groups: list[tuple[int, ...]] = []
+    for neighbors in graph.values():
+        if len(neighbors) < 2:
+            continue
+        by_atomic_number: defaultdict[int, set[int]] = defaultdict(set)
+        for atom_index in neighbors:
+            by_atomic_number[molecule.GetAtomWithIdx(atom_index).GetAtomicNum()].add(atom_index)
+        terminal_groups.extend(
+            tuple(sorted(group)) for group in by_atomic_number.values() if len(group) > 1
+        )
+    terminal_groups.sort()
+    if not terminal_groups:
+        return permutations
+
+    max_terminal_groups = max(
+        1,
+        math.ceil(math.log(max_matches / max(1, len(permutations)), 3)),
+    )
+    terminal_groups = terminal_groups[:max_terminal_groups]
+    augmented = set(permutations)
+    for group in terminal_groups:
+        next_permutations: set[tuple[int, ...]] = set()
+        group_orders = tuple(itertools.permutations(group))
+        for permutation in augmented:
+            positions = [index for index, value in enumerate(permutation) if value in group]
+            for order in group_orders:
+                candidate = list(permutation)
+                for position, value in zip(positions, order):
+                    candidate[position] = value
+                next_permutations.add(tuple(candidate))
+        augmented = set(sorted(next_permutations)[:max_matches])
+    return tuple(sorted(augmented)[:max_matches])
+
+
+def _rdkit_substructure_permutations(
+    molecule: Mol,
+    *,
+    neutralize: bool,
+    max_matches: int,
+) -> tuple[tuple[int, ...], ...]:
+    r"""Compute one protonation branch of baseline CCD automorphisms."""
+
+    from rdkit import Chem
+
+    working = Chem.Mol(molecule)
+    original_atom_count = working.GetNumAtoms()
+    for atom in working.GetAtoms():
+        atom.SetIntProp("ofoldx_original_atom_index", atom.GetIdx())
+    working = Chem.RemoveHs(working)
+    if neutralize:
+        working = _neutralize_symmetry_atoms(working)
+    Chem.AssignStereochemistry(working, force=True, cleanIt=True)
+    matches = working.GetSubstructMatches(
+        working,
+        uniquify=False,
+        maxMatches=max_matches,
+    )
+    if not matches:
+        raise RuntimeError("RDKit found no CCD self-match")
+    canonical_rank = tuple(Chem.rdmolfiles.CanonicalRankAtoms(working, breakTies=False))
+    permutations = tuple(
+        tuple(match)
+        for match in matches
+        if all(canonical_rank[match[index]] == canonical_rank[index] for index in range(len(match)))
+    )
+    permutations = _augment_conjugated_terminal_permutations(
+        working,
+        permutations,
+        max_matches=max_matches,
+    )
+
+    new_to_original = {
+        atom.GetIdx(): atom.GetIntProp("ofoldx_original_atom_index") for atom in working.GetAtoms()
+    }
+    original_to_new = {original: new for new, original in new_to_original.items()}
+    expanded: list[tuple[int, ...]] = []
+    for permutation in permutations:
+        values = []
+        for original_index in range(original_atom_count):
+            if original_index not in original_to_new:
+                values.append(original_index)
+                continue
+            new_index = original_to_new[original_index]
+            values.append(new_to_original[permutation[new_index]])
+        expanded.append(tuple(values))
+    return tuple(expanded)
+
+
+def _ccd_component_permutations(
+    molecule: Mol,
+    *,
+    max_matches: int,
+) -> tuple[tuple[int, ...], ...]:
+    r"""Return deterministic identity-first CCD automorphisms across protonation states."""
+
+    candidates: set[tuple[int, ...]] = set()
+    for neutralize in (False, True):
+        candidates.update(
+            _rdkit_substructure_permutations(
+                molecule,
+                neutralize=neutralize,
+                max_matches=max_matches,
+            )
+        )
+    identity = tuple(range(molecule.GetNumAtoms()))
+    candidates.add(identity)
+    return (identity, *sorted(candidates - {identity}))[:max_matches]
+
+
+def _component_boundary_atoms(
+    system: MolecularSystem,
+    component_index: int,
+    current_atom_indices: set[int],
+) -> set[int]:
+    r"""Return component boundary atoms whose bonded partners survive the crop."""
+
+    atom_start = int(system.component_atom_ptr[component_index])
+    atom_stop = int(system.component_atom_ptr[component_index + 1])
+    boundary: set[int] = set()
+    for first, second in system.edge_index.detach().cpu().T.tolist():
+        if first not in current_atom_indices or second not in current_atom_indices:
+            continue
+        first_inside = atom_start <= first < atom_stop
+        second_inside = atom_start <= second < atom_stop
+        if first_inside and not second_inside:
+            boundary.add(first)
+        elif second_inside and not first_inside:
+            boundary.add(second)
+    return boundary
+
+
+def _token_frame_features(
+    system: MolecularSystem,
+    tokens: list[dict[str, object]],
+    atom_indices: tuple[int, ...],
+) -> tuple[Tensor, Tensor, Tensor]:
+    system_to_model_atom = {atom_index: model_index for model_index, atom_index in enumerate(atom_indices)}
+    atom_symbols = system.atom_symbol.detach().cpu().tolist()
+    reference_positions = system.reference_coordinates.detach().cpu()
+    reference_mask = system.reference_coordinate_mask.detach().cpu().bool()
+    reference_groups: dict[int, list[int]] = {}
+    for token in tokens:
+        reference_groups.setdefault(cast(int, token["reference_space"]), []).extend(
+            cast(tuple[int, ...], token["atoms"])
+        )
+
+    center_atom_index: list[int] = []
+    frame_atom_index: list[tuple[int, int, int]] = []
+    has_frame: list[bool] = []
+    for token in tokens:
+        center = cast(int, token["center"])
+        center_model_index = system_to_model_atom[center]
+        center_atom_index.append(center_model_index)
+        token_atoms = cast(tuple[int, ...], token["atoms"])
+        entity_type = int(system.entity_type[cast(int, token["entity_index"])])
+        standard_aggregate = cast(bool, token["standard"]) and len(token_atoms) > 1
+        if standard_aggregate and entity_type in {
+            ENTITY_PROTEIN,
+            ENTITY_RNA,
+            ENTITY_DNA,
+            ENTITY_DNA_RNA_HYBRID,
+        }:
+            names = ("N", "CA", "C") if entity_type == ENTITY_PROTEIN else ("C1'", "C3'", "C4'")
+            by_name = {system.symbols[atom_symbols[index]]: index for index in token_atoms}
+            if all(name in by_name for name in names):
+                frame_atom_index.append(tuple(system_to_model_atom[by_name[name]] for name in names))
+                has_frame.append(True)
+            else:
+                frame_atom_index.append((-1, -1, -1))
+                has_frame.append(False)
+            continue
+
+        candidates = [
+            atom_index
+            for atom_index in reference_groups[cast(int, token["reference_space"])]
+            if atom_index != center and atom_index in system_to_model_atom
+        ]
+        candidates.sort(
+            key=lambda atom_index: (
+                float(torch.sum((reference_positions[atom_index] - reference_positions[center]) ** 2)),
+                system_to_model_atom[atom_index],
+            )
+        )
+        if len(candidates) < 2:
+            frame_atom_index.append((-1, center_model_index, -1))
+            has_frame.append(False)
+            continue
+        first, third = candidates[:2]
+        frame_atom_index.append(
+            (system_to_model_atom[first], center_model_index, system_to_model_atom[third])
+        )
+        valid = bool(reference_mask[[first, center, third]].all())
+        first_vector = reference_positions[first] - reference_positions[center]
+        third_vector = reference_positions[third] - reference_positions[center]
+        first_norm = float(torch.linalg.vector_norm(first_vector))
+        third_norm = float(torch.linalg.vector_norm(third_vector))
+        if first_norm == 0.0 or third_norm == 0.0:
+            valid = False
+        elif valid:
+            cosine = float(torch.dot(first_vector, third_vector) / (first_norm * third_norm))
+            angle = math.degrees(math.acos(min(1.0, max(-1.0, cosine))))
+            valid = 25.0 < angle < 155.0
+        has_frame.append(valid)
+
+    return (
+        torch.tensor(center_atom_index, dtype=torch.long),
+        torch.tensor(frame_atom_index, dtype=torch.long).reshape(-1, 3),
+        torch.tensor(has_frame, dtype=torch.bool),
+    )
+
+
+def _plddt_rep_atom_mask(system: MolecularSystem, atom_indices: tuple[int, ...]) -> Tensor:
+    component_instance = torch.repeat_interleave(
+        torch.arange(system.instance_symbol.numel(), dtype=torch.long),
+        (system.instance_component_ptr[1:] - system.instance_component_ptr[:-1]).detach().cpu(),
+    ).tolist()
+    atom_component = torch.repeat_interleave(
+        torch.arange(system.component_symbol.numel(), dtype=torch.long),
+        (system.component_atom_ptr[1:] - system.component_atom_ptr[:-1]).detach().cpu(),
+    ).tolist()
+    instance_entities = system.instance_entity.detach().cpu().tolist()
+    entity_types = system.entity_type.detach().cpu().tolist()
+    atom_symbols = system.atom_symbol.detach().cpu().tolist()
+    mask = []
+    for atom_index in atom_indices:
+        component_index = atom_component[atom_index]
+        entity_type = entity_types[instance_entities[component_instance[component_index]]]
+        atom_name = system.symbols[atom_symbols[atom_index]]
+        expected_name = "CA" if entity_type == ENTITY_PROTEIN else "C1'"
+        mask.append(
+            entity_type in {ENTITY_PROTEIN, ENTITY_RNA, ENTITY_DNA, ENTITY_DNA_RNA_HYBRID}
+            and _is_standard(system, component_index, entity_type)
+            and atom_name == expected_name
+        )
+    return torch.tensor(mask, dtype=torch.bool)
+
+
+def _ligand_polymer_bond_features(
+    system: MolecularSystem,
+    atom_indices: tuple[int, ...],
+) -> tuple[Tensor, Tensor]:
+    system_to_model_atom = {atom_index: model_index for model_index, atom_index in enumerate(atom_indices)}
+    component_instance = torch.repeat_interleave(
+        torch.arange(system.instance_symbol.numel(), dtype=torch.long),
+        (system.instance_component_ptr[1:] - system.instance_component_ptr[:-1]).detach().cpu(),
+    ).tolist()
+    atom_component = torch.repeat_interleave(
+        torch.arange(system.component_symbol.numel(), dtype=torch.long),
+        (system.component_atom_ptr[1:] - system.component_atom_ptr[:-1]).detach().cpu(),
+    ).tolist()
+    atom_instance = [component_instance[component_index] for component_index in atom_component]
+    instance_entities = system.instance_entity.detach().cpu().tolist()
+    entity_types = system.entity_type.detach().cpu().tolist()
+    visible_atom_count_by_instance: dict[int, int] = {}
+    for atom_index in atom_indices:
+        instance_index = atom_instance[atom_index]
+        visible_atom_count_by_instance[instance_index] = (
+            visible_atom_count_by_instance.get(instance_index, 0) + 1
+        )
+    polymer_types = {
+        ENTITY_PROTEIN,
+        ENTITY_RNA,
+        ENTITY_DNA,
+        ENTITY_DNA_RNA_HYBRID,
+        ENTITY_PNA,
+    }
+    rows: list[tuple[int, int]] = []
+    for edge_offset, (first, second) in enumerate(system.edge_index.detach().cpu().T.tolist()):
+        if int(system.bond_kind[edge_offset]) != BOND_KIND_COVALENT:
+            continue
+        if first not in system_to_model_atom or second not in system_to_model_atom:
+            continue
+        first_instance = atom_instance[first]
+        second_instance = atom_instance[second]
+        first_type = entity_types[instance_entities[first_instance]]
+        second_type = entity_types[instance_entities[second_instance]]
+        if first_type == ENTITY_MOLECULE and second_type in polymer_types:
+            ligand_instance = first_instance
+        elif second_type == ENTITY_MOLECULE and first_type in polymer_types:
+            ligand_instance = second_instance
+        else:
+            continue
+        if visible_atom_count_by_instance.get(ligand_instance, 0) <= 1:
+            continue
+        rows.append((system_to_model_atom[first], system_to_model_atom[second]))
+    rows.sort()
+    index = torch.tensor(rows, dtype=torch.long).reshape(-1, 2)
+    return index, torch.ones(index.shape[0], dtype=torch.bool)
 
 
 def _validate_crop_arguments(max_tokens: int | None, method_weights: Sequence[float]) -> None:
@@ -962,7 +1639,7 @@ def _crop_training_tokens(
     method_weights: tuple[float, float, float],
     indices: ProtenixCropIndex | None,
     generator: torch.Generator | None,
-) -> list[dict[str, object]]:
+) -> tuple[list[dict[str, object]], int]:
     weights = torch.tensor(method_weights, dtype=torch.float64, device=_generator_device(generator))
     method = int(torch.multinomial(weights, 1, generator=generator).item())
     if method == 0:
@@ -989,7 +1666,7 @@ def _crop_training_tokens(
     mask_indices = torch.tensor(atom_indices, dtype=torch.long, device=coordinate_mask.device)
     if not bool(coordinate_mask[mask_indices].any()):
         raise UnresolvedTrainingCropError("training crop contains no resolved atoms to score")
-    return [tokens[index] for index in selected]
+    return [tokens[index] for index in selected], method
 
 
 def molecular_system_from_input(
@@ -1200,6 +1877,8 @@ def _hydrate_structure(
         source_symbols=structure.source_symbols,
         residue_id=structure.residue_id,
         insertion_code=structure.insertion_code,
+        resolution=structure.resolution,
+        resolution_is_known=structure.resolution_is_known,
         batch_size=[],
     )
 

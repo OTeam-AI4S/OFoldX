@@ -4,9 +4,9 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:a800:1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=96G
-#SBATCH --time=01:00:00
+#SBATCH --cpus-per-task=96
+#SBATCH --mem=0
+# Slurm opens these paths before the script runs; create the logs directory before sbatch.
 #SBATCH --output=/data/users/qinghanw313/AlloDesign/logs/%x-%j.out
 #SBATCH --error=/data/users/qinghanw313/AlloDesign/logs/%x-%j.err
 
@@ -23,9 +23,13 @@ fail() {
 }
 
 usage() {
-    echo "Usage: sbatch [sbatch-options] $0 [--] <ofoldx.runners.train arguments...>" >&2
+    echo "Usage: sbatch [resources] $0 -- --config YAML_PATH" >&2
+    echo "Config smoke: sbatch --cpus-per-task=4 --mem=96G --time=00:10:00 $0 -- \\" >&2
+    echo "  --config configs/train.yaml --print-config" >&2
+    echo "Before sbatch, create /data/users/qinghanw313/AlloDesign/logs for Slurm output." >&2
+    echo "Put GPU/node/job resources before the script; they are not YAML keys." >&2
     echo "All arguments after an optional leading -- are forwarded unchanged." >&2
-    echo "Crop example: sbatch $0 data/cifs --max-tokens 384 --cluster-file data/clusters.txt" >&2
+    echo "Legacy CLI-only mode: sbatch $0 -- data/cifs --epochs 10 --device cuda" >&2
 }
 
 [[ -n "${SLURM_JOB_ID:-}" ]] || fail "submit this script with sbatch; do not run it on a management node"
@@ -40,6 +44,19 @@ case "${NCCL_SOCKET_FAMILY}" in
 esac
 
 NNODES="${SLURM_NNODES}"
+
+# Keep JIT compiler caches off the shared home/NFS filesystem.  The job ID
+# isolates concurrent jobs, while /scratch is node-local on compute nodes.
+# Each path remains independently overridable through the environment.
+OFOLDX_LOCAL_CACHE_ROOT="${OFOLDX_LOCAL_CACHE_ROOT:-/scratch/qinghanw313/tmp/ofoldx-cache/${SLURM_JOB_ID}}"
+TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${OFOLDX_LOCAL_CACHE_ROOT}/triton}"
+TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-${OFOLDX_LOCAL_CACHE_ROOT}/torchinductor}"
+CUDA_CACHE_PATH="${CUDA_CACHE_PATH:-${OFOLDX_LOCAL_CACHE_ROOT}/cuda}"
+
+[[ -n "${OFOLDX_LOCAL_CACHE_ROOT}" ]] || fail "OFOLDX_LOCAL_CACHE_ROOT must be non-empty"
+[[ -n "${TRITON_CACHE_DIR}" ]] || fail "TRITON_CACHE_DIR must be non-empty"
+[[ -n "${TORCHINDUCTOR_CACHE_DIR}" ]] || fail "TORCHINDUCTOR_CACHE_DIR must be non-empty"
+[[ -n "${CUDA_CACHE_PATH}" ]] || fail "CUDA_CACHE_PATH must be non-empty"
 
 if [[ "${1:-}" == "--" ]]; then
     shift
@@ -66,6 +83,10 @@ export PYTHONDONTWRITEBYTECODE=1
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-${REPO_ROOT}/tmp/mplconfig}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+export OFOLDX_LOCAL_CACHE_ROOT
+export TRITON_CACHE_DIR
+export TORCHINDUCTOR_CACHE_DIR
+export CUDA_CACHE_PATH
 
 if (( NNODES == 1 && NPROC_PER_NODE == 1 )); then
     command=("${PYTHON}" -m ofoldx.runners.train "$@")
@@ -118,5 +139,6 @@ fi
 printf 'Command:'
 printf ' %q' "${command[@]}"
 printf '\n'
+printf 'Local compile cache root: %s\n' "${OFOLDX_LOCAL_CACHE_ROOT}"
 
 exec "${command[@]}"

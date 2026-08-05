@@ -23,6 +23,7 @@ from .model import (
     ProtenixChiralAtomPotential,
     ProtenixChiralAtomTerm,
     ProtenixConstraintModel,
+    ProtenixEvaluationOutput,
     ProtenixExperimentalTorsionPotential,
     ProtenixExperimentalTorsionTerm,
     ProtenixExponentialInterpolation,
@@ -50,6 +51,7 @@ from .model import (
     ProtenixTfgGuidance,
     ProtenixTfgPotential,
     ProtenixTokenContact,
+    ProtenixTrainingOutput,
     ProtenixVinaStericPotential,
     ProtenixVinaStericTerm,
 )

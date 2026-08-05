@@ -7,8 +7,10 @@ from __future__ import annotations
 import math
 import operator
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Callable, Literal, cast, overload
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from tensordict import tensorclass
@@ -32,8 +34,10 @@ from ...modules.backend.attention import projected_attention
 from ...modules.denoiser import CoordinateDenoiser
 from ...modules.diffusion import (
     CoordinateDenoiseContext,
+    CoordinateDenoisingOutput,
     CoordinateEdmSampler,
     EdmScheduler,
+    denoise_coordinates,
 )
 from ...modules.embedding import (
     FactorizedPairLinear,
@@ -61,6 +65,7 @@ from .config import (
     ProtenixStructureConditionConfig,
     ProtenixTemplateModelConfig,
 )
+from .permutation import match_protenix_truth
 
 #: Sentinel for an omitted ``tfg_guidance`` argument, distinct from an explicit ``None``: omission inherits
 #: the guidance a processor-prepared input carries, while ``None`` disables guidance (the documented meaning).
@@ -344,6 +349,8 @@ class ProtenixModel(Model):
         target: ProtenixStructureTarget,
         *,
         num_samples: int = 1,
+        sample_chunk_size: int | None = None,
+        compute_auxiliary_heads: bool = True,
         synchronize_noise_levels: bool = False,
         coordinate_augmentation: bool = True,
         augmentation_translation_scale: float = 1.0,
@@ -352,7 +359,13 @@ class ProtenixModel(Model):
         recycling_steps: int | None = None,
         use_conditioning: bool = True,
         generator: torch.Generator | None = None,
-    ) -> ProtenixOutput:
+        training_recipe: Literal["ofoldx_edm_v1", "protenix_baseline_v1"] = "ofoldx_edm_v1",
+        mini_rollout_steps: int = 20,
+        current_step: int | None = None,
+        train_confidence_only: bool = False,
+        condition_embedding_drop_rate: float = 0.0,
+        confidence_embedding_drop_rate: float = 0.0,
+    ) -> ProtenixOutput | CoordinateDenoisingOutput | ProtenixTrainingOutput:
         r"""
         Denoise randomly corrupted target coordinates for diffusion training.
 
@@ -361,6 +374,10 @@ class ProtenixModel(Model):
             target: Heavy-atom truth-pool coordinates and their current atom-axis
                 mapping.
             num_samples: Number ``S`` of independently corrupted copies per input.
+            sample_chunk_size: Maximum number of coordinate samples denoised
+                together. ``None`` processes all samples together.
+            compute_auxiliary_heads: Whether to compute the distogram and
+                confidence heads. Disable for a diffusion-only objective.
             synchronize_noise_levels: Whether samples from one example share sigma.
             coordinate_augmentation: Whether to apply random rigid augmentation.
             augmentation_translation_scale: Standard deviation of augmentation
@@ -373,19 +390,66 @@ class ProtenixModel(Model):
                 coordinate denoiser.
             generator: Optional generator for rigid augmentation, noise levels,
                 and Gaussian coordinate noise.
+            training_recipe: Training graph to execute. ``"ofoldx_edm_v1"``
+                preserves the historical one-step EDM contract;
+                ``"protenix_baseline_v1"`` enables the parity-oriented recipe.
+            mini_rollout_steps: Reverse-diffusion transitions used by the
+                baseline recipe's detached S=1 mini-rollout.
+            current_step: Optional deterministic seed for baseline recycle depth.
+            train_confidence_only: Return only mini-rollout confidence predictions
+                and matched truth in the baseline recipe.
+            condition_embedding_drop_rate: Per-forward probability of dropping
+                trunk conditioning from the training denoiser for the whole batch.
+            confidence_embedding_drop_rate: Per-forward probability of dropping
+                pair embeddings from the confidence head for the whole batch.
 
         Returns:
-            Denoised and augmented target coordinates with shape ``(B, S, A, 3)``,
-            noise levels with shape ``(B, S)``, one distogram, and the four
-            confidence logits.
+            The complete [`ProtenixOutput`][] by default. When
+            ``compute_auxiliary_heads=False``, only the denoised coordinates,
+            augmented targets, and noise levels required by a diffusion objective
+            are returned.
 
         Raises:
-            ValueError: If ``num_samples`` or ``recycling_steps`` is not positive.
+            TypeError: If ``num_samples`` or ``sample_chunk_size`` is not an integer.
+            ValueError: If ``num_samples``, ``sample_chunk_size``, or
+                ``recycling_steps`` is not positive.
         """
 
+        if training_recipe == "protenix_baseline_v1":
+            return self._forward_protenix_baseline(
+                input,
+                target,
+                num_samples=num_samples,
+                sample_chunk_size=sample_chunk_size,
+                compute_auxiliary_heads=compute_auxiliary_heads,
+                synchronize_noise_levels=synchronize_noise_levels,
+                coordinate_augmentation=coordinate_augmentation,
+                augmentation_translation_scale=augmentation_translation_scale,
+                noise_log_mean=noise_log_mean,
+                noise_log_std=noise_log_std,
+                recycling_steps=recycling_steps,
+                use_conditioning=use_conditioning,
+                generator=generator,
+                mini_rollout_steps=mini_rollout_steps,
+                current_step=current_step,
+                train_confidence_only=train_confidence_only,
+                condition_embedding_drop_rate=condition_embedding_drop_rate,
+                confidence_embedding_drop_rate=confidence_embedding_drop_rate,
+            )
+        if training_recipe != "ofoldx_edm_v1":
+            raise ValueError(f"unsupported Protenix training recipe: {training_recipe!r}")
+
+        if isinstance(num_samples, bool):
+            raise TypeError("num_samples must be an integer, not bool")
         num_samples = operator.index(num_samples)
         if num_samples < 1:
             raise ValueError("num_samples must be positive")
+        if sample_chunk_size is not None:
+            if isinstance(sample_chunk_size, bool):
+                raise TypeError("sample_chunk_size must be an integer, not bool")
+            sample_chunk_size = operator.index(sample_chunk_size)
+            if sample_chunk_size < 1:
+                raise ValueError("sample_chunk_size must be positive")
         recycling_steps = self._recycling_steps if recycling_steps is None else recycling_steps
         if recycling_steps < 1:
             raise ValueError("recycling_steps must be positive")
@@ -428,24 +492,32 @@ class ProtenixModel(Model):
             3,
         )
         noise_level = noise_level.reshape(batch_size, num_samples)
-        coordinates = self.coordinate_denoiser(
-            self._denoise_context(
+        coordinates = denoise_coordinates(
+            self.coordinate_denoiser,
+            context=self._denoise_context(
                 input,
                 representations,
                 reference_positions=input.reference_positions,
                 use_conditioning=use_conditioning,
-            ).to_denoising_input(
-                noisy_coords=noisy_coordinates.reshape(
-                    batch_size,
-                    num_samples,
-                    atom_count,
-                    3,
-                ),
-                noise_level=noise_level,
-            )
+            ),
+            noisy_coords=noisy_coordinates.reshape(
+                batch_size,
+                num_samples,
+                atom_count,
+                3,
+            ),
+            noise_level=noise_level,
+            sample_chunk_size=sample_chunk_size,
         )
+        if not compute_auxiliary_heads:
+            return CoordinateDenoisingOutput(
+                coordinates=coordinates,
+                augmented_target_coordinates=augmented_target_coordinates,
+                noise_level=noise_level,
+                batch_size=[augmented_target_coordinates.shape[0]],
+            )
         raw_output = self._assemble_output(input, representations, coordinates)
-        return ProtenixOutput(  # type: ignore[call-arg]
+        return ProtenixOutput(
             coordinates=raw_output.coordinates,
             distogram_logits=raw_output.distogram_logits,
             plddt_logits=raw_output.plddt_logits,
@@ -455,6 +527,307 @@ class ProtenixModel(Model):
             augmented_target_coordinates=augmented_target_coordinates,
             noise_level=noise_level,
             batch_size=[augmented_target_coordinates.shape[0]],
+        )
+
+    def _forward_protenix_baseline(
+        self,
+        input: ProtenixInput,
+        target: ProtenixStructureTarget,
+        *,
+        num_samples: int,
+        sample_chunk_size: int | None,
+        compute_auxiliary_heads: bool,
+        synchronize_noise_levels: bool,
+        coordinate_augmentation: bool,
+        augmentation_translation_scale: float,
+        noise_log_mean: float,
+        noise_log_std: float,
+        recycling_steps: int | None,
+        use_conditioning: bool,
+        generator: torch.Generator | None,
+        mini_rollout_steps: int,
+        current_step: int | None,
+        train_confidence_only: bool,
+        condition_embedding_drop_rate: float,
+        confidence_embedding_drop_rate: float,
+    ) -> ProtenixTrainingOutput:
+        r"""
+        Execute the parity-oriented Protenix training recipe.
+
+        The trunk is evaluated exactly once. Its detached representations feed
+        an S=1 mini-rollout and the confidence head, while the ordinary training
+        denoiser and distogram head retain gradients through the trunk.
+        """
+
+        num_samples = _positive_index(num_samples, "num_samples")
+        if sample_chunk_size is not None:
+            sample_chunk_size = _positive_index(sample_chunk_size, "sample_chunk_size")
+        mini_rollout_steps = _positive_index(mini_rollout_steps, "mini_rollout_steps")
+        if not compute_auxiliary_heads:
+            raise ValueError("protenix_baseline_v1 requires compute_auxiliary_heads=True")
+        _validate_probability(condition_embedding_drop_rate, "condition_embedding_drop_rate")
+        _validate_probability(confidence_embedding_drop_rate, "confidence_embedding_drop_rate")
+        _require_protenix_matching_metadata(target)
+
+        actual_recycling_steps = self._training_recycling_steps(
+            recycling_steps,
+            current_step=current_step,
+            generator=generator,
+        )
+        msa_indices = tuple(
+            self._sample_msa_indices(input.msa_tokens.shape[-2], input.msa_tokens.device, generator=generator)
+            for _ in range(actual_recycling_steps)
+        )
+        trunk_kwargs: dict[str, Any] = {
+            "recycling_steps": actual_recycling_steps,
+            "reference_positions": input.reference_positions,
+            "msa_indices": msa_indices,
+        }
+        if train_confidence_only:
+            trunk_modes = _snapshot_module_training_modes(self._confidence_only_trunk_modules())
+            try:
+                for module, _ in trunk_modes:
+                    module.training = False
+                with torch.no_grad():
+                    representations = self._run_trunk(input, **trunk_kwargs)
+            finally:
+                _restore_module_training_modes(trunk_modes)
+        else:
+            representations = self._run_trunk(input, **trunk_kwargs)
+        detached_representations = _detach_protenix_representations(representations)
+        mini_rollout_coordinates = self._training_mini_rollout(
+            input,
+            detached_representations,
+            num_sampling_steps=mini_rollout_steps,
+            generator=generator,
+        )
+        matched_target_coordinates, matched_target_mask = match_protenix_truth(
+            mini_rollout_coordinates,
+            cast(Any, target),
+            input,
+        )
+        matched_target_coordinates = matched_target_coordinates.to(
+            device=representations.single.device,
+            dtype=torch.float32,
+        )
+        matched_target_mask = matched_target_mask.to(
+            device=matched_target_coordinates.device,
+            dtype=torch.bool,
+        )
+        matched_target_coordinates = matched_target_coordinates.masked_fill(
+            ~matched_target_mask.unsqueeze(-1),
+            0,
+        )
+
+        batch_size = matched_target_coordinates.shape[0]
+        confidence_pair_keep = _draw_keep_mask(
+            batch_size,
+            confidence_embedding_drop_rate,
+            device=representations.single.device,
+            generator=generator,
+        )
+        confidence_representations = _mask_confidence_pair_embeddings(
+            detached_representations,
+            confidence_pair_keep,
+        )
+        plddt_logits, pae_logits, pde_logits, resolved_logits = self.confidence_head(
+            confidence_representations.single,
+            pair=confidence_representations.pair,
+            token_embedding=confidence_representations.token_embedding,
+            pred_coords=mini_rollout_coordinates,
+            token_to_rep_atom=input.token_to_rep_atom,
+            atom_to_token=input.atom_to_token,
+            atom_token_index=input.atom_token_index,
+        )
+
+        if train_confidence_only:
+            return ProtenixTrainingOutput(  # type: ignore[call-arg]
+                coordinates=None,
+                mini_rollout_coordinates=mini_rollout_coordinates,
+                matched_target_coordinates=matched_target_coordinates,
+                matched_target_mask=matched_target_mask,
+                augmented_target_coordinates=None,
+                augmented_target_mask=None,
+                noise_level=None,
+                distogram_logits=None,
+                plddt_logits=plddt_logits,
+                pae_logits=pae_logits,
+                pde_logits=pde_logits,
+                resolved_logits=resolved_logits,
+                batch_size=[batch_size],
+            )
+
+        flat_target = matched_target_coordinates.repeat_interleave(num_samples, dim=0)
+        flat_target_mask = matched_target_mask.repeat_interleave(num_samples, dim=0)
+        augmented_target_coordinates = _center_random_augmentation(
+            flat_target,
+            flat_target_mask,
+            augmentation=coordinate_augmentation,
+            translation_scale=augmentation_translation_scale,
+            generator=generator,
+        )
+        # Centering and rigid augmentation move zero-filled unresolved atoms;
+        # restore baseline label semantics before adding coordinate noise.
+        augmented_target_coordinates = augmented_target_coordinates.masked_fill(
+            ~flat_target_mask.unsqueeze(-1),
+            0,
+        )
+        noise_count = batch_size if synchronize_noise_levels else batch_size * num_samples
+        normal = _draw_normal(
+            (noise_count,),
+            device=augmented_target_coordinates.device,
+            dtype=torch.float32,
+            generator=generator,
+        )
+        noise_level = self.coordinate_denoiser.preconditioner.sigma_data * (
+            noise_log_mean + noise_log_std * normal
+        ).exp()
+        if synchronize_noise_levels:
+            noise_level = noise_level.repeat_interleave(num_samples)
+        coordinate_noise = _draw_normal_like(augmented_target_coordinates, generator)
+        noisy_coordinates = augmented_target_coordinates + noise_level[:, None, None] * coordinate_noise
+
+        atom_count = matched_target_coordinates.shape[-2]
+        augmented_target_coordinates = augmented_target_coordinates.reshape(batch_size, num_samples, atom_count, 3)
+        augmented_target_mask = flat_target_mask.reshape(batch_size, num_samples, atom_count)
+        noise_level = noise_level.reshape(batch_size, num_samples)
+        conditioning_keep = _draw_keep_mask(
+            batch_size,
+            condition_embedding_drop_rate,
+            device=representations.single.device,
+            generator=generator,
+        )
+        if not use_conditioning:
+            conditioning_keep = torch.zeros_like(conditioning_keep)
+        with torch.autocast(device_type=noisy_coordinates.device.type, enabled=False):
+            fp32_representations = _float32_protenix_representations(representations)
+            denoise_context = _float32_coordinate_denoise_context(
+                self._denoise_context(
+                    input,
+                    fp32_representations,
+                    reference_positions=input.reference_positions.float(),
+                    use_conditioning=conditioning_keep,
+                )
+            )
+            coordinates = denoise_coordinates(
+                self.coordinate_denoiser,
+                context=denoise_context,
+                noisy_coords=noisy_coordinates.reshape(batch_size, num_samples, atom_count, 3).float(),
+                noise_level=noise_level.float(),
+                sample_chunk_size=sample_chunk_size,
+            )
+        with torch.autocast(device_type=representations.pair.device.type, enabled=False):
+            distogram_logits = self.distogram_head(representations.pair.float())
+        return ProtenixTrainingOutput(  # type: ignore[call-arg]
+            coordinates=coordinates,
+            mini_rollout_coordinates=mini_rollout_coordinates,
+            matched_target_coordinates=matched_target_coordinates,
+            matched_target_mask=matched_target_mask,
+            augmented_target_coordinates=augmented_target_coordinates,
+            augmented_target_mask=augmented_target_mask,
+            noise_level=noise_level,
+            distogram_logits=distogram_logits,
+            plddt_logits=plddt_logits,
+            pae_logits=pae_logits,
+            pde_logits=pde_logits,
+            resolved_logits=resolved_logits,
+            batch_size=[batch_size],
+        )
+
+    def _training_recycling_steps(
+        self,
+        recycling_steps: int | None,
+        *,
+        current_step: int | None,
+        generator: torch.Generator | None,
+    ) -> int:
+        r"""Choose the actual baseline training recycle depth in ``[1, N]``."""
+
+        if recycling_steps is not None:
+            return _positive_index(recycling_steps, "recycling_steps")
+        maximum = _positive_index(self._recycling_steps, "configured recycling_steps")
+        if current_step is not None:
+            if isinstance(current_step, bool):
+                raise TypeError("current_step must be an integer, not bool")
+            seed = operator.index(current_step)
+            return int(np.random.RandomState(seed).randint(1, maximum + 1))
+        random_device = torch.device("cpu") if generator is None else generator.device
+        return int(
+            torch.randint(
+                1,
+                maximum + 1,
+                (),
+                device=random_device,
+                generator=generator,
+            )
+        )
+
+    def _training_mini_rollout(
+        self,
+        input: ProtenixInput,
+        representations: _ProtenixTrunkOutput,
+        *,
+        num_sampling_steps: int,
+        generator: torch.Generator | None,
+    ) -> Tensor:
+        r"""Run the detached S=1 label-matching rollout and restore exact modes."""
+
+        denoiser_modes = _snapshot_module_training_modes((self.coordinate_denoiser,))
+        reference_positions = input.reference_positions.float()
+        try:
+            for module, _ in denoiser_modes:
+                module.training = False
+            with torch.no_grad(), torch.autocast(device_type=reference_positions.device.type, enabled=False):
+                fp32_representations = _float32_protenix_representations(representations)
+                denoise_context = _float32_coordinate_denoise_context(
+                    self._denoise_context(
+                        input,
+                        fp32_representations,
+                        reference_positions=reference_positions,
+                    )
+                )
+                coordinates = self._predict_coords(
+                    input,
+                    representations=fp32_representations,
+                    reference_positions=reference_positions,
+                    num_samples=1,
+                    num_sampling_steps=num_sampling_steps,
+                    churn_rate=None,
+                    step_scale=None,
+                    generator=generator,
+                    tfg_potential=None,
+                    context=denoise_context,
+                )
+        finally:
+            _restore_module_training_modes(denoiser_modes)
+        return coordinates.detach()
+
+    def _confidence_only_trunk_modules(self) -> tuple[nn.Module, ...]:
+        r"""Return every module participating in the confidence-only trunk pass."""
+
+        names = (
+            "input_embeddings",
+            "esm_encoder",
+            "esm_projection",
+            "single_init_projection",
+            "pair_left_projection",
+            "pair_right_projection",
+            "relative_position_embedder",
+            "token_bond_projection",
+            "constraint_embeddings",
+            "pair_recycle_norm",
+            "pair_recycle_projection",
+            "template_embedder",
+            "noisy_structure_embedder",
+            "msa_trunk",
+            "single_recycle_norm",
+            "single_recycle_projection",
+            "pairformer_stack",
+        )
+        return tuple(
+            module
+            for name in names
+            if isinstance(module := getattr(self, name, None), nn.Module)
         )
 
     def denoise(
@@ -520,6 +893,9 @@ class ProtenixModel(Model):
         churn_rate: float | None = None,
         step_scale: float | None = None,
         tfg_guidance: ProtenixTfgGuidance | None = _INHERIT_TFG_GUIDANCE,
+        evaluation_recipe: Literal["ofoldx_edm_v1", "protenix_baseline_v1"] = "ofoldx_edm_v1",
+        mc_dropout: bool = False,
+        mc_dropout_rate: float = 0.4,
     ) -> ProtenixRawOutput:
         r"""
         Run reverse diffusion and return raw coordinates and prediction heads.
@@ -537,6 +913,13 @@ class ProtenixModel(Model):
             step_scale: Per-call solver-step multiplier. ``None`` uses the configured value.
             tfg_guidance: Training-free chemical guidance. Omit to inherit the guidance the input was
                 prepared with; pass ``None`` to disable it.
+            evaluation_recipe: Evaluation graph to execute. The default keeps
+                historical sampling behavior; ``"protenix_baseline_v1"`` uses
+                200 diffusion transitions by default and an FP32 diffusion island.
+            mc_dropout: Caller-decided baseline Monte Carlo dropout flag. This
+                forces dropout only on the projected pair recycling update.
+            mc_dropout_rate: Drop probability for the forced pair recycling
+                update. The caller remains responsible for deciding ``mc_dropout``.
 
         Returns:
             Raw sampled coordinates, distogram, and confidence logits.
@@ -547,13 +930,23 @@ class ProtenixModel(Model):
                 paired with input that has no prepared TFG geometry.
         """
 
+        if evaluation_recipe not in ("ofoldx_edm_v1", "protenix_baseline_v1"):
+            raise ValueError(f"unsupported Protenix evaluation recipe: {evaluation_recipe!r}")
+        baseline_evaluation = evaluation_recipe == "protenix_baseline_v1"
+        if not isinstance(mc_dropout, bool):
+            raise TypeError("mc_dropout must be bool")
+        _validate_probability(mc_dropout_rate, "mc_dropout_rate")
+        if mc_dropout and not baseline_evaluation:
+            raise ValueError("mc_dropout requires evaluation_recipe='protenix_baseline_v1'")
+
         num_samples = 5 if num_samples is None else operator.index(num_samples)
         if num_samples < 1:
             raise ValueError("num_samples must be positive")
         recycling_steps = self._recycling_steps if recycling_steps is None else recycling_steps
         if recycling_steps < 1:
             raise ValueError("recycling_steps must be positive")
-        num_sampling_steps = self._num_sampling_steps if num_sampling_steps is None else num_sampling_steps
+        default_sampling_steps = 200 if baseline_evaluation else self._num_sampling_steps
+        num_sampling_steps = default_sampling_steps if num_sampling_steps is None else num_sampling_steps
         if num_sampling_steps < 1:
             raise ValueError("num_sampling_steps must be positive")
         if tfg_guidance is _INHERIT_TFG_GUIDANCE:
@@ -566,7 +959,10 @@ class ProtenixModel(Model):
             # ``.to()`` cannot reach, so align the potential's feature buffers to the coordinates here.
             # ``.to(reference_positions)`` follows ``nn.Module.to(Tensor)``: it matches the sampling device
             # and float dtype while leaving the integer index and bool mask buffers' dtypes untouched.
-            tfg_potential = ProtenixTfgPotential(input.tfg_features, tfg_guidance).to(input.reference_positions)
+            potential_reference = (
+                input.reference_positions.float() if baseline_evaluation else input.reference_positions
+            )
+            tfg_potential = ProtenixTfgPotential(input.tfg_features, tfg_guidance).to(potential_reference)
 
         reference_positions = input.reference_positions
         msa_indices = tuple(
@@ -578,19 +974,50 @@ class ProtenixModel(Model):
             recycling_steps=recycling_steps,
             reference_positions=reference_positions,
             msa_indices=msa_indices,
+            mc_dropout=mc_dropout,
+            mc_dropout_rate=mc_dropout_rate,
         )
-        coordinates = self._predict_coords(
+        if baseline_evaluation:
+            fp32_reference_positions = reference_positions.float()
+            with torch.autocast(device_type=reference_positions.device.type, enabled=False):
+                fp32_representations = _float32_protenix_representations(representations)
+                denoise_context = _float32_coordinate_denoise_context(
+                    self._denoise_context(
+                        input,
+                        fp32_representations,
+                        reference_positions=fp32_reference_positions,
+                    )
+                )
+                coordinates = self._predict_coords(
+                    input,
+                    representations=fp32_representations,
+                    reference_positions=fp32_reference_positions,
+                    num_samples=num_samples,
+                    num_sampling_steps=num_sampling_steps,
+                    churn_rate=churn_rate,
+                    step_scale=step_scale,
+                    generator=generator,
+                    tfg_potential=tfg_potential,
+                    context=denoise_context,
+                )
+        else:
+            coordinates = self._predict_coords(
+                input,
+                representations=representations,
+                reference_positions=reference_positions,
+                num_samples=num_samples,
+                num_sampling_steps=num_sampling_steps,
+                churn_rate=churn_rate,
+                step_scale=step_scale,
+                generator=generator,
+                tfg_potential=tfg_potential,
+            )
+        return self._assemble_output(
             input,
-            representations=representations,
-            reference_positions=reference_positions,
-            num_samples=num_samples,
-            num_sampling_steps=num_sampling_steps,
-            churn_rate=churn_rate,
-            step_scale=step_scale,
-            generator=generator,
-            tfg_potential=tfg_potential,
+            representations,
+            coordinates,
+            distogram_fp32=baseline_evaluation,
         )
-        return self._assemble_output(input, representations, coordinates)
 
     @torch.no_grad()
     def fold(
@@ -687,7 +1114,7 @@ class ProtenixModel(Model):
         )
         pde = _protenix_bin_expectation(pde_logits, 0.0, 32.0)
         resolved_probability = resolved_logits.softmax(dim=-1)[..., 1]
-        contact_probability = _protenix_contact_probability(distogram_logits)
+        contact_probability = protenix_contact_probability(distogram_logits)
         token_has_frame = _protenix_token_has_frame(
             reference_positions,
             reference_mask=input.reference_mask,
@@ -884,6 +1311,8 @@ class ProtenixModel(Model):
         input: ProtenixInput,
         representations: _ProtenixTrunkOutput,
         coordinates: Tensor,
+        *,
+        distogram_fp32: bool = False,
     ) -> ProtenixRawOutput:
         r"""
         Compute the distogram and confidence predictions.
@@ -898,9 +1327,14 @@ class ProtenixModel(Model):
             atom_to_token=input.atom_to_token,
             atom_token_index=input.atom_token_index,
         )
+        if distogram_fp32:
+            with torch.autocast(device_type=representations.pair.device.type, enabled=False):
+                distogram_logits = self.distogram_head(representations.pair.float())
+        else:
+            distogram_logits = self.distogram_head(representations.pair)
         return ProtenixRawOutput(  # type: ignore[call-arg]
             coordinates=coordinates,
-            distogram_logits=self.distogram_head(representations.pair),
+            distogram_logits=distogram_logits,
             plddt_logits=plddt_logits,
             pae_logits=pae_logits,
             pde_logits=pde_logits,
@@ -914,14 +1348,20 @@ class ProtenixModel(Model):
         representations: _ProtenixTrunkOutput,
         *,
         reference_positions: Tensor,
-        use_conditioning: bool = True,
+        use_conditioning: bool | Tensor = True,
     ) -> CoordinateDenoiseContext:
         r"""
         Assemble conditioning shared by forward and the sampler.
         """
 
-        conditioning_single = representations.single if use_conditioning else 0 * representations.single
-        conditioning_pair = representations.pair if use_conditioning else 0 * representations.pair
+        if isinstance(use_conditioning, Tensor):
+            single_keep = use_conditioning.to(representations.single).reshape(-1, 1, 1)
+            pair_keep = use_conditioning.to(representations.pair).reshape(-1, 1, 1, 1)
+            conditioning_single = representations.single * single_keep
+            conditioning_pair = representations.pair * pair_keep
+        else:
+            conditioning_single = representations.single if use_conditioning else 0 * representations.single
+            conditioning_pair = representations.pair if use_conditioning else 0 * representations.pair
         return CoordinateDenoiseContext(
             atom_features=input.atom_features,
             atom_to_token=input.atom_to_token,
@@ -947,6 +1387,8 @@ class ProtenixModel(Model):
         recycling_steps: int,
         reference_positions: Tensor,
         msa_indices: tuple[Tensor, ...] | None = None,
+        mc_dropout: bool = False,
+        mc_dropout_rate: float = 0.4,
     ) -> _ProtenixTrunkOutput:
         r"""
         Embed the inputs and run the recycling trunk.
@@ -988,6 +1430,8 @@ class ProtenixModel(Model):
             pair_mask,
             recycling_steps,
             msa_indices=msa_indices,
+            mc_dropout=mc_dropout,
+            mc_dropout_rate=mc_dropout_rate,
         )
         return _ProtenixTrunkOutput(  # type: ignore[call-arg]
             token_embedding=token_embedding,
@@ -1037,6 +1481,8 @@ class ProtenixModel(Model):
         recycling_steps: int,
         *,
         msa_indices: tuple[Tensor, ...] | None,
+        mc_dropout: bool,
+        mc_dropout_rate: float,
     ) -> tuple[Tensor, Tensor]:
         r"""
         Run the recycling loop.
@@ -1047,7 +1493,14 @@ class ProtenixModel(Model):
         for cycle in range(recycling_steps):
             grad_enabled = torch.is_grad_enabled() and cycle == recycling_steps - 1
             with torch.set_grad_enabled(grad_enabled):
-                pair = pair_init + self.pair_recycle_projection(self.pair_recycle_norm(pair))
+                pair_recycle_update = self.pair_recycle_projection(self.pair_recycle_norm(pair))
+                if mc_dropout:
+                    pair_recycle_update = F.dropout(
+                        pair_recycle_update,
+                        p=mc_dropout_rate,
+                        training=True,
+                    )
+                pair = pair_init + pair_recycle_update
                 if self.template_embedder is not None:
                     pair = pair + self.template_embedder(
                         pair,
@@ -1129,16 +1582,18 @@ class ProtenixModel(Model):
         step_scale: float | None,
         generator: torch.Generator | None,
         tfg_potential: ProtenixTfgPotential | None,
+        context: CoordinateDenoiseContext | None = None,
     ) -> Tensor:
         r"""
         Run sequential EDM sampling.
         """
 
-        context = self._denoise_context(
-            input,
-            representations,
-            reference_positions=reference_positions,
-        )
+        if context is None:
+            context = self._denoise_context(
+                input,
+                representations,
+                reference_positions=reference_positions,
+            )
         if tfg_potential is not None:
             return self._predict_coords_with_tfg(
                 context=context,
@@ -1442,6 +1897,8 @@ class ProtenixStructureConditionModel(ProtenixModel):
         recycling_steps: int,
         *,
         msa_indices: tuple[Tensor, ...] | None,
+        mc_dropout: bool,
+        mc_dropout_rate: float,
     ) -> tuple[Tensor, Tensor]:
         r"""
         Run the fixed structure-conditioned recycling loop.
@@ -1452,7 +1909,14 @@ class ProtenixStructureConditionModel(ProtenixModel):
         for cycle in range(recycling_steps):
             grad_enabled = torch.is_grad_enabled() and cycle == recycling_steps - 1
             with torch.set_grad_enabled(grad_enabled):
-                pair = pair_init + self.pair_recycle_projection(self.pair_recycle_norm(pair))
+                pair_recycle_update = self.pair_recycle_projection(self.pair_recycle_norm(pair))
+                if mc_dropout:
+                    pair_recycle_update = F.dropout(
+                        pair_recycle_update,
+                        p=mc_dropout_rate,
+                        training=True,
+                    )
+                pair = pair_init + pair_recycle_update
                 pair = pair + self.noisy_structure_embedder(
                     pair,
                     input.structure_rep_positions,
@@ -3459,7 +3923,7 @@ def _protenix_bin_expectation(
     return values
 
 
-def _protenix_contact_probability(distogram_logits: Tensor) -> Tensor:
+def protenix_contact_probability(distogram_logits: Tensor) -> Tensor:
     r"""
     Decode the probability of distance below 8 Å.
     """
@@ -3471,6 +3935,11 @@ def _protenix_contact_probability(distogram_logits: Tensor) -> Tensor:
         distogram_logits.shape[-1],
     )
     return distogram_logits.softmax(dim=-1)[..., centers < 8.0].sum(dim=-1)
+
+
+# Backward-compatible private spelling retained for downstream callers that
+# used the original module-local helper before the evaluation API exposed it.
+_protenix_contact_probability = protenix_contact_probability
 
 
 def _protenix_tm_scores(
@@ -4181,6 +4650,205 @@ def _gather_protenix_structure_target(
     return coordinates, coordinate_mask
 
 
+def _positive_index(value: int, name: str) -> int:
+    r"""Return a positive integer argument without accepting booleans."""
+
+    if isinstance(value, bool):
+        raise TypeError(f"{name} must be an integer, not bool")
+    value = operator.index(value)
+    if value < 1:
+        raise ValueError(f"{name} must be positive")
+    return value
+
+
+def _require_protenix_matching_metadata(target: ProtenixStructureTarget) -> None:
+    r"""Fail before the expensive trunk if baseline truth matching is unavailable."""
+
+    required = (
+        "molecule_id",
+        "molecule_equivalence_index",
+        "molecule_atom_index",
+        "representative_atom_mask",
+        "permutation_pool_mask",
+        "atom_molecule_type",
+        "symmetry_atom_index",
+        "symmetry_permutation",
+    )
+    missing = tuple(name for name in required if getattr(target, name, None) is None)
+    if missing:
+        raise ValueError(
+            "protenix_baseline_v1 requires target permutation metadata: " + ", ".join(missing)
+        )
+
+
+def _validate_probability(value: float, name: str) -> None:
+    r"""Validate a finite probability in the closed unit interval."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{name} must be a real number")
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        raise ValueError(f"{name} must be between zero and one")
+
+
+def _snapshot_module_training_modes(
+    roots: tuple[nn.Module, ...],
+) -> tuple[tuple[nn.Module, bool], ...]:
+    r"""Snapshot every distinct module mode below one or more roots."""
+
+    modes: list[tuple[nn.Module, bool]] = []
+    seen: set[int] = set()
+    for root in roots:
+        for module in root.modules():
+            identity = id(module)
+            if identity not in seen:
+                modes.append((module, module.training))
+                seen.add(identity)
+    return tuple(modes)
+
+
+def _restore_module_training_modes(modes: tuple[tuple[nn.Module, bool], ...]) -> None:
+    r"""Restore an exact module-mode snapshot without recursive train calls."""
+
+    for module, training in modes:
+        module.training = training
+
+
+def _draw_keep_mask(
+    batch_size: int,
+    drop_rate: float,
+    *,
+    device: torch.device,
+    generator: torch.Generator | None,
+) -> Tensor:
+    r"""Draw one call-level embedding-keep decision and broadcast it over ``B``."""
+
+    if drop_rate == 0.0:
+        return torch.ones(batch_size, device=device, dtype=torch.bool)
+    if drop_rate == 1.0:
+        return torch.zeros(batch_size, device=device, dtype=torch.bool)
+    random_device = device if generator is None else generator.device
+    keep = (torch.rand((), device=random_device, generator=generator) >= drop_rate).to(device)
+    return keep.expand(batch_size)
+
+
+def _float32_relative_features(features: RelativePositionBuckets) -> RelativePositionBuckets:
+    r"""Retain integer relative buckets while requesting FP32 embeddings."""
+
+    return RelativePositionBuckets(
+        residue_bucket=features.residue_bucket,
+        token_bucket=features.token_bucket,
+        same_entity=features.same_entity,
+        chain_bucket=features.chain_bucket,
+        residue_size=features.residue_size,
+        chain_size=features.chain_size,
+        dtype=torch.float32,
+    )
+
+
+def _floating_tensor_to_float32(value: Tensor) -> Tensor:
+    r"""Cast only floating tensors, retaining integer and boolean metadata."""
+
+    return value.float() if value.is_floating_point() else value
+
+
+def _float32_protenix_representations(
+    representations: _ProtenixTrunkOutput,
+) -> _ProtenixTrunkOutput:
+    r"""Cast diffusion/distogram trunk embeddings to FP32 without detaching."""
+
+    relative_features = representations.relative_features
+    if relative_features is not None:
+        relative_features = _float32_relative_features(relative_features)
+    if isinstance(representations, _ProtenixTrunkOutput):
+        return _ProtenixTrunkOutput(  # type: ignore[call-arg]
+            token_embedding=representations.token_embedding.float(),
+            single=representations.single.float(),
+            pair=representations.pair.float(),
+            relative_features=relative_features,
+            batch_size=representations.batch_size,
+        )
+    # Lightweight test doubles use a namespace rather than the tensorclass.
+    values = vars(representations).copy()
+    values.update(
+        token_embedding=representations.token_embedding.float(),
+        single=representations.single.float(),
+        pair=representations.pair.float(),
+        relative_features=relative_features,
+    )
+    return cast(_ProtenixTrunkOutput, SimpleNamespace(**values))
+
+
+def _float32_coordinate_denoise_context(
+    context: CoordinateDenoiseContext,
+) -> CoordinateDenoiseContext:
+    r"""Recursively cast floating diffusion context fields to FP32."""
+
+    if not isinstance(context, CoordinateDenoiseContext):
+        # Lightweight unit-test contexts carry no floating conditioning.
+        return context
+    return CoordinateDenoiseContext(
+        atom_features=_floating_tensor_to_float32(context.atom_features),
+        atom_to_token=context.atom_to_token,
+        reference_positions=_floating_tensor_to_float32(context.reference_positions),
+        reference_charges=_floating_tensor_to_float32(context.reference_charges),
+        reference_mask=context.reference_mask,
+        atom_mask=context.atom_mask,
+        token_embedding=_floating_tensor_to_float32(context.token_embedding),
+        single=_floating_tensor_to_float32(context.single),
+        conditioning_single=_floating_tensor_to_float32(context.conditioning_single),
+        conditioning_pair=_floating_tensor_to_float32(context.conditioning_pair),
+        relative_features=_float32_relative_features(context.relative_features),
+        local_geometry=LocalAtomGeometry(
+            distance_vectors=_floating_tensor_to_float32(context.local_geometry.distance_vectors),
+            distance_mask=_floating_tensor_to_float32(context.local_geometry.distance_mask),
+            window_info=context.local_geometry.window_info,
+        ),
+    )
+
+
+def _detach_protenix_representations(representations: _ProtenixTrunkOutput) -> _ProtenixTrunkOutput:
+    r"""Detach every floating trunk embedding while retaining relative metadata."""
+
+    if isinstance(representations, _ProtenixTrunkOutput):
+        return _ProtenixTrunkOutput(  # type: ignore[call-arg]
+            token_embedding=representations.token_embedding.detach(),
+            single=representations.single.detach(),
+            pair=representations.pair.detach(),
+            relative_features=representations.relative_features,
+            batch_size=representations.batch_size,
+        )
+    # Lightweight test doubles use a namespace rather than the tensorclass.
+    return cast(
+        _ProtenixTrunkOutput,
+        SimpleNamespace(
+            **{
+                name: value.detach() if isinstance(value, Tensor) else value
+                for name, value in vars(representations).items()
+            }
+        ),
+    )
+
+
+def _mask_confidence_pair_embeddings(
+    representations: _ProtenixTrunkOutput,
+    keep: Tensor,
+) -> _ProtenixTrunkOutput:
+    r"""Apply confidence embedding dropout independently per structure."""
+
+    pair = representations.pair * keep.to(representations.pair).reshape(-1, 1, 1, 1)
+    if isinstance(representations, _ProtenixTrunkOutput):
+        return _ProtenixTrunkOutput(  # type: ignore[call-arg]
+            token_embedding=representations.token_embedding,
+            single=representations.single,
+            pair=pair,
+            relative_features=representations.relative_features,
+            batch_size=representations.batch_size,
+        )
+    values = vars(representations).copy()
+    values["pair"] = pair
+    return cast(_ProtenixTrunkOutput, SimpleNamespace(**values))
+
+
 def _draw_normal(
     size: tuple[int, ...] | torch.Size,
     *,
@@ -4421,10 +5089,47 @@ class ProtenixStructureTarget:
         coordinates: Full canonical atom-axis coordinates with shape
             ``(B, T, 3)`` in angstroms.
         coordinate_mask: Resolved-coordinate mask with shape ``(B, T)``.
+        molecule_id: Canonical connected-molecule ID for each atom.
+        molecule_equivalence_index: Equivalence-class ID for each molecule atom.
+        molecule_atom_index: Stable atom index local to its connected molecule.
+        representative_atom_mask: Canonical representative-atom mask.
+        permutation_pool_mask: Canonical atoms eligible for truth matching.
+        atom_molecule_type: Canonical per-atom molecule type IDs.
+        symmetry_atom_index: Current-axis atom groups with shape ``(B, G, W)``.
+        symmetry_permutation: Allowed within-group permutations with shape
+            ``(B, G, P, W)``.
+        token_center_atom_index: Current-axis center atom per token.
+        token_frame_atom_index: Current-axis three-atom frame per token.
+        token_has_frame: Valid token-frame mask.
+        plddt_rep_atom_mask: Current-axis representative mask for pLDDT losses.
+        ligand_polymer_bond_index: Current-axis ligand/polymer bond endpoints.
+        ligand_polymer_bond_mask: Valid ligand/polymer bond-edge mask.
+        resolution: Experimental resolution in angstroms.
+        resolution_is_known: Whether ``resolution`` is known.
+
+    All metadata fields are optional so the legacy EDM recipe and existing
+    direct two-field constructors remain source compatible. The baseline recipe
+    validates the matching metadata it consumes.
     """
 
     coordinates: Tensor
     coordinate_mask: Tensor
+    molecule_id: Tensor | None = None
+    molecule_equivalence_index: Tensor | None = None
+    molecule_atom_index: Tensor | None = None
+    representative_atom_mask: Tensor | None = None
+    permutation_pool_mask: Tensor | None = None
+    atom_molecule_type: Tensor | None = None
+    symmetry_atom_index: Tensor | None = None
+    symmetry_permutation: Tensor | None = None
+    token_center_atom_index: Tensor | None = None
+    token_frame_atom_index: Tensor | None = None
+    token_has_frame: Tensor | None = None
+    plddt_rep_atom_mask: Tensor | None = None
+    ligand_polymer_bond_index: Tensor | None = None
+    ligand_polymer_bond_mask: Tensor | None = None
+    resolution: Tensor | None = None
+    resolution_is_known: Tensor | None = None
 
 
 @tensorclass
@@ -4565,6 +5270,25 @@ class ProtenixRawOutput:
 
 
 @tensorclass
+class ProtenixEvaluationOutput(ProtenixRawOutput):
+    r"""Raw Protenix predictions augmented for labeled evaluation.
+
+    The shared distogram remains on its native ``(B, N, N, D)`` trunk output
+    contract. Contact probabilities derived from it are carried both in shared
+    order and in each independently canonicalized diffusion sample's order.
+
+    Args:
+        contact_probs: Shared token-pair contact probabilities with shape
+            ``(B, N, N)``.
+        per_sample_contact_probs: Canonically ordered contact probabilities
+            with shape ``(B, S, N, N)``.
+    """
+
+    contact_probs: Tensor
+    per_sample_contact_probs: Tensor
+
+
+@tensorclass
 class ProtenixOutput(ProtenixRawOutput):
     r"""
     Predictions from one Protenix training denoising pass.
@@ -4578,3 +5302,45 @@ class ProtenixOutput(ProtenixRawOutput):
 
     augmented_target_coordinates: Tensor
     noise_level: Tensor
+
+
+@tensorclass
+class ProtenixTrainingOutput:
+    r"""
+    Predictions and matched labels from the parity-oriented training recipe.
+
+    Confidence predictions always carry an S=1 sample axis and consume the
+    detached S=1 mini-rollout. Diffusion and distogram fields are ``None`` for
+    an explicit confidence-only stage.
+
+    Args:
+        coordinates: Training denoiser output with shape ``(B, S, A, 3)``.
+        mini_rollout_coordinates: Detached mini-rollout with shape
+            ``(B, 1, A, 3)``.
+        matched_target_coordinates: Truth matched onto the current atom axis,
+            with shape ``(B, A, 3)``.
+        matched_target_mask: Resolved matched truth mask with shape ``(B, A)``.
+        augmented_target_coordinates: Matched targets after rigid augmentation,
+            with shape ``(B, S, A, 3)``.
+        augmented_target_mask: Resolved augmented-target mask with shape
+            ``(B, S, A)``.
+        noise_level: Training noise levels with shape ``(B, S)``.
+        distogram_logits: Token-pair distance logits ``(B, N, N, D)``.
+        plddt_logits: Confidence logits ``(B, 1, A, D_plddt)``.
+        pae_logits: Confidence logits ``(B, 1, N, N, D_pae)``.
+        pde_logits: Confidence logits ``(B, 1, N, N, D_pde)``.
+        resolved_logits: Confidence logits ``(B, 1, A, D_resolved)``.
+    """
+
+    coordinates: Tensor | None
+    mini_rollout_coordinates: Tensor
+    matched_target_coordinates: Tensor
+    matched_target_mask: Tensor
+    augmented_target_coordinates: Tensor | None
+    augmented_target_mask: Tensor | None
+    noise_level: Tensor | None
+    distogram_logits: Tensor | None
+    plddt_logits: Tensor
+    pae_logits: Tensor
+    pde_logits: Tensor
+    resolved_logits: Tensor

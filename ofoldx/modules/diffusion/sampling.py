@@ -4,6 +4,7 @@ Elucidated-diffusion-model coordinate sampling.
 
 from __future__ import annotations
 
+import operator
 from dataclasses import dataclass
 from typing import Literal
 
@@ -130,6 +131,88 @@ class CoordinateDenoiseContext:
             noisy_coords=noisy_coords,
             local_geometry=self.local_geometry,
         )
+
+
+def denoise_coordinates(
+    denoise: CoordinateDenoiseFn,
+    *,
+    context: CoordinateDenoiseContext,
+    noisy_coords: Tensor,
+    noise_level: Tensor,
+    sample_chunk_size: int | None = None,
+) -> Tensor:
+    r"""
+    Denoise coordinate samples, optionally bounding the samples processed together.
+
+    Callers draw target augmentation, noise levels, and coordinate noise and build
+    the shared context before this function. Chunking therefore does not change the
+    corrupted coordinate inputs, repeat trunk computation, or detach gradients.
+
+    Args:
+        denoise: Coordinate denoiser.
+        context: Conditioning shared by all samples.
+        noisy_coords: Noisy coordinates with shape ``[..., S, N_atom, 3]``.
+        noise_level: Noise levels with shape ``[..., S]``.
+        sample_chunk_size: Maximum number of samples denoised together. ``None``
+            denoises all samples in one call.
+
+    Returns:
+        Denoised coordinates with the same shape as ``noisy_coords``.
+
+    Raises:
+        TypeError: If ``sample_chunk_size`` is not an integer.
+        ValueError: If an input shape is inconsistent or ``sample_chunk_size``
+            is not positive.
+    """
+
+    batch_shape = tuple(context.batch_shape)
+    if noisy_coords.ndim != len(batch_shape) + 3:
+        raise ValueError(
+            "noisy_coords must have context leading dimensions followed by "
+            f"(sample, atom, xyz); got shape {tuple(noisy_coords.shape)} for batch shape {batch_shape}"
+        )
+    if tuple(noisy_coords.shape[:-3]) != batch_shape:
+        raise ValueError(
+            f"noisy_coords leading shape {tuple(noisy_coords.shape[:-3])} does not match context {batch_shape}"
+        )
+    if noisy_coords.shape[-3] < 1:
+        raise ValueError("noisy_coords must contain at least one coordinate sample")
+    if noisy_coords.shape[-2:] != (context.num_atoms, 3):
+        raise ValueError(
+            f"noisy_coords atom/coordinate shape {tuple(noisy_coords.shape[-2:])} does not match "
+            f"({context.num_atoms}, 3)"
+        )
+    expected_noise_shape = (*batch_shape, noisy_coords.shape[-3])
+    if tuple(noise_level.shape) != expected_noise_shape:
+        raise ValueError(
+            f"noise_level shape {tuple(noise_level.shape)} does not match noisy_coords sample shape "
+            f"{expected_noise_shape}"
+        )
+
+    if sample_chunk_size is None:
+        chunk_size = noisy_coords.shape[-3]
+    else:
+        if isinstance(sample_chunk_size, bool):
+            raise TypeError("sample_chunk_size must be an integer, not bool")
+        chunk_size = operator.index(sample_chunk_size)
+        if chunk_size < 1:
+            raise ValueError("sample_chunk_size must be positive")
+
+    if chunk_size >= noisy_coords.shape[-3]:
+        return denoise(context.to_denoising_input(noisy_coords=noisy_coords, noise_level=noise_level))
+
+    chunks = []
+    for sample_start in range(0, noisy_coords.shape[-3], chunk_size):
+        sample_end = min(sample_start + chunk_size, noisy_coords.shape[-3])
+        chunks.append(
+            denoise(
+                context.to_denoising_input(
+                    noisy_coords=noisy_coords[..., sample_start:sample_end, :, :],
+                    noise_level=noise_level[..., sample_start:sample_end],
+                )
+            )
+        )
+    return torch.cat(chunks, dim=-3)
 
 
 class CoordinateEdmSampler(nn.Module):

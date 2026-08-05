@@ -4,9 +4,9 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:a800:1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=96G
-#SBATCH --time=01:00:00
+#SBATCH --cpus-per-task=96
+#SBATCH --mem=0
+# Slurm opens these paths before the script runs; create the logs directory before sbatch.
 #SBATCH --output=/data/users/qinghanw313/AlloDesign/logs/%x-%j.out
 #SBATCH --error=/data/users/qinghanw313/AlloDesign/logs/%x-%j.err
 
@@ -26,8 +26,13 @@ fail() {
 }
 
 usage() {
-    echo "Usage: sbatch [sbatch-options] $0 [--] <ofoldx.runners.train arguments...>" >&2
+    echo "Usage: sbatch [resources] $0 -- --config YAML_PATH" >&2
+    echo "Config smoke: sbatch --cpus-per-task=4 --mem=96G --time=00:10:00 $0 -- \\" >&2
+    echo "  --config configs/train.yaml --print-config" >&2
+    echo "Before sbatch, create /data/users/qinghanw313/AlloDesign/logs for Slurm output." >&2
+    echo "Put GPU/node/job resources before the script; they are not YAML keys." >&2
     echo "All arguments after an optional leading -- are forwarded unchanged." >&2
+    echo "Legacy CLI-only mode: sbatch $0 -- data/cifs --epochs 10 --device cuda" >&2
     echo "Default image: ${SQSH_IMAGE}" >&2
     echo "Override image/mounts with SQSH_IMAGE and CONTAINER_MOUNTS in --export." >&2
 }
