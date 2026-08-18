@@ -4218,7 +4218,13 @@ def write_mmcif(structure: Structure, path: Path) -> None:
         )
     reconstructions = resolution_rows.get(RESOLUTION_KIND_EM_RECONSTRUCTION, [])
     if reconstructions:
-        raise ValueError("mmCIF cannot write EM reconstruction resolution without its image-processing provenance")
+        categories["em_3d_reconstruction"] = CIFCategory(
+            {
+                "id": list(range(1, len(reconstructions) + 1)),
+                "entry_id": ["ofoldx"] * len(reconstructions),
+                "resolution": reconstructions,
+            }
+        )
     # A structure that resolves no atom still states its chemistry through the declaration
     # categories below, and mmCIF writes an absent loop rather than an empty one.
     if tuple(atom_site_columns.values())[0]:

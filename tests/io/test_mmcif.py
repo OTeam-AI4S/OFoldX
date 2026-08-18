@@ -366,10 +366,6 @@ class TestMmcifRoundTrip:
         assert restored.resolution_kind.tolist() == [kind]
 
         output = tmp_path / f"{category_name}-roundtrip.cif"
-        if kind == RESOLUTION_KIND_EM_RECONSTRUCTION:
-            with pytest.raises(ValueError, match="without its image-processing provenance"):
-                write_structure(restored, output)
-            return
         write_structure(restored, output)
         reread = read_structure(output)
         assert reread.resolution.tolist() == pytest.approx([expected])

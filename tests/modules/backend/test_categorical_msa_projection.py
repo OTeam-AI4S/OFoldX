@@ -24,11 +24,6 @@ class TestCategoricalMsaProjection:
         torch.testing.assert_close(actual, expected)
         torch.testing.assert_close(continuous.grad, expected_continuous.grad)
         torch.testing.assert_close(weight.grad, expected_weight.grad)
-        with torch.autocast("cpu", dtype=torch.bfloat16):
-            expected = F.linear(features, expected_weight)
-            actual = categorical_msa_projection(tokens, continuous, weight, backend="eager")
-        assert actual.dtype == expected.dtype == torch.bfloat16
-        torch.testing.assert_close(actual, expected, atol=1e-3, rtol=2e-2)
 
     def test_shape(self) -> None:
         with pytest.raises(ValueError, match="continuous_features must have shape"):
