@@ -9,7 +9,7 @@ from typing import Literal
 from chanfig import Config
 
 
-class OInvFoldPolymerConfig(Config):
+class OInvFoldConfig(Config):
     r"""
     Configure the shared protein, DNA, and RNA OInvFold graph.
 
@@ -24,8 +24,8 @@ class OInvFoldPolymerConfig(Config):
         decoder_hidden_size: Width of the polymer decoder transition.
 
     Examples:
-        >>> from ofoldx.models.oinvfold import OInvFoldPolymerConfig
-        >>> config = OInvFoldPolymerConfig()
+        >>> from ofoldx.models.oinvfold import OInvFoldConfig
+        >>> config = OInvFoldConfig()
         >>> config.num_encoder_blocks
         12
     """
@@ -69,7 +69,7 @@ class OInvFoldLigandConfig(Config):
     dropout: float = 0.0
 
 
-class OInvFoldPolymerProcessorConfig(Config):
+class OInvFoldProcessorConfig(Config):
     r"""
     Select the polymer chemistry represented by one OInvFold repository.
 

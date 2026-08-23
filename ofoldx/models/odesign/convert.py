@@ -22,7 +22,7 @@ from .processor import ODesignLigandProcessor, ODesignProcessor
 if TYPE_CHECKING:
     from ..grnade import GrnadePipeline
     from ..ligandmpnn import LigandMpnnPipeline
-    from ..oinvfold import OInvFoldLigandPipeline, OInvFoldPolymerPipeline
+    from ..oinvfold import OInvFoldLigandPipeline, OInvFoldPipeline
     from ..proteinmpnn import ProteinMpnnPipeline
 
 _ReferenceKey: TypeAlias = str | tuple[str, ...]
@@ -522,11 +522,11 @@ def _load_oinvfold_polymer_designer(
     modality: Literal["protein", "dna", "rna"],
     dtype: torch.dtype | None,
     token: str | None,
-) -> OInvFoldPolymerPipeline:
+) -> OInvFoldPipeline:
     from ...api import pipeline
 
     designer = cast(
-        "OInvFoldPolymerPipeline",
+        "OInvFoldPipeline",
         pipeline(
             "design",
             model=repository,

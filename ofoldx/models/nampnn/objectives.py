@@ -106,6 +106,6 @@ def criterion(
         weight=label_smoothing,
         shared_nucleic_tokens=shared_nucleic_tokens,
     )
-    mask = (target.residue_mask & target.design_positions).to(per_residue.dtype)
+    mask = (target.residue_mask & target.design_mask).to(per_residue.dtype)
     scope = mask.sum()
     return (per_residue * mask).sum() / scope

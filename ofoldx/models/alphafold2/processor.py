@@ -592,7 +592,7 @@ def _prepare_alphafold2_features(
     )
     floating = {
         "token_features": token_features,
-        "sequence_mask": torch.ones(residue_type_ids.shape[0]),
+        "token_mask": torch.ones(residue_type_ids.shape[0]),
         "msa_deletions": msa_deletions,
         "msa_profile": msa_profile,
         "template_mask": template_mask,

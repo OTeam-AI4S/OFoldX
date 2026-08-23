@@ -23,7 +23,7 @@ class MpnnProbabilityResult:
             padding or an unresolved row.
         sequence_tokens: Input token IDs with shape ``(num_residues,)``.
         residue_mask: Valid-residue mask with shape ``(num_residues,)``.
-        design_positions: Designed-position mask with shape ``(num_residues,)``.
+        design_mask: Designed-position mask with shape ``(num_residues,)``.
         logits: Vocabulary logits with shape
             ``(num_evaluations, num_residues, vocabulary_size)``.
         decoding_ranks: Autoregressive ranks with shape
@@ -37,7 +37,7 @@ class MpnnProbabilityResult:
     component_references: tuple[ComponentReference | None, ...]
     sequence_tokens: Tensor
     residue_mask: Tensor
-    design_positions: Tensor
+    design_mask: Tensor
     logits: Tensor
     decoding_ranks: Tensor
 

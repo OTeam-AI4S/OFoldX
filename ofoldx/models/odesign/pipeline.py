@@ -42,7 +42,7 @@ from ..grnade import GrnadePipeline
 from ..ligandmpnn import LigandMpnnPipeline
 from ..oinvfold import (
     OInvFoldLigandPipeline,
-    OInvFoldPolymerPipeline,
+    OInvFoldPipeline,
 )
 from ..proteinmpnn import ProteinMpnnPipeline
 from .model import ODesignInput, ODesignLigandInput, ODesignModel
@@ -282,7 +282,7 @@ class ODesignDnaPipeline(CompositePipeline):
             "oinvfold",
             "sequence_designer",
             None,
-            wrap=OInvFoldPolymerPipeline,
+            wrap=OInvFoldPipeline,
         ),
     )
 
@@ -291,7 +291,7 @@ class ODesignDnaPipeline(CompositePipeline):
         *,
         model: ODesignModel,
         processor: ODesignProcessor,
-        sequence_designer: OInvFoldPolymerPipeline,
+        sequence_designer: OInvFoldPipeline,
     ) -> None:
         self.model = model
         self.processor = processor
@@ -713,7 +713,7 @@ class ODesignOInvFoldProteinPipeline(CompositePipeline):
             "oinvfold",
             "sequence_designer",
             None,
-            wrap=OInvFoldPolymerPipeline,
+            wrap=OInvFoldPipeline,
         ),
     )
 
@@ -722,7 +722,7 @@ class ODesignOInvFoldProteinPipeline(CompositePipeline):
         *,
         model: ODesignModel,
         processor: ODesignProcessor,
-        sequence_designer: OInvFoldPolymerPipeline,
+        sequence_designer: OInvFoldPipeline,
     ) -> None:
         self.model = model
         self.processor = processor
@@ -866,7 +866,7 @@ class ODesignOInvFoldRnaPipeline(CompositePipeline):
             "oinvfold",
             "sequence_designer",
             None,
-            wrap=OInvFoldPolymerPipeline,
+            wrap=OInvFoldPipeline,
         ),
     )
 
@@ -875,7 +875,7 @@ class ODesignOInvFoldRnaPipeline(CompositePipeline):
         *,
         model: ODesignModel,
         processor: ODesignProcessor,
-        sequence_designer: OInvFoldPolymerPipeline,
+        sequence_designer: OInvFoldPipeline,
     ) -> None:
         self.model = model
         self.processor = processor

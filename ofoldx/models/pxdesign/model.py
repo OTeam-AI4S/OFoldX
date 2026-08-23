@@ -435,7 +435,10 @@ class PxDesignSampler(nn.Module):
             )
             noisy_coordinates = coordinates + (self.noise_scale * torch.sqrt(sigma_hat**2 - sigma_prev**2) * churn)
 
-            fraction = step_index / schedule_length
+            # ``fraction`` advances over the transitions (schedule_length - 1 steps, matching the shared
+            # sampler's num_transitions), so it reaches ~1.0 on the final step instead of undershooting by
+            # a step; dividing by schedule_length (the point count) biased every step_scale schedule low.
+            fraction = step_index / max(schedule_length - 1, 1)
             minimum = float(self.step_scale_min)
             maximum = float(self.step_scale_max)
             if self.step_scale_schedule == "const":

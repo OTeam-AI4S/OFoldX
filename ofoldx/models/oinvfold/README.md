@@ -36,9 +36,9 @@ for ProteinMPNN, LigandMPNN, or gRNAde.
 
 | Checkpoint | Model and Processor pair                                                  | Decoded output                                                                         |
 | ---------- | ------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
-| Protein    | `OInvFoldPolymerModel` and `OInvFoldPolymerProcessor(modality="protein")` | Protein sequence and a `Structure` with only design-masked residue identities replaced |
-| DNA        | `OInvFoldPolymerModel` and `OInvFoldPolymerProcessor(modality="dna")`     | DNA sequence and canonical nucleotide identities                                       |
-| RNA        | `OInvFoldPolymerModel` and `OInvFoldPolymerProcessor(modality="rna")`     | RNA sequence and canonical nucleotide identities                                       |
+| Protein    | `OInvFoldModel` and `OInvFoldProcessor(modality="protein")` | Protein sequence and a `Structure` with only design-masked residue identities replaced |
+| DNA        | `OInvFoldModel` and `OInvFoldProcessor(modality="dna")`     | DNA sequence and canonical nucleotide identities                                       |
+| RNA        | `OInvFoldModel` and `OInvFoldProcessor(modality="rna")`     | RNA sequence and canonical nucleotide identities                                       |
 | Ligand     | `OInvFoldLigandModel` and `OInvFoldLigandProcessor`                       | Ordered atom-element assignments with unresolved bonds                                 |
 
 Protein, DNA, and RNA share the registered `oinvfold` graph and its
@@ -48,7 +48,7 @@ coordinate convention and allowed chemistry. Ligand uses the distinct
 
 ### Decoding and Scores
 
-`OInvFoldPolymerPipeline.design` and `OInvFoldLigandPipeline.design` expose the
+`OInvFoldPipeline.design` and `OInvFoldLigandPipeline.design` expose the
 released decoding controls without conflating them:
 
 - With `use_beam=False`, decoding is greedy and returns one candidate; `topk`

@@ -17,7 +17,7 @@ from torch.nn.utils.rnn import pad_sequence
 from ...data.structure import Structure
 from ...model import Model, _TensorCollection
 from ...modules.backend import LayerNorm
-from .config import OInvFoldLigandConfig, OInvFoldPolymerConfig
+from .config import OInvFoldLigandConfig, OInvFoldConfig
 
 #: Fixed number of learned global nodes appended to each OInvFold graph.
 OINVFOLD_NUM_GLOBAL_NODES = 3
@@ -67,7 +67,7 @@ OINVFOLD_LIGAND_ELEMENTS = (
 )
 
 
-class OInvFoldPolymerModel(Model):
+class OInvFoldModel(Model):
     r"""
     OInvFold inverse folding for protein, DNA, or RNA backbones.
 
@@ -75,9 +75,9 @@ class OInvFoldPolymerModel(Model):
         >>> import torch
         >>> from ofoldx.data import AtomSite, MolecularSystem, PolymerSequence, Structure
         >>> from ofoldx.models.oinvfold import (
-        ...     OInvFoldPolymerConfig,
-        ...     OInvFoldPolymerModel,
-        ...     OInvFoldPolymerProcessor,
+        ...     OInvFoldConfig,
+        ...     OInvFoldModel,
+        ...     OInvFoldProcessor,
         ... )
         >>> sequence = PolymerSequence.from_one_letter("AC")
         >>> system = MolecularSystem.from_entities({"protein": sequence}, {"A": "protein"})
@@ -110,13 +110,13 @@ class OInvFoldPolymerModel(Model):
         ...     standard_component_id=torch.full((system.component_symbol.numel(),), -1, dtype=torch.long),
         ...     batch_size=[],
         ... )
-        >>> input = OInvFoldPolymerProcessor()(structure)
-        >>> config = OInvFoldPolymerConfig(
+        >>> input = OInvFoldProcessor()(structure)
+        >>> config = OInvFoldConfig(
         ...     {"hidden_size": 8, "num_encoder_blocks": 1, "num_virtual_atoms": 2,
         ...      "num_attention_heads": 1, "num_geometric_layers": 1,
         ...      "num_edge_layers": 1, "decoder_hidden_size": 8}
         ... )
-        >>> model = OInvFoldPolymerModel(config)
+        >>> model = OInvFoldModel(config)
         >>> with torch.inference_mode():
         ...     output = model(input, mask_probability=0.0)
         >>> output.logits.shape
@@ -125,11 +125,11 @@ class OInvFoldPolymerModel(Model):
         True
     """
 
-    config_class = OInvFoldPolymerConfig
-    config: OInvFoldPolymerConfig
+    config_class = OInvFoldConfig
+    config: OInvFoldConfig
 
-    def __init__(self, config: OInvFoldPolymerConfig | None = None) -> None:
-        config = OInvFoldPolymerConfig() if config is None else config
+    def __init__(self, config: OInvFoldConfig | None = None) -> None:
+        config = OInvFoldConfig() if config is None else config
         super().__init__(config)
         self.node_embedding = OInvFoldNormalizedReluFeedForward(
             2,
@@ -156,7 +156,7 @@ class OInvFoldPolymerModel(Model):
             config.num_edge_layers,
             config.dropout,
         )
-        self.decoder = OInvFoldPolymerDecoder(
+        self.decoder = OInvFoldDecoder(
             config.hidden_size,
             config.decoder_hidden_size,
             len(OINVFOLD_POLYMER_TOKENS),
@@ -178,7 +178,7 @@ class OInvFoldPolymerModel(Model):
 
     def encode(
         self,
-        input: OInvFoldPolymerInput,
+        input: OInvFoldInput,
         *,
         mask_probability: float = 0.1,
         generator: torch.Generator | None = None,
@@ -215,7 +215,7 @@ class OInvFoldPolymerModel(Model):
 
     def forward(
         self,
-        input: OInvFoldPolymerInput,
+        input: OInvFoldInput,
         *,
         mask_probability: float = 0.1,
         generator: torch.Generator | None = None,
@@ -229,7 +229,7 @@ class OInvFoldPolymerModel(Model):
 
     def autoregressive_probabilities(
         self,
-        input: OInvFoldPolymerInput,
+        input: OInvFoldInput,
         *,
         mask_probability: float = 0.1,
         generator: torch.Generator | None = None,
@@ -404,9 +404,9 @@ class OInvFoldLigandModel(Model):
             generator=generator,
         )
         output = self.decoder(node)
-        if input.vocabulary_logit_mask is None:
+        if input.allowed_token_mask is None:
             return output
-        logits = output.logits + input.vocabulary_logit_mask.to(output.logits.dtype)
+        logits = output.logits + input.allowed_token_mask.to(output.logits.dtype)
         return OInvFoldOutput(logits=logits, batch_size=[])
 
 
@@ -852,7 +852,7 @@ class OInvFoldGeluTransition(nn.Module):
         return self.output_projection(hidden)
 
 
-class OInvFoldPolymerDecoder(nn.Module):
+class OInvFoldDecoder(nn.Module):
     r"""
     Released residual transition decoder for the unified polymer vocabulary.
     """
@@ -1091,7 +1091,7 @@ class OInvFoldGraph:
 
 
 @tensorclass
-class OInvFoldPolymerInput:
+class OInvFoldInput:
     r"""
     Lowered polymer graph and canonical decode alignment.
 
@@ -1119,7 +1119,7 @@ class OInvFoldLigandInput:
     context: Structure | None
     slot_ids: tuple[str, ...]
     coordinates: Tensor
-    vocabulary_logit_mask: Tensor | None = None
+    allowed_token_mask: Tensor | None = None
 
 
 class OInvFoldOutput(_TensorCollection):

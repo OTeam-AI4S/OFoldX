@@ -378,7 +378,7 @@ class RfDiffusionProcessor(Processor):
             ] = True
 
         residue_index = _residue_index(output_instances, device=self.device)
-        symmetry_residue_index, symmetry_rotation, symmetry_radial_axis, symmetry_radial_mask = _lower_symmetry(
+        symmetry_index, symmetry_rotation, symmetry_radial_axis, symmetry_radial_mask = _lower_symmetry(
             rotations, output_length, symmetry, dtype=self.dtype, device=self.device
         )
         potential_input = _lower_potentials(
@@ -414,7 +414,7 @@ class RfDiffusionProcessor(Processor):
             secondary_structure=secondary[None],
             block_adjacency=adjacency[None],
             timestep=torch.tensor([timestep], dtype=torch.int64, device=self.device),
-            symmetry_residue_index=symmetry_residue_index,
+            symmetry_index=symmetry_index,
             symmetry_rotation=symmetry_rotation,
             symmetry_radial_axis=symmetry_radial_axis,
             symmetry_radial_mask=symmetry_radial_mask,

@@ -3205,12 +3205,12 @@ class RfDiffusionSampler:
             generator=generator,
         )
         noisy_coords = diffused[-1, :, :14]
-        has_symmetry = input.symmetry_residue_index.numel() > 0
+        has_symmetry = input.symmetry_index.numel() > 0
         if has_symmetry:
             noisy_coords, residue_type_features = _apply_rfdiffusion_symmetry(
                 noisy_coords,
                 residue_type_features,
-                input.symmetry_residue_index,
+                input.symmetry_index,
                 input.symmetry_rotation,
                 input.symmetry_radial_axis,
                 input.symmetry_radial_mask,
@@ -3232,7 +3232,7 @@ class RfDiffusionSampler:
         previous_prediction: Tensor | None = None
         residue_index = input.residue_index
         if has_symmetry:
-            residue_index = _symmetry_residue_index(residue_index, input.symmetry_residue_index)
+            residue_index = _symmetry_residue_index(residue_index, input.symmetry_index)
         secondary_structure = input.secondary_structure[0]
         block_adjacency = input.block_adjacency[0]
         hotspot_mask = input.hotspot_mask[0]
@@ -3286,7 +3286,7 @@ class RfDiffusionSampler:
                 symmetric_coords, _symmetric_residue_type_features = _apply_rfdiffusion_symmetry(
                     predicted_coordinates,
                     residue_type_features,
-                    input.symmetry_residue_index,
+                    input.symmetry_index,
                     input.symmetry_rotation,
                     input.symmetry_radial_axis,
                     input.symmetry_radial_mask,
@@ -3319,7 +3319,7 @@ class RfDiffusionSampler:
                 noisy_coords, residue_type_features = _apply_rfdiffusion_symmetry(
                     noisy_coords,
                     residue_type_features,
-                    input.symmetry_residue_index,
+                    input.symmetry_index,
                     input.symmetry_rotation,
                     input.symmetry_radial_axis,
                     input.symmetry_radial_mask,
@@ -5518,7 +5518,7 @@ class RfDiffusionInput:
     secondary_structure: Tensor
     block_adjacency: Tensor
     timestep: Tensor
-    symmetry_residue_index: Tensor
+    symmetry_index: Tensor
     symmetry_rotation: Tensor
     symmetry_radial_axis: Tensor
     symmetry_radial_mask: Tensor

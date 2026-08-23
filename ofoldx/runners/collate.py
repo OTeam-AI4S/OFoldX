@@ -55,7 +55,7 @@ def collate_single(batch: list[Any]) -> Any:
 
 
 def _design_count(input: Any) -> int:
-    count = int((input.residue_mask & input.design_positions).sum())
+    count = int((input.residue_mask & input.design_mask).sum())
     if count == 0:
         raise ValueError("the batch has no designable residue to score")
     return count

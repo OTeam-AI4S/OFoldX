@@ -7,38 +7,41 @@ from __future__ import annotations
 from ...pipelines.registry import PIPELINES as _PIPELINES
 from ..registry import MODELS as _MODELS
 from .config import (
+    OInvFoldConfig,
     OInvFoldLigandConfig,
-    OInvFoldPolymerConfig,
-    OInvFoldPolymerProcessorConfig,
+    OInvFoldProcessorConfig,
 )
 from .model import (
     OINVFOLD_LIGAND_ELEMENTS,
     OINVFOLD_POLYMER_TOKENS,
     OInvFoldGraph,
+    OInvFoldInput,
     OInvFoldLigandInput,
     OInvFoldLigandModel,
+    OInvFoldModel,
     OInvFoldOutput,
-    OInvFoldPolymerInput,
-    OInvFoldPolymerModel,
 )
 from .objectives import criterion
 from .pipeline import (
+    OInvFoldCandidate,
     OInvFoldLigandCandidate,
     OInvFoldLigandPipeline,
     OInvFoldLigandResult,
-    OInvFoldPolymerCandidate,
-    OInvFoldPolymerPipeline,
-    OInvFoldPolymerResult,
+    OInvFoldPipeline,
+    OInvFoldResult,
 )
 from .processor import (
     OInvFoldLigandProcessor,
-    OInvFoldPolymerProcessor,
+    OInvFoldProcessor,
 )
 
 __all__ = [
     "OINVFOLD_LIGAND_ELEMENTS",
     "OINVFOLD_POLYMER_TOKENS",
+    "OInvFoldCandidate",
+    "OInvFoldConfig",
     "OInvFoldGraph",
+    "OInvFoldInput",
     "OInvFoldLigandCandidate",
     "OInvFoldLigandConfig",
     "OInvFoldLigandInput",
@@ -46,22 +49,19 @@ __all__ = [
     "OInvFoldLigandPipeline",
     "OInvFoldLigandProcessor",
     "OInvFoldLigandResult",
+    "OInvFoldModel",
     "OInvFoldOutput",
-    "OInvFoldPolymerCandidate",
-    "OInvFoldPolymerConfig",
-    "OInvFoldPolymerInput",
-    "OInvFoldPolymerModel",
-    "OInvFoldPolymerPipeline",
-    "OInvFoldPolymerProcessor",
-    "OInvFoldPolymerProcessorConfig",
-    "OInvFoldPolymerResult",
+    "OInvFoldPipeline",
+    "OInvFoldProcessor",
+    "OInvFoldProcessorConfig",
+    "OInvFoldResult",
     "criterion",
 ]
 
 _MODELS.register(
     "oinvfold",
-    model=OInvFoldPolymerModel,
-    processor=OInvFoldPolymerProcessor,
+    model=OInvFoldModel,
+    processor=OInvFoldProcessor,
 )
 _MODELS.register(
     "oinvfold_ligand",
@@ -70,7 +70,7 @@ _MODELS.register(
 )
 _PIPELINES.register(
     "oinvfold",
-    pipeline=OInvFoldPolymerPipeline,
+    pipeline=OInvFoldPipeline,
 )
 _PIPELINES.register(
     "oinvfold_ligand",

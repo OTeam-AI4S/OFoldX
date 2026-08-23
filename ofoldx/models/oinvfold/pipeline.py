@@ -28,18 +28,18 @@ from .model import (
     OINVFOLD_POLYMER_TOKENS,
     OInvFoldLigandInput,
     OInvFoldLigandModel,
-    OInvFoldPolymerInput,
-    OInvFoldPolymerModel,
+    OInvFoldInput,
+    OInvFoldModel,
 )
 from .processor import (
     OInvFoldLigandProcessor,
-    OInvFoldPolymerProcessor,
+    OInvFoldProcessor,
     _polymer_atom_ids,
 )
 
 
 @dataclass(eq=False)
-class OInvFoldPolymerCandidate:
+class OInvFoldCandidate:
     r"""
     One decoded full-chain sequence and design-mask realization.
 
@@ -57,7 +57,7 @@ class OInvFoldPolymerCandidate:
 
 
 @dataclass(eq=False)
-class OInvFoldPolymerResult:
+class OInvFoldResult:
     r"""
     Raw polymer predictions and generation-ordered decoded candidates.
     """
@@ -68,10 +68,10 @@ class OInvFoldPolymerResult:
     logits: NDArray
     log_probabilities: NDArray
     probabilities: NDArray
-    candidates: tuple[OInvFoldPolymerCandidate, ...]
+    candidates: tuple[OInvFoldCandidate, ...]
 
     @property
-    def best(self) -> OInvFoldPolymerCandidate:
+    def best(self) -> OInvFoldCandidate:
         r"""Return the highest-ranked greedy or beam candidate."""
 
         return self.candidates[0]
@@ -124,7 +124,7 @@ class OInvFoldLigandResult:
         return self.candidates[0]
 
 
-class OInvFoldPolymerPipeline(PairedPipeline[OInvFoldPolymerModel, OInvFoldPolymerProcessor]):
+class OInvFoldPipeline(PairedPipeline[OInvFoldModel, OInvFoldProcessor]):
     r"""
     Full-chain protein, DNA, or RNA OInvFold inference.
 
@@ -145,7 +145,7 @@ class OInvFoldPolymerPipeline(PairedPipeline[OInvFoldPolymerModel, OInvFoldPolym
         use_beam: bool = False,
         temperature: float = 1.0,
         filter_by_occupancy: bool = True,
-    ) -> OInvFoldPolymerResult:
+    ) -> OInvFoldResult:
         r"""
         Decode a full polymer chain and replace only design-masked identities.
 
@@ -179,7 +179,7 @@ class OInvFoldPolymerPipeline(PairedPipeline[OInvFoldPolymerModel, OInvFoldPolym
             model_input.structure.system.component_reference(component_index)
             for component_index in model_input.component_index.detach().cpu().tolist()
         )
-        return OInvFoldPolymerResult(
+        return OInvFoldResult(
             target=input,
             component_references=component_references,
             design_mask=model_input.design_mask.detach().cpu().numpy(),
@@ -191,17 +191,17 @@ class OInvFoldPolymerPipeline(PairedPipeline[OInvFoldPolymerModel, OInvFoldPolym
 
     def _candidate(
         self,
-        input: OInvFoldPolymerInput,
+        input: OInvFoldInput,
         log_probabilities: torch.Tensor,
         tokens: tuple[int, ...],
-    ) -> OInvFoldPolymerCandidate:
+    ) -> OInvFoldCandidate:
         rows = torch.nonzero(input.design_mask, as_tuple=False).flatten()
         indices = torch.tensor(tokens, dtype=torch.long, device=log_probabilities.device)
         selected = log_probabilities[
             rows,
             indices,
         ]
-        return OInvFoldPolymerCandidate(
+        return OInvFoldCandidate(
             structure=_realize_polymer_structure(
                 input,
                 tokens,
@@ -230,7 +230,7 @@ class OInvFoldLigandPipeline(PairedPipeline[OInvFoldLigandModel, OInvFoldLigandP
         *,
         slot_ids: Sequence[str],
         context: Structure | None = None,
-        vocabulary_logit_mask: torch.Tensor | NDArray | None = None,
+        allowed_token_mask: torch.Tensor | NDArray | None = None,
         topk: int = 1,
         use_beam: bool = False,
         temperature: float = 1.0,
@@ -249,7 +249,7 @@ class OInvFoldLigandPipeline(PairedPipeline[OInvFoldLigandModel, OInvFoldLigandP
                 coordinates,
                 slot_ids=slot_ids,
                 context=context,
-                vocabulary_logit_mask=vocabulary_logit_mask,
+                allowed_token_mask=allowed_token_mask,
             ),
             topk=topk,
             use_beam=use_beam,
@@ -366,7 +366,7 @@ def _polymer_allowed_indices(
 
 
 def _realize_polymer_structure(
-    input: OInvFoldPolymerInput,
+    input: OInvFoldInput,
     tokens: tuple[int, ...],
     modality: str,
 ) -> Structure:
@@ -489,7 +489,7 @@ def _realize_polymer_structure(
 
 
 def _polymer_candidate_sequence(
-    input: OInvFoldPolymerInput,
+    input: OInvFoldInput,
     tokens: tuple[int, ...],
     modality: str,
 ) -> str:

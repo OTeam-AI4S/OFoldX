@@ -87,7 +87,7 @@ class LigandMpnnPipeline(PairedPipeline[LigandMpnnModel, LigandMpnnProcessor]):
             positions=positions,
             conditions=conditions,
             tied_weights=tied_weights,
-            logit_bias=logit_bias,
+            global_logit_bias=logit_bias,
             residue_logit_bias=residue_logit_bias,
             use_atom_context=use_atom_context,
             ligand_interface_cutoff=ligand_interface_cutoff,
@@ -418,7 +418,7 @@ class LigandMpnnDesignAndPackPipeline(CompositePipeline):
             positions=positions,
             conditions=conditions,
             tied_weights=tied_weights,
-            logit_bias=logit_bias,
+            global_logit_bias=logit_bias,
             residue_logit_bias=residue_logit_bias,
             use_atom_context=use_atom_context,
             ligand_interface_cutoff=ligand_interface_cutoff,
@@ -441,7 +441,7 @@ class LigandMpnnDesignAndPackPipeline(CompositePipeline):
             references = tuple(
                 model_input.structure.system.component_reference(component) for component in component_indices
             )
-            selected = (model_input.residue_mask[0] & model_input.design_positions[0]).tolist()
+            selected = (model_input.residue_mask[0] & model_input.design_mask[0]).tolist()
             pack_positions = [reference for reference, keep in zip(references, selected, strict=True) if keep]
         packs = self.packer.pack_sequences(
             structure,

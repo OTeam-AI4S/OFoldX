@@ -200,14 +200,14 @@ class LigandMpnnModel(Model):
             context_mask=repeat(input.context_mask),
             residue_context_coordinates=repeat(input.residue_context_coordinates),
             residue_context_mask=repeat(input.residue_context_mask),
-            design_positions=repeat(input.design_positions),
+            design_mask=repeat(input.design_mask),
             ligand_interface_mask=repeat(input.ligand_interface_mask),
             structure=input.structure,
             component_index=repeat(input.component_index),
             tied_group_ids=repeat(input.tied_group_ids),
             tied_weights=repeat(input.tied_weights),
             allowed_token_mask=repeat(input.allowed_token_mask),
-            logit_bias=repeat(input.logit_bias),
+            global_logit_bias=repeat(input.global_logit_bias),
             batch_size=[],
         )
 
@@ -229,7 +229,7 @@ class LigandMpnnModel(Model):
             ),
             sequence_tokens=input.sequence_tokens[0],
             residue_mask=input.residue_mask[0],
-            design_positions=input.design_positions[0],
+            design_mask=input.design_mask[0],
             logits=logits,
             decoding_ranks=decoding_ranks,
         )
@@ -266,13 +266,13 @@ class LigandMpnnModel(Model):
     @staticmethod
     def _generate_ranks(
         residue_mask: Tensor,
-        design_positions: Tensor,
+        design_mask: Tensor,
         tied_group_ids: Tensor,
         generator: torch.Generator | None,
     ) -> Tensor:
         r"""Draw independent half-normal priorities for fixed-first causal units."""
 
-        designed = (residue_mask & design_positions).to(torch.long)
+        designed = (residue_mask & design_mask).to(torch.long)
         unit_class = torch.full_like(tied_group_ids, 2).scatter_reduce(
             1,
             tied_group_ids,
@@ -352,7 +352,7 @@ class LigandMpnnModel(Model):
             input.context_mask.to(dtype=backbone_coordinates.dtype),
             input.residue_context_coordinates,
             input.residue_context_mask.to(dtype=backbone_coordinates.dtype),
-            input.design_positions.to(dtype=backbone_coordinates.dtype),
+            input.design_mask.to(dtype=backbone_coordinates.dtype),
             use_side_chain_context=use_side_chain_context,
         )
         # Zero node states with the residue structure of ``edges`` (one neighbor slot, edge width, which
@@ -523,7 +523,7 @@ class LigandMpnnModel(Model):
         if decoding_ranks is None:
             decoding_ranks = self._generate_ranks(
                 input.residue_mask,
-                input.design_positions,
+                input.design_mask,
                 input.tied_group_ids,
                 generator,
             )
@@ -583,7 +583,7 @@ class LigandMpnnModel(Model):
         if decoding_ranks is None:
             ranks = self._generate_ranks(
                 repeated.residue_mask,
-                repeated.design_positions,
+                repeated.design_mask,
                 repeated.tied_group_ids,
                 generator,
             )
@@ -641,7 +641,7 @@ class LigandMpnnModel(Model):
         if decoding_ranks is None:
             ranks = self._generate_ranks(
                 repeated.residue_mask,
-                repeated.design_positions,
+                repeated.design_mask,
                 repeated.tied_group_ids,
                 generator,
             )
@@ -689,7 +689,7 @@ class LigandMpnnModel(Model):
         if base_decoding_ranks is None:
             base_ranks = self._generate_ranks(
                 repeated.residue_mask,
-                repeated.design_positions,
+                repeated.design_mask,
                 untied_group_ids,
                 generator,
             )
@@ -843,7 +843,7 @@ class LigandMpnnModel(Model):
         if decoding_ranks is None:
             ranks = self._generate_ranks(
                 repeated.residue_mask,
-                repeated.design_positions,
+                repeated.design_mask,
                 repeated.tied_group_ids,
                 generator,
             )
@@ -906,7 +906,7 @@ class LigandMpnnModel(Model):
 
             logits = self.output_projection(block_states[-1][batch_indices, positions])
             selected = (
-                repeated.residue_mask[batch_indices, positions] & repeated.design_positions[batch_indices, positions]
+                repeated.residue_mask[batch_indices, positions] & repeated.design_mask[batch_indices, positions]
             )
             log_probabilities[batch_indices, positions] = F.log_softmax(logits, dim=-1) * selected.unsqueeze(-1)
 
@@ -927,10 +927,10 @@ class LigandMpnnModel(Model):
                 )
             )
             representative_rows = positions[segment_starts]
-            if repeated.logit_bias is not None:
+            if repeated.global_logit_bias is not None:
                 combined_logits = (
                     combined_logits
-                    + repeated.logit_bias[
+                    + repeated.global_logit_bias[
                         sample_indices,
                         representative_rows,
                     ]
@@ -945,7 +945,7 @@ class LigandMpnnModel(Model):
                 ).bool()
             )
 
-            fixed_mask = member_mask & ~(repeated.residue_mask & repeated.design_positions)
+            fixed_mask = member_mask & ~(repeated.residue_mask & repeated.design_mask)
             has_fixed = fixed_mask.any(dim=-1)
             anchor_positions = fixed_mask.long().argmax(dim=-1)
             anchor_tokens = repeated.sequence_tokens[sample_indices, anchor_positions]
@@ -1007,7 +1007,7 @@ class LigandMpnnModel(Model):
         system: MolecularSystem,
         component_indices: list[int],
         sampled_tokens: list[int],
-        design_positions: list[bool],
+        design_mask: list[bool],
     ) -> MolecularSystem:
         r"""
         Realize one candidate while preserving entity and bond identity.
@@ -1017,7 +1017,7 @@ class LigandMpnnModel(Model):
             component
             for component, selected in zip(
                 component_indices,
-                design_positions,
+                design_mask,
                 strict=True,
             )
             if selected
@@ -1026,7 +1026,7 @@ class LigandMpnnModel(Model):
             get_component(AMINO_ACID_COMPONENT_IDS[int(token)])
             for token, selected in zip(
                 sampled_tokens,
-                design_positions,
+                design_mask,
                 strict=True,
             )
             if selected
@@ -1078,18 +1078,21 @@ class LigandMpnnModel(Model):
             generator=generator,
         )
         losses = nll_loss(sampled.sequence_tokens, sampled.log_probabilities)
-        designed = (input.residue_mask & input.design_positions)[0]
+        designed = (input.residue_mask & input.design_mask)[0]
         interface = designed & input.ligand_interface_mask[0].bool()
         designed_row = designed.to(dtype=losses.dtype)
         interface_row = interface.to(dtype=losses.dtype)
-        designed_nll = (losses * designed_row).sum(dim=-1) / designed_row.sum(dim=-1)
-        interface_nll = (losses * interface_row).sum(dim=-1) / interface_row.sum(dim=-1)
+        # ``clamp_min(1)`` keeps the per-candidate confidence/recovery finite when a candidate has no
+        # designed (or no interface) residues; the numerator is already zero on those rows, so the
+        # guard only replaces a 0/0 NaN and never changes a non-empty scope.
+        designed_nll = (losses * designed_row).sum(dim=-1) / designed_row.sum(dim=-1).clamp_min(1)
+        interface_nll = (losses * interface_row).sum(dim=-1) / interface_row.sum(dim=-1).clamp_min(1)
         designed_confidence = torch.exp(-designed_nll)
         interface_confidence = torch.exp(-interface_nll)
         recovery = (
             (sampled.sequence_tokens == input.sequence_tokens.repeat(num_candidates, 1)).to(dtype=losses.dtype)
             * designed_row
-        ).sum(dim=-1) / designed_row.sum(dim=-1)
+        ).sum(dim=-1) / designed_row.sum(dim=-1).clamp_min(1)
 
         component_indices = input.component_index[0].detach().cpu().tolist()
         references = tuple(input.structure.system.component_reference(component) for component in component_indices)
@@ -1220,7 +1223,7 @@ class LigandMpnnFeatures(MpnnProteinFeatures):
         context_mask: Tensor,
         residue_context_coordinates: Tensor,
         residue_context_mask: Tensor,
-        design_positions: Tensor,
+        design_mask: Tensor,
         *,
         use_side_chain_context: bool,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
@@ -1239,7 +1242,7 @@ class LigandMpnnFeatures(MpnnProteinFeatures):
             residue_context_coordinates: Side-chain coordinates with shape
                 ``(B, L, 32, 3)``.
             residue_context_mask: Side-chain atom mask with shape ``(B, L, 32)``.
-            design_positions: Design-position mask with shape ``(B, L)``.
+            design_mask: Design-position mask with shape ``(B, L)``.
             use_side_chain_context: Whether fixed side chains are added to atom context.
 
         Returns:
@@ -1269,7 +1272,7 @@ class LigandMpnnFeatures(MpnnProteinFeatures):
                 context_mask,
                 residue_context_coordinates,
                 residue_context_mask,
-                design_positions,
+                design_mask,
                 residue_mask,
                 neighbor_indices,
                 neighbor_valid,
@@ -1316,7 +1319,7 @@ class LigandMpnnFeatures(MpnnProteinFeatures):
         context_mask: Tensor,
         residue_context_coordinates: Tensor,
         residue_context_mask: Tensor,
-        design_positions: Tensor,
+        design_mask: Tensor,
         residue_mask: Tensor,
         neighbor_indices: Tensor,
         neighbor_valid: Tensor,
@@ -1331,7 +1334,7 @@ class LigandMpnnFeatures(MpnnProteinFeatures):
         """
 
         batch, length = context_mask.shape[:2]
-        fixed_mask = residue_context_mask.bool() & ~design_positions[:, :, None].bool()
+        fixed_mask = residue_context_mask.bool() & ~design_mask[:, :, None].bool()
         neighbor_subset = neighbor_indices[:, :, :16]
         neighbor_subset_valid = neighbor_valid[:, :, :16]
         sidechain_mask = gather_nodes(fixed_mask, neighbor_subset)
@@ -1483,7 +1486,7 @@ class LigandMpnnInput:
             ``(batch_size, num_residues, 32, 3)``.
         residue_context_mask: Side-chain context mask with shape
             ``(batch_size, num_residues, 32)``.
-        design_positions: Positions eligible for design with shape
+        design_mask: Positions eligible for design with shape
             ``(batch_size, num_residues)``.
         ligand_interface_mask: Residues at the ligand interface with shape
             ``(batch_size, num_residues)``.
@@ -1493,7 +1496,7 @@ class LigandMpnnInput:
         tied_weights: Optional tied-group weights with shape ``(batch_size, num_residues)``.
         allowed_token_mask: Optional token mask with shape
             ``(batch_size, num_residues, vocabulary_size)``.
-        logit_bias: Optional additive bias with shape
+        global_logit_bias: Optional additive bias with shape
             ``(batch_size, num_residues, vocabulary_size)``.
     """
 
@@ -1507,14 +1510,14 @@ class LigandMpnnInput:
     context_mask: Tensor
     residue_context_coordinates: Tensor
     residue_context_mask: Tensor
-    design_positions: Tensor
+    design_mask: Tensor
     ligand_interface_mask: Tensor
     structure: Structure
     component_index: Tensor
     tied_group_ids: Tensor
     tied_weights: Tensor | None = None
     allowed_token_mask: Tensor | None = None
-    logit_bias: Tensor | None = None
+    global_logit_bias: Tensor | None = None
 
 
 class LigandMpnnOutput(_TensorCollection):

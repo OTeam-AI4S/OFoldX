@@ -373,6 +373,8 @@ class ODesignModel(Model):
         partial_diffusion = partial_diffusion_snr is not None
         if partial_diffusion and not bool(input.observed_mask.all()):
             raise ValueError("partial diffusion requires observed coordinates for every model atom")
+        if partial_diffusion and partial_diffusion_snr <= 0:
+            raise ValueError("partial_diffusion_snr must be positive")
         max_noise_level = 1 / math.sqrt(partial_diffusion_snr + 1e-6) if partial_diffusion_snr is not None else None
         coordinates = []
         distograms = []

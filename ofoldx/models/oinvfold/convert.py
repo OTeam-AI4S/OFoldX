@@ -15,10 +15,10 @@ from torch import Tensor
 
 from .config import (
     OInvFoldLigandConfig,
-    OInvFoldPolymerConfig,
-    OInvFoldPolymerProcessorConfig,
+    OInvFoldConfig,
+    OInvFoldProcessorConfig,
 )
-from .model import OInvFoldLigandModel, OInvFoldPolymerModel
+from .model import OInvFoldLigandModel, OInvFoldModel
 
 
 def convert_oinvfold_protein_checkpoint(
@@ -136,10 +136,10 @@ def _convert_polymer_checkpoint(
     token: str | None,
     private: bool,
 ) -> None:
-    from .pipeline import OInvFoldPolymerPipeline
-    from .processor import OInvFoldPolymerProcessor
+    from .pipeline import OInvFoldPipeline
+    from .processor import OInvFoldProcessor
 
-    model = OInvFoldPolymerModel(OInvFoldPolymerConfig())
+    model = OInvFoldModel(OInvFoldConfig())
     state_dict = _lightning_state_dict(checkpoint_path)
     model.load_state_dict(
         _live_state_dict(
@@ -153,8 +153,8 @@ def _convert_polymer_checkpoint(
         assign=True,
     )
     model.eval()
-    processor = OInvFoldPolymerProcessor(OInvFoldPolymerProcessorConfig(modality=modality))
-    OInvFoldPolymerPipeline(model=model, processor=processor).save(
+    processor = OInvFoldProcessor(OInvFoldProcessorConfig(modality=modality))
+    OInvFoldPipeline(model=model, processor=processor).save(
         output_dir,
         repo_id=repo_id,
         token=token,
@@ -181,7 +181,7 @@ def _live_state_dict(
     omitted_source_keys: frozenset[str],
     *,
     architecture: Literal["polymer", "ligand"],
-    config: OInvFoldPolymerConfig | OInvFoldLigandConfig,
+    config: OInvFoldConfig | OInvFoldLigandConfig,
 ) -> dict[str, Tensor]:
     prefixed = tuple(key.startswith("model.") for key in source)
     if all(prefixed):
@@ -215,7 +215,7 @@ def _live_state_dict(
 def _target_key(
     key: str,
     architecture: Literal["polymer", "ligand"],
-    config: OInvFoldPolymerConfig | OInvFoldLigandConfig,
+    config: OInvFoldConfig | OInvFoldLigandConfig,
 ) -> str:
     for embedding in ("node_embedding", "edge_embedding"):
         translated = _normalized_relu_target_key(

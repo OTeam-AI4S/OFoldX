@@ -7,10 +7,10 @@ from __future__ import annotations
 import torch.nn.functional as F
 from torch import Tensor
 
-from .model import OInvFoldOutput, OInvFoldPolymerInput
+from .model import OInvFoldOutput, OInvFoldInput
 
 
-def criterion(pred: OInvFoldOutput, target: OInvFoldPolymerInput) -> Tensor:
+def criterion(pred: OInvFoldOutput, target: OInvFoldInput) -> Tensor:
     r"""Average released polymer negative log likelihood over designable nodes."""
 
     sequence_tokens = target.sequence_tokens

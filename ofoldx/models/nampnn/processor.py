@@ -74,7 +74,7 @@ class _Row(NamedTuple):
     polymer_type_index: int
     chain_index: int
     residue_index: int
-    atom_coordinates: Tensor
+    backbone_coordinates: Tensor
     atom_mask: Tensor
     backbone_complete: bool
 
@@ -281,7 +281,7 @@ class NaMpnnProcessor(Processor):
             device=device,
         )
         length = component_index_tensor.numel()
-        atom_coordinates = structure.coordinates.new_zeros((length, len(NA_MPNN_ATOM_NAMES), 3))
+        backbone_coordinates = structure.coordinates.new_zeros((length, len(NA_MPNN_ATOM_NAMES), 3))
         atom_mask = torch.zeros(
             (length, len(NA_MPNN_ATOM_NAMES)),
             dtype=torch.bool,
@@ -327,7 +327,7 @@ class NaMpnnProcessor(Processor):
         retained_slot = atom_slot[retained]
         observed = structure.coordinate_mask & (~structure.occupancy_mask | (structure.occupancy > 0))
         retained_observed = observed[retained]
-        atom_coordinates[retained_row, retained_slot] = torch.where(
+        backbone_coordinates[retained_row, retained_slot] = torch.where(
             retained_observed[:, None],
             structure.coordinates[retained],
             0,
@@ -360,7 +360,7 @@ class NaMpnnProcessor(Processor):
                 polymer_type,
                 chain,
                 residue_index[position],
-                atom_coordinates[position],
+                backbone_coordinates[position],
                 atom_mask[position],
                 valids[position],
             )
@@ -420,8 +420,8 @@ class NaMpnnProcessor(Processor):
         structure: Structure,
         rows: list[_Row],
         *,
-        design_positions: list[bool],
-        token_group_ids: list[int],
+        design_mask: list[bool],
+        tied_group_ids: list[int],
         sequence_tokens: list[int],
         tied_weights: Tensor,
         residue_logit_bias: Tensor,
@@ -429,7 +429,7 @@ class NaMpnnProcessor(Processor):
         pair_logit_bias: Tensor | None,
     ) -> NaMpnnInput:
         return NaMpnnInput(  # type: ignore[call-arg]
-            atom_coordinates=torch.stack([row.atom_coordinates for row in rows])
+            backbone_coordinates=torch.stack([row.backbone_coordinates for row in rows])
             .to(device=self.device, dtype=self.dtype)
             .unsqueeze(0),
             atom_mask=torch.stack([row.atom_mask for row in rows]).to(device=self.device).unsqueeze(0),
@@ -441,8 +441,8 @@ class NaMpnnProcessor(Processor):
                 [row.polymer_type_index if row.backbone_complete else 3 for row in rows],
                 torch.int64,
             ),
-            design_positions=self._tensor(design_positions, torch.bool),
-            token_group_ids=self._tensor(token_group_ids, torch.int64),
+            design_mask=self._tensor(design_mask, torch.bool),
+            tied_group_ids=self._tensor(tied_group_ids, torch.int64),
             structure=structure,
             component_index=self._tensor([row.component_index for row in rows], torch.int64),
             tied_weights=tied_weights,
@@ -485,15 +485,15 @@ class NaMpnnProcessor(Processor):
             if missing:
                 references = [structure.system.component_reference(component) for component in missing]
                 raise ValueError(f"NA-MPNN positions are not polymer residues: {references!r}")
-        lowered_design_positions = [
+        lowered_design_mask = [
             bool(row.backbone_complete and (selected is None or row.component_index in selected)) for row in rows
         ]
-        token_group_ids = list(range(len(rows)))
+        tied_group_ids = list(range(len(rows)))
         return self._base_input(
             structure,
             rows,
-            design_positions=lowered_design_positions,
-            token_group_ids=token_group_ids,
+            design_mask=lowered_design_mask,
+            tied_group_ids=tied_group_ids,
             sequence_tokens=sequence_tokens,
             tied_weights=torch.ones(1, len(rows), device=self.device, dtype=self.dtype),
             residue_logit_bias=torch.zeros(
@@ -698,7 +698,7 @@ class NaMpnnProcessor(Processor):
             if missing:
                 references = [system.component_reference(component) for component in missing]
                 raise ValueError(f"NA-MPNN positions are not polymer residues: {references!r}")
-        lowered_design_positions = [
+        lowered_design_mask = [
             bool(
                 row.backbone_complete
                 and row.component_index not in bonded
@@ -753,7 +753,7 @@ class NaMpnnProcessor(Processor):
             # A tie shares one decoding position, so a fixed member pins the whole unit to its identity.
             # Two fixed members disagreeing over that identity is unsatisfiable; fail loud rather than let
             # the sampler silently keep each member's own token.
-            fixed_identities = {sequence_tokens[index] for index in members if not lowered_design_positions[index]}
+            fixed_identities = {sequence_tokens[index] for index in members if not lowered_design_mask[index]}
             if len(fixed_identities) > 1:
                 raise ValueError("NA-MPNN cannot tie residues fixed to different identities")
             # A tie shares one decoding position, so allowed identities intersect in token space:
@@ -776,7 +776,7 @@ class NaMpnnProcessor(Processor):
                     }
                     if not supported:
                         if self._component_token(row.component_id, row.polymer_type_index) in allowed_tokens:
-                            lowered_design_positions[index] = False
+                            lowered_design_mask[index] = False
                             continue
                         raise ValueError("NA-MPNN allowed identities contain no residue it can generate")
                     mask = [False] * _VOCAB_SIZE
@@ -784,7 +784,7 @@ class NaMpnnProcessor(Processor):
                         mask[self._component_token(component_id, row.polymer_type_index)] = True
                     allowed_token_mask[0, index] = torch.tensor(mask, device=self.device, dtype=torch.bool)
 
-            if fixed_identities and any(lowered_design_positions[index] for index in members):
+            if fixed_identities and any(lowered_design_mask[index] for index in members):
                 anchor = next(iter(fixed_identities))
                 if not allowed_token_mask[0, members, anchor].all():
                     raise ValueError("NA-MPNN tied fixed identity is outside the common token support")
@@ -793,12 +793,12 @@ class NaMpnnProcessor(Processor):
                 allowed_token_mask[0, members] &= anchor_support
 
             if (
-                any(lowered_design_positions[index] for index in members)
+                any(lowered_design_mask[index] for index in members)
                 and not allowed_token_mask[0, members].all(dim=0).any()
             ):
                 raise ValueError("NA-MPNN tied residues have no common token support")
 
-        token_group_ids = self._dense_ids([find(index) for index in range(length)])
+        tied_group_ids = self._dense_ids([find(index) for index in range(length)])
 
         tied_weight_tensor = self._tied_weights_tensor(
             rows,
@@ -817,8 +817,8 @@ class NaMpnnProcessor(Processor):
         return self._base_input(
             structure,
             rows,
-            design_positions=lowered_design_positions,
-            token_group_ids=token_group_ids,
+            design_mask=lowered_design_mask,
+            tied_group_ids=tied_group_ids,
             sequence_tokens=sequence_tokens,
             tied_weights=tied_weight_tensor,
             residue_logit_bias=residue_bias_tensor,

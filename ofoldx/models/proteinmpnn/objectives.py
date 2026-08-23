@@ -19,7 +19,7 @@ def criterion(
 ) -> Tensor:
     r"""
     DanLing-shaped loss: score the model output's logits for the observed sequence and reduce over the
-    designable residues (``residue_mask & design_positions``).
+    designable residues (``residue_mask & design_mask``).
 
     Args:
         pred: The model output (``ProteinMpnnOutput`` with ``logits``).
@@ -32,6 +32,8 @@ def criterion(
         log_probabilities,
         weight=label_smoothing,
     )
-    mask = (target.residue_mask & target.design_positions).to(per_residue.dtype)
-    scope = mask.sum()
+    mask = (target.residue_mask & target.design_mask).to(per_residue.dtype)
+    # Clamp so a batch with no supervised residues contributes a finite zero loss rather than a NaN
+    # that would poison the gradient (numerator is zero when the scope is empty).
+    scope = mask.sum().clamp_min(1)
     return (per_residue * mask).sum() / scope

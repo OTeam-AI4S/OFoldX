@@ -635,7 +635,9 @@ def _pool_conformations(
             (edge[0][:, 0], edge[1][:, 0]),
         )
 
-    count = conformation_mask.sum(dim=1, keepdim=True)
+    # Clamp so a residue that is masked in every conformation pools to zero rather than dividing
+    # 0/0 into NaN; the masked numerators are already zero on those rows.
+    count = conformation_mask.sum(dim=1, keepdim=True).clamp_min(1)
     scalar_mask = conformation_mask.unsqueeze(-1)
     vector_mask = scalar_mask.unsqueeze(-1)
     source = edge_index[0]

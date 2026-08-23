@@ -381,7 +381,7 @@ class _BoltzGenStructureModel(Model):
         step_scale: float | Tensor | None = None,
         noise_scale: float | Tensor | None = None,
         return_trajectory: bool = False,
-    ) -> BoltzGenSampleOutput | BoltzGenResidueTypeSampleOutput:
+    ) -> BoltzGenSamplingOutput | BoltzGenResidueTypeSamplingOutput:
         r"""
         Draw reverse-diffusion structure samples from a preprocessed input.
 
@@ -443,7 +443,7 @@ class _BoltzGenStructureModel(Model):
             "batch_size": [batch_size],
         }
         if residue_type_logits is not None:
-            return BoltzGenResidueTypeSampleOutput(
+            return BoltzGenResidueTypeSamplingOutput(
                 **values,
                 residue_type_logits=residue_type_logits.reshape(
                     batch_size,
@@ -451,7 +451,7 @@ class _BoltzGenStructureModel(Model):
                     *residue_type_logits.shape[1:],
                 ),
             )
-        return BoltzGenSampleOutput(
+        return BoltzGenSamplingOutput(
             **values,
         )
 
@@ -802,9 +802,9 @@ class BoltzGenModel(_BoltzGenDenoisingModel):
         step_scale: float | Tensor | None = None,
         noise_scale: float | Tensor | None = None,
         return_trajectory: bool = False,
-    ) -> BoltzGenSampleOutput:
+    ) -> BoltzGenSamplingOutput:
         return cast(
-            BoltzGenSampleOutput,
+            BoltzGenSamplingOutput,
             self._sample(
                 input,
                 num_samples=num_samples,
@@ -875,9 +875,9 @@ class BoltzGenResidueTypeModel(_BoltzGenDenoisingModel):
         step_scale: float | Tensor | None = None,
         noise_scale: float | Tensor | None = None,
         return_trajectory: bool = False,
-    ) -> BoltzGenResidueTypeSampleOutput:
+    ) -> BoltzGenResidueTypeSamplingOutput:
         return cast(
-            BoltzGenResidueTypeSampleOutput,
+            BoltzGenResidueTypeSamplingOutput,
             self._sample(
                 input,
                 num_samples=num_samples,
@@ -1102,7 +1102,7 @@ class BoltzGenConfidenceModel(_BoltzGenStructureModel):
         step_scale: float | Tensor | None = None,
         noise_scale: float | Tensor | None = None,
         return_trajectory: bool = False,
-    ) -> BoltzGenSampleWithConfidenceOutput:
+    ) -> BoltzGenSamplingWithConfidenceOutput:
         r"""
         Sample coordinates and score them without recomputing the structure trunk.
         """
@@ -1139,7 +1139,7 @@ class BoltzGenConfidenceModel(_BoltzGenStructureModel):
             )
         bfactor_logits = self.bfactor_head(trunk.single)
         confidence = self._score_confidence(input, trunk=trunk, coordinates=coordinates)
-        return BoltzGenSampleWithConfidenceOutput(
+        return BoltzGenSamplingWithConfidenceOutput(
             coordinates=coordinates,
             distogram_logits=trunk.distogram_logits,
             bfactor_logits=bfactor_logits,
@@ -5517,7 +5517,7 @@ class BoltzGenConfidenceOutput(_TensorCollection):
     confidence_pair: _OptionalTensor
 
 
-class BoltzGenSampleOutput(_TensorCollection):
+class BoltzGenSamplingOutput(_TensorCollection):
     r"""
     Predictions from one BoltzGen reverse-diffusion sampling pass.
 
@@ -5539,13 +5539,13 @@ class BoltzGenSampleOutput(_TensorCollection):
     denoised_coordinate_trajectory: _OptionalTensor
 
 
-class BoltzGenResidueTypeSampleOutput(BoltzGenSampleOutput):
+class BoltzGenResidueTypeSamplingOutput(BoltzGenSamplingOutput):
     r"""Reverse-diffusion samples with required final residue-type logits."""
 
     residue_type_logits: Tensor
 
 
-class BoltzGenSampleWithConfidenceOutput(_TensorCollection):
+class BoltzGenSamplingWithConfidenceOutput(_TensorCollection):
     r"""
     Coordinate samples and confidence values produced from one trunk execution.
     """

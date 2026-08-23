@@ -244,7 +244,7 @@ class ProteinMpnnModel(Model):
             residue_mask=repeat(input.residue_mask),
             residue_index=repeat(input.residue_index),
             chain_index=repeat(input.chain_index),
-            design_positions=repeat(input.design_positions),
+            design_mask=repeat(input.design_mask),
             structure=input.structure,
             component_index=repeat(input.component_index),
             tied_group_ids=repeat(input.tied_group_ids),
@@ -275,7 +275,7 @@ class ProteinMpnnModel(Model):
             ),
             sequence_tokens=input.sequence_tokens[0],
             residue_mask=input.residue_mask[0],
-            design_positions=input.design_positions[0],
+            design_mask=input.design_mask[0],
             logits=logits,
             decoding_ranks=decoding_ranks,
         )
@@ -315,7 +315,7 @@ class ProteinMpnnModel(Model):
     @staticmethod
     def _generate_ranks(
         residue_mask: Tensor,
-        design_positions: Tensor,
+        design_mask: Tensor,
         tied_group_ids: Tensor,
         generator: torch.Generator | None,
     ) -> Tensor:
@@ -331,7 +331,7 @@ class ProteinMpnnModel(Model):
         each structure's order over its own residues, with no padded rows.
         """
 
-        designed = (residue_mask & design_positions).to(torch.long)
+        designed = (residue_mask & design_mask).to(torch.long)
         unit_class = torch.full_like(tied_group_ids, 2).scatter_reduce(
             1,
             tied_group_ids,
@@ -565,7 +565,7 @@ class ProteinMpnnModel(Model):
         if decoding_ranks is None:
             decoding_ranks = self._generate_ranks(
                 input.residue_mask,
-                input.design_positions,
+                input.design_mask,
                 input.tied_group_ids,
                 generator,
             )
@@ -662,7 +662,7 @@ class ProteinMpnnModel(Model):
         if decoding_ranks is None:
             decoding_ranks = self._generate_ranks(
                 repeated.residue_mask,
-                repeated.design_positions,
+                repeated.design_mask,
                 repeated.tied_group_ids,
                 generator,
             )
@@ -710,7 +710,7 @@ class ProteinMpnnModel(Model):
             untied_group_ids = torch.ones_like(repeated.tied_group_ids).cumsum(dim=1) - 1
             base_ranks = self._generate_ranks(
                 repeated.residue_mask,
-                repeated.design_positions,
+                repeated.design_mask,
                 untied_group_ids,
                 generator,
             )
@@ -860,9 +860,11 @@ class ProteinMpnnModel(Model):
         ).log_probabilities
         losses = nll_loss(repeated.sequence_tokens, log_probabilities)
         valid = repeated.residue_mask.to(dtype=losses.dtype)
-        designed = (repeated.residue_mask & repeated.design_positions).to(dtype=losses.dtype)
-        designed_values = (losses * designed).sum(dim=-1) / designed.sum(dim=-1)
-        global_values = (losses * valid).sum(dim=-1) / valid.sum(dim=-1)
+        designed = (repeated.residue_mask & repeated.design_mask).to(dtype=losses.dtype)
+        # Clamp the per-row denominators so a target with no designed (or no valid) residues yields a
+        # finite score instead of a 0/0 NaN; the numerator is already zero on those rows.
+        designed_values = (losses * designed).sum(dim=-1) / designed.sum(dim=-1).clamp_min(1)
+        global_values = (losses * valid).sum(dim=-1) / valid.sum(dim=-1).clamp_min(1)
         host_designed_values = designed_values.detach().cpu()
         host_global_values = global_values.detach().cpu()
         if host_designed_values.dtype == torch.bfloat16:
@@ -870,7 +872,7 @@ class ProteinMpnnModel(Model):
             host_global_values = host_global_values.float()
         designed_evaluations = host_designed_values.numpy()
         global_evaluations = host_global_values.numpy()
-        host_design_positions = input.design_positions[0].detach().cpu()
+        host_design_positions = input.design_mask[0].detach().cpu()
         host_residue_mask = input.residue_mask[0].detach().cpu()
         references = _component_references(
             input.structure.system,
@@ -952,7 +954,15 @@ class ProteinMpnnModel(Model):
         if allowed_token_mask is not None:
             support &= allowed_token_mask
         supported_probabilities = probabilities * support
-        return supported_probabilities / supported_probabilities.sum(dim=-1, keepdim=True)
+        total = supported_probabilities.sum(dim=-1, keepdim=True)
+        # Fall back to the unconstrained distribution where the hard support mask leaves no eligible
+        # token, rather than dividing by zero and emitting NaN sampling probabilities. The reference
+        # keeps a ``probs * 0.001`` floor for the same reason (protein_mpnn_utils.py:1174); here the
+        # fallback is confined to the degenerate empty-support rows so ordinary masking is unchanged.
+        empty = total == 0
+        supported_probabilities = torch.where(empty, probabilities, supported_probabilities)
+        total = torch.where(empty, probabilities.sum(dim=-1, keepdim=True), total)
+        return supported_probabilities / total
 
     @torch.inference_mode()
     def sample(
@@ -1003,7 +1013,7 @@ class ProteinMpnnModel(Model):
         if decoding_ranks is None:
             ranks = self._generate_ranks(
                 repeated.residue_mask,
-                repeated.design_positions,
+                repeated.design_mask,
                 repeated.tied_group_ids,
                 generator,
             )
@@ -1115,7 +1125,7 @@ class ProteinMpnnModel(Model):
                 )
             )
             member_selected = (
-                repeated.residue_mask[batch_indices, positions] & repeated.design_positions[batch_indices, positions]
+                repeated.residue_mask[batch_indices, positions] & repeated.design_mask[batch_indices, positions]
             )
             active = torch.segment_reduce(
                 member_selected.to(logits.dtype),
@@ -1127,7 +1137,7 @@ class ProteinMpnnModel(Model):
                 "max",
                 lengths=member_counts,
             ).bool()
-            fixed_mask = member_mask & ~(repeated.residue_mask & repeated.design_positions)
+            fixed_mask = member_mask & ~(repeated.residue_mask & repeated.design_mask)
             anchor_positions = fixed_mask.long().argmax(dim=-1)
             anchor_tokens = repeated.sequence_tokens[sample_indices, anchor_positions]
             anchored = ~active & has_designed_member & (member_counts > 1)
@@ -1206,7 +1216,7 @@ class ProteinMpnnModel(Model):
         system: MolecularSystem,
         component_index: Tensor,
         sampled_tokens: Tensor,
-        design_positions: Tensor,
+        design_mask: Tensor,
     ) -> MolecularSystem:
         r"""
         Realize one candidate while preserving entity and bond identity.
@@ -1217,7 +1227,7 @@ class ProteinMpnnModel(Model):
         for component, token, selected in zip(
             component_index.detach().cpu().tolist(),
             sampled_tokens.tolist(),
-            design_positions.tolist(),
+            design_mask.tolist(),
             strict=True,
         ):
             if component < 0 or not selected:
@@ -1294,7 +1304,7 @@ class ProteinMpnnModel(Model):
             residue_mask=input.residue_mask,
             residue_index=input.residue_index,
             chain_index=input.chain_index,
-            design_positions=input.design_positions,
+            design_mask=input.design_mask,
             structure=input.structure,
             component_index=input.component_index,
             tied_group_ids=untied_group_ids,
@@ -1315,19 +1325,22 @@ class ProteinMpnnModel(Model):
         losses = nll_loss(sampled.sequence_tokens, sampled.log_probabilities)
         valid = input.residue_mask.repeat_interleave(num_candidates, dim=0).to(losses.dtype)
         designed = (
-            (input.residue_mask & input.design_positions).repeat_interleave(num_candidates, dim=0).to(losses.dtype)
+            (input.residue_mask & input.design_mask).repeat_interleave(num_candidates, dim=0).to(losses.dtype)
         )
-        designed_nll = (losses * designed).sum(dim=-1) / designed.sum(dim=-1)
-        global_nll = (losses * valid).sum(dim=-1) / valid.sum(dim=-1)
+        # Clamp per-candidate denominators so a candidate with no designed residues yields finite
+        # nll/recovery instead of a 0/0 NaN (numerator is already zero on those rows).
+        designed_scope = designed.sum(dim=-1).clamp_min(1)
+        designed_nll = (losses * designed).sum(dim=-1) / designed_scope
+        global_nll = (losses * valid).sum(dim=-1) / valid.sum(dim=-1).clamp_min(1)
         recovery = (sampled.sequence_tokens == input.sequence_tokens.repeat_interleave(num_candidates, dim=0)).to(
             losses.dtype
-        ).mul(designed).sum(dim=-1) / designed.sum(dim=-1)
+        ).mul(designed).sum(dim=-1) / designed_scope
         length = sampled.sequence_tokens.shape[1]
         host_result = (
             torch.cat(
                 (
                     sampled.sequence_tokens.reshape(-1),
-                    input.design_positions[0],
+                    input.design_mask[0],
                     input.residue_mask[0],
                     torch.stack((designed_nll, global_nll, recovery), dim=-1).reshape(-1),
                 )
@@ -1601,7 +1614,7 @@ class ProteinMpnnInput:
         residue_mask: Valid-residue mask with shape ``(batch_size, num_residues)``.
         residue_index: Residue indices with shape ``(batch_size, num_residues)``.
         chain_index: Chain indices with shape ``(batch_size, num_residues)``.
-        design_positions: Positions eligible for design with shape
+        design_mask: Positions eligible for design with shape
             ``(batch_size, num_residues)``.
         structure: Canonical source structure. A Runner batch is one disjoint union
             whose system axis follows the row batch.
@@ -1626,7 +1639,7 @@ class ProteinMpnnInput:
     residue_mask: Tensor
     residue_index: Tensor
     chain_index: Tensor
-    design_positions: Tensor
+    design_mask: Tensor
     structure: Structure
     component_index: Tensor
     tied_group_ids: Tensor

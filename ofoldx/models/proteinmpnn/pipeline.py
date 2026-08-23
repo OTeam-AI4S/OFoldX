@@ -506,7 +506,7 @@ class ProteinMpnnDesignAndPackPipeline(CompositePipeline):
                 None if component < 0 else model_input.structure.system.component_reference(component)
                 for component in model_input.component_index[0].detach().cpu().tolist()
             )
-            selected = (model_input.residue_mask[0] & model_input.design_positions[0]).tolist()
+            selected = (model_input.residue_mask[0] & model_input.design_mask[0]).tolist()
             pack_positions = [
                 reference for reference, keep in zip(references, selected) if keep and reference is not None
             ]

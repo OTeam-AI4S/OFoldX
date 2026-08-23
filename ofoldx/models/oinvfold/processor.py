@@ -25,13 +25,13 @@ from ...data.molecular import (
 )
 from ...data.structure import Structure
 from ...processor import Processor
-from .config import OInvFoldPolymerProcessorConfig
+from .config import OInvFoldProcessorConfig
 from .model import (
     OINVFOLD_NUM_GLOBAL_NODES,
     OINVFOLD_POLYMER_TOKENS,
     OInvFoldGraph,
     OInvFoldLigandInput,
-    OInvFoldPolymerInput,
+    OInvFoldInput,
 )
 
 _POLYMER_ATOM_SLOTS = {
@@ -41,7 +41,7 @@ _POLYMER_ATOM_SLOTS = {
 }
 
 
-class OInvFoldPolymerProcessor(Processor):
+class OInvFoldProcessor(Processor):
     r"""
     Lower one protein, DNA, or RNA chain to the released OInvFold graph.
 
@@ -68,14 +68,14 @@ class OInvFoldPolymerProcessor(Processor):
         ...     ),
         ...     coordinate_mask=torch.ones(system.atom_symbol.numel(), dtype=torch.bool),
         ... )
-        >>> complete = OInvFoldPolymerProcessor()(structure)
+        >>> complete = OInvFoldProcessor()(structure)
         >>> def take_alternating(
         ...     _structure,
         ...     _layout,
         ...     **_kwargs,
         ... ):
         ...     return torch.tensor([0, 2, 4])
-        >>> value = OInvFoldPolymerProcessor()(
+        >>> value = OInvFoldProcessor()(
         ...     structure,
         ...     design_positions=(("A", 0), ("A", 1), ("A", 4)),
         ...     cropper=take_alternating,
@@ -90,17 +90,17 @@ class OInvFoldPolymerProcessor(Processor):
         ... )
     """
 
-    config_class = OInvFoldPolymerProcessorConfig
-    config: OInvFoldPolymerProcessorConfig
+    config_class = OInvFoldProcessorConfig
+    config: OInvFoldProcessorConfig
 
     def __init__(
         self,
-        config: OInvFoldPolymerProcessorConfig | None = None,
+        config: OInvFoldProcessorConfig | None = None,
         *,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
-        self.config = OInvFoldPolymerProcessorConfig() if config is None else config
+        self.config = OInvFoldProcessorConfig() if config is None else config
         super().__init__(device=device, dtype=dtype)
 
     def __call__(
@@ -112,7 +112,7 @@ class OInvFoldPolymerProcessor(Processor):
         filter_by_occupancy: bool = True,
         cropper: Cropper | None = None,
         generator: torch.Generator | None = None,
-    ) -> OInvFoldPolymerInput:
+    ) -> OInvFoldInput:
         r"""
         Lower one complete polymer chain while retaining its design mask.
 
@@ -251,7 +251,7 @@ class OInvFoldPolymerProcessor(Processor):
             edge_feature_size=310,
             dtype=self.dtype,
         )
-        return OInvFoldPolymerInput(  # type: ignore[call-arg]
+        return OInvFoldInput(  # type: ignore[call-arg]
             graph=graph,
             structure=structure,
             component_index=component_index,
@@ -309,7 +309,7 @@ class OInvFoldLigandProcessor(Processor):
         *,
         slot_ids: Sequence[str],
         context: Structure | None = None,
-        vocabulary_logit_mask: Tensor | NDArray | None = None,
+        allowed_token_mask: Tensor | NDArray | None = None,
     ) -> OInvFoldLigandInput:
         r"""
         Prepare an atom-element assignment graph.
@@ -318,7 +318,7 @@ class OInvFoldLigandProcessor(Processor):
             coordinates: Provisional atom coordinates in slot order.
             slot_ids: Stable caller-owned identifiers in coordinate order.
             context: Optional canonical context retained with decoded candidates.
-            vocabulary_logit_mask: Optional additive logits mask aligned to slots.
+            allowed_token_mask: Optional additive logits mask aligned to slots.
 
         Returns:
             One atom graph retaining the ordered slot alignment.
@@ -347,11 +347,11 @@ class OInvFoldLigandProcessor(Processor):
             context=context,
             slot_ids=slot_ids,
             coordinates=coordinates,
-            vocabulary_logit_mask=(
+            allowed_token_mask=(
                 None
-                if vocabulary_logit_mask is None
+                if allowed_token_mask is None
                 else torch.as_tensor(
-                    vocabulary_logit_mask,
+                    allowed_token_mask,
                     dtype=self.dtype,
                     device=self.device,
                 )

@@ -722,7 +722,7 @@ class ProteinMpnnProcessor(Processor):
                 device=self.device,
                 dtype=torch.int64,
             ).unsqueeze(0),
-            design_positions=torch.tensor(
+            design_mask=torch.tensor(
                 row_design,
                 device=self.device,
                 dtype=torch.bool,

@@ -116,7 +116,7 @@ class LigandMpnnProcessor(Processor):
         positions: Sequence[ComponentReference] | None = None,
         conditions: Sequence[AllowedResidueIdentities | TiedResidueIdentities] = (),
         tied_weights: Mapping[ComponentReference, float] | None = None,
-        logit_bias: Tensor | None = None,
+        global_logit_bias: Tensor | None = None,
         residue_logit_bias: Mapping[ComponentReference, Tensor] | None = None,
         use_atom_context: bool = True,
         ligand_interface_cutoff: float = 8.0,
@@ -133,7 +133,7 @@ class LigandMpnnProcessor(Processor):
                 occurrence with complete backbone coordinates.
             conditions: Allowed-identity and tied-identity conditions.
             tied_weights: Optional sampling coefficient for each member of a tied group.
-            logit_bias: Global bias vector over the 20 generatable identities.
+            global_logit_bias: Global bias vector over the 20 generatable identities.
             residue_logit_bias: Per-residue bias vectors over the 20 generatable identities.
             use_atom_context: Whether nonwater, nonprotein heavy-atom context is visible to the model.
             ligand_interface_cutoff: Distance cutoff in angstroms used to mark interface residues.
@@ -216,8 +216,8 @@ class LigandMpnnProcessor(Processor):
             length,
         )
         allowed_token_mask = self._lower_allowed(tied_groups, restrictions, row_design, row_component_ids)
-        logit_bias_values = self._lower_logit_bias(
-            logit_bias,
+        global_logit_bias_values = self._lower_global_logit_bias(
+            global_logit_bias,
             residue_logit_bias,
             system,
             row_by_component,
@@ -262,14 +262,14 @@ class LigandMpnnProcessor(Processor):
             context_mask=selected_mask.unsqueeze(0),
             residue_context_coordinates=residue_context_coordinates.unsqueeze(0),
             residue_context_mask=residue_context_mask.unsqueeze(0),
-            design_positions=torch.tensor(row_design, device=self.device, dtype=torch.bool).unsqueeze(0),
+            design_mask=torch.tensor(row_design, device=self.device, dtype=torch.bool).unsqueeze(0),
             ligand_interface_mask=interface.unsqueeze(0),
             structure=structure,
             component_index=row_component_index.to(device=self.device).unsqueeze(0),
             tied_group_ids=torch.tensor(tied_group_ids, device=self.device, dtype=torch.int64).unsqueeze(0),
             tied_weights=tied_weight_values,
             allowed_token_mask=allowed_token_mask,
-            logit_bias=logit_bias_values,
+            global_logit_bias=global_logit_bias_values,
             batch_size=[],
         )
 
@@ -648,9 +648,9 @@ class LigandMpnnProcessor(Processor):
                 allowed_token_mask[0, row, AMINO_ACID_TOKEN_BY_COMPONENT[component_id]] = True
         return allowed_token_mask
 
-    def _lower_logit_bias(
+    def _lower_global_logit_bias(
         self,
-        logit_bias: Tensor | None,
+        global_logit_bias: Tensor | None,
         residue_logit_bias: Mapping[ComponentReference, Tensor] | None,
         system: MolecularSystem,
         row_by_component: Mapping[int, int],
@@ -665,13 +665,13 @@ class LigandMpnnProcessor(Processor):
         across a tied group after sparse defaults.
         """
 
-        if logit_bias is None and not residue_logit_bias:
+        if global_logit_bias is None and not residue_logit_bias:
             return None
         bias_values = torch.zeros(1, length, _VOCABULARY, device=self.device, dtype=self.dtype)
-        if logit_bias is not None:
-            converted = logit_bias.to(device=self.device, dtype=self.dtype)
+        if global_logit_bias is not None:
+            converted = global_logit_bias.to(device=self.device, dtype=self.dtype)
             if converted.shape != (_GENERATED_IDENTITIES,):
-                raise ValueError(f"LigandMPNN logit_bias must have shape ({_GENERATED_IDENTITIES},)")
+                raise ValueError(f"LigandMPNN global_logit_bias must have shape ({_GENERATED_IDENTITIES},)")
             bias_values[0, :, :_GENERATED_IDENTITIES] = converted
         if residue_logit_bias:
             for reference, value in residue_logit_bias.items():

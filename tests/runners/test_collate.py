@@ -22,7 +22,7 @@ def _protein_input(length: int) -> ProteinMpnnInput:
         residue_mask=torch.ones(1, length, dtype=torch.bool),
         residue_index=torch.arange(length).unsqueeze(0),
         chain_index=torch.zeros(1, length, dtype=torch.int64),
-        design_positions=torch.ones(1, length, dtype=torch.bool),
+        design_mask=torch.ones(1, length, dtype=torch.bool),
         structure=Structure.from_sequence("A" * length),
         component_index=torch.arange(length).unsqueeze(0),
         tied_group_ids=torch.arange(length).unsqueeze(0),

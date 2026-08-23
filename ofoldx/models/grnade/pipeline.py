@@ -216,8 +216,10 @@ def _decode_design(
         output.sequence_tokens.unsqueeze(-1),
     ).squeeze(-1)
     total_log_probability = (selected_log_probability * design).sum(dim=-1)
-    mean_log_probability = total_log_probability / count
-    native_recovery = ((output.sequence_tokens == input.sequence_tokens) & known_design).sum(dim=-1) / known_count
+    # Guard the degenerate empty-scope rows (no designable / no known-native residues) so the
+    # reported metrics stay finite instead of dividing 0/0 into NaN (and exp(-NaN) perplexity).
+    mean_log_probability = total_log_probability / count.clamp_min(1)
+    native_recovery = ((output.sequence_tokens == input.sequence_tokens) & known_design).sum(dim=-1) / known_count.clamp_min(1)
 
     component_index = input.component_index.detach().cpu().tolist()
     component_references = tuple(input.structure.system.component_reference(index) for index in component_index)

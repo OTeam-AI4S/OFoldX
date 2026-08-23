@@ -86,7 +86,7 @@ class NaMpnnPipeline(PairedPipeline[NaMpnnModel, NaMpnnProcessor]):
             pair_logit_bias=pair_logit_bias,
             global_omit_tokens=global_omit_tokens,
         )
-        generator = resolve_generator(seed, generator, device=model_input.atom_coordinates.device)
+        generator = resolve_generator(seed, generator, device=model_input.backbone_coordinates.device)
         return self.model.design(
             model_input,
             num_candidates=num_candidates,
@@ -125,7 +125,7 @@ class NaMpnnPipeline(PairedPipeline[NaMpnnModel, NaMpnnProcessor]):
 
         structure = read_structure(input) if isinstance(input, (str, PathLike)) else input
         model_input = self.processor(structure, sequence=sequence, positions=positions)
-        generator = resolve_generator(seed, generator, device=model_input.atom_coordinates.device)
+        generator = resolve_generator(seed, generator, device=model_input.backbone_coordinates.device)
         return self.model.score(
             model_input,
             num_decoding_orders=num_decoding_orders,
@@ -215,7 +215,7 @@ class NaMpnnPipeline(PairedPipeline[NaMpnnModel, NaMpnnProcessor]):
             pair_logit_bias=pair_logit_bias,
             global_omit_tokens=global_omit_tokens,
         )
-        generator = resolve_generator(seed, generator, device=model_input.atom_coordinates.device)
+        generator = resolve_generator(seed, generator, device=model_input.backbone_coordinates.device)
         return self.model.specificity_profile(
             model_input,
             num_samples=num_samples,

@@ -426,7 +426,7 @@ class AlphaFold2Model(Model):
         pair_metrics: dict[str, PairMetric] = {}
         if output.pae_logits is not None and pae is not None:
             scores["ptm"] = Score(
-                alphafold2_predicted_tm_score(output.pae_logits[0], input.sequence_mask[0], self.config),
+                alphafold2_predicted_tm_score(output.pae_logits[0], input.token_mask[0], self.config),
                 preferred="higher",
             )
             pair_metrics["pae"] = PairMetric(
@@ -637,7 +637,7 @@ class AlphaFold2Model(Model):
         return msa, single, pair, msa_first_row
 
     def _initial_recycling(self, input: _AlphaFold2RecyclingInput) -> tuple[Tensor, Tensor, Tensor]:
-        token_shape = input.sequence_mask.shape
+        token_shape = input.token_mask.shape
         num_tokens = token_shape[-1]
         dtype = input.token_features.dtype
         device = input.token_features.device
@@ -772,7 +772,7 @@ class AlphaFold2InitialGuessModel(AlphaFold2Model):
 
         initial_guess_input = cast(AlphaFold2InitialGuessInput, input)
         binder_mask = initial_guess_input.binder_mask[0].bool()
-        target_mask = initial_guess_input.sequence_mask[0].bool() & ~binder_mask
+        target_mask = initial_guess_input.token_mask[0].bool() & ~binder_mask
         interface_mask = binder_mask[:, None] & target_mask[None, :]
         pae = prediction.pair_metrics["pae"].values
         symmetric_pae = (pae + pae.T) / 2.0
@@ -782,7 +782,7 @@ class AlphaFold2InitialGuessModel(AlphaFold2Model):
         iptm = alphafold2_predicted_interface_tm_score(
             output.pae_logits[0],
             chain_index,
-            initial_guess_input.sequence_mask[0],
+            initial_guess_input.token_mask[0],
             self.config,
         )
         binder_scope = frozenset(
@@ -1212,9 +1212,9 @@ class AlphaFold2MultimerModel(Model):
         pae_logits = output.pae_logits
         assert pae_logits is not None  # the multimer TM head is always constructed
         pae = _predicted_aligned_error(pae_logits[0], self.config)
-        ptm = alphafold2_predicted_tm_score(pae_logits[0], input.sequence_mask[0], self.config)
+        ptm = alphafold2_predicted_tm_score(pae_logits[0], input.token_mask[0], self.config)
         iptm = alphafold2_predicted_interface_tm_score(
-            pae_logits[0], input.chain_index[0], input.sequence_mask[0], self.config
+            pae_logits[0], input.chain_index[0], input.token_mask[0], self.config
         )
         weights = self.config.heads.predicted_aligned_error
         ranking_score = weights.iptm_weight * iptm + weights.ptm_weight * ptm
@@ -1289,7 +1289,7 @@ class AlphaFold2MultimerModel(Model):
                 )
                 next_distances = torch.sqrt(torch.square(next_ca.unsqueeze(-2) - next_ca.unsqueeze(-3)).sum(dim=-1))
                 squared_difference = torch.square(previous_distances - next_distances)
-                pair_mask = input.sequence_mask.unsqueeze(-1) * input.sequence_mask.unsqueeze(-2)
+                pair_mask = input.token_mask.unsqueeze(-1) * input.token_mask.unsqueeze(-2)
                 mean_squared_difference = (squared_difference * pair_mask).sum(dim=(-2, -1)) / (
                     pair_mask.sum(dim=(-2, -1)) + 1e-10
                 )
@@ -1462,7 +1462,7 @@ class AlphaFold2MultimerModel(Model):
         return msa, single, pair, msa_first_row
 
     def _initial_recycling(self, input: _AlphaFold2RecyclingInput) -> tuple[Tensor, Tensor, Tensor]:
-        token_shape = input.sequence_mask.shape
+        token_shape = input.token_mask.shape
         num_tokens = token_shape[-1]
         dtype = input.token_features.dtype
         device = input.token_features.device
@@ -1535,13 +1535,13 @@ class AlphaFold2StructureModule(nn.Module):
         )
 
     def forward(self, single: Tensor, pair: Tensor, input: AlphaFold2Input) -> AlphaFold2StructureModuleOutput:
-        sequence_mask = input.sequence_mask.to(dtype=single.dtype)
+        token_mask = input.token_mask.to(dtype=single.dtype)
         residue_type_ids = input.residue_type_ids.clamp(min=0, max=20)
         act = self.single_norm(single)
         initial_act = act
         act = self.input_projection(act)
         pair = self.pair_norm(pair)
-        affine = AlphaFold2QuatAffine.identity(sequence_mask.shape, device=single.device, dtype=single.dtype)
+        affine = AlphaFold2QuatAffine.identity(token_mask.shape, device=single.device, dtype=single.dtype)
 
         affines = []
         atom14_trajectory = []
@@ -1552,7 +1552,7 @@ class AlphaFold2StructureModule(nn.Module):
             act, affine, angles, unnormalized_angles, sidechain_frames, atom14_positions, raw_affine = self.block(
                 act=act,
                 pair=pair,
-                mask=sequence_mask,
+                mask=token_mask,
                 affine=affine,
                 initial_act=initial_act,
                 residue_type_ids=residue_type_ids,
@@ -1575,8 +1575,8 @@ class AlphaFold2StructureModule(nn.Module):
             [1.0, 1.0, 1.0, 1.0, self.position_scale, self.position_scale, self.position_scale],
         )
         traj = traj * traj_scale
-        atom14_mask = _residue_type_atom14_mask(residue_type_ids, dtype=single.dtype) * sequence_mask.unsqueeze(-1)
-        atom37_positions, atom37_mask = _atom14_to_atom37(atom14_positions, residue_type_ids, sequence_mask)
+        atom14_mask = _residue_type_atom14_mask(residue_type_ids, dtype=single.dtype) * token_mask.unsqueeze(-1)
+        atom37_positions, atom37_mask = _atom14_to_atom37(atom14_positions, residue_type_ids, token_mask)
         return AlphaFold2StructureModuleOutput(
             final_atom_positions=atom37_positions,
             final_atom_mask=atom37_mask,
@@ -1637,13 +1637,13 @@ class AlphaFold2MultimerStructureModule(nn.Module):
         )
 
     def forward(self, single: Tensor, pair: Tensor, input: AlphaFold2MultimerInput) -> AlphaFold2StructureModuleOutput:
-        sequence_mask = input.sequence_mask.to(dtype=single.dtype)
+        token_mask = input.token_mask.to(dtype=single.dtype)
         residue_type_ids = input.residue_type_ids.clamp(min=0, max=20)
         act = self.single_norm(single)
         initial_act = act
         act = self.input_projection(act)
         pair = self.pair_norm(pair)
-        rigid = AlphaFold2Rigid.identity(sequence_mask.shape, device=single.device, dtype=single.dtype)
+        rigid = AlphaFold2Rigid.identity(token_mask.shape, device=single.device, dtype=single.dtype)
 
         frames = []
         atom14_trajectory = []
@@ -1654,7 +1654,7 @@ class AlphaFold2MultimerStructureModule(nn.Module):
             act, rigid, angles, unnormalized_angles, sidechain_frames, atom14_positions = self.block(
                 act=act,
                 pair=pair,
-                mask=sequence_mask,
+                mask=token_mask,
                 rigid=rigid,
                 initial_act=initial_act,
                 residue_type_ids=residue_type_ids,
@@ -1676,8 +1676,8 @@ class AlphaFold2MultimerStructureModule(nn.Module):
             sidechain_unnormalized_angle_trajectory,
             dim=0,
         )
-        atom14_mask = _residue_type_atom14_mask(residue_type_ids, dtype=single.dtype) * sequence_mask.unsqueeze(-1)
-        atom37_positions, atom37_mask = _atom14_to_atom37(atom14_positions, residue_type_ids, sequence_mask)
+        atom14_mask = _residue_type_atom14_mask(residue_type_ids, dtype=single.dtype) * token_mask.unsqueeze(-1)
+        atom37_positions, atom37_mask = _atom14_to_atom37(atom14_positions, residue_type_ids, token_mask)
         return AlphaFold2StructureModuleOutput(
             final_atom_positions=atom37_positions,
             final_atom_mask=atom37_mask,
@@ -1875,8 +1875,8 @@ class AlphaFold2InputEmbeddings(nn.Module):
         token_embedding = self.token_projection(input.token_features)
         msa = token_embedding.unsqueeze(-3) + self.msa_projection(input.msa_features)
         pair = self._build_pair_activations(input, input.token_features)
-        sequence_mask = input.sequence_mask.to(torch.bool)
-        pair_mask = sequence_mask.unsqueeze(-1) & sequence_mask.unsqueeze(-2)
+        token_mask = input.token_mask.to(torch.bool)
+        pair_mask = token_mask.unsqueeze(-1) & token_mask.unsqueeze(-2)
         return msa, pair, input.msa_mask, pair_mask
 
     def _build_pair_activations(self, input: AlphaFold2Input, token_features: Tensor) -> Tensor:
@@ -1944,8 +1944,8 @@ class AlphaFold2MultimerInputEmbeddings(nn.Module):
         token_embedding = self.token_projection(input.token_features)
         msa = token_embedding.unsqueeze(-3) + self.msa_projection(input.msa_features)
         pair = self._build_pair_activations(input)
-        sequence_mask = input.sequence_mask.to(torch.bool)
-        pair_mask = (sequence_mask.unsqueeze(-1) & sequence_mask.unsqueeze(-2)).to(dtype=pair.dtype)
+        token_mask = input.token_mask.to(torch.bool)
+        pair_mask = (token_mask.unsqueeze(-1) & token_mask.unsqueeze(-2)).to(dtype=pair.dtype)
         return msa, pair, input.msa_mask, pair_mask
 
     def _build_pair_activations(self, input: AlphaFold2MultimerInput) -> Tensor:
@@ -3157,7 +3157,7 @@ class _AlphaFold2RecyclingInput(Protocol):
 
     residue_type_ids: Tensor
     token_features: Tensor
-    sequence_mask: Tensor
+    token_mask: Tensor
     msa_tokens: Tensor
     msa_deletions: Tensor
     msa_profile: Tensor
@@ -3729,7 +3729,7 @@ def _predicted_aligned_error(
 
 def alphafold2_predicted_tm_score(
     logits: Tensor,
-    sequence_mask: Tensor,
+    token_mask: Tensor,
     config: AlphaFold2Config | AlphaFold2MultimerConfig,
 ) -> float:
     r"""
@@ -3737,7 +3737,7 @@ def alphafold2_predicted_tm_score(
 
     Args:
         logits: PAE logits for one protein with shape ``(N, N, D)``.
-        sequence_mask: Valid-residue mask with shape ``(N,)``.
+        token_mask: Valid-residue mask with shape ``(N,)``.
         config: AlphaFold 2 configuration defining the PAE bins.
 
     Returns:
@@ -3752,9 +3752,9 @@ def alphafold2_predicted_tm_score(
     )
     step = breaks[1] - breaks[0]
     centers = torch.cat([breaks + step / 2, breaks[-1:] + 3 * step / 2])
-    residue_count = max(int(sequence_mask.sum().item()), 19)
+    residue_count = max(int(token_mask.sum().item()), 19)
     predicted = (logits.float().softmax(dim=-1) * tm_bin_weights(centers, residue_count)).sum(dim=-1)
-    weights = sequence_mask.to(device=predicted.device, dtype=predicted.dtype)
+    weights = token_mask.to(device=predicted.device, dtype=predicted.dtype)
     pair_mask = weights.unsqueeze(-1) * weights.unsqueeze(-2)
     alignment = (predicted * pair_mask * weights.unsqueeze(0)).sum(dim=-1) / (
         pair_mask.mul(weights.unsqueeze(0)).sum(dim=-1) + 1e-8
@@ -3904,20 +3904,20 @@ def _frames_and_literature_positions_to_atom14_pos(
 
 
 def _atom14_to_atom37(
-    atom14_positions: Tensor, residue_type_ids: Tensor, sequence_mask: Tensor
+    atom14_positions: Tensor, residue_type_ids: Tensor, token_mask: Tensor
 ) -> tuple[Tensor, Tensor]:
     r"""
     Scatter dense ``atom14`` coordinates into the ``atom37`` layout.
 
     Returns ``(atom37_positions, atom37_mask)`` where the mask combines the per-residue-type atom37
-    existence table with ``sequence_mask``.
+    existence table with ``token_mask``.
     """
 
     atom37_to_atom14 = _gather_residue_type(_RESIDUE_TYPE_ATOM37_TO_ATOM14, residue_type_ids, dtype=torch.long)
     gather_index = atom37_to_atom14.unsqueeze(-1).expand(*atom37_to_atom14.shape, atom14_positions.shape[-1])
     atom37_positions = torch.gather(atom14_positions, dim=-2, index=gather_index)
     atom37_mask = _gather_residue_type(_RESIDUE_TYPE_ATOM37_MASK, residue_type_ids, dtype=atom14_positions.dtype)
-    atom37_mask = atom37_mask * sequence_mask.unsqueeze(-1).to(dtype=atom37_mask.dtype)
+    atom37_mask = atom37_mask * token_mask.unsqueeze(-1).to(dtype=atom37_mask.dtype)
     return atom37_positions * atom37_mask.unsqueeze(-1), atom37_mask
 
 
@@ -4177,7 +4177,7 @@ def _apply_inverse_rigid_to_points(rigid: AlphaFold2Rigid, points: Tensor) -> Te
 def alphafold2_predicted_interface_tm_score(
     logits: Tensor,
     chain_index: Tensor,
-    sequence_mask: Tensor,
+    token_mask: Tensor,
     config: AlphaFold2Config | AlphaFold2MultimerConfig,
 ) -> float:
     r"""
@@ -4186,7 +4186,7 @@ def alphafold2_predicted_interface_tm_score(
     Args:
         logits: PAE logits for one assembly with shape ``(N, N, D)``.
         chain_index: Chain index for each residue with shape ``(N,)``.
-        sequence_mask: Valid-residue mask with shape ``(N,)``.
+        token_mask: Valid-residue mask with shape ``(N,)``.
         config: AlphaFold 2 configuration defining the PAE bins.
 
     Returns:
@@ -4202,12 +4202,12 @@ def alphafold2_predicted_interface_tm_score(
     )
     step = breaks[1] - breaks[0]
     centers = torch.cat([breaks + step / 2, breaks[-1:] + 3 * step / 2])
-    residue_count = max(int(sequence_mask.sum().item()), 19)
+    residue_count = max(int(token_mask.sum().item()), 19)
     d0 = 1.24 * (residue_count - 15) ** (1.0 / 3.0) - 1.8
     tm_per_bin = 1.0 / (1.0 + (centers / d0) ** 2)
     predicted = (logits.float().softmax(dim=-1) * tm_per_bin).sum(dim=-1)
 
-    weights = sequence_mask.to(device=predicted.device, dtype=predicted.dtype)
+    weights = token_mask.to(device=predicted.device, dtype=predicted.dtype)
     chain_index = chain_index.to(device=predicted.device)
     cross_chain = (chain_index.unsqueeze(-1) != chain_index.unsqueeze(-2)).to(dtype=predicted.dtype)
     pair_mask = weights.unsqueeze(-1) * weights.unsqueeze(-2) * cross_chain
@@ -4373,7 +4373,7 @@ class AlphaFold2Input:
         residue_type_ids: Residue token IDs with shape ``(B, N)``.
         token_features: Target features with shape ``(B, N, 22)``.
         residue_index: Chain-local residue indices with shape ``(B, N)``.
-        sequence_mask: Valid-residue mask with shape ``(B, N)``.
+        token_mask: Valid-residue mask with shape ``(B, N)``.
         msa_tokens: Unclustered canonical MSA token IDs with shape ``(B, M, N)``.
         msa_deletions: MSA deletion counts with shape ``(B, M, N)``.
         msa_profile: Full-MSA residue frequencies with shape ``(B, N, 38)``.
@@ -4412,7 +4412,7 @@ class AlphaFold2Input:
     residue_type_ids: Tensor
     token_features: Tensor
     residue_index: Tensor
-    sequence_mask: Tensor
+    token_mask: Tensor
     msa_tokens: Tensor
     msa_deletions: Tensor
     msa_profile: Tensor
@@ -4525,7 +4525,7 @@ class AlphaFold2MultimerInput:
         residue_type_ids: Residue token IDs with shape ``(B, N)``.
         token_features: Target features with shape ``(B, N, 21)``.
         residue_index: Chain-local residue indices with shape ``(B, N)``.
-        sequence_mask: Valid-residue mask with shape ``(B, N)``.
+        token_mask: Valid-residue mask with shape ``(B, N)``.
         chain_index: Molecular-instance indices with shape ``(B, N)``.
         entity_index: Shared-sequence entity indices with shape ``(B, N)``.
         symmetry_index: Copy indices within each entity with shape ``(B, N)``.
@@ -4568,7 +4568,7 @@ class AlphaFold2MultimerInput:
     residue_type_ids: Tensor
     token_features: Tensor
     residue_index: Tensor
-    sequence_mask: Tensor
+    token_mask: Tensor
     chain_index: Tensor
     entity_index: Tensor
     symmetry_index: Tensor

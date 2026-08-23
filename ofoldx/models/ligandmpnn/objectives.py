@@ -30,6 +30,6 @@ def criterion(
         log_probabilities,
         weight=label_smoothing,
     )
-    mask = (target.residue_mask & target.design_positions).to(per_residue.dtype)
+    mask = (target.residue_mask & target.design_mask).to(per_residue.dtype)
     scope = mask.sum()
     return (per_residue * mask).sum() / scope
