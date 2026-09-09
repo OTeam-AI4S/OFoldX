@@ -12,6 +12,10 @@ CHECKS = (
     "ligandmpnn.py",
     "nampnn.py",
     "mpnn_packer.py",
+    "grnade.py",
+    "oinvfold.py",
+    "rfdiffusion.py",
+    "blocked.py",
 )
 
 

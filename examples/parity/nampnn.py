@@ -18,7 +18,8 @@ import torch
 import torch.nn.functional as F
 
 from ofoldx.data.structure import Structure
-from ofoldx.models.nampnn import NA_MPNN_ATOM_NAMES, NaMpnnConfig, NaMpnnInput, NaMpnnModel
+from ofoldx.models.nampnn.model import NA_MPNN_ATOM_NAMES, NaMpnnInput, NaMpnnModel
+from ofoldx.models.nampnn import NaMpnnConfig
 from ofoldx.models.nampnn.convert import convert_nampnn_state_dict
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))

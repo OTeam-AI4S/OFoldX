@@ -120,7 +120,7 @@ def _from_checkpoint(source: Path, checkpoint: Path):
         dropout=0.1,
         ca_only=ca_only,
     )
-    upstream.load_state_dict(state, strict=False)
+    upstream.load_state_dict(state, strict=True)
     converted = convert_proteinmpnn_model(checkpoint)
     return upstream, converted, max(neighbors, 12), ca_only
 
