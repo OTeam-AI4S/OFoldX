@@ -15,6 +15,27 @@ CKPT_DIR = Path("/tmp/ofoldx-ckpts")
 UPSTREAM_DIR = Path("/tmp/ofoldx-upstream")
 
 
+def hf_download(repo_id: str, filename: str, dest_dir: Path | None = None) -> Path:
+    from huggingface_hub import hf_hub_download
+
+    dest_dir = CKPT_DIR if dest_dir is None else dest_dir
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    return Path(
+        hf_hub_download(
+            repo_id,
+            filename,
+            local_dir=str(dest_dir),
+        )
+    )
+
+
+def report_convert(label: str, model: object) -> None:
+    state = model.state_dict()  # type: ignore[attr-defined]
+    n_tensors = sum(1 for _ in state)
+    n_params = sum(value.numel() for value in state.values() if hasattr(value, "numel"))
+    print(f"{label}: tensors={n_tensors} params={n_params} strict_load=ok", flush=True)
+
+
 def clone_source(url: str, dest: Path, marker: str) -> Path:
     if (dest / marker).exists():
         return dest

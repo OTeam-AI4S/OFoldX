@@ -15,7 +15,15 @@ CHECKS = (
     "grnade.py",
     "oinvfold.py",
     "rfdiffusion.py",
-    "blocked.py",
+    "alphafold2.py",
+    "pxdesign.py",
+    "protenix.py",
+    "esmfold2.py",
+    "boltzgen.py",
+    "boltz2.py",
+    "boltz1.py",
+    "odesign.py",
+    "alphafold3.py",
 )
 
 
