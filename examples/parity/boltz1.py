@@ -24,7 +24,7 @@ from ofoldx.models.boltz1.convert import (
 from ofoldx.models.boltz1.model import Boltz1Model
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _common import hf_download, report_convert
+from _common import hf_download, load_pickle_checkpoint, report_convert
 
 _REPO = "boltz-community/boltz-1"
 _FILE = "boltz1_conf.ckpt"
@@ -32,10 +32,10 @@ _FALLBACK = "boltz1.ckpt"
 
 
 def _load_checkpoint(path: Path) -> dict:
-    try:
-        return torch.load(path, map_location="cpu", mmap=True, weights_only=False)
-    except TypeError:
-        return torch.load(path, map_location="cpu", weights_only=False)
+    loaded = load_pickle_checkpoint(path, mmap=True)
+    if not isinstance(loaded, dict):
+        raise TypeError(f"unsupported Boltz-1 checkpoint type {type(loaded)!r}")
+    return loaded
 
 
 def main(argv: list[str] | None = None) -> None:

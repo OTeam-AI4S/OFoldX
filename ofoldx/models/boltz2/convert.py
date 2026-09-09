@@ -994,7 +994,7 @@ def boltz2_config_from_checkpoint(
     if template_args is not None:
         config.template.hidden_size = template_args["template_dim"]
         config.template.num_blocks = template_args["template_blocks"]
-        config.template.num_distogram_bins = template_args["num_bins"]
+        config.template.num_distogram_bins = template_args.get("num_bins", config.template.num_distogram_bins)
         config.template.dropout = template_args.get("dropout", 0.25)
         config.template.min_distance = template_args.get("min_dist", 3.25)
         config.template.max_distance = template_args.get("max_dist", 50.75)

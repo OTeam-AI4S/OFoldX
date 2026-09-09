@@ -328,7 +328,7 @@ def _normalize_structure_module_key(key: str) -> str | None:
     angle_match = re.fullmatch(r"structure_module\.angle_resnet\.layers\.(\d+)\.linear_([12])\.(.+)", key)
     if angle_match is not None:
         block_index, linear_index, suffix = angle_match.groups()
-        target_name = "linear1" if linear_index == "1" else "linear2"
+        target_name = "input_projection" if linear_index == "1" else "output_projection"
         return f"structure_module.block.sidechain.blocks.{block_index}.{target_name}.{suffix}"
     return None
 

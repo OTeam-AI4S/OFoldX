@@ -15,6 +15,42 @@ CKPT_DIR = Path("/tmp/ofoldx-ckpts")
 UPSTREAM_DIR = Path("/tmp/ofoldx-upstream")
 
 
+def load_pickle_checkpoint(path: Path, *, mmap: bool = False) -> object:
+    """Load a Lightning/PyTorch pickle that references missing upstream classes."""
+
+    import pickle
+
+    class _Dummy:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            if kwargs:
+                self.__dict__.update(kwargs)
+
+        def __setstate__(self, state: object) -> None:
+            if isinstance(state, dict):
+                self.__dict__.update(state)
+
+    class _TolerantUnpickler(pickle.Unpickler):
+        def find_class(self, module: str, name: str):
+            try:
+                return super().find_class(module, name)
+            except (ModuleNotFoundError, AttributeError):
+                return _Dummy
+
+    class _tolerant_pickle:
+        Unpickler = _TolerantUnpickler
+        load = pickle.load
+        loads = pickle.loads
+
+    kwargs: dict = {
+        "map_location": "cpu",
+        "weights_only": False,
+        "pickle_module": _tolerant_pickle,
+    }
+    if mmap:
+        kwargs["mmap"] = True
+    return torch.load(path, **kwargs)
+
+
 def hf_download(repo_id: str, filename: str, dest_dir: Path | None = None) -> Path:
     from huggingface_hub import hf_hub_download
 

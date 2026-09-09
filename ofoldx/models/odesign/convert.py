@@ -952,7 +952,7 @@ def _replace_atom_key(key: str) -> str:
 
 
 def _replace_pairformer_key(key: str) -> str:
-    return _replace_many(
+    key = _replace_many(
         key,
         {
             ".pair_update.transition.": ".pair_transition.",
@@ -987,6 +987,11 @@ def _replace_pairformer_key(key: str) -> str:
             ".tri_att_start.attention.projection.": ".tri_att_start.mha.",
             ".tri_att_end.attention.projection.": ".tri_att_end.mha.",
         },
+    )
+    return re.sub(
+        r"\.pairformer_stack\.blocks\.(\d+)\.transition\.",
+        r".pairformer_stack.blocks.\1.pair_transition.",
+        key,
     )
 
 
