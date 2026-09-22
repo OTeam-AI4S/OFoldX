@@ -5,14 +5,20 @@ Use these values to select chains, combine molecular systems, and pass structure
 
 ## Usage
 
-Identify a component within an instance:
+Set `OFOLDX_CCD_ARTIFACT` to an existing CCD artifact before reading a structure.
+
+Read a structure and select author chain `A`, omitting water and folding explicit hydrogens into hydrogen counts:
 
 ```python
-from ofoldx.data import ComponentRef
+from ofoldx.io import read_structure
 
-component = ComponentRef("A", 0)
-print(component)
+structure, report = read_structure("input.cif")
+protein = structure.select(chains=["A"], water=False, hydrogens=False)
+print(protein.coordinates.shape)
+print(protein.coordinate_mask.sum())
 ```
+
+Supply a structure containing author chain `A`. Selection returns the selected `Structure` and leaves the source unchanged. Use `namespace="label"` when selecting label asym IDs instead of author chain names.
 
 ## Molecular Values
 
@@ -59,4 +65,5 @@ Invalid requests, unsupported representations, and insufficient placement inform
 
 ## Related Modules
 
+- [I/O](../io/README.md): read, write, and persist structures.
 - [Chemistry](../chemistry/README.md): component definitions and construction recipes.

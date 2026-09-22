@@ -148,7 +148,11 @@ jobs:
           /tmp/ofoldx-smoke/bin/python -m pip install dist/*.whl
           ofoldx_smoke_dir=$(mktemp -d)
           cd "$ofoldx_smoke_dir"
-          /tmp/ofoldx-smoke/bin/python -I -c "import ofoldx"
+          /tmp/ofoldx-smoke/bin/python -I - <<'PY_SMOKE'
+          from importlib.resources import files
+
+          assert files("ofoldx").joinpath("reference/space_groups/space_group_operators.json").is_file()
+          PY_SMOKE
       - name: Upload distributions
         uses: actions/upload-artifact@v7
         with:

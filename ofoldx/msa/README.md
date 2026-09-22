@@ -43,6 +43,27 @@ construction.
 Use `save_msa_collection` and `load_msa_collection` to retain an explicit row plan, its pools, deletion counts, and
 instance bindings together.
 
+## Indexed Collections
+
+Set `OFOLDX_CCD_ARTIFACT` to an existing CCD artifact before reading a structure.
+
+`IndexedMsaLoader` reads existing protein/RNA alignment directories lazily:
+
+```python
+from ofoldx.io import read_structure
+from ofoldx.msa import IndexedMsaLoader
+
+structure, report = read_structure("complex.cif")
+loader = IndexedMsaLoader(index="sequence_to_directory.json", root="msa")
+pools = loader(structure)
+print(tuple(pools))
+```
+
+The JSON index maps query sequences to directory names under `root`. Protein directories contain `pairing.a3m`
+and `non_pairing.a3m`; optional RNA indices use the RNA directory layout documented by the loader. The returned
+mapping is keyed by instance ID, and a pool's files are read on access. Instances without an index entry remain
+absent from that mapping.
+
 ## Related Modules
 
 - [Data](../data/README.md): target instances, sequence classes, and token layouts.

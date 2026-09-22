@@ -33,6 +33,7 @@ ACRONYMS = {
 
 SECTION_PACKAGES = {
     "Data": ("data", PACKAGE_ROOT / "data", "ofoldx.data"),
+    "I/O": ("io", PACKAGE_ROOT / "io", "ofoldx.io"),
     "Modules": ("modules", PACKAGE_ROOT / "modules", "ofoldx.modules"),
 }
 
@@ -44,6 +45,7 @@ PACKAGE_DOC_TARGETS = {
     ROOT / "privacy.md": "about/privacy.md",
     ROOT / "privacy.zh.md": "about/privacy.md",
     PACKAGE_ROOT / "data": "data/index.md",
+    PACKAGE_ROOT / "io": "io/index.md",
     PACKAGE_ROOT / "modules": "modules/index.md",
 }
 

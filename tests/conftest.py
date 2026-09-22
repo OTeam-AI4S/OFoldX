@@ -21,12 +21,29 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from pathlib import Path
 
 import numpy as np
 import pytest
 
+from ofoldx.chemistry.construction import Molecule, PolymerSequence, Recipe, build_system
+from ofoldx.chemistry.definitions import (
+    ChemicalComponent,
+    ComponentItems,
+    ComponentLibrary,
+    define_component,
+    load_library,
+    write_artifact,
+)
+from ofoldx.data import Structure
+from ofoldx.data.molecular import DefinitionScope
+from ofoldx.data.structure import CoordinateEvidence, replace_coordinates
 from ofoldx.errors import InvalidRequestError
+from ofoldx.io.cif import read_cif
+from ofoldx.io.mmcif.decode import decode_components
+
+from .chemistry.builders import SUBSET, provenance
 
 
 def _beta_backbone() -> np.ndarray:
@@ -158,5 +175,70 @@ def polymers():
         symbols = {name: () for name in ("chem_comp_type", "connection_type", "parent", "one_letter", "polymer_type")}
         symbols |= {"entity": tuple(entities), "instance": tuple(name for name, _, _ in chains), "component": family}
         return MolecularSystem.from_arrays(SystemArrays(symbols | {"atom": ("CA", "CB")}, columns))
+
+    return build
+
+
+@pytest.fixture(scope="session")
+def ccd() -> Mapping[str, ComponentItems]:
+    r"""The CCD subset decoded through io, by component id."""
+    cif = read_cif(SUBSET)
+    return {
+        block.name: decode_components(block.categories, block=block.name).components[block.name] for block in cif.blocks
+    }
+
+
+@pytest.fixture(scope="session")
+def archive(ccd) -> Callable[[str], ChemicalComponent]:
+    r"""The ARCHIVE definition of a subset id (defined once per id)."""
+    cache: dict[str, ChemicalComponent] = {}
+
+    def get(component_id: str) -> ChemicalComponent:
+        if component_id not in cache:
+            cache[component_id] = define_component(ccd[component_id], scope=DefinitionScope.ARCHIVE)
+        return cache[component_id]
+
+    return get
+
+
+@pytest.fixture(scope="session")
+def ccd_artifact(ccd, archive, tmp_path_factory) -> Path:
+    """The CCD subset of ``tests/fixtures/ccd`` written as an artifact (ALA, GLY, SER, LYS, MSE, ACT, ZN, HOH, …)."""
+    path = tmp_path_factory.mktemp("ccd") / "subset.safetensors"
+    write_artifact([archive(component_id) for component_id in ccd], path, provenance("subset"))
+    return path
+
+
+@pytest.fixture(scope="session")
+def library(ccd_artifact) -> ComponentLibrary:
+    """The CCD subset artifact, loaded."""
+    return load_library(ccd_artifact)
+
+
+@pytest.fixture
+def peptide(library) -> Callable[..., Structure]:
+    """``peptide("ALA", "MSE", ..., copies=1, ligands=("ACT",))``: chains ``A``, ``B``, … of those residues (``copies``
+    instances of entity ``P``) and one instance per ligand after them, every atom placed at its reference coordinates
+    shifted 4 Å per component, evidence OBSERVED."""
+
+    def build(*components: str, copies: int = 1, ligands: tuple[str, ...] = ()) -> Structure:
+        entities: dict = {"P": PolymerSequence("polypeptide(L)", components)}
+        instances = {chr(ord("A") + k): "P" for k in range(copies)}
+        for k, ligand in enumerate(ligands):
+            entities[f"L{k}"] = Molecule((ligand,))
+            instances[chr(ord("A") + copies + k)] = f"L{k}"
+        system, _, _ = build_system(Recipe(entities, instances), library)
+        reference, _ = system.reference_coordinates()
+        owner = np.repeat(np.arange(len(system.component_symbol)), np.diff(system.component_atom_ptr))
+        coordinates = reference + 4.0 * owner[:, None] * np.array([1.0, 0.0, 0.0])
+        every = np.ones(len(owner), dtype=bool)
+        structure, _ = replace_coordinates(
+            Structure.unobserved(system),
+            np.arange(len(owner)),
+            coordinates,
+            scope=every,
+            evidence=CoordinateEvidence.OBSERVED,
+        )
+        return structure
 
     return build

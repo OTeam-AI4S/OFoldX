@@ -48,7 +48,8 @@ prepare such a target according to their own scientific requirements.
   can be supplied to `build_system` through its `components` argument.
 
 SMILES syntax, chemical identity, reference conformers, and observed coordinates carry distinct evidence. The
-definition and construction APIs retain unknown facts and report contradictions.
+definition and construction APIs retain unknown facts and report contradictions. A default structure read applies
+no consumer assumptions; select explicit `AssumptionSet` rules when a task requires them.
 
 Reference conformer embedding and RDKit conversion operate on the chemical information their concrete functions
 require. A generated conformer does not become an experimental observation.
@@ -56,3 +57,4 @@ require. A generated conformer does not become an experimental observation.
 ## Related Modules
 
 - [Data](../data/README.md): molecular values, graph edits, projections, and coordinate evidence.
+- [I/O](../io/README.md): read source definitions and structure observations together.

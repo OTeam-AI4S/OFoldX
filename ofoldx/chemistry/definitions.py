@@ -45,7 +45,7 @@ from dataclasses import dataclass, field, fields
 from enum import IntEnum
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, NoReturn, cast
+from typing import TYPE_CHECKING, NoReturn, TypeGuard, cast
 
 import numpy as np
 from numpy.typing import NDArray
@@ -492,13 +492,15 @@ def _parse(items: ComponentItems, component_id: str) -> tuple[_Draft | None, lis
         if i < 0 or j < 0 or i == j:
             return withheld(offset + n + row)
         pairs.append((min(i, j), max(i, j)))
-    token, token_states = _enumerated(items.bonds, "value_order", m, _TOKENS, 0)
-    token = np.array(token, dtype=np.uint8)
+    order_values, token_states = _enumerated(items.bonds, "value_order", m, _TOKENS, 0)
+    order_tokens = np.array(order_values, dtype=np.uint8)
     bond_aromatic, bond_aromatic_state = _boolean(items.bonds, "pdbx_aromatic_flag", m)
     bond_labels, _ = _enumerated(items.bonds, "pdbx_stereo_config", m, _LABELS, None)
     bonds: dict[str, NDArray] = {
-        "bond_order_token": token,
-        "bond_order_token_state": np.where(known(token_states) & (token == 0), _NULL, token_states).astype(np.uint8),
+        "bond_order_token": order_tokens,
+        "bond_order_token_state": np.where(known(token_states) & (order_tokens == 0), _NULL, token_states).astype(
+            np.uint8
+        ),
         "bond_aromatic": bond_aromatic,
         "bond_aromatic_state": bond_aromatic_state,
         "label": np.array(bond_labels, dtype=object),
@@ -1226,9 +1228,12 @@ class ComponentLibrary:
                 values[name] = columns[name][ptr[i] : ptr[i + 1]]
             offsets, item = columns["record.offset"], f"{self._ids[i]}.record"
             record = _json(columns["record"][offsets[i] : offsets[i + 1]].tobytes(), item)
-            fields_ = isinstance(record, dict) and set(record) == set(_RECORD)
-            source = record["reference_source"] if fields_ else None
-            if not fields_ or type(source) is not int or source not in _REFERENCE_SOURCES:
+            if (
+                not isinstance(record, dict)
+                or set(record) != set(_RECORD)
+                or type(source := record["reference_source"]) is not int
+                or source not in _REFERENCE_SOURCES
+            ):
                 _corrupt(item)  # not one definition's fields
             values |= {key: tuple(value) if isinstance(value, list) else value for key, value in record.items()}
             values["reference_source"] = ReferenceSource(source)
@@ -1299,7 +1304,7 @@ def _json(data: bytes, item: str) -> object:
         return None
 
 
-def _counts(value: object, length: int | None = None) -> bool:
+def _counts(value: object, length: int | None = None) -> TypeGuard[list[int]]:
     r"""Whether ``value`` is a JSON list of non-negative integers (of ``length`` entries when given)."""
     return (
         isinstance(value, list)
@@ -1313,10 +1318,10 @@ def _tensor(payload: memoryview, name: str, entry: object) -> NDArray:
     layout, a shape of at most two dimensions, none past the payload, and the byte range of exactly that many values
     inside the payload."""
     entry = entry if isinstance(entry, dict) else {}
-    dtype, shape, offsets = entry.get("dtype"), entry.get("shape"), entry.get("data_offsets")
-    if not (isinstance(dtype, str) and dtype in _DTYPES and _counts(shape) and _counts(offsets, 2)):
+    dtype_name, shape, offsets = entry.get("dtype"), entry.get("shape"), entry.get("data_offsets")
+    if not (isinstance(dtype_name, str) and dtype_name in _DTYPES and _counts(shape) and _counts(offsets, 2)):
         _corrupt(name)
-    dtype, (start, stop) = _DTYPES[dtype], offsets
+    dtype, (start, stop) = _DTYPES[dtype_name], offsets
     if not start <= stop <= len(payload) or stop - start != dtype.itemsize * math.prod(shape):
         _corrupt(name)
     # a zero dimension passes the byte count whatever the others are: they are bounded by the payload too
@@ -1350,7 +1355,7 @@ def load_library(path: str | PathLike) -> ComponentLibrary:
         _corrupt("sha256")
     if "content_version" not in metadata:
         _corrupt("header")
-    columns = {name: _tensor(payload, name, entry) for name, entry in header.items()}
+    columns = {name: _tensor(payload, name, entry) for name, entry in cast(dict[str, object], header).items()}
     provenance = ArtifactProvenance(**{key: str(metadata[key]) for key in (*_PROVENANCE, "sha256")})
     return ComponentLibrary(columns, provenance)
 
