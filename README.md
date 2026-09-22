@@ -29,6 +29,7 @@ pip install git+https://github.com/OTeam-AI4S/OFoldX
 | [`msa`](ofoldx/msa)             | Read, pair and prepare sequence alignments.                 |
 | [`templates`](ofoldx/templates) | Supply structural template evidence.                        |
 | [`modules`](ofoldx/modules)     | Reuse neural-network and geometry components.               |
+| [`results`](ofoldx/results)     | Interpret candidates, scores and molecular metrics.         |
 
 ## Community
 

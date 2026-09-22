@@ -29,6 +29,7 @@ pip install git+https://github.com/OTeam-AI4S/OFoldX
 | [`msa`](ofoldx/msa)             | 读取、配对和准备序列比对。   |
 | [`templates`](ofoldx/templates) | 提供结构模板证据。           |
 | [`modules`](ofoldx/modules)     | 复用神经网络与几何组件。     |
+| [`results`](ofoldx/results)     | 解读候选、分数与分子指标。   |
 
 ## 社区
 

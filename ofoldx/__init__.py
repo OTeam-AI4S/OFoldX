@@ -35,6 +35,23 @@ if TYPE_CHECKING:
     from .data import MolecularSystem, Structure
     from .modules.backend import Backend
     from .msa import MSA
+    from .results import (
+        AutoregressiveProbabilityResult,
+        DesignAndPackResult,
+        DesignCandidate,
+        DesignResult,
+        FoldPrediction,
+        FoldResult,
+        Metric,
+        MetricReference,
+        PackPrediction,
+        PackResult,
+        PairMetric,
+        Score,
+        Scored,
+        ScoreResult,
+        best,
+    )
     from .templates import Template
 
 
@@ -47,6 +64,21 @@ _EXPORTS = {
     "Structure": (".data", "Structure"),
     "Template": (".templates", "Template"),
     "Backend": (".modules.backend", "Backend"),
+    "AutoregressiveProbabilityResult": (".results", "AutoregressiveProbabilityResult"),
+    "DesignAndPackResult": (".results", "DesignAndPackResult"),
+    "DesignCandidate": (".results", "DesignCandidate"),
+    "DesignResult": (".results", "DesignResult"),
+    "FoldPrediction": (".results", "FoldPrediction"),
+    "FoldResult": (".results", "FoldResult"),
+    "Metric": (".results", "Metric"),
+    "MetricReference": (".results", "MetricReference"),
+    "PackPrediction": (".results", "PackPrediction"),
+    "PackResult": (".results", "PackResult"),
+    "PairMetric": (".results", "PairMetric"),
+    "Score": (".results", "Score"),
+    "Scored": (".results", "Scored"),
+    "ScoreResult": (".results", "ScoreResult"),
+    "best": (".results", "best"),
 }
 
 

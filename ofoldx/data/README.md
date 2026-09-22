@@ -67,3 +67,4 @@ Invalid requests, unsupported representations, and insufficient placement inform
 
 - [I/O](../io/README.md): read, write, and persist structures.
 - [Chemistry](../chemistry/README.md): component definitions and construction recipes.
+- [Results](../results/README.md): structures and scores returned by model workflows.

@@ -35,6 +35,7 @@ SECTION_PACKAGES = {
     "Data": ("data", PACKAGE_ROOT / "data", "ofoldx.data"),
     "I/O": ("io", PACKAGE_ROOT / "io", "ofoldx.io"),
     "Modules": ("modules", PACKAGE_ROOT / "modules", "ofoldx.modules"),
+    "Results": ("results", PACKAGE_ROOT / "results", "ofoldx.results"),
 }
 
 PACKAGE_DOC_TARGETS = {
@@ -47,6 +48,7 @@ PACKAGE_DOC_TARGETS = {
     PACKAGE_ROOT / "data": "data/index.md",
     PACKAGE_ROOT / "io": "io/index.md",
     PACKAGE_ROOT / "modules": "modules/index.md",
+    PACKAGE_ROOT / "results": "results/index.md",
 }
 
 ATTRIBUTE_MODULES = {
