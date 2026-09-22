@@ -32,6 +32,7 @@ pip install git+https://github.com/OTeam-AI4S/OFoldX
 | [`modules`](ofoldx/modules)     | Reuse neural-network and geometry components.                     |
 | [`results`](ofoldx/results)     | Interpret candidates, scores and molecular metrics.               |
 | [`metrics`](ofoldx/metrics)     | Compute structural comparison metrics.                            |
+| [`analysis`](ofoldx/analysis)   | Filter and rank design candidates.                                |
 
 ## Community
 

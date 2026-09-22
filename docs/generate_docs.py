@@ -32,6 +32,7 @@ ACRONYMS = {
 }
 
 SECTION_PACKAGES = {
+    "Analysis": ("analysis", PACKAGE_ROOT / "analysis", "ofoldx.analysis"),
     "Data": ("data", PACKAGE_ROOT / "data", "ofoldx.data"),
     "I/O": ("io", PACKAGE_ROOT / "io", "ofoldx.io"),
     "Modules": ("modules", PACKAGE_ROOT / "modules", "ofoldx.modules"),
@@ -46,6 +47,7 @@ PACKAGE_DOC_TARGETS = {
     ROOT / "license-faq.zh.md": "about/license-faq.md",
     ROOT / "privacy.md": "about/privacy.md",
     ROOT / "privacy.zh.md": "about/privacy.md",
+    PACKAGE_ROOT / "analysis": "analysis/index.md",
     PACKAGE_ROOT / "data": "data/index.md",
     PACKAGE_ROOT / "io": "io/index.md",
     PACKAGE_ROOT / "modules": "modules/index.md",

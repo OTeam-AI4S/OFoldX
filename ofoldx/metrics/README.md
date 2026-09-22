@@ -45,5 +45,6 @@ describes each reduction.
 
 ## Related Modules
 
+- [Analysis](../analysis/README.md): matching, annotations, grouping, filtering, and ranking.
 - [Results](../results/README.md): retain units and molecular axes alongside scores.
 - [Modules](../modules/README.md): learned heads that produce confidence logits.
