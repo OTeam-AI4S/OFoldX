@@ -32,6 +32,7 @@ pip install git+https://github.com/OTeam-AI4S/OFoldX
 | [`modules`](ofoldx/modules)     | 复用神经网络与几何组件。                 |
 | [`results`](ofoldx/results)     | 解读候选、分数与分子指标。               |
 | [`metrics`](ofoldx/metrics)     | 计算结构比较指标。                       |
+| [`analysis`](ofoldx/analysis)   | 筛选和排序设计候选。                     |
 
 ## 社区
 

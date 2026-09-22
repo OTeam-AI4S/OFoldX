@@ -23,6 +23,7 @@ nav:
   - I/O: []
   - Modules: []
   - Metrics: []
+  - Analysis: []
   - Results: []
   - About:
       - License: about/license.md
