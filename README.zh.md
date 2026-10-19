@@ -25,6 +25,7 @@ pip install git+https://github.com/OTeam-AI4S/OFoldX
 | ------------------------------- | -------------------------- |
 | [`data`](ofoldx/data)           | 表达分子身份、坐标和观测。 |
 | [`chemistry`](ofoldx/chemistry) | 定义化学组分和构建分子。   |
+| [`msa`](ofoldx/msa)             | 读取、配对和准备序列比对。 |
 | [`modules`](ofoldx/modules)     | 复用神经网络与几何组件。   |
 
 ## 社区

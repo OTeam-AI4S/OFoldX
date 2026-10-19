@@ -25,6 +25,7 @@ pip install git+https://github.com/OTeam-AI4S/OFoldX
 | ------------------------------- | ----------------------------------------------------------- |
 | [`data`](ofoldx/data)           | Represent molecular identity, coordinates and observations. |
 | [`chemistry`](ofoldx/chemistry) | Define chemical components and construct molecules.         |
+| [`msa`](ofoldx/msa)             | Read, pair and prepare sequence alignments.                 |
 | [`modules`](ofoldx/modules)     | Reuse neural-network and geometry components.               |
 
 ## Community

@@ -34,11 +34,13 @@ if TYPE_CHECKING:
     from .chemistry import PolymerSequence
     from .data import MolecularSystem, Structure
     from .modules.backend import Backend
+    from .msa import MSA
 
 
 _EXPORTS = {
     "__version__": ("._version", "__version__"),
     "version": ("._version", "version"),
+    "MSA": (".msa", "MSA"),
     "MolecularSystem": (".data", "MolecularSystem"),
     "PolymerSequence": (".chemistry", "PolymerSequence"),
     "Structure": (".data", "Structure"),
