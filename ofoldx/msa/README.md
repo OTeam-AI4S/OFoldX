@@ -66,4 +66,5 @@ absent from that mapping.
 
 ## Related Modules
 
+- [Templates](../templates/README.md): aligned structural evidence.
 - [Data](../data/README.md): target instances, sequence classes, and token layouts.

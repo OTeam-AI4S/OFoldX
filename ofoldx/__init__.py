@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from .data import MolecularSystem, Structure
     from .modules.backend import Backend
     from .msa import MSA
+    from .templates import Template
 
 
 _EXPORTS = {
@@ -44,6 +45,7 @@ _EXPORTS = {
     "MolecularSystem": (".data", "MolecularSystem"),
     "PolymerSequence": (".chemistry", "PolymerSequence"),
     "Structure": (".data", "Structure"),
+    "Template": (".templates", "Template"),
     "Backend": (".modules.backend", "Backend"),
 }
 

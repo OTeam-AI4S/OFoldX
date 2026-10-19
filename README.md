@@ -27,6 +27,7 @@ pip install git+https://github.com/OTeam-AI4S/OFoldX
 | [`io`](ofoldx/io)               | Read and write mmCIF, PDB and native artifacts.             |
 | [`chemistry`](ofoldx/chemistry) | Define chemical components and construct molecules.         |
 | [`msa`](ofoldx/msa)             | Read, pair and prepare sequence alignments.                 |
+| [`templates`](ofoldx/templates) | Supply structural template evidence.                        |
 | [`modules`](ofoldx/modules)     | Reuse neural-network and geometry components.               |
 
 ## Community

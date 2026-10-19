@@ -27,6 +27,7 @@ pip install git+https://github.com/OTeam-AI4S/OFoldX
 | [`io`](ofoldx/io)               | 读写 mmCIF、PDB 和原生制品。 |
 | [`chemistry`](ofoldx/chemistry) | 定义化学组分和构建分子。     |
 | [`msa`](ofoldx/msa)             | 读取、配对和准备序列比对。   |
+| [`templates`](ofoldx/templates) | 提供结构模板证据。           |
 | [`modules`](ofoldx/modules)     | 复用神经网络与几何组件。     |
 
 ## 社区
