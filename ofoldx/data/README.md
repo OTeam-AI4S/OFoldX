@@ -58,3 +58,5 @@ Invalid requests, unsupported representations, and insufficient placement inform
 [`ofoldx.errors`][ofoldx.errors]. Each operation documents its failure conditions.
 
 ## Related Modules
+
+- [Chemistry](../chemistry/README.md): component definitions and construction recipes.

@@ -1,0 +1,109 @@
+# Source block hashes below describe their original snapshots before concatenation.
+# The first 35 blocks came from source; the final 7 came from supplemental_source.
+# Block boundary whitespace changed where the later blocks were appended; fixture hashes record those bytes.
+source = "/local/projects/allodesign/datasets/protenix_26.01.01/common/components.cif"
+source_sha256 = "bb31ae5cf6c8bc669924313077cb4231ee5ffefd3a20118cd14f3ec89f8bb6a5"
+blocks = [
+  "ALA",
+  "GLY",
+  "PRO",
+  "LYS",
+  "HIS",
+  "CYS",
+  "ASN",
+  "SER",
+  "MSE",
+  "SME",
+  "DA",
+  "A",
+  "U",
+  "DT",
+  "CRO",
+  "7WC",
+  "ACE",
+  "FOR",
+  "NH2",
+  "NME",
+  "UNL",
+  "NAG",
+  "FRU",
+  "ACT",
+  "HOH",
+  "ZN",
+  "C49",
+  "8D8",
+  "1AP",
+  "0NC",
+  "IAS",
+  "DCZ",
+  "DOD",
+  "ASX",
+  "ACF",
+  "C",
+  "DC",
+  "DG",
+  "G",
+  "UNK",
+  "N",
+  "DN",
+]
+[block_sha256]
+"ALA" = "6d32b34d4f7b3ddf0cd3dff3f98ddaf7649bc5303ff9a8bd95ba62283f47a1ca"
+"GLY" = "c49458946b0ebc057db6ad0a4e1557a1caaed4c80a203accd458efddccbf92ff"
+"PRO" = "08674e4d60bc40ad5702b8de6e5e4abb66c2bbb603832c021c31194f4b4e593c"
+"LYS" = "318a0f6fa8f98682b35e1793517d5b683b9045c1e6174bc564b7d43e07e4c07c"
+"HIS" = "89355e09d9c622dd514738e559d7a75ab0a1659df9a179978e88e1a44704a46f"
+"CYS" = "b28c79381f9f41fe57a9e97468fc8101d5fd1064272a22da1eed6d05d27a24cc"
+"ASN" = "81491bbdb49f96e2945192c07510324d206298d3479029b76defba2ed6ab2dc7"
+"SER" = "46db0296a07732854d2c3ca67ed0f74f4c82ddc5698d0e59f433039a5d7c88a0"
+"MSE" = "2f8373207105fd6e18aa25ec22cfb229987da61cc79a3980e64d7ee31fb4d31c"
+"SME" = "213793c127e4c2a1c5c739461946a97eb1a4a3f9272f9459c4050a7e09bfdb71"
+"DA" = "57f7122cec3b98b35d1ab6428b6e0ed84898d37857d048079e1455804f4fa225"
+"A" = "57bb4f3ac7657a576ad5f042c27b006aec6f8de024eefe00ceeaa569fa770505"
+"U" = "de78a1e4a9860baaefc17c5e509fad96b0b25e0b62f90352976f9079cd4b051b"
+"DT" = "6fda70602012a9fbed3529298e850cd34fef2c3074856ee7fb5d6007fe02a4f6"
+"CRO" = "628869490a8e0855e57e12f229676095237afbd77124a470cc74f9729dd2a4b2"
+"7WC" = "0c4a2997f04685fcfff365b4012a35b5460c71aa4133196d0b55631272710a51"
+"ACE" = "463cfab0e3ed37e0c6308546855d30c14408b2031fe9c0996acd67185c314074"
+"FOR" = "61365494c9ce67491906e8ce7fa4435151ef2e4504a1f23766a9599a178c5659"
+"NH2" = "201cd96928975d125408ecda11d69139f08280cfef91f86c8f9b4e5e464fd627"
+"NME" = "fb95b4cd28ade57c1c72e41fbdbdc243bb5770d4f8d45586f6a1c52d21767447"
+"UNL" = "8235bc4712032ff877b382a66f9f1772281f20a714e8d8b552edc66eae4c640c"
+"NAG" = "eada750ebb20e7abd76ef486c0a8278e461309e1cdde415545bb1c63c09bfb0f"
+"FRU" = "703e377c5b9ececb7d03266cbe4d49b0fa9c2eacc1f975d09613afee12f165ad"
+"ACT" = "84496b5575ab0672cfc921426995c80ae04968435ad9581c3b47d07ea1e0839d"
+"HOH" = "fba49260366ebecbde618cc380f3557016d6fdef5c1836337be8f89ed62750b5"
+"ZN" = "dfd90cb88732a63f688150e3768c67b26dc9e9dfcd43037e125781a7e9cd9667"
+"C49" = "27f3508fd8a28f1bb090ba0497f2aa5d8acb8f5d7deb6b13df02b266f7b1a748"
+"8D8" = "47a1abd50641983eced3075e4182117400aebf2641540c84d9580844dc70ed09"
+"1AP" = "a3504169321624458d4aee175fe0f9f029668ed94dee3605127cdf06d7c5a7e8"
+"0NC" = "998d5d0704d47c2fd97a558ceb9f2de60cae4ad5e36d004afa8e24a82c0d5f4f"
+"IAS" = "a6f1d75260d332944b5afa4b3d2992086d81a86343643b3115e9ae1a469e353d"
+"DCZ" = "ab5e8f40229e86a8a560c0bbd5884560788d0dbade9cf34a26c5a0e05738e125"
+"DOD" = "aecf90255812bbe3e140e6b7508cf570199f6be38f681a136b82ddb9b09c034c"
+"ASX" = "8fc1d7434db88fb76c99b5ba7d870efa02be367190c621123a1e05f4dff5cfda"
+"ACF" = "130dba72a587817a944adbb12c0c8df3b7868feb66dca3202194f2f1022a643a"
+"C" = "4937647bc2142b3a67fedb3db7e4f24c0ecad844ca5330356f2e95a981e9544e"
+"DC" = "898169cacb03d9375cabe76813110e69e3892609ef3afb9f8e48576541179ea4"
+"DG" = "87b9c4eddf89edcbc7aba4f77ed2159bb572e9c8092409d893998be426d872f2"
+"G" = "4fbcf5b5222d7c7f0a761676cffa9bb997daa8f76d41fdb7657aa59e969b85fa"
+"UNK" = "46fc71ee8131a4f07d26b53cfd597faa86772f14b450caf61081039df0cc0450"
+"N" = "b57a00e84662710942dfb76d0cece545f6de86123e24ee13e4b40d265619d390"
+"DN" = "4bf9215c5af6f68c16f0a07d9f74ad227084322a74ee3b7a6e696b1922787822"
+
+[supplemental_source]
+url = "https://files.wwpdb.org/pub/pdb/data/monomers/components.cif.gz"
+last_modified = "2026-10-24T04:56:15Z"
+sha256 = "d5be0434a719108e2dd50708b17b0af26b088c1ce7d751a668aeecf9bdc26949"
+blocks = ["C", "DC", "DG", "G", "UNK", "N", "DN"]
+# Each appended source block was stripped of trailing whitespace before joining.
+
+[fixture_block_sha256]
+"ACF" = "16c59fa80454368817ab3c44b010e2c8a69538dca9784b3c3bc025c6274b680b"
+"C" = "7be72902c8a235123bd860a69dd0f814b7d220f7a656d4027c836fd465e8c022"
+"DC" = "dc4c2d1dca8c7a8c4057c323846a2ca7b9354c438a6e872e506335a2ef0c8e64"
+"DG" = "1b53bc4691323dde7e1fdb892da6eddab838dd85b78e1a6cf4074ef8200de46c"
+"G" = "5e5d5a420391201e83ce0461c88073cc9509037d58e12b87297ca61a091bcb1f"
+"UNK" = "369e379b6f0e45476a9049118abf5ca797a07ca061306e906e068371d7424aed"
+"N" = "36a35342bc2add357dffa86199b0b792aa426c9825f340d44c658c30480f3b5b"
+"DN" = "82e615fde0124cd9860ff79691ac9dc50fce62d123b5f0fcf8a8f2e750cbb3ee"
