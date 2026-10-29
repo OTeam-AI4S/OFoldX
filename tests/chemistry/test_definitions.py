@@ -520,8 +520,34 @@ class TestGetComponent:
         monkeypatch.setenv("OFOLDX_CCD_ARTIFACT", str(path))  # the environment variable is the interface
         assert get_component("ALA").digest == archive("ALA").digest
 
-    def test_unconfigured_refused(self, monkeypatch):
+    @pytest.mark.parametrize("value", [None, ""])
+    def test_default_download_is_cached(self, monkeypatch, archive, tmp_path, value):
+        from ofoldx.chemistry import definitions
+
+        path = tmp_path / "default.safetensors"
+        write_artifact([archive("ALA")], path, provenance())
+        monkeypatch.setattr(definitions, "_CONFIGURED", {})
         monkeypatch.delenv("OFOLDX_CCD_ARTIFACT", raising=False)
-        with pytest.raises(InvalidRequestError) as raised:
+        if value is not None:
+            monkeypatch.setenv("OFOLDX_CCD_ARTIFACT", value)
+        calls = []
+
+        def download():
+            calls.append(True)
+            return path
+
+        monkeypatch.setattr("ofoldx.chemistry.definitions.download_library", download)
+        first = configured_library()
+        assert configured_library() is first
+        assert get_component("ALA").digest == archive("ALA").digest
+        assert len(calls) == 1
+
+    def test_missing_local_override_does_not_download(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("OFOLDX_CCD_ARTIFACT", str(tmp_path / "missing.safetensors"))
+
+        def download():
+            pytest.fail("an explicit local path must not fall back to the Hub")
+
+        monkeypatch.setattr("ofoldx.chemistry.definitions.download_library", download)
+        with pytest.raises(FileNotFoundError):
             configured_library()
-        assert raised.value.code == "ccd_artifact_unconfigured"

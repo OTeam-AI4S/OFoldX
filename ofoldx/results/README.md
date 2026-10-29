@@ -6,8 +6,6 @@ these values with their own scientific records.
 
 ## Usage
 
-Set `OFOLDX_CCD_ARTIFACT` to an existing CCD artifact before reading a structure.
-
 After a ProteinMPNN design call, select a candidate by sequence NLL and save its target:
 
 ```python
@@ -22,7 +20,7 @@ print(candidate.scores["designed_sequence_nll"].value)
 save_structure(candidate.target, "candidate.safetensors")
 ```
 
-The official model is downloaded and cached on first use. A sequence
+The [CCD artifact](../reference/ccd/README.md) and official model are downloaded and cached on first use. A sequence
 design's target contains its designed chemistry and available guide coordinates. Use a packing workflow when the
 next step needs generated side-chain coordinates.
 

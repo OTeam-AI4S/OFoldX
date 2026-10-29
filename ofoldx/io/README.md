@@ -5,8 +5,6 @@ chemical definitions; write reports describe information that an exchange format
 
 ## Usage
 
-Set `OFOLDX_CCD_ARTIFACT` to an existing CCD artifact before reading a structure.
-
 Read a structure and write it as mmCIF with the definitions used during the read:
 
 ```python
@@ -18,7 +16,9 @@ print(structure.coordinates.shape)
 print(len(write_report.records))
 ```
 
-Supply your `input.cif`. An explicit `library=` can also be supplied to a read or write.
+Supply your `input.cif`. Chemical definitions come from the cached `oteam/ccd` dataset by default.
+The [CCD guide](../reference/ccd/README.md) explains local library overrides and offline use. An explicit `library=` can
+also be supplied to a read or write.
 
 ## Reading Structures
 

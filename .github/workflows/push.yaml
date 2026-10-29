@@ -150,11 +150,16 @@ jobs:
           /tmp/ofoldx-smoke/bin/python -m pip install dist/*.whl
           ofoldx_smoke_dir=$(mktemp -d)
           cd "$ofoldx_smoke_dir"
+          /tmp/ofoldx-smoke/bin/python -I -m ofoldx.reference.ccd --help
+          /tmp/ofoldx-smoke/bin/python -I -m ofoldx.reference.ccd build \
+            --source "$GITHUB_WORKSPACE/tests/fixtures/ccd/components_subset.cif.gz" \
+            --content-version ci-subset --output "$ofoldx_smoke_dir/ccd"
           /tmp/ofoldx-smoke/bin/python -I - <<'PY_SMOKE'
           import os
           from importlib.resources import files
           from pathlib import Path
           from ofoldx import AutoModel, AutoProcessor
+          from ofoldx.chemistry.definitions import load_library
           from ofoldx.conversion import save_repository
           from ofoldx.hub import resolve_hub_repository
 
@@ -166,6 +171,7 @@ jobs:
               relative = card.relative_to(source).as_posix()
               assert package.joinpath(relative).is_file(), relative
           assert all(callable(api) for api in (AutoModel, AutoProcessor, save_repository, resolve_hub_repository))
+          assert load_library(Path("ccd/components.safetensors")).definition("ALA") is not None
           PY_SMOKE
       - name: Upload distributions
         uses: actions/upload-artifact@v7

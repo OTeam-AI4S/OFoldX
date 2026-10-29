@@ -5,8 +5,6 @@ Use these values to select chains, combine molecular systems, and pass structure
 
 ## Usage
 
-Set `OFOLDX_CCD_ARTIFACT` to an existing CCD artifact before reading a structure.
-
 Read a structure and select author chain `A`, omitting water and folding explicit hydrogens into hydrogen counts:
 
 ```python

@@ -4,8 +4,6 @@ Examples of inference, training, and model export.
 
 ## Score a Protein Sequence
 
-Set `OFOLDX_CCD_ARTIFACT` to an existing CCD artifact before reading a structure.
-
 Provide a backbone file to the [ProteinMPNN example](pipelines/proteinmpnn.py):
 
 ```bash
@@ -20,7 +18,7 @@ residues by instance and component ordinal.
 
 Omitting `--structure` uses the bundled [tripeptide](data/tripeptide.pdb).
 `--device` defaults to `cpu`; use `--device cuda` for a CUDA model.
-`--seed` initializes decoding-order sampling.
+`--seed` initializes decoding-order sampling. The [CCD guide](../ofoldx/reference/ccd/README.md) describes local artifact overrides and offline use.
 
 ## Use a Local Checkpoint
 

@@ -15,8 +15,6 @@ OFoldX 是用于生物分子结构预测与设计的 PyTorch 库。
 pip install ofoldx
 ```
 
-读取结构前，将 `OFOLDX_CCD_ARTIFACT` 指向已有 CCD 文件。
-
 使用 ProteinMPNN 对蛋白质序列评分：
 
 ```python
@@ -43,7 +41,7 @@ pip install git+https://github.com/OTeam-AI4S/OFoldX
 ## 社区
 
 - [GitHub Issues](https://github.com/OTeam-AI4S/OFoldX/issues)：错误报告、使用问题和功能请求。
-- [Hugging Face](https://huggingface.co/oteam)：模型检查点。
+- [Hugging Face](https://huggingface.co/oteam)：模型检查点和数据集。
 
 ## 引用
 

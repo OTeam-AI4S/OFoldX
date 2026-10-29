@@ -36,6 +36,7 @@ import pytest
 CORE = (
     "ofoldx.reference.space_groups",
     "ofoldx.errors",
+    "ofoldx.reference.ccd.source",
     "ofoldx.provenance",
     "ofoldx.data",
     "ofoldx.msa",
@@ -47,7 +48,7 @@ CORE = (
 BESIDE = ("ofoldx.msa",)
 #: Above models: the user-facing entry points that read files. ``pipelines``, ``results`` and ``analysis`` are the
 #: base classes and values the model families build on, so they sit on the models side and never import io.
-UPPER = ("ofoldx.runners", "ofoldx.api", "ofoldx.auto")
+UPPER = ("ofoldx.runners", "ofoldx.api", "ofoldx.auto", "ofoldx.reference.ccd")
 SCOPE = (*CORE, "ofoldx.models", "ofoldx.pipelines", "ofoldx.results", "ofoldx.analysis", *UPPER)
 OFFLINE = ("tools", "ofoldx.reference.space_groups.build")
 COMPUTE = ("torch", "tensordict", "danling")
