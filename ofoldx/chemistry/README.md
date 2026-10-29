@@ -18,7 +18,8 @@ print(len(imported.records))
 ```
 
 The import returns a component definition and records describing the read. To construct a polymer, state its
-sequence and physical instances. Set `OFOLDX_CCD_ARTIFACT` to an existing CCD artifact.
+sequence and physical instances. CCD definitions are downloaded from `oteam/ccd` on first use and cached;
+the [CCD guide](../reference/ccd/README.md) describes local artifact overrides and offline use.
 
 ```python
 from ofoldx.chemistry import Recipe, build_system, polymer_sequence
@@ -56,6 +57,7 @@ require. A generated conformer does not become an experimental observation.
 
 ## Related Modules
 
+- [CCD](../reference/ccd/README.md): build, cache, and share the component library.
 - [Data](../data/README.md): molecular values, graph edits, projections, and coordinate evidence.
 - [I/O](../io/README.md): read source definitions and structure observations together.
 - [Models](../models/README.md): family-specific preparation and chemical capacity.

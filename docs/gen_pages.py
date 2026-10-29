@@ -177,9 +177,6 @@ def rewrite_readme_links(body: str, *, readme: Path, page: str) -> str:
         if source_target.name == "README.md":
             source_target = source_target.parent
 
-        if not source_target.exists():
-            return label
-
         doc_target = PACKAGE_DOC_TARGETS.get(source_target)
         if source_target.parent == MODEL_ROOT and (source_target / "model.py").exists():
             doc_target = f"models/{source_target.name}.md"

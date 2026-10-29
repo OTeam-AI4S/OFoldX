@@ -45,8 +45,6 @@ instance bindings together.
 
 ## Indexed Collections
 
-Set `OFOLDX_CCD_ARTIFACT` to an existing CCD artifact before reading a structure.
-
 `IndexedMsaLoader` reads existing protein/RNA alignment directories lazily:
 
 ```python

@@ -6,8 +6,6 @@ may own one Model–Processor pair or several named child workflows.
 
 ## Usage
 
-Set `OFOLDX_CCD_ARTIFACT` to an existing CCD artifact before reading a structure.
-
 ```python
 from ofoldx import AutoPipelineForDesign, pipeline
 

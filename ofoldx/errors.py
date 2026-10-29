@@ -650,7 +650,7 @@ _TABLE = [
         },
     ),
     *_raise("artifact_schema_unsupported", UNS, "a CCD artifact of a schema this version does not read"),
-    *_raise("ccd_artifact_unconfigured", REQ, "no CCD artifact configured (no silent fallback)"),
+    *_raise("ccd_revision_invalid", REQ, "a CCD dataset revision must be nonempty"),
     *_raise("component_not_in_library", INS, "get_component miss"),
     # Attachments — Conflict reasons
     *_record(

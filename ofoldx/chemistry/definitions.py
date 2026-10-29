@@ -54,6 +54,13 @@ from ..data.molecular import DefinitionScope, ReferenceSource
 from ..data.stereo import bond_configuration, parity_from_coordinates, permutation_parity
 from ..errors import CODE_NAMES, CODES, PayloadKind, RequestRef, SourceRef, fail
 from ..provenance import Basis, Records, Resolution, SourceRefs, basis, known, resolution, state
+from ..reference.ccd.source import (
+    ARTIFACT_FILENAME,
+    DEFAULT_REPOSITORY,
+    DEFAULT_REVISION,
+    PROVENANCE_FILENAME,
+    resolve_snapshot,
+)
 from .fragments import findings
 
 if TYPE_CHECKING:
@@ -919,7 +926,7 @@ def stated_component(values: Mapping[str, object], *, scope: DefinitionScope) ->
     return cast(Callable[..., ChemicalComponent], ChemicalComponent)(scope=scope, digest=_digest(values), **values)
 
 
-def _findings(c: ChemicalComponent) -> list[tuple[str, Mapping[str, object]]]:
+def component_findings(c: ChemicalComponent) -> list[tuple[str, Mapping[str, object]]]:
     r"""The artifact findings of a definition with their payloads: the reference-graph findings of
     ``fragments.findings``, a refused parity per row and a contradicted conformer."""
     out = list(findings(c))
@@ -1032,7 +1039,7 @@ def resolve_definitions(
         if definition is None:
             continue
         by_id[cid], sources[cid] = definition, tuple(refs)
-        entries += [(code, {"id": cid, **payload}, sources[cid]) for code, payload in _findings(definition)]
+        entries += [(code, {"id": cid, **payload}, sources[cid]) for code, payload in component_findings(definition)]
     records, provenance = _records(entries, block), library.provenance
     return Definitions(MappingProxyType(by_id), records, provenance, MappingProxyType(sources))
 
@@ -1360,18 +1367,68 @@ def load_library(path: str | PathLike) -> ComponentLibrary:
     return ComponentLibrary(columns, provenance)
 
 
+def validate_library(directory: Path) -> Path:
+    r"""Check a CCD dataset's schema, payload, sidecar digest and content version."""
+    artifact = directory / ARTIFACT_FILENAME
+    sidecar = directory / PROVENANCE_FILENAME
+    library = load_library(artifact)
+    record = _json(sidecar.read_bytes(), "provenance")
+    if not isinstance(record, dict):
+        _corrupt("provenance")
+    with artifact.open("rb") as handle:
+        digest = hashlib.file_digest(handle, "sha256").hexdigest()
+    if record.get("sha256") != digest:
+        _corrupt("provenance.sha256")
+    if library.provenance is None or record.get("content_version") != library.provenance.content_version:
+        _corrupt("provenance.content_version")
+    return artifact
+
+
+def download_library(
+    repo_id: str = DEFAULT_REPOSITORY,
+    *,
+    revision: str = DEFAULT_REVISION,
+    token: str | None = None,
+    local_files_only: bool = False,
+) -> Path:
+    r"""Download a CCD artifact and provenance sidecar from one dataset snapshot.
+
+    Args:
+        repo_id: Dataset repository; defaults to `oteam/ccd`.
+        revision: Dataset tag, branch, or full commit; defaults to main. Select a full
+            commit when a run needs a fixed snapshot.
+        token: Optional Hub authentication token.
+        local_files_only: Whether to resolve files only from the existing Hub cache.
+
+    Returns:
+        The cached `components.safetensors` path after schema, payload, and sidecar checks.
+        Both files are resolved at the same dataset commit.
+
+    Raises:
+        InvalidRequestError: The requested revision is empty (`ccd_revision_invalid`).
+        UnsupportedError: The artifact schema is unsupported.
+        ContradictionError: The artifact or its provenance sidecar is inconsistent.
+    """
+    directory = resolve_snapshot(repo_id, revision=revision, token=token, local_files_only=local_files_only)
+    return validate_library(directory)
+
+
 _CONFIGURED: dict[str, ComponentLibrary] = {}
 
 
 def configured_library() -> ComponentLibrary:
-    r"""The artifact named by ``OFOLDX_CCD_ARTIFACT``, loaded once per process; unset or empty →
-    ``InvalidRequestError(ccd_artifact_unconfigured)``."""
+    r"""Return the default CCD library, loaded once per process.
+
+    ``OFOLDX_CCD_ARTIFACT`` overrides the artifact with a local path. Otherwise,
+    download the official ``oteam/ccd`` dataset using the Hugging Face cache.
+    An explicit local path is never replaced by a download if loading fails.
+    """
     path = os.environ.get("OFOLDX_CCD_ARTIFACT", "")
-    if not path:
-        fail("ccd_artifact_unconfigured", RequestRef("OFOLDX_CCD_ARTIFACT", ""))
-    key = str(Path(path).resolve())
+    key = str(Path(path).resolve()) if path else ""
     if key not in _CONFIGURED:
-        _CONFIGURED[key] = load_library(key)
+        if not path:
+            path = str(download_library())
+        _CONFIGURED[key] = load_library(path)
     return _CONFIGURED[key]
 
 

@@ -33,8 +33,6 @@ required child models together.
 
 ## Load and Run a Model
 
-Set `OFOLDX_CCD_ARTIFACT` to an existing CCD artifact before reading a structure.
-
 Read a protein backbone from `backbone.cif` and score its sequence with the
 official ProteinMPNN model:
 
@@ -49,7 +47,8 @@ nll = result.scores["designed_sequence_nll"]
 print(nll.value, nll.unit)
 ```
 
-Model files are downloaded and cached on first use. The [standalone scoring example](../../examples/pipelines/proteinmpnn.py)
+Model files and the [CCD artifact](../reference/ccd/README.md) are downloaded and cached
+on first use. The [standalone scoring example](../../examples/pipelines/proteinmpnn.py)
 writes named scores, their units and molecular scopes to JSON. Its `--model`
 argument also accepts a native local export.
 

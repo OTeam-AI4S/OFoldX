@@ -6,8 +6,6 @@ Load and run folding, design, scoring and side-chain packing workflows through
 
 ## Usage
 
-Set `OFOLDX_CCD_ARTIFACT` to an existing CCD artifact before reading a structure.
-
 Read the protein backbone in `backbone.cif`, load ProteinMPNN and inspect its
 sequence score:
 
@@ -32,7 +30,8 @@ result = score("backbone.cif", model="oteam/proteinmpnn", seed=7)
 print(result.scores["designed_sequence_nll"].value)
 ```
 
-Model files are downloaded and cached on first use.
+Model files and the [CCD artifact](../reference/ccd/README.md) are downloaded and cached
+on first use.
 
 ## Tasks and Inputs
 

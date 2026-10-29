@@ -5,8 +5,6 @@ paths, and publish repository files on the Hugging Face Hub.
 
 ## Usage
 
-Set `OFOLDX_CCD_ARTIFACT` to an existing CCD artifact before reading a structure.
-
 Resolve the official ProteinMPNN repository, then use its local snapshot to score
 the protein backbone in `backbone.cif`:
 
@@ -48,6 +46,10 @@ and `AutoProcessor` load individual components. The lower-level helpers in
 `ofoldx.hub.model` read native repository metadata and restore model weights;
 they are also available from `ofoldx.hub`.
 
+For the chemical component dictionary, use [the CCD functions](../reference/ccd/README.md).
+They download a dataset snapshot and check the artifact with its provenance
+sidecar.
+
 ## Publish a Repository
 
 After converting or exporting a local model, publish its directory to your Hub
@@ -74,3 +76,4 @@ and `delete_patterns` to control the destination and uploaded file set.
 - [Task API](../api/README.md): load and execute a biological operation.
 - [Models](../models/README.md): checkpoint conversion and native model repositories.
 - [Pipelines](../pipelines/README.md): paired and composite workflows.
+- [CCD](../reference/ccd/README.md): build, download and publish chemical component dictionaries.

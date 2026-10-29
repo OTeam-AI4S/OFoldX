@@ -66,8 +66,6 @@ The model file depends on the [`ofoldx`](https://ofoldx.valtech.ai/) library. Yo
 pip install ofoldx
 ```
 
-Before reading a structure, set `OFOLDX_CCD_ARTIFACT` to an existing CCD artifact.
-
 ### Direct Use
 
 #### Structure Prediction

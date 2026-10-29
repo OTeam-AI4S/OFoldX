@@ -16,8 +16,6 @@ Install OFoldX from PyPI:
 pip install ofoldx
 ```
 
-Set `OFOLDX_CCD_ARTIFACT` to an existing CCD artifact before reading a structure.
-
 Score a protein sequence with ProteinMPNN:
 
 ```python
@@ -45,7 +43,7 @@ pip install git+https://github.com/OTeam-AI4S/OFoldX
 ## Community
 
 - [GitHub Issues](https://github.com/OTeam-AI4S/OFoldX/issues): bugs, usage questions, and feature requests.
-- [Hugging Face](https://huggingface.co/oteam): model checkpoints.
+- [Hugging Face](https://huggingface.co/oteam): model checkpoints and datasets.
 
 ## Citation
 

@@ -5,8 +5,6 @@ read structure, binds caller-supplied alignments to target instances, and stores
 
 ## Usage
 
-Set `OFOLDX_CCD_ARTIFACT` to an existing CCD artifact before reading a structure.
-
 Read a template structure whose author chain `A` contains at
 least two polymer positions. This example aligns its first two positions to the first two positions of target
 entity `query`:
