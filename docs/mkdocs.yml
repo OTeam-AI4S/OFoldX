@@ -1,22 +1,18 @@
 site_name: OFoldX
-site_url: https://ofoldx.valhalla.technology/
+site_url: https://ofoldx.valtech.ai/
 site_author: OFoldX Contributors
 site_description: Fold molecules, unfold possibilities. Open biomolecular models for prediction and design.
 copyright: All rights reserved &copy; 2026-Present, OFoldX Contributors
 docs_dir: docs
-site_dir: build/docs
+site_dir: site
 exclude_docs: |
   !/templates/
-  /generate_docs.py
-  /site/
-  /__pycache__/
-  /requirements.txt
 
 repo_name: OTeam-AI4S/OFoldX
 repo_url: https://github.com/OTeam-AI4S/OFoldX
 
 hooks:
-  - docs/generate_docs.py
+  - gen_pages.py
 
 nav:
   - Home: index.md
@@ -25,6 +21,7 @@ nav:
   - Task API: []
   - Data: []
   - Chemistry: []
+  - Reference Data: []
   - MSA: []
   - Templates: []
   - I/O: []
@@ -92,7 +89,7 @@ extra:
       as to measure the effectiveness of our documentation and whether users
       find what they're searching for. With your consent, you're helping us to
       make our documentation better. Please check out our
-      <a href="https://ofoldx.valhalla.technology/about/privacy/">Privacy Notice</a> for more information.
+      <a href="https://ofoldx.valtech.ai/about/privacy">Privacy Notice</a> for more information.
   generator: false
   social:
     - icon: fontawesome/brands/github
@@ -173,7 +170,7 @@ plugins:
       handlers:
         python:
           paths:
-            - .
+            - ..
           options:
             docstring_style: google
             members_order: source
@@ -192,12 +189,12 @@ plugins:
             - https://chanfig.danling.org/objects.inv
             - https://danling.org/objects.inv
 watch:
-  - ofoldx/
-  - README.md
-  - README.zh.md
-  - license.md
-  - license.zh.md
-  - license-faq.md
-  - license-faq.zh.md
-  - privacy.md
-  - privacy.zh.md
+  - ../ofoldx/
+  - ../README.md
+  - ../README.zh.md
+  - ../license.md
+  - ../license.zh.md
+  - ../license-faq.md
+  - ../license-faq.zh.md
+  - ../privacy.md
+  - ../privacy.zh.md

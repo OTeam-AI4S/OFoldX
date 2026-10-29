@@ -19,24 +19,6 @@ pip install ofoldx
 pip install git+https://github.com/OTeam-AI4S/OFoldX
 ```
 
-## 浏览
-
-| 入口                            | 用途                                                |
-| ------------------------------- | --------------------------------------------------- |
-| [`models`](ofoldx/models)       | 选择模型家族、转换检查点和加载模型仓库。            |
-| [`pipelines`](ofoldx/pipelines) | 运行和组合生物学工作流。                            |
-| [`api`](ofoldx/api)             | 加载任务 pipeline，调用通用评分与侧链构象预测接口。 |
-| [`data`](ofoldx/data)           | 表达分子身份、坐标和观测。                          |
-| [`io`](ofoldx/io)               | 读写 mmCIF、PDB 和原生制品。                        |
-| [`chemistry`](ofoldx/chemistry) | 定义化学组分和构建分子。                            |
-| [`msa`](ofoldx/msa)             | 读取、配对和准备序列比对。                          |
-| [`templates`](ofoldx/templates) | 提供结构模板证据。                                  |
-| [`modules`](ofoldx/modules)     | 复用神经网络与几何组件。                            |
-| [`results`](ofoldx/results)     | 解读候选、分数与分子指标。                          |
-| [`metrics`](ofoldx/metrics)     | 计算结构比较指标。                                  |
-| [`analysis`](ofoldx/analysis)   | 筛选和排序设计候选。                                |
-| [`hub`](ofoldx/hub)             | 解析、下载和发布模型或数据集仓库。                  |
-
 ## 社区
 
 - [GitHub Issues](https://github.com/OTeam-AI4S/OFoldX/issues)：错误报告、使用问题和功能请求。

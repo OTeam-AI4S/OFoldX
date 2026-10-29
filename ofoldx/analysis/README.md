@@ -44,3 +44,10 @@ pipeline combines those measurements with its own candidate and result types.
 - [Metrics](../metrics/README.md): individual score formulas and confidence reductions.
 - [Results](../results/README.md): candidate structures, scores, and their molecular scope.
 - [Models](../models/README.md): the analyses used by each scientific workflow.
+
+[ofoldx.analysis.diversity]: https://ofoldx.valtech.ai/analysis/diversity/#ofoldx.analysis.diversity
+[ofoldx.analysis.ranking]: https://ofoldx.valtech.ai/analysis/ranking/#ofoldx.analysis.ranking
+[ofoldx.analysis.ranking.CandidateFilter]: https://ofoldx.valtech.ai/analysis/ranking/#ofoldx.analysis.ranking.CandidateFilter
+[ofoldx.analysis.ranking.rank_candidates]: https://ofoldx.valtech.ai/analysis/ranking/#ofoldx.analysis.ranking.rank_candidates
+[ofoldx.analysis.sequence]: https://ofoldx.valtech.ai/analysis/sequence/#ofoldx.analysis.sequence
+[ofoldx.analysis.structure]: https://ofoldx.valtech.ai/analysis/structure/#ofoldx.analysis.structure
