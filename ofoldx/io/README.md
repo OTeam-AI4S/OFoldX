@@ -84,3 +84,9 @@ print(restored.coordinates.shape)
 [`read_cif`][ofoldx.io.cif.read_cif] and [`parse_cif`][ofoldx.io.cif.parse_cif] expose CIF blocks and categories.
 `TokenState` distinguishes a stated value, unknown `?`, inapplicable `.`, and an item absent from its category.
 Sequence alignments have their own readers in [MSA](../msa/README.md).
+
+[ofoldx.chemistry.smiles.read_smiles]: https://ofoldx.valtech.ai/chemistry/smiles/#ofoldx.chemistry.smiles.read_smiles
+[ofoldx.io.cif.parse_cif]: https://ofoldx.valtech.ai/io/cif/#ofoldx.io.cif.parse_cif
+[ofoldx.io.cif.read_cif]: https://ofoldx.valtech.ai/io/cif/#ofoldx.io.cif.read_cif
+[ofoldx.io.read.read_structure]: https://ofoldx.valtech.ai/io/read/#ofoldx.io.read.read_structure
+[ofoldx.io.write.write_structure]: https://ofoldx.valtech.ai/io/write/#ofoldx.io.write.write_structure

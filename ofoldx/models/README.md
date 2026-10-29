@@ -10,7 +10,7 @@ Model families provide their own task pipelines and checkpoints.
 
 ## Processor Data Preparation
 
-Processors expose three data operations, shared by training, labelled evaluation, and prediction:
+Processors use three data operations for preparation:
 
 ```python
 input = processor.prepare_input(structure, **task_options)
@@ -20,7 +20,8 @@ input, target = processor.prepare(structure, target=truth, **task_options)
 
 Use the processor and task options for your chosen family. `prepare_input` returns a `PreparedInput` with
 `features` for the task and a `context` that maps them to the molecular structure. `prepare_target` aligns
-truth to that context, reusing the same crop and molecular correspondence.
+truth to that context, reusing the same crop and molecular correspondence. The supported targets depend on
+the model family; processors without target preparation raise an error when a target is supplied.
 
 `prepare` combines these operations and returns `(input, target)`. Without an explicit target, it returns
 `(input, None)`. To use the source structure as truth, pass `target=structure` explicitly. Targets contain

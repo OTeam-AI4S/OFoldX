@@ -68,3 +68,14 @@ Invalid requests, unsupported representations, and insufficient placement inform
 - [I/O](../io/README.md): read, write, and persist structures.
 - [Chemistry](../chemistry/README.md): component definitions and construction recipes.
 - [Results](../results/README.md): structures and scores returned by model workflows.
+
+[ofoldx.data.assembly]: https://ofoldx.valtech.ai/data/assembly/#ofoldx.data.assembly
+[ofoldx.data.editing]: https://ofoldx.valtech.ai/data/editing/#ofoldx.data.editing
+[ofoldx.data.molecular.MolecularSystem]: https://ofoldx.valtech.ai/data/molecular/#ofoldx.data.molecular.MolecularSystem
+[ofoldx.data.projection]: https://ofoldx.valtech.ai/data/projection/#ofoldx.data.projection
+[ofoldx.data.schema]: https://ofoldx.valtech.ai/data/schema/#ofoldx.data.schema
+[ofoldx.data.schema.ArrayRecord]: https://ofoldx.valtech.ai/data/schema/#ofoldx.data.schema.ArrayRecord
+[ofoldx.data.stereo]: https://ofoldx.valtech.ai/data/stereo/#ofoldx.data.stereo
+[ofoldx.data.structure.Structure]: https://ofoldx.valtech.ai/data/structure/#ofoldx.data.structure.Structure
+[ofoldx.data.tokenization.TokenLayout]: https://ofoldx.valtech.ai/data/tokenization/#ofoldx.data.tokenization.TokenLayout
+[ofoldx.errors]: https://ofoldx.valtech.ai/reference/errors/#ofoldx.errors
